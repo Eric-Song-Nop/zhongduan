@@ -1,0 +1,7 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "vendor/wterm/packages/*"
+
+catalog:
+  zod: 4.4.3

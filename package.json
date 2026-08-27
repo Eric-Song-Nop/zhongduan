@@ -1,0 +1,15 @@
+{
+  "name": "zhongduan",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "26.4.0",
+    "vite-plus": "0.3.0",
+    "vitest": "4.1.11"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "packageManager": "pnpm@10.33.2"
+}
