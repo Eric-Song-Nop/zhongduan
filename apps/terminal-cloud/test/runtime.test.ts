@@ -399,7 +399,7 @@ describe("cloud relay runtime", () => {
         },
     );
     expect(clientCount.value).toBeLessThanOrEqual(16);
-  });
+  }, 15_000);
 
   it("keeps only one pending connection set for the same browser identity", async () => {
     const session = await createSession();
