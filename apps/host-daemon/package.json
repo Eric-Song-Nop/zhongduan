@@ -10,11 +10,12 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "build": "vp pack",
-    "check": "vp check",
-    "test": "vp test --run"
+    "build": "node ../../scripts/prepare-wterm.mjs && vp pack && node ../../scripts/package-host-assets.mjs",
+    "check": "node ../../scripts/prepare-wterm.mjs && vp check",
+    "test": "node ../../scripts/prepare-wterm.mjs && vp test --run"
   },
   "dependencies": {
+    "@wterm/ghostty": "workspace:*",
     "@zhongduan/protocol": "workspace:*",
     "node-pty": "1.1.0"
   },

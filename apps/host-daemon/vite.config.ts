@@ -1,11 +1,18 @@
 import { defineConfig } from "vite-plus";
 
 export default defineConfig({
+  lint: {
+    options: {
+      typeAware: true,
+      typeCheck: true,
+    },
+  },
   pack: {
     deps: {
-      alwaysBundle: ["@zhongduan/protocol"],
+      alwaysBundle: ["@wterm/core", "@wterm/ghostty", "@zhongduan/protocol"],
       neverBundle: ["node-pty"],
       onlyBundle: ["zod"],
+      onlyImport: ["node-pty"],
     },
     entry: ["src/index.ts", "src/cli.ts"],
     format: ["esm"],

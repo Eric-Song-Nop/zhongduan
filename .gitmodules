@@ -1,0 +1,3 @@
+[submodule "vendor/wterm"]
+	path = vendor/wterm
+	url = https://github.com/Eric-Song-Nop/wterm.git

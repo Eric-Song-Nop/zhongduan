@@ -32,6 +32,9 @@ importers:
 
   apps/host-daemon:
     dependencies:
+      '@wterm/ghostty':
+        specifier: workspace:*
+        version: link:../../vendor/wterm/packages/@wterm/ghostty
       '@zhongduan/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
@@ -84,6 +87,30 @@ importers:
       zod:
         specifier: 'catalog:'
         version: 4.4.3
+
+  vendor/wterm/packages/@internal/ts: {}
+
+  vendor/wterm/packages/@wterm/core:
+    devDependencies:
+      '@internal/ts':
+        specifier: workspace:*
+        version: link:../../@internal/ts
+      typescript:
+        specifier: ^6.0.2
+        version: 6.0.3
+
+  vendor/wterm/packages/@wterm/ghostty:
+    dependencies:
+      '@wterm/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@internal/ts':
+        specifier: workspace:*
+        version: link:../../@internal/ts
+      typescript:
+        specifier: ^6.0.2
+        version: 6.0.3
 
 packages:
 

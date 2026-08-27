@@ -17,7 +17,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   const command = requested.shift() ?? process.env.SHELL ?? "/bin/sh";
   const args = requested.length > 0 ? requested : command === process.env.SHELL ? ["-i"] : [];
   const dimensions = terminalDimensions();
-  const session = startLocalSession({ command, args, ...dimensions });
+  const session = await startLocalSession({ command, args, ...dimensions });
   let forcedExitCode: number | null = null;
   let cleaned = false;
   const wasRaw = process.stdin.isTTY ? process.stdin.isRaw : false;

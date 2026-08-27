@@ -227,14 +227,14 @@ export class TerminalSession {
     const captured = { ...input };
     return this.#submitInput(identity, () => {
       const bytes = this.#authority.encodeKey(captured);
-      return () => this.#pty.write(bytes);
+      return () => this.#writePty(bytes);
     });
   }
 
   submitPaste(identity: SemanticInputIdentity, data: string): Promise<InputAck> {
     return this.#submitInput(identity, () => {
       const bytes = this.#authority.encodePaste(data);
-      return () => this.#pty.write(bytes);
+      return () => this.#writePty(bytes);
     });
   }
 
@@ -284,13 +284,13 @@ export class TerminalSession {
             this.#commitResize(next.dimensions);
             break;
           case "raw-input":
-            this.#pty.write(next.data);
+            this.#writePty(next.data);
             break;
           case "key":
-            this.#pty.write(this.#authority.encodeKey(next.input));
+            this.#writePty(this.#authority.encodeKey(next.input));
             break;
           case "paste":
-            this.#pty.write(this.#authority.encodePaste(next.data));
+            this.#writePty(this.#authority.encodePaste(next.data));
             break;
           case "submitted-input":
             next.resolve(this.#commitSubmittedInput(next.identity, next.prepare));
@@ -324,7 +324,7 @@ export class TerminalSession {
       });
       this.#nextPtyOffset += BigInt(chunk.byteLength);
       this.#publish(frame);
-      for (const reply of replies) this.#pty.write(reply);
+      for (const reply of replies) this.#writePty(reply);
     }
   }
 
@@ -410,7 +410,7 @@ export class TerminalSession {
 
   #commitResize(dimensions: ResizePayload): void {
     const payload = encodeResizePayload(dimensions);
-    this.#authority.resize(dimensions);
+    const replies = this.#authority.resize(dimensions);
     this.#pty.resize(dimensions);
     const frame = encodeDataFrame({
       kind: DataFrameKind.ResizeApplied,
@@ -423,6 +423,7 @@ export class TerminalSession {
       payload,
     });
     this.#publish(frame);
+    for (const reply of replies) this.#writePty(reply);
   }
 
   #captureSnapshot(
@@ -466,6 +467,10 @@ export class TerminalSession {
       inputEpoch: identity.inputEpoch,
       status,
     };
+  }
+
+  #writePty(data: Uint8Array): void {
+    if (data.byteLength !== 0) this.#pty.write(data);
   }
 
   #assertPtyWritable(): void {

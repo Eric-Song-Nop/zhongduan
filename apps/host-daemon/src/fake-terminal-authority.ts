@@ -40,8 +40,9 @@ export class FakeTerminalAuthority implements TerminalAuthority {
     return hasStatusQuery ? [textEncoder.encode("\u001b[1;1R")] : [];
   }
 
-  resize(dimensions: ResizePayload): void {
+  resize(dimensions: ResizePayload): readonly Uint8Array[] {
     this.#record({ type: "resize", dimensions: { ...dimensions } });
+    return [];
   }
 
   encodeSnapshot(): Uint8Array {
@@ -58,6 +59,8 @@ export class FakeTerminalAuthority implements TerminalAuthority {
   }
 
   encodeKey(input: SemanticKey): Uint8Array {
+    if (input.action === "release") return new Uint8Array();
+
     if ((input.modifiers & KeyModifier.Control) !== 0 && input.key.length === 1) {
       const codePoint = input.key.toUpperCase().codePointAt(0);
       if (codePoint !== undefined && codePoint >= 0x40 && codePoint <= 0x5f) {
