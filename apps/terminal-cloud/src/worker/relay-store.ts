@@ -20,6 +20,7 @@ export interface SessionRow {
   engine_id: string;
   head_event_seq: string;
   host_fence: string;
+  latest_snapshot_id: string | null;
   next_pty_offset: string;
   next_stream_id: number;
   session_epoch: string;

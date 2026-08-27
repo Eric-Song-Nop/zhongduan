@@ -10,6 +10,7 @@ import {
   type CapabilityRole,
 } from "./auth";
 import type { CloudEnv } from "./env";
+import { handleSnapshotRequest } from "./snapshot-http";
 
 export { TerminalSessionDO } from "./terminal-session-do";
 
@@ -20,6 +21,10 @@ const ConnectionSetRoute = new RegExp(
 );
 const WebSocketRoute = new RegExp(
   `^/api/v1/sessions/(${sessionIdPattern})/ws/(control|data)$`,
+  "u",
+);
+const SnapshotRoute = new RegExp(
+  `^/api/v1/sessions/(${sessionIdPattern})/snapshots/(${sessionIdPattern})$`,
   "u",
 );
 
@@ -183,6 +188,11 @@ async function fetch(request: Request, env: CloudEnv): Promise<Response> {
   const connectionSetMatch = ConnectionSetRoute.exec(url.pathname);
   if (request.method === "POST" && connectionSetMatch !== null) {
     return createConnectionSet(request, env, connectionSetMatch[1]!);
+  }
+
+  const snapshotMatch = SnapshotRoute.exec(url.pathname);
+  if (snapshotMatch !== null) {
+    return handleSnapshotRequest(request, env, snapshotMatch[1]!, snapshotMatch[2]!);
   }
 
   const webSocketMatch = WebSocketRoute.exec(url.pathname);

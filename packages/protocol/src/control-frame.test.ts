@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   ClientControlFrameSchema,
+  HostControlFrameSchema,
   RelayToHostControlFrameSchema,
   ServerControlFrameSchema,
   decodeControlFrame,
@@ -187,6 +188,60 @@ describe("control frame validation", () => {
     });
   });
 
+  it("validates the generic data-channel delivery barrier result", () => {
+    const acknowledgement = {
+      type: "delivery-barrier-result",
+      status: "ready",
+      mode: "snapshot",
+      connectionId: "connection_AAAAAAAAA",
+      snapshotId: "snapshot_AAAAAAAAAAA",
+      streamId: 42,
+      deliveryGeneration: "9",
+      commitEventSeq: "19",
+      commitPtyOffset: "4221",
+    } as const;
+    expect(RelayToHostControlFrameSchema.parse(acknowledgement)).toEqual(acknowledgement);
+    const { snapshotId: _snapshotId, ...commonAcknowledgement } = acknowledgement;
+    expect(
+      RelayToHostControlFrameSchema.parse({
+        ...commonAcknowledgement,
+        mode: "warm",
+        status: "stale",
+      }),
+    ).toMatchObject({ mode: "warm", status: "stale" });
+    expect(() =>
+      RelayToHostControlFrameSchema.parse({
+        ...acknowledgement,
+        mode: "warm",
+      }),
+    ).toThrow();
+    expect(() =>
+      RelayToHostControlFrameSchema.parse({
+        ...acknowledgement,
+        mode: "snapshot",
+        snapshotId: undefined,
+      }),
+    ).toThrow();
+    expect(() =>
+      HostControlFrameSchema.parse({ ...acknowledgement, type: "snapshot-offer" }),
+    ).toThrow();
+  });
+
+  it("echoes a warm attach baseline and pinned commit in replay-start", () => {
+    const replay = {
+      type: "replay-start",
+      sessionEpoch: "7",
+      streamId: 42,
+      deliveryGeneration: "9",
+      baseEventSeq: "11",
+      basePtyOffset: "42",
+      commitEventSeq: "19",
+      commitPtyOffset: "72",
+    } as const;
+    expect(ServerControlFrameSchema.parse(replay)).toEqual(replay);
+    expect(() => ServerControlFrameSchema.parse({ ...replay, commitEventSeq: "10" })).toThrow();
+  });
+
   it("accepts a replacement data ticket on resync", () => {
     expect(
       ServerControlFrameSchema.parse({
@@ -214,9 +269,10 @@ describe("control frame validation", () => {
     const frame = decodeControlFrame(
       JSON.stringify({
         type: "snapshot-manifest",
-        snapshotId: "snap-88",
+        snapshotId: "snapshot_AAAAAAAAAAA",
         engineId: "ghostty:f2d5758+wterm:local",
         sessionEpoch: "7",
+        streamId: 42,
         deliveryGeneration: "4",
         cutEventSeq: "441",
         nextPtyOffset: "9012",
@@ -226,12 +282,27 @@ describe("control frame validation", () => {
         compressedLength: "260000",
         uncompressedLength: "13000000",
         sha256: "a".repeat(64),
-        downloadPath: "/api/v1/sessions/s-1/snapshots/snap-88",
+        downloadPath: "/api/v1/sessions/session_AAAAAAAAAAAA/snapshots/snapshot_AAAAAAAAAAA",
         restoreThrough: "finish",
       }),
       ServerControlFrameSchema,
     );
 
     expect(frame.type).toBe("snapshot-manifest");
+    expect(() =>
+      ServerControlFrameSchema.parse({
+        ...frame,
+        compressedLength: String(32 * 1024 * 1024 + 1),
+      }),
+    ).toThrow();
+    expect(() =>
+      ServerControlFrameSchema.parse({
+        ...frame,
+        compression: "none",
+        compressedLength: "10",
+        uncompressedLength: "11",
+      }),
+    ).toThrow();
+    expect(() => ServerControlFrameSchema.parse({ ...frame, commitEventSeq: "440" })).toThrow();
   });
 });
