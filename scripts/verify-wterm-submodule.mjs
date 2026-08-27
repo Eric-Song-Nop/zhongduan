@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const EXPECTED_SHA = "0d22cb727fe855083a89d2a9e5dbca0d6dc31d79";
+const EXPECTED_SHA = "a00eb78f7698dcb998c8695d4c84a3d462a198b2";
 const EXPECTED_URL = "https://github.com/Eric-Song-Nop/wterm.git";
 const SUBMODULE_PATH = "vendor/wterm";
 const root = fileURLToPath(new URL("..", import.meta.url));

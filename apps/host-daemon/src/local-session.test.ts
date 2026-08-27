@@ -53,6 +53,52 @@ describe("local terminal session", () => {
       session.dispose();
     }
   });
+
+  it("keeps a real Ghostty authority interruptible during sustained PTY output", async () => {
+    const session = await startLocalSession({
+      args: [],
+      cols: 80,
+      command: "/usr/bin/yes",
+      journal: { maxBytes: 1024 * 1024 },
+      rows: 24,
+      scrollbackLimit: 1024 * 1024,
+    });
+    const epoch = session.sessionEpoch;
+    let outputBytes = 0;
+    let resolveOutputStarted!: () => void;
+    const outputStarted = new Promise<void>((resolve) => {
+      resolveOutputStarted = resolve;
+    });
+    session.subscribe((encoded) => {
+      const frame = decodeDataFrame(encoded);
+      if (frame.kind !== DataFrameKind.PtyOutput) return;
+      outputBytes += frame.payload.byteLength;
+      if (outputBytes >= 64 * 1024) resolveOutputStarted();
+    });
+
+    try {
+      await withTimeout(outputStarted, 5_000);
+      const snapshot = await session.captureSnapshot();
+      await expect(
+        session.submitText(
+          {
+            clientId: "client-local-test",
+            clientInputSeq: 1n,
+            inputEpoch: "writer-local-test",
+            writerFence: 1n,
+          },
+          "\u0003",
+        ),
+      ).resolves.toMatchObject({ status: "written" });
+      const exit = await withTimeout(session.waitForExit(), 5_000);
+
+      expect(exit.status).toBe("exited");
+      expect(snapshot.cutEventSeq).toBeGreaterThan(0n);
+      expect(session.sessionEpoch).toBe(epoch);
+    } finally {
+      session.dispose();
+    }
+  });
 });
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {

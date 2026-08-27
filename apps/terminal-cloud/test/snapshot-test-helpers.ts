@@ -26,6 +26,7 @@ export interface UploadOverrides {
 export const origin = "https://terminal.example.test";
 export const engineId = "ghostty:test+snapshot-v1+wterm:test";
 export const encoder = new TextEncoder();
+let sessionCounter = 0;
 
 export async function within<T>(promise: Promise<T>, label: string, timeoutMs = 1_000): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -68,6 +69,8 @@ export async function metadataFor(
 }
 
 export async function createSession(): Promise<CreatedSession> {
+  sessionCounter += 1;
+  const sessionId = `session_snapshot_${sessionCounter.toString().padStart(16, "0")}`;
   const response = await workerExports.default.fetch(
     new Request(`${origin}/api/v1/sessions`, {
       method: "POST",
@@ -75,7 +78,7 @@ export async function createSession(): Promise<CreatedSession> {
         authorization: "Bearer test-bootstrap-token-with-at-least-32-bytes",
         "content-type": "application/json",
       },
-      body: JSON.stringify({ engineId, sessionEpoch: "7" }),
+      body: JSON.stringify({ sessionId, engineId, sessionEpoch: "7" }),
     }),
   );
   expect(response.status).toBe(201);

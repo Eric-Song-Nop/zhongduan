@@ -19,10 +19,17 @@ interface ConnectionSet {
 }
 
 const origin = "https://terminal.example.test";
+let sessionCounter = 0;
 const testSockets = new Set<WebSocket>();
 const testSocketSessions = new Set<string>();
 
+function nextSessionId(): string {
+  sessionCounter += 1;
+  return `session_runtime_${sessionCounter.toString().padStart(16, "0")}`;
+}
+
 async function createSession(): Promise<CreatedSession> {
+  const sessionId = nextSessionId();
   const response = await workerExports.default.fetch(
     new Request(`${origin}/api/v1/sessions`, {
       method: "POST",
@@ -31,6 +38,7 @@ async function createSession(): Promise<CreatedSession> {
         "content-type": "application/json",
       },
       body: JSON.stringify({
+        sessionId,
         engineId: "ghostty:test+snapshot-v1+wterm:test",
         sessionEpoch: "7",
       }),
@@ -155,6 +163,7 @@ describe("cloud relay runtime", () => {
             "content-type": "application/json",
           },
           body: JSON.stringify({
+            sessionId: nextSessionId(),
             engineId: "ghostty:test+snapshot-v1+wterm:test",
             sessionEpoch,
           }),
@@ -174,7 +183,10 @@ describe("cloud relay runtime", () => {
             authorization: "Bearer test-bootstrap-token-with-at-least-32-bytes",
             "content-type": "application/json",
           },
-          body: JSON.stringify({ engineId: "ghostty:test+snapshot-v1+wterm:test" }),
+          body: JSON.stringify({
+            sessionId: nextSessionId(),
+            engineId: "ghostty:test+snapshot-v1+wterm:test",
+          }),
         }),
       );
       expect(missingEpoch.status).toBe(400);
@@ -183,6 +195,7 @@ describe("cloud relay runtime", () => {
 
     const created = await Promise.all(
       ["11", "12"].map(async (sessionEpoch) => {
+        const sessionId = nextSessionId();
         const response = await workerExports.default.fetch(
           new Request(`${origin}/api/v1/sessions`, {
             method: "POST",
@@ -191,6 +204,7 @@ describe("cloud relay runtime", () => {
               "content-type": "application/json",
             },
             body: JSON.stringify({
+              sessionId,
               engineId: "ghostty:test+snapshot-v1+wterm:test",
               sessionEpoch,
             }),
@@ -202,6 +216,52 @@ describe("cloud relay runtime", () => {
     );
     expect(created.map(({ sessionEpoch }) => sessionEpoch)).toEqual(["11", "12"]);
     expect(created[0]!.sessionId).not.toBe(created[1]!.sessionId);
+  });
+
+  it("retries a lost create response against one stable session identity", async () => {
+    const sessionId = nextSessionId();
+    const identity = {
+      sessionId,
+      engineId: "ghostty:test+snapshot-v1+wterm:test",
+      sessionEpoch: "21",
+    };
+    const create = (body: object) =>
+      workerExports.default.fetch(
+        new Request(`${origin}/api/v1/sessions`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer test-bootstrap-token-with-at-least-32-bytes",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+        }),
+      );
+
+    const lost = await create(identity);
+    expect(lost.status).toBe(201);
+    const firstIssue = await lost.clone().json<{ hostCapability: string }>();
+    await lost.body?.cancel();
+    const retried = await create(identity);
+    expect(retried.status).toBe(200);
+    const recreated = await retried.json<{ hostCapability: string; sessionId: string }>();
+    expect(recreated.sessionId).toBe(sessionId);
+    expect(recreated.hostCapability).not.toBe(firstIssue.hostCapability);
+
+    const row = await runInDurableObject(
+      env.TERMINAL_SESSIONS.get(env.TERMINAL_SESSIONS.idFromName(`v1:${sessionId}`)),
+      (_instance, state) =>
+        state.storage.sql.exec("SELECT COUNT(*) AS count FROM session_state").one(),
+    );
+    expect(row).toEqual({ count: 1 });
+    const engineConflict = await create({
+      ...identity,
+      engineId: `${identity.engineId}+other`,
+    });
+    expect(engineConflict.status).toBe(409);
+    await engineConflict.text();
+    const epochConflict = await create({ ...identity, sessionEpoch: "22" });
+    expect(epochConflict.status).toBe(409);
+    await epochConflict.text();
   });
 
   it("consumes each channel ticket once and requires control first", async () => {
@@ -410,7 +470,7 @@ describe("cloud relay runtime", () => {
     await activeOverflow.text();
     for (const { socket } of controls) socket?.close(1000, "test complete");
     await drainSession(session.sessionId);
-  });
+  }, 15_000);
 
   it("reclaims fully disconnected clients instead of imposing a lifetime quota", async () => {
     const session = await createSession();

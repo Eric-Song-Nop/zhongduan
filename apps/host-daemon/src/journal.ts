@@ -120,15 +120,31 @@ export class EventJournal {
 
   replayFrom(cursor: JournalCursor): JournalReplay {
     this.#maintain();
+    return this.#replayRange(cursor, this.#headCursor);
+  }
+
+  replayThrough(cursor: JournalCursor, commit: JournalCursor): JournalReplay {
+    this.#maintain();
+    return this.#replayRange(cursor, commit);
+  }
+
+  #replayRange(cursor: JournalCursor, commit: JournalCursor): JournalReplay {
     if (
       cursor.lastEventSeq < this.#evictedCursor.lastEventSeq ||
-      cursor.lastEventSeq > this.#headCursor.lastEventSeq
+      cursor.lastEventSeq > commit.lastEventSeq ||
+      commit.lastEventSeq > this.#headCursor.lastEventSeq
     ) {
       return { status: "gap" };
     }
 
-    const expectedOffset = this.#offsetAfter(cursor.lastEventSeq);
-    if (expectedOffset === undefined || cursor.nextPtyOffset !== expectedOffset) {
+    const baseOffset = this.#offsetAfter(cursor.lastEventSeq);
+    const commitOffset = this.#offsetAfter(commit.lastEventSeq);
+    if (
+      baseOffset === undefined ||
+      cursor.nextPtyOffset !== baseOffset ||
+      commitOffset === undefined ||
+      commit.nextPtyOffset !== commitOffset
+    ) {
       return { status: "gap" };
     }
 
@@ -136,7 +152,10 @@ export class EventJournal {
       status: "ok",
       frames: this.#segments.flatMap((segment) =>
         segment.entries
-          .filter((entry) => entry.eventSeq > cursor.lastEventSeq)
+          .filter(
+            (entry) =>
+              entry.eventSeq > cursor.lastEventSeq && entry.eventSeq <= commit.lastEventSeq,
+          )
           .map((entry) => entry.frame.slice()),
       ),
     };

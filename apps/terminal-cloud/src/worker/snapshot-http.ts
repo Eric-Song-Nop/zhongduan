@@ -1,4 +1,8 @@
-import { SNAPSHOT_MEDIA_TYPE, SnapshotHeader, SnapshotMetadataSchema } from "@zhongduan/protocol";
+import {
+  SNAPSHOT_MEDIA_TYPE,
+  SnapshotHeader,
+  SnapshotUploadResponseSchema,
+} from "@zhongduan/protocol";
 import { z } from "zod";
 import { AuthError, verifyBearerCapability, type CapabilityRole } from "./auth";
 import type { CloudEnv } from "./env";
@@ -8,11 +12,6 @@ import {
   parseSnapshotUploadMetadata,
   snapshotUploadHeaders,
 } from "./snapshot-contract";
-
-const UploadResponseSchema = z.strictObject({
-  created: z.boolean(),
-  snapshot: SnapshotMetadataSchema,
-});
 
 const UploadErrorSchema = z.strictObject({
   error: z.enum([
@@ -99,12 +98,13 @@ async function putSnapshot(
   } catch {
     return json({ error: "snapshot-finalize-failed" }, 503);
   }
-  if (response.ok) {
-    const parsed = UploadResponseSchema.safeParse(body);
+  if (response.status === 200 || response.status === 201) {
+    const parsed = SnapshotUploadResponseSchema.safeParse(body);
     return parsed.success
       ? json(parsed.data, response.status === 201 ? 201 : 200)
       : json({ error: "snapshot-finalize-failed" }, 503);
   }
+  if (response.ok) return json({ error: "snapshot-finalize-failed" }, 503);
   const parsed = UploadErrorSchema.safeParse(body);
   return parsed.success
     ? json(parsed.data, response.status)

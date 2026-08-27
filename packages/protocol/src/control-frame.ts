@@ -315,7 +315,7 @@ const attachRequest = z.discriminatedUnion("hasLiveReplica", [
   }),
 ]);
 
-const verifiedClient = { connectionId: id, clientId: id };
+const verifiedClient = { connectionId: id, clientId: id, writerFence: u64 };
 const forwardedKey = key.safeExtend(verifiedClient);
 const forwardedText = text.extend(verifiedClient);
 const forwardedPaste = paste.extend(verifiedClient);

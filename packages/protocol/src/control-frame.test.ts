@@ -112,6 +112,7 @@ describe("control frame validation", () => {
     });
     const { inputEpoch: _inputEpoch, ...missingEpoch } = input;
     expect(() => ClientControlFrameSchema.parse(missingEpoch)).toThrow();
+    expect(() => ClientControlFrameSchema.parse({ ...input, writerFence: "1" })).toThrow();
   });
 
   it("models writer lease renewal separately from semantic input", () => {
@@ -289,6 +290,7 @@ describe("control frame validation", () => {
       writerLease: "lease_AAAAAAAAAAAA",
       inputEpoch: "input_AAAAAAAAAAAA",
       clientInputSeq: "47",
+      writerFence: "9",
     };
     for (const frame of [
       { type: "text", ...verified, data: "a" },
@@ -307,9 +309,18 @@ describe("control frame validation", () => {
       expect(RelayToHostControlFrameSchema.parse(frame)).toMatchObject({
         connectionId: verified.connectionId,
         clientId: verified.clientId,
+        writerFence: verified.writerFence,
       });
       const { clientId: _clientId, ...unverified } = frame;
       expect(() => RelayToHostControlFrameSchema.parse(unverified)).toThrow();
+      const { writerFence: _writerFence, ...unfenced } = frame;
+      expect(() => RelayToHostControlFrameSchema.parse(unfenced)).toThrow();
+      expect(() =>
+        RelayToHostControlFrameSchema.parse({
+          ...frame,
+          writerFence: "18446744073709551616",
+        }),
+      ).toThrow();
     }
   });
 

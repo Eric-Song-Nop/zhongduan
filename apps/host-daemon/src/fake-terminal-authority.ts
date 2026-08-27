@@ -1,7 +1,12 @@
 import type { ResizePayload } from "@zhongduan/protocol";
 
 import { KeyModifier } from "@zhongduan/protocol";
-import type { SemanticKey, TerminalAuthority } from "./terminal-authority";
+import {
+  validateSemanticMouse,
+  type SemanticKey,
+  type SemanticMouse,
+  type TerminalAuthority,
+} from "./terminal-authority";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -19,6 +24,7 @@ export class FakeTerminalAuthority implements TerminalAuthority {
   #applicationCursorKeys = false;
   #controlTail = "";
   #operationBytes = 0;
+  #dimensions: ResizePayload = { cols: 80, rows: 24, widthPx: 800, heightPx: 480 };
 
   constructor(options: { maxOperationBytes?: number } = {}) {
     this.#maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES;
@@ -42,6 +48,7 @@ export class FakeTerminalAuthority implements TerminalAuthority {
 
   resize(dimensions: ResizePayload): readonly Uint8Array[] {
     this.#record({ type: "resize", dimensions: { ...dimensions } });
+    this.#dimensions = { ...dimensions };
     return [];
   }
 
@@ -88,6 +95,18 @@ export class FakeTerminalAuthority implements TerminalAuthority {
       throw new RangeError(`paste exceeds ${MAX_PASTE_BYTES} bytes`);
     }
     return encoded;
+  }
+
+  encodeFocus(_focused: boolean): Uint8Array {
+    return new Uint8Array();
+  }
+
+  validateMouse(mouse: SemanticMouse): void {
+    validateSemanticMouse(mouse, this.#dimensions);
+  }
+
+  encodeMouse(_mouse: SemanticMouse): Uint8Array {
+    return new Uint8Array();
   }
 
   dispose(): void {}

@@ -6,13 +6,14 @@ import {
   type ResizePayload,
 } from "@zhongduan/protocol";
 
-import type { EventJournal, JournalCursor } from "./journal";
+import type { EventJournal, JournalCursor, JournalReplay } from "./journal";
 import type { PtyProcess } from "./pty-process";
-import type { SemanticKey, TerminalAuthority } from "./terminal-authority";
+import type { SemanticKey, SemanticMouse, TerminalAuthority } from "./terminal-authority";
 
 const MAX_PTY_FRAME_BYTES = 16 * 1024;
-const DEFAULT_INPUT_DEDUP_EPOCHS = 256;
+const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_U64 = (1n << 64n) - 1n;
+const textEncoder = new TextEncoder();
 
 type SessionMessage =
   | { type: "pty-output"; data: Uint8Array }
@@ -23,11 +24,13 @@ type SessionMessage =
   | {
       type: "submitted-input";
       identity: SemanticInputIdentity;
-      prepare: () => () => void;
+      validate?: () => void;
+      commit: () => void;
       resolve: (ack: InputAck) => void;
     }
   | {
       type: "snapshot";
+      fence?: (snapshot: SnapshotCapture) => void;
       resolve: (snapshot: SnapshotCapture) => void;
       reject: (error: unknown) => void;
     };
@@ -39,7 +42,6 @@ export interface TerminalSessionOptions {
   sessionEpoch: bigint;
   monotonicNow?: () => number;
   inputDedupEntries?: number;
-  inputDedupEpochs?: number;
 }
 
 export interface SnapshotCapture {
@@ -61,6 +63,7 @@ export interface SemanticInputIdentity {
   clientInputSeq: bigint;
   inputEpoch: string;
   observedEventSeq?: bigint;
+  writerFence: bigint;
 }
 
 export interface ReplayCursor extends JournalCursor {
@@ -80,6 +83,12 @@ export type SubscriptionResult =
   | { status: "attached"; unsubscribe: () => void }
   | { status: "gap" };
 
+interface InputWriterState {
+  clientId: string;
+  highWater: bigint;
+  inputEpoch: string;
+}
+
 export class TerminalSession {
   readonly #authority: TerminalAuthority;
   readonly #journal: EventJournal;
@@ -93,9 +102,7 @@ export class TerminalSession {
   readonly #exitPromise: Promise<PtyExit>;
   readonly #resolveExit: (exit: PtyExit) => void;
   readonly #inputDedupEntries: number;
-  readonly #inputDedupEpochs: number;
   readonly #inputResults = new Map<string, "written" | "uncertain">();
-  readonly #inputHighWater = new Map<string, bigint>();
 
   #draining = false;
   #disposed = false;
@@ -104,6 +111,8 @@ export class TerminalSession {
   #failure: Error | null = null;
   #ptyExited = false;
   #eventSeq = 0n;
+  #inputFence = 0n;
+  #inputWriter: InputWriterState | undefined;
   #nextPtyOffset = 0n;
 
   constructor(options: TerminalSessionOptions) {
@@ -117,10 +126,6 @@ export class TerminalSession {
     this.#inputDedupEntries = options.inputDedupEntries ?? 4_096;
     if (!Number.isInteger(this.#inputDedupEntries) || this.#inputDedupEntries <= 0) {
       throw new RangeError("inputDedupEntries must be a positive integer");
-    }
-    this.#inputDedupEpochs = options.inputDedupEpochs ?? DEFAULT_INPUT_DEDUP_EPOCHS;
-    if (!Number.isInteger(this.#inputDedupEpochs) || this.#inputDedupEpochs <= 0) {
-      throw new RangeError("inputDedupEpochs must be a positive integer");
     }
     this.#monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
     let resolveExitPromise!: (exit: PtyExit) => void;
@@ -138,7 +143,12 @@ export class TerminalSession {
     });
     this.#disposePtyData = this.#pty.onData((data) => {
       try {
-        this.#enqueue({ type: "pty-output", data: data.slice() });
+        for (let start = 0; start < data.byteLength; start += MAX_PTY_FRAME_BYTES) {
+          this.#enqueue({
+            type: "pty-output",
+            data: data.slice(start, start + MAX_PTY_FRAME_BYTES),
+          });
+        }
       } catch {
         // The actor has already failed closed; the failure is observable via waitForExit().
       }
@@ -159,6 +169,21 @@ export class TerminalSession {
 
   get sessionEpoch(): bigint {
     return this.#sessionEpoch;
+  }
+
+  get cursor(): ReplayCursor {
+    return {
+      sessionEpoch: this.#sessionEpoch,
+      lastEventSeq: this.#eventSeq,
+      nextPtyOffset: this.#nextPtyOffset,
+    };
+  }
+
+  replayThrough(base: ReplayCursor, commit: ReplayCursor): JournalReplay {
+    if (base.sessionEpoch !== this.#sessionEpoch || commit.sessionEpoch !== this.#sessionEpoch) {
+      return { status: "gap" };
+    }
+    return this.#journal.replayThrough(base, commit);
   }
 
   subscribe(subscriber: (frame: Uint8Array) => void, cursor?: ReplayCursor): SubscriptionResult {
@@ -220,32 +245,72 @@ export class TerminalSession {
 
   writeRawInput(data: Uint8Array): void {
     this.#assertPtyWritable();
-    this.#enqueue({ type: "raw-input", data: data.slice() });
+    for (let start = 0; start < data.byteLength; start += MAX_PTY_FRAME_BYTES) {
+      this.#enqueue({ type: "raw-input", data: data.slice(start, start + MAX_PTY_FRAME_BYTES) });
+    }
   }
 
   submitKey(identity: SemanticInputIdentity, input: SemanticKey): Promise<InputAck> {
     const captured = { ...input };
     return this.#submitInput(identity, () => {
       const bytes = this.#authority.encodeKey(captured);
-      return () => this.#writePty(bytes);
+      this.#writePty(bytes);
     });
   }
 
   submitPaste(identity: SemanticInputIdentity, data: string): Promise<InputAck> {
     return this.#submitInput(identity, () => {
       const bytes = this.#authority.encodePaste(data);
-      return () => this.#writePty(bytes);
+      this.#writePty(bytes);
     });
+  }
+
+  submitText(identity: SemanticInputIdentity, data: string): Promise<InputAck> {
+    const encoded = textEncoder.encode(data);
+    return this.#submitInput(
+      identity,
+      () => this.#writePty(encoded),
+      () => {
+        if (encoded.byteLength > MAX_TEXT_BYTES) {
+          throw new RangeError(`text exceeds ${MAX_TEXT_BYTES} bytes`);
+        }
+      },
+    );
+  }
+
+  submitFocus(identity: SemanticInputIdentity, focused: boolean): Promise<InputAck> {
+    return this.#submitInput(identity, () => {
+      const bytes = this.#authority.encodeFocus(focused);
+      this.#writePty(bytes);
+    });
+  }
+
+  submitMouse(identity: SemanticInputIdentity, mouse: SemanticMouse): Promise<InputAck> {
+    const captured = cloneMouse(mouse);
+    return this.#submitInput(
+      identity,
+      () => {
+        const bytes = this.#authority.encodeMouse(captured);
+        this.#writePty(bytes);
+      },
+      () => this.#authority.validateMouse(captured),
+    );
   }
 
   submitResize(identity: SemanticInputIdentity, dimensions: ResizePayload): Promise<InputAck> {
     const captured = { ...dimensions };
-    return this.#submitInput(identity, () => () => this.#commitResize(captured));
+    return this.#submitInput(identity, () => this.#commitResize(captured));
   }
 
   captureSnapshot(): Promise<SnapshotCapture> {
     return new Promise((resolve, reject) => {
       this.#enqueue({ type: "snapshot", resolve, reject });
+    });
+  }
+
+  captureSnapshotWithFence(fence: (snapshot: SnapshotCapture) => void): Promise<SnapshotCapture> {
+    return new Promise((resolve, reject) => {
+      this.#enqueue({ type: "snapshot", fence, resolve, reject });
     });
   }
 
@@ -270,7 +335,11 @@ export class TerminalSession {
     if (this.#failure !== null)
       throw new Error("terminal session failed", { cause: this.#failure });
     this.#queue.push(message);
-    if (this.#draining) return;
+    this.#drainQueue();
+  }
+
+  #drainQueue(): void {
+    if (this.#draining || this.#disposed || this.#failure !== null) return;
 
     this.#draining = true;
     try {
@@ -293,10 +362,17 @@ export class TerminalSession {
             this.#writePty(this.#authority.encodePaste(next.data));
             break;
           case "submitted-input":
-            next.resolve(this.#commitSubmittedInput(next.identity, next.prepare));
+            next.resolve(this.#commitSubmittedInput(next.identity, next.commit, next.validate));
             break;
           case "snapshot":
-            this.#captureSnapshot(next.resolve, next.reject);
+            try {
+              const snapshot = this.#captureSnapshot();
+              next.fence?.(snapshot);
+              next.resolve(snapshot);
+            } catch (error) {
+              next.reject(error);
+              throw error;
+            }
             break;
         }
       }
@@ -328,7 +404,11 @@ export class TerminalSession {
     }
   }
 
-  #submitInput(identity: SemanticInputIdentity, prepare: () => () => void): Promise<InputAck> {
+  #submitInput(
+    identity: SemanticInputIdentity,
+    commit: () => void,
+    validate?: () => void,
+  ): Promise<InputAck> {
     if (this.#disposed || this.#failure !== null || this.#ptyExited) {
       return Promise.resolve(this.#inputAck(identity, "rejected"));
     }
@@ -336,70 +416,91 @@ export class TerminalSession {
       this.#enqueue({
         type: "submitted-input",
         identity: { ...identity },
-        prepare,
+        commit,
+        ...(validate === undefined ? {} : { validate }),
         resolve,
       });
     });
   }
 
-  #commitSubmittedInput(identity: SemanticInputIdentity, prepare: () => () => void): InputAck {
+  #commitSubmittedInput(
+    identity: SemanticInputIdentity,
+    commit: () => void,
+    validate?: () => void,
+  ): InputAck {
     const ack = (status: InputAckStatus): InputAck => this.#inputAck(identity, status);
     if (this.#ptyExited || this.#failure !== null) return ack("rejected");
+    if (identity.writerFence <= 0n || identity.writerFence > MAX_U64) {
+      return ack("rejected");
+    }
+    if (identity.writerFence < this.#inputFence) return ack("rejected");
+    if (identity.writerFence > this.#inputFence) {
+      this.#inputFence = identity.writerFence;
+      this.#inputWriter = undefined;
+      this.#inputResults.clear();
+    }
+
     if (
       identity.clientId.length === 0 ||
       identity.clientId.length > 128 ||
       identity.inputEpoch.length === 0 ||
       identity.inputEpoch.length > 128 ||
-      identity.clientInputSeq < 0n
+      identity.clientInputSeq <= 0n
     ) {
       return ack("rejected");
+    }
+
+    const currentWriter = this.#inputWriter;
+    if (currentWriter !== undefined) {
+      if (
+        currentWriter.clientId !== identity.clientId ||
+        currentWriter.inputEpoch !== identity.inputEpoch
+      ) {
+        return ack("rejected");
+      }
+    } else if (identity.clientInputSeq !== 1n) {
+      return ack("rejected");
+    }
+
+    const key = identity.clientInputSeq.toString();
+    if (currentWriter !== undefined) {
+      const previous = this.#inputResults.get(key);
+      if (previous !== undefined) {
+        return ack(previous === "written" ? "duplicate" : "uncertain");
+      }
+      if (identity.clientInputSeq <= currentWriter.highWater) return ack("uncertain");
     }
     if (identity.observedEventSeq !== undefined && identity.observedEventSeq > this.#eventSeq) {
       return ack("rejected");
     }
 
-    const epochKey = `${identity.clientId.length}:${identity.clientId}:${identity.inputEpoch}`;
-    const key = `${epochKey}:${identity.clientInputSeq}`;
-    const previous = this.#inputResults.get(key);
-    if (previous !== undefined) {
-      return ack(previous === "written" ? "duplicate" : "uncertain");
-    }
-    const highWater = this.#inputHighWater.get(epochKey);
-    if (highWater !== undefined && identity.clientInputSeq <= highWater) {
-      return ack("uncertain");
-    }
-    if (highWater === undefined && this.#inputHighWater.size >= this.#inputDedupEpochs) {
-      return ack("rejected");
-    }
-
-    let commit: () => void;
     try {
-      commit = prepare();
+      validate?.();
     } catch {
       return ack("rejected");
     }
 
+    this.#inputWriter ??= {
+      clientId: identity.clientId,
+      highWater: 0n,
+      inputEpoch: identity.inputEpoch,
+    };
+
     try {
       commit();
-      this.#rememberInput(key, epochKey, identity, "written");
+      this.#rememberInput(key, identity.clientInputSeq, "written");
       return ack("written");
     } catch (error) {
-      this.#rememberInput(key, epochKey, identity, "uncertain");
+      this.#rememberInput(key, identity.clientInputSeq, "uncertain");
       this.#fail(error);
       return ack("uncertain");
     }
   }
 
-  #rememberInput(
-    key: string,
-    epochKey: string,
-    identity: SemanticInputIdentity,
-    result: "written" | "uncertain",
-  ): void {
+  #rememberInput(key: string, clientInputSeq: bigint, result: "written" | "uncertain"): void {
     this.#inputResults.set(key, result);
-    const highWater = this.#inputHighWater.get(epochKey);
-    if (highWater === undefined || identity.clientInputSeq > highWater) {
-      this.#inputHighWater.set(epochKey, identity.clientInputSeq);
+    if (clientInputSeq > this.#inputWriter!.highWater) {
+      this.#inputWriter!.highWater = clientInputSeq;
     }
     while (this.#inputResults.size > this.#inputDedupEntries) {
       const oldest = this.#inputResults.keys().next().value;
@@ -426,26 +527,20 @@ export class TerminalSession {
     for (const reply of replies) this.#writePty(reply);
   }
 
-  #captureSnapshot(
-    resolve: (snapshot: SnapshotCapture) => void,
-    reject: (error: unknown) => void,
-  ): void {
+  #captureSnapshot(): SnapshotCapture {
     const cutEventSeq = this.#eventSeq;
     const nextPtyOffset = this.#nextPtyOffset;
     const startedAt = this.#monotonicNow();
-    try {
-      const bytes = this.#authority.encodeSnapshot().slice();
-      resolve({
-        bytes,
-        cutEventSeq,
-        encodeMs: this.#monotonicNow() - startedAt,
-        engineId: this.#authority.engineId,
-        nextPtyOffset,
-        sessionEpoch: this.#sessionEpoch,
-      });
-    } catch (error) {
-      reject(error);
-    }
+    const bytes = this.#authority.encodeSnapshot().slice();
+    if (bytes.byteLength === 0) throw new Error("terminal authority returned an empty snapshot");
+    return {
+      bytes,
+      cutEventSeq,
+      encodeMs: this.#monotonicNow() - startedAt,
+      engineId: this.#authority.engineId,
+      nextPtyOffset,
+      sessionEpoch: this.#sessionEpoch,
+    };
   }
 
   #publish(frame: Uint8Array): void {
@@ -515,4 +610,11 @@ export class TerminalSession {
       // Preserve the first actor failure while still releasing independent resources.
     }
   }
+}
+
+function cloneMouse(mouse: SemanticMouse): SemanticMouse {
+  return {
+    ...mouse,
+    surface: { ...mouse.surface },
+  };
 }

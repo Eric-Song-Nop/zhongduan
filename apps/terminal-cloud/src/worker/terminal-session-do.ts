@@ -1060,6 +1060,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       latestAttachment === undefined ||
       latestAttachment.clientId !== attachment.clientId ||
       latestAttachment.controlState !== "active" ||
+      latestAttachment.leaseFence === null ||
       latestAttachment.leaseFence !== attachment.leaseFence ||
       this.activeBrowserControl(attachment.clientId) !== webSocket
     ) {
@@ -1083,6 +1084,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         ...frame,
         connectionId: attachment.connectionId,
         clientId: attachment.clientId,
+        writerFence: latestAttachment.leaseFence,
       },
       "semantic input delivery failed",
     );

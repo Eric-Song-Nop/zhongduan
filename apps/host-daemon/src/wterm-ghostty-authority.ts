@@ -6,7 +6,13 @@ import { fileURLToPath } from "node:url";
 import type { ResizePayload } from "@zhongduan/protocol";
 import { GHOSTTY_ENGINE_ID, GhosttyCore, GhosttyRuntime } from "@wterm/ghostty";
 
-import type { SemanticKey, TerminalAuthority } from "./terminal-authority";
+import { KeyModifier } from "@zhongduan/protocol";
+import {
+  validateSemanticMouse,
+  type SemanticKey,
+  type SemanticMouse,
+  type TerminalAuthority,
+} from "./terminal-authority";
 
 const COMMITTED_WASM_EXPORT = "@wterm/ghostty/ghostty-vt.wasm";
 const PACKAGED_WASM_FILE = "ghostty-vt.wasm";
@@ -35,10 +41,12 @@ export async function loadCommittedGhosttyRuntime(): Promise<GhosttyRuntime> {
 export class WtermGhosttyAuthority implements TerminalAuthority {
   readonly engineId: string;
   #core: GhosttyCore | null;
+  #dimensions: ResizePayload;
 
-  private constructor(core: GhosttyCore, engineId: string) {
+  private constructor(core: GhosttyCore, engineId: string, dimensions: ResizePayload) {
     this.#core = core;
     this.engineId = engineId;
+    this.#dimensions = { ...dimensions };
   }
 
   static async create(options: WtermGhosttyAuthorityOptions): Promise<WtermGhosttyAuthority> {
@@ -53,7 +61,7 @@ export class WtermGhosttyAuthority implements TerminalAuthority {
       if (options.widthPx !== 0 || options.heightPx !== 0) {
         core.resize(options.cols, options.rows, options.widthPx, options.heightPx);
       }
-      const authority = new WtermGhosttyAuthority(core, runtime.engineId);
+      const authority = new WtermGhosttyAuthority(core, runtime.engineId, options);
       if (authority.#drainEffects().length !== 0) {
         throw new Error("Ghostty produced an effect before the PTY was attached");
       }
@@ -73,6 +81,7 @@ export class WtermGhosttyAuthority implements TerminalAuthority {
   resize(dimensions: ResizePayload): readonly Uint8Array[] {
     const core = this.#operationalCore();
     core.resize(dimensions.cols, dimensions.rows, dimensions.widthPx, dimensions.heightPx);
+    this.#dimensions = { ...dimensions };
     return this.#drainEffects();
   }
 
@@ -86,6 +95,42 @@ export class WtermGhosttyAuthority implements TerminalAuthority {
 
   encodePaste(data: string): Uint8Array {
     return this.#operationalCore().encodePaste(data);
+  }
+
+  encodeFocus(focused: boolean): Uint8Array {
+    return this.#operationalCore().encodeFocus(focused);
+  }
+
+  validateMouse(mouse: SemanticMouse): void {
+    validateSemanticMouse(mouse, this.#dimensions);
+  }
+
+  encodeMouse(mouse: SemanticMouse): Uint8Array {
+    const modifiers = mouse.altGraph
+      ? mouse.modifiers & ~(KeyModifier.Control | KeyModifier.Alt)
+      : mouse.modifiers;
+    if (mouse.action === "wheel") {
+      const deltaMode = mouse.deltaMode === "pixel" ? 0 : mouse.deltaMode === "line" ? 1 : 2;
+      return this.#operationalCore().encodeMouse({
+        action: mouse.action,
+        altGraph: mouse.altGraph,
+        button: mouse.button,
+        buttons: mouse.buttons,
+        modifiers,
+        surface: mouse.surface,
+        deltaMode,
+        ...(mouse.deltaX === undefined ? {} : { deltaX: mouse.deltaX }),
+        ...(mouse.deltaY === undefined ? {} : { deltaY: mouse.deltaY }),
+      });
+    }
+    return this.#operationalCore().encodeMouse({
+      action: mouse.action,
+      altGraph: mouse.altGraph,
+      button: mouse.button,
+      buttons: mouse.buttons,
+      modifiers,
+      surface: mouse.surface,
+    });
   }
 
   dispose(): void {

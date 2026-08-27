@@ -21,8 +21,15 @@ const origin = "https://terminal.example.test";
 const bootstrap = "test-bootstrap-token-with-at-least-32-bytes";
 const signingKey = "test-capability-key-with-at-least-32-bytes";
 const engineId = "ghostty:test+snapshot-v1+wterm:test";
+let sessionCounter = 0;
+
+function nextSessionId(): string {
+  sessionCounter += 1;
+  return `session_capability_${sessionCounter.toString().padStart(16, "0")}`;
+}
 
 async function createSession(): Promise<CreatedSession> {
+  const sessionId = nextSessionId();
   const response = await workerExports.default.fetch(
     new Request(`${origin}/api/v1/sessions`, {
       method: "POST",
@@ -30,7 +37,7 @@ async function createSession(): Promise<CreatedSession> {
         authorization: `Bearer ${bootstrap}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ engineId, sessionEpoch: "7" }),
+      body: JSON.stringify({ sessionId, engineId, sessionEpoch: "7" }),
     }),
   );
   expect(response.status).toBe(201);

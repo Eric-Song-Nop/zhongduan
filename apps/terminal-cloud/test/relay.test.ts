@@ -55,6 +55,7 @@ interface ReplicaCursor {
 
 const origin = "https://terminal.example.test";
 const engineId = "ghostty:test+snapshot-v1+wterm:test";
+let sessionCounter = 0;
 const textEncoder = new TextEncoder();
 const testSockets = new Set<WebSocket>();
 const testSocketSessions = new Set<string>();
@@ -172,6 +173,7 @@ async function injectHostControlSendFailure(session: CreatedSession): Promise<vo
 }
 
 async function createSession(): Promise<CreatedSession> {
+  const sessionId = `session_relay_${(++sessionCounter).toString().padStart(16, "0")}`;
   const response = await workerExports.default.fetch(
     new Request(`${origin}/api/v1/sessions`, {
       method: "POST",
@@ -179,7 +181,7 @@ async function createSession(): Promise<CreatedSession> {
         authorization: "Bearer test-bootstrap-token-with-at-least-32-bytes",
         "content-type": "application/json",
       },
-      body: JSON.stringify({ engineId, sessionEpoch: "7" }),
+      body: JSON.stringify({ sessionId, engineId, sessionEpoch: "7" }),
     }),
   );
   expect(response.status).toBe(201);
@@ -1273,7 +1275,7 @@ describe("live Durable Object relay", () => {
     await createConnectionSet(session.sessionId, session.hostCapability);
   });
 
-  it("fences writer leases and injects the authenticated client identity", async () => {
+  it("forwards strictly increasing writer fences in Host control order", async () => {
     const session = await createSession();
     const host = await openHost(session);
     const first = await openBrowser(session, session.writerCapability);
@@ -1297,6 +1299,7 @@ describe("live Durable Object relay", () => {
       type: "key",
       connectionId: first.connection.connectionId,
       clientId: first.connection.clientId,
+      writerFence: "1",
       inputEpoch: "input_first",
       clientInputSeq: "1",
       action: "press",
@@ -1332,13 +1335,14 @@ describe("live Durable Object relay", () => {
     expect(Number(lease.expires_at)).toBeGreaterThan(Date.now());
 
     secondReplacement.control.socket.send(
-      JSON.stringify(keyFrame(String(secondLease), "input_second", "2")),
+      JSON.stringify(keyFrame(String(secondLease), "input_second", "1")),
     );
     expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
       type: "key",
       clientId: second.connection.clientId,
+      writerFence: "2",
       inputEpoch: "input_second",
-      clientInputSeq: "2",
+      clientInputSeq: "1",
     });
 
     secondReplacement.control.socket.send(
@@ -1348,6 +1352,83 @@ describe("live Durable Object relay", () => {
       }),
     );
     expect((await secondReplacement.control.inbox.nextClose()).code).toBe(4400);
+  });
+
+  it("keeps the writer fence high-water when inactive client LRU reclaims its row", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const first = await openBrowser(session, session.writerCapability);
+    const firstAttach = await attachBrowser(session, host, first);
+    expect(typeof firstAttach.welcome.writerLease).toBe("string");
+
+    await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      state.storage.sql.exec("UPDATE writer_lease SET expires_at = 0 WHERE singleton = 1");
+      state.storage.sql.exec(
+        "UPDATE client_delivery SET updated_at = 0 WHERE client_id = ?",
+        first.connection.clientId,
+      );
+    });
+    first.control.socket.close(1000, "expire first writer");
+    first.data.socket.close(1000, "expire first writer");
+    await drainSession(session.sessionId);
+
+    for (let index = 0; index < 15; index += 1) {
+      const inactive = await openBrowser(session, session.observerCapability);
+      inactive.control.socket.close(1000, "inactive observer");
+      inactive.data.socket.close(1000, "inactive observer");
+      await drainSession(session.sessionId);
+    }
+
+    const next = await openBrowser(session, session.writerCapability);
+    const nextAttach = await attachBrowser(session, host, next);
+    expect(typeof nextAttach.welcome.writerLease).toBe("string");
+    const state = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, durableState) => ({
+        firstClient: durableState.storage.sql
+          .exec(
+            "SELECT client_id FROM client_delivery WHERE client_id = ?",
+            first.connection.clientId,
+          )
+          .toArray()[0],
+        lease: durableState.storage.sql
+          .exec("SELECT client_id, fence, expires_at FROM writer_lease WHERE singleton = 1")
+          .one(),
+      }),
+    );
+    expect(state.firstClient).toBeUndefined();
+    expect(state.lease).toMatchObject({
+      client_id: next.connection.clientId,
+      fence: "2",
+    });
+    expect(Number(state.lease.expires_at)).toBeGreaterThan(Date.now());
+  });
+
+  it("fails closed instead of wrapping an exhausted writer fence", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const first = await openBrowser(session, session.writerCapability);
+    await attachBrowser(session, host, first);
+    first.control.socket.close(1000, "expire first writer");
+    first.data.socket.close(1000, "expire first writer");
+    await drainSession(session.sessionId);
+    await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE writer_lease SET fence = '18446744073709551615', expires_at = 0 WHERE singleton = 1",
+      );
+    });
+
+    const next = await openBrowser(session, session.writerCapability);
+    sendBrowserAttach(next, { sessionEpoch: "7", eventSeq: "0", nextPtyOffset: "0" });
+    expect((await next.control.inbox.nextClose()).code).toBe(4400);
+    await drainSession(session.sessionId);
+    const lease = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) =>
+      state.storage.sql
+        .exec("SELECT fence, expires_at FROM writer_lease WHERE singleton = 1")
+        .one(),
+    );
+    expect(lease).toEqual({ fence: "18446744073709551615", expires_at: 0 });
+    expect(host.control.inbox.pendingMessageCount).toBe(0);
   });
 
   it("keeps a writer lease alive across semantic idle with explicit ten-second renewals", async () => {
@@ -1477,6 +1558,7 @@ describe("live Durable Object relay", () => {
         ...input,
         connectionId: writer.connection.connectionId,
         clientId: writer.connection.clientId,
+        writerFence: "1",
       });
     }
 
@@ -1713,6 +1795,7 @@ describe("live Durable Object relay", () => {
       ...interrupt,
       connectionId: browser.connection.connectionId,
       clientId: browser.connection.clientId,
+      writerFence: "1",
     });
 
     browser.data = await upgrade(session.sessionId, "data", resync.dataTicket);
@@ -2514,6 +2597,7 @@ describe("live Durable Object relay", () => {
       ...input,
       connectionId: browser.connection.connectionId,
       clientId: browser.connection.clientId,
+      writerFence: "1",
     });
 
     const connection = await createConnectionSet(
@@ -2539,13 +2623,14 @@ describe("live Durable Object relay", () => {
       status: "rejected",
     });
     replacement.control.socket.send(
-      JSON.stringify(keyFrame(replacementLease, "full_replacement", "2")),
+      JSON.stringify(keyFrame(replacementLease, "full_replacement", "1")),
     );
     expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
       type: "key",
       clientId: browser.connection.clientId,
+      writerFence: "2",
       inputEpoch: "full_replacement",
-      clientInputSeq: "2",
+      clientInputSeq: "1",
     });
     const lease = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
       return state.storage.sql.exec("SELECT client_id, fence FROM writer_lease").one();
@@ -2686,6 +2771,7 @@ describe("live Durable Object relay", () => {
         ...input,
         connectionId: browser.connection.connectionId,
         clientId: browser.connection.clientId,
+        writerFence: "1",
       });
     }
     host.control.socket.send(
@@ -2755,6 +2841,7 @@ describe("live Durable Object relay", () => {
       ...postHibernateInput,
       connectionId: browser.connection.connectionId,
       clientId: browser.connection.clientId,
+      writerFence: "1",
     });
     const restoredAwaiting = await runInDurableObject(
       sessionStub(session.sessionId),
