@@ -13,7 +13,7 @@ export default defineConfig({
     },
   },
   test: {
-    exclude: [...configDefaults.exclude, "apps/terminal-cloud/test/runtime.test.ts"],
+    exclude: [...configDefaults.exclude, "apps/terminal-cloud/test/**/*.test.ts"],
   },
   run: {
     tasks: {

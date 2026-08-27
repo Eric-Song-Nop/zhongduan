@@ -27,7 +27,15 @@ describe("local terminal session", () => {
     });
 
     session.writePaste("printf '__ZHONGDUAN_HOST_OK__\\n'; exit");
-    session.writeKey({ code: "Enter", key: "Enter", modifiers: 0, repeat: false });
+    session.writeKey({
+      action: "press",
+      altGraph: false,
+      code: "Enter",
+      composing: false,
+      consumedModifiers: 0,
+      key: "Enter",
+      modifiers: 0,
+    });
     const exit = await Promise.race([
       session.waitForExit(),
       new Promise<never>((_, reject) =>

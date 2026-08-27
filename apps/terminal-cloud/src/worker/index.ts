@@ -1,3 +1,4 @@
+import { PositiveDecimalU64Schema } from "@zhongduan/protocol";
 import { z } from "zod";
 import {
   AuthError,
@@ -24,10 +25,7 @@ const WebSocketRoute = new RegExp(
 
 const CreateSessionSchema = z.strictObject({
   engineId: z.string().min(1).max(512),
-  sessionEpoch: z
-    .string()
-    .regex(/^(0|[1-9][0-9]*)$/)
-    .default("1"),
+  sessionEpoch: PositiveDecimalU64Schema,
 });
 
 const ConnectionSetRequestSchema = z.strictObject({

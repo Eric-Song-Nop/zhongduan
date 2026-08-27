@@ -1,4 +1,5 @@
 import { ProtocolError } from "./errors";
+import { MAX_U64 } from "./scalars";
 
 export const DATA_MAGIC = 0x5a54524d;
 export const DATA_PROTOCOL_VERSION = 1;
@@ -49,7 +50,7 @@ function assertU16(value: number, field: string): void {
 }
 
 function assertU64(value: bigint, field: string): void {
-  if (value < 0n || value > 0xffff_ffff_ffff_ffffn) {
+  if (value < 0n || value > MAX_U64) {
     throw new ProtocolError("OUT_OF_RANGE", `${field} must be a uint64`);
   }
 }

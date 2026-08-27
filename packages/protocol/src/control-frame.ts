@@ -1,6 +1,7 @@
 import { z } from "zod";
+import { DecimalU64Schema } from "./scalars";
 
-const u64 = z.string().regex(/^(0|[1-9][0-9]*)$/);
+const u64 = DecimalU64Schema;
 const id = z.string().min(1).max(128);
 const engineId = z.string().min(1).max(512);
 const dimensions = {
@@ -9,44 +10,84 @@ const dimensions = {
   widthPx: z.number().int().min(0).max(1_000_000),
   heightPx: z.number().int().min(0).max(1_000_000),
 };
+const MAX_PASTE_BYTES = 1024 * 1024;
+const textEncoder = new TextEncoder();
 const inputIdentity = {
   writerLease: id,
   inputEpoch: id,
   clientInputSeq: u64,
 };
+const unicodeScalar = z
+  .number()
+  .int()
+  .min(0)
+  .max(0x10ffff)
+  .refine((value) => value < 0xd800 || value > 0xdfff, "must be a Unicode scalar value");
 
-const attach = z.strictObject({
+const attachBase = {
   type: z.literal("attach"),
   engineId,
-  hasLiveReplica: z.boolean(),
-  lastSessionEpoch: u64.optional(),
-  lastEventSeq: u64.optional(),
-  nextPtyOffset: u64.optional(),
-});
+};
+const attach = z.discriminatedUnion("hasLiveReplica", [
+  z.strictObject({
+    ...attachBase,
+    hasLiveReplica: z.literal(false),
+  }),
+  z.strictObject({
+    ...attachBase,
+    hasLiveReplica: z.literal(true),
+    lastSessionEpoch: u64,
+    lastEventSeq: u64,
+    nextPtyOffset: u64,
+  }),
+]);
 
-const ack = z.strictObject({
-  type: z.literal("ack"),
+const deliveryCursor = {
   sessionEpoch: u64,
   deliveryGeneration: u64,
   eventSeq: u64,
   nextPtyOffset: u64,
+};
+
+const ack = z.strictObject({
+  type: z.literal("ack"),
+  ...deliveryCursor,
 });
 
-const key = z.strictObject({
-  type: z.literal("key"),
-  ...inputIdentity,
-  observedEventSeq: u64,
-  code: z.string().max(128),
-  key: z.string().max(128),
-  text: z.string().max(1024).optional(),
-  modifiers: z.number().int().min(0).max(0xffff),
-  repeat: z.boolean(),
-});
+const key = z
+  .strictObject({
+    type: z.literal("key"),
+    ...inputIdentity,
+    observedEventSeq: u64,
+    code: z.string().max(128),
+    key: z.string().max(128),
+    text: z.string().max(1024).optional(),
+    modifiers: z.number().int().min(0).max(0x3f),
+    action: z.enum(["press", "repeat", "release"]),
+    altGraph: z.boolean(),
+    composing: z.boolean(),
+    consumedModifiers: z.number().int().min(0).max(0x3f),
+    unshiftedCodepoint: unicodeScalar.optional(),
+  })
+  .refine((frame) => (frame.consumedModifiers & ~frame.modifiers) === 0, {
+    message: "consumedModifiers must be a subset of modifiers",
+    path: ["consumedModifiers"],
+  });
 
 const paste = z.strictObject({
   type: z.literal("paste"),
   ...inputIdentity,
-  data: z.string().max(1024 * 1024),
+  data: z
+    .string()
+    .max(MAX_PASTE_BYTES)
+    .superRefine((value, context) => {
+      if (
+        value.length <= MAX_PASTE_BYTES &&
+        textEncoder.encode(value).byteLength > MAX_PASTE_BYTES
+      ) {
+        context.addIssue({ code: "custom", message: "paste exceeds UTF-8 byte limit" });
+      }
+    }),
 });
 
 const resizeRequest = z.strictObject({
@@ -55,13 +96,7 @@ const resizeRequest = z.strictObject({
   ...dimensions,
 });
 
-export const ClientControlFrameSchema = z.discriminatedUnion("type", [
-  attach,
-  ack,
-  key,
-  paste,
-  resizeRequest,
-]);
+export const ClientControlFrameSchema = z.union([attach, ack, key, paste, resizeRequest]);
 
 export type ClientControlFrame = z.infer<typeof ClientControlFrameSchema>;
 
@@ -112,11 +147,24 @@ const hostOffline = z.strictObject({
   type: z.literal("host-offline"),
 });
 
-const resyncRequired = z.strictObject({
-  type: z.literal("resync-required"),
-  deliveryGeneration: u64,
-  reason: z.enum(["journal-gap", "slow-client", "engine-mismatch", "epoch-changed"]),
-});
+const resyncRequired = z
+  .strictObject({
+    type: z.literal("resync-required"),
+    deliveryGeneration: u64,
+    reason: z.enum([
+      "journal-gap",
+      "slow-client",
+      "engine-mismatch",
+      "epoch-changed",
+      "data-disconnected",
+      "host-reconnect",
+    ]),
+    dataTicket: id.optional(),
+    expiresAt: z.number().int().positive().optional(),
+  })
+  .refine((frame) => (frame.dataTicket === undefined) === (frame.expiresAt === undefined), {
+    message: "dataTicket and expiresAt must be provided together",
+  });
 
 const snapshotManifest = z.strictObject({
   type: z.literal("snapshot-manifest"),
@@ -146,28 +194,52 @@ export const ServerControlFrameSchema = z.discriminatedUnion("type", [
 
 export type ServerControlFrame = z.infer<typeof ServerControlFrameSchema>;
 
-const attachRequest = z.strictObject({
+const attachRequestBase = {
   type: z.literal("attach-request"),
   connectionId: id,
   streamId: z.number().int().min(1).max(0xffff_ffff),
   deliveryGeneration: u64,
   engineId,
-  hasLiveReplica: z.boolean(),
-  lastSessionEpoch: u64.optional(),
-  lastEventSeq: u64.optional(),
-  nextPtyOffset: u64.optional(),
-});
+};
+const attachRequest = z.discriminatedUnion("hasLiveReplica", [
+  z.strictObject({
+    ...attachRequestBase,
+    hasLiveReplica: z.literal(false),
+  }),
+  z.strictObject({
+    ...attachRequestBase,
+    hasLiveReplica: z.literal(true),
+    lastSessionEpoch: u64,
+    lastEventSeq: u64,
+    nextPtyOffset: u64,
+  }),
+]);
 
 const verifiedClient = { connectionId: id, clientId: id };
-const forwardedKey = key.extend(verifiedClient);
+const forwardedKey = key.safeExtend(verifiedClient);
 const forwardedPaste = paste.extend(verifiedClient);
 const forwardedResize = resizeRequest.extend(verifiedClient);
+const deliveryReset = z.strictObject({
+  type: z.literal("delivery-reset"),
+  connectionId: id,
+  streamId: z.number().int().min(1).max(0xffff_ffff),
+  deliveryGeneration: u64,
+  reason: z.literal("slow-client"),
+});
+const hostReadyAck = z.strictObject({
+  type: z.literal("host-ready-ack"),
+  sessionEpoch: u64,
+  headEventSeq: u64,
+  nextPtyOffset: u64,
+});
 
-export const RelayToHostControlFrameSchema = z.discriminatedUnion("type", [
+export const RelayToHostControlFrameSchema = z.union([
+  hostReadyAck,
   attachRequest,
   forwardedKey,
   forwardedPaste,
   forwardedResize,
+  deliveryReset,
 ]);
 
 export type RelayToHostControlFrame = z.infer<typeof RelayToHostControlFrameSchema>;

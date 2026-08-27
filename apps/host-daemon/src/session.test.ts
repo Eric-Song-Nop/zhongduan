@@ -165,7 +165,15 @@ describe("TerminalSession", () => {
     });
 
     pty.emit(new TextEncoder().encode("\u001b[?1h"));
-    session.writeKey({ code: "ArrowUp", key: "ArrowUp", modifiers: 0, repeat: false });
+    session.writeKey({
+      action: "press",
+      altGraph: false,
+      code: "ArrowUp",
+      composing: false,
+      consumedModifiers: 0,
+      key: "ArrowUp",
+      modifiers: 0,
+    });
     session.writePaste("hello");
     pty.emit(new TextEncoder().encode("\u001b[6n"));
 
@@ -272,7 +280,15 @@ describe("TerminalSession", () => {
       pty,
       sessionEpoch: 1n,
     });
-    const enter = { code: "Enter", key: "Enter", modifiers: 0, repeat: false };
+    const enter = {
+      action: "press" as const,
+      altGraph: false,
+      code: "Enter",
+      composing: false,
+      consumedModifiers: 0,
+      key: "Enter",
+      modifiers: 0,
+    };
 
     await expect(
       session.submitKey(

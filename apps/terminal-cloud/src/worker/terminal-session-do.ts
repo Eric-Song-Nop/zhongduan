@@ -1,15 +1,57 @@
+import {
+  ClientControlFrameSchema,
+  DATA_HEADER_BYTES,
+  DataFrameKind,
+  HostControlFrameSchema,
+  MAX_U64,
+  PositiveDecimalU64Schema,
+  RelayToHostControlFrameSchema,
+  ServerControlFrameSchema,
+  decodeControlFrame,
+  decodeDataFrame,
+  encodeControlFrame,
+  rewriteDelivery,
+  type DataFrame,
+} from "@zhongduan/protocol";
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
-import { randomId, sha256Hex, type CapabilityRole } from "./auth";
+import { randomId, sha256Hex } from "./auth";
+import {
+  connectionSockets,
+  eligibleControlForDataTicket,
+  matchingSocket,
+  sameConnection,
+} from "./relay-connection-state";
+import { RelayConnectionStore } from "./relay-connection-store";
 import type { CloudEnv } from "./env";
+import { advanceDeliveryCursor } from "./relay-delivery";
+import {
+  BoundedSerialQueue,
+  RELAY_MESSAGE_QUEUE_PROFILES,
+  type SocketQueueLimits,
+} from "./relay-message-queue";
+import {
+  readSocketAttachment as readAttachment,
+  SocketAttachmentSchema,
+  writeSocketAttachment as writeAttachment,
+  type RelayChannel as Channel,
+  type SocketAttachment,
+} from "./relay-socket";
+import {
+  migrateRelayStore,
+  RelayStore,
+  type ClientRow,
+  type SessionRow,
+  type TicketRow,
+  type WriterLeaseRow,
+} from "./relay-store";
 
 const identifier = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/);
-const decimalU64 = z.string().regex(/^(0|[1-9][0-9]*)$/);
 const engineId = z.string().min(1).max(512);
 
 const InitializeSessionSchema = z.strictObject({
   sessionId: identifier,
-  sessionEpoch: decimalU64,
+  sessionEpoch: PositiveDecimalU64Schema,
   engineId,
 });
 
@@ -20,54 +62,41 @@ const CreateConnectionSetSchema = z.strictObject({
   clientId: identifier.optional(),
 });
 
-const SocketAttachmentSchema = z.strictObject({
-  version: z.literal(1),
-  peer: z.enum(["host", "browser"]),
-  channel: z.enum(["control", "data"]),
-  connectionSetId: identifier,
-  connectionId: identifier,
-  clientId: identifier.nullable(),
-  role: z.enum(["host", "writer", "observer"]),
-  streamId: z.number().int().min(0).max(0xffff_ffff),
-  deliveryGeneration: decimalU64,
-  hostFence: decimalU64.nullable(),
-});
-
-type SocketAttachment = z.infer<typeof SocketAttachmentSchema>;
-type Channel = SocketAttachment["channel"];
-
-interface TicketRow {
-  channel: Channel;
-  client_id: string | null;
-  connection_id: string;
-  connection_set_id: string;
-  delivery_generation: string;
-  expires_at: number;
-  host_fence: string | null;
-  peer: "host" | "browser";
-  role: CapabilityRole;
-  stream_id: number;
-  subject: string;
-  ticket_digest: string;
+interface AcquiredLease {
+  fence: string;
+  token: string;
 }
 
-interface SessionRow {
-  engine_id: string;
-  host_fence: string;
-  next_stream_id: number;
-  session_epoch: string;
-  session_id: string;
+interface BrowserAttachContext {
+  client: ClientRow;
+  controlAttachment: SocketAttachment;
+  dataAttachment: SocketAttachment;
+  dataSocket: WebSocket;
+  session: SessionRow;
 }
 
-interface ClientRow {
-  delivery_generation: string;
-  principal_id_hash: string;
-  role: "writer" | "observer";
-  stream_id: number;
-}
+type BrowserAttachContextResult =
+  | { ok: true; value: BrowserAttachContext }
+  | {
+      ok: false;
+      client?: ClientRow;
+      reason:
+        | "cursor-ahead"
+        | "data-missing"
+        | "engine-mismatch"
+        | "epoch-changed"
+        | "session-missing"
+        | "stale-control";
+    };
 
 const TICKET_LIFETIME_MS = 30_000;
+const WRITER_LEASE_MS = 30_000;
 const MAX_BROWSER_CONNECTIONS = 16;
+const MAX_PENDING_CONNECTION_SETS = MAX_BROWSER_CONNECTIONS + 1;
+const MAX_CONTROL_MESSAGE_CHARS = 6 * 1024 * 1024 + 4_096;
+const MAX_HOST_DATA_BYTES = DATA_HEADER_BYTES + 16 * 1024;
+const SOCKET_REPLACED = 4001;
+const SLOW_CLIENT = 4008;
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, {
@@ -84,18 +113,46 @@ async function parseJson(request: Request): Promise<unknown> {
   }
 }
 
-function readAttachment(webSocket: WebSocket): SocketAttachment | undefined {
-  const parsed = SocketAttachmentSchema.safeParse(webSocket.deserializeAttachment());
-  return parsed.success ? parsed.data : undefined;
+function sendServerControl(
+  webSocket: WebSocket,
+  frame: z.input<typeof ServerControlFrameSchema>,
+): void {
+  if (webSocket.readyState !== WebSocket.OPEN) return;
+  webSocket.send(encodeControlFrame(ServerControlFrameSchema.parse(frame)));
+}
+
+function sendRelayControl(
+  webSocket: WebSocket,
+  frame: z.input<typeof RelayToHostControlFrameSchema>,
+): void {
+  if (webSocket.readyState !== WebSocket.OPEN) return;
+  webSocket.send(encodeControlFrame(RelayToHostControlFrameSchema.parse(frame)));
+}
+
+function closeProtocol(webSocket: WebSocket, reason: string): void {
+  if (webSocket.readyState < WebSocket.CLOSING) {
+    webSocket.close(4400, reason);
+  }
 }
 
 export class TerminalSessionDO extends DurableObject<CloudEnv> {
   private readonly sql: SqlStorage;
+  private readonly store: RelayStore;
+  private readonly connections: RelayConnectionStore;
+  private readonly messageQueue = new BoundedSerialQueue<WebSocket>();
 
   constructor(ctx: DurableObjectState, env: CloudEnv) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.migrate();
+    this.store = new RelayStore(this.sql);
+    migrateRelayStore(ctx, this.sql);
+    this.connections = new RelayConnectionStore(
+      ctx,
+      this.sql,
+      this.store,
+      MAX_BROWSER_CONNECTIONS,
+      MAX_PENDING_CONNECTION_SETS,
+    );
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
@@ -116,106 +173,201 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     return json({ error: "not-found" }, 404);
   }
 
-  webSocketMessage(webSocket: WebSocket, _message: ArrayBuffer | string): void {
+  webSocketMessage(webSocket: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    const inbound = this.validateInboundMessage(webSocket, message);
+    if (inbound === undefined) return Promise.resolve();
+    const processing = this.messageQueue.enqueue(
+      webSocket,
+      inbound.bytes,
+      () => this.processWebSocketMessage(webSocket, message),
+      inbound.queueLimits,
+    );
+    if (processing === undefined) {
+      this.rejectInboundMessage(webSocket, inbound.attachment, "relay message queue exceeded");
+      return Promise.resolve();
+    }
+    return processing.catch(() => {
+      this.rejectInboundMessage(webSocket, inbound.attachment, "relay message failed");
+    });
+  }
+
+  private validateInboundMessage(
+    webSocket: WebSocket,
+    message: ArrayBuffer | string,
+  ): { attachment: SocketAttachment; bytes: number; queueLimits: SocketQueueLimits } | undefined {
     const attachment = readAttachment(webSocket);
     if (attachment === undefined) {
-      webSocket.close(4400, "invalid attachment");
-      return;
+      closeProtocol(webSocket, "invalid attachment");
+      return undefined;
     }
-    webSocket.close(4404, "channel handler not implemented");
+    if (attachment.channel === "control") {
+      if (typeof message !== "string") {
+        this.rejectInboundMessage(webSocket, attachment, "control channel requires text frames");
+        return undefined;
+      }
+      if (message.length > MAX_CONTROL_MESSAGE_CHARS) {
+        this.rejectInboundMessage(webSocket, attachment, "control frame is too large");
+        return undefined;
+      }
+      return {
+        attachment,
+        bytes: message.length * 2,
+        queueLimits:
+          attachment.peer === "host"
+            ? RELAY_MESSAGE_QUEUE_PROFILES.hostControl
+            : RELAY_MESSAGE_QUEUE_PROFILES.browserControl,
+      };
+    }
+    if (attachment.peer !== "host") {
+      closeProtocol(webSocket, "browser data channel is receive-only");
+      return undefined;
+    }
+    if (typeof message === "string") {
+      this.rejectInboundMessage(webSocket, attachment, "host data channel requires binary frames");
+      return undefined;
+    }
+    if (message.byteLength > MAX_HOST_DATA_BYTES) {
+      this.rejectInboundMessage(webSocket, attachment, "host data frame is too large");
+      return undefined;
+    }
+    return {
+      attachment,
+      bytes: message.byteLength,
+      queueLimits: RELAY_MESSAGE_QUEUE_PROFILES.hostData,
+    };
   }
 
-  webSocketClose(webSocket: WebSocket): void {
+  private rejectInboundMessage(
+    webSocket: WebSocket,
+    attachment: SocketAttachment,
+    reason: string,
+  ): void {
+    if (attachment.peer === "host") {
+      this.failCurrentHost(attachment, reason);
+      if (webSocket.readyState < WebSocket.CLOSING) closeProtocol(webSocket, reason);
+      return;
+    }
+    closeProtocol(webSocket, reason);
+  }
+
+  private async processWebSocketMessage(
+    webSocket: WebSocket,
+    message: ArrayBuffer | string,
+  ): Promise<void> {
     const attachment = readAttachment(webSocket);
-    if (attachment?.channel === "control") {
-      this.closeTaggedSockets(`set:${attachment.connectionSetId}`, webSocket);
-    }
-  }
-
-  webSocketError(webSocket: WebSocket): void {
-    webSocket.close(1011, "relay socket error");
-  }
-
-  private migrate(): void {
-    if ((this.ctx.storage.kv.get<number>("schema-version") ?? 0) >= 1) {
+    if (attachment === undefined) {
+      closeProtocol(webSocket, "invalid attachment");
       return;
     }
 
-    this.ctx.storage.transactionSync(() => {
-      this.sql.exec(`
-        CREATE TABLE IF NOT EXISTS session_state (
-          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-          session_id TEXT NOT NULL UNIQUE,
-          session_epoch TEXT NOT NULL,
-          engine_id TEXT NOT NULL,
-          host_fence TEXT NOT NULL DEFAULT '0',
-          host_agent_epoch TEXT,
-          latest_snapshot_id TEXT,
-          next_stream_id INTEGER NOT NULL DEFAULT 1,
-          terminated_at INTEGER,
-          updated_at INTEGER NOT NULL
-        )
-      `);
-      this.sql.exec(`
-        CREATE TABLE IF NOT EXISTS client_delivery (
-          client_id TEXT PRIMARY KEY,
-          principal_id_hash TEXT NOT NULL,
-          role TEXT NOT NULL CHECK (role IN ('writer', 'observer')),
-          stream_id INTEGER NOT NULL UNIQUE,
-          delivery_generation TEXT NOT NULL,
-          last_ack_event_seq TEXT,
-          next_ack_pty_offset TEXT,
-          updated_at INTEGER NOT NULL
-        )
-      `);
-      this.sql.exec(`
-        CREATE TABLE IF NOT EXISTS writer_lease (
-          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-          client_id TEXT NOT NULL,
-          lease_digest TEXT NOT NULL,
-          fence TEXT NOT NULL,
-          expires_at INTEGER NOT NULL
-        )
-      `);
-      this.sql.exec(`
-        CREATE TABLE IF NOT EXISTS snapshot (
-          snapshot_id TEXT PRIMARY KEY,
-          session_epoch TEXT NOT NULL,
-          cut_event_seq TEXT NOT NULL,
-          next_pty_offset TEXT NOT NULL,
-          engine_id TEXT NOT NULL,
-          object_key TEXT NOT NULL UNIQUE,
-          r2_version TEXT NOT NULL,
-          etag TEXT NOT NULL,
-          sha256 TEXT NOT NULL,
-          compressed_length INTEGER NOT NULL,
-          uncompressed_length TEXT NOT NULL,
-          compression TEXT NOT NULL CHECK (compression IN ('none', 'zstd')),
-          state TEXT NOT NULL CHECK (state IN ('servable', 'retired')),
-          created_at INTEGER NOT NULL
-        )
-      `);
-      this.sql.exec(`
-        CREATE TABLE IF NOT EXISTS connection_ticket (
-          ticket_digest TEXT PRIMARY KEY,
-          connection_set_id TEXT NOT NULL,
-          connection_id TEXT NOT NULL,
-          peer TEXT NOT NULL CHECK (peer IN ('host', 'browser')),
-          channel TEXT NOT NULL CHECK (channel IN ('control', 'data')),
-          client_id TEXT,
-          subject TEXT NOT NULL,
-          role TEXT NOT NULL CHECK (role IN ('host', 'writer', 'observer')),
-          stream_id INTEGER NOT NULL,
-          delivery_generation TEXT NOT NULL,
-          host_fence TEXT,
-          expires_at INTEGER NOT NULL
-        )
-      `);
-      this.sql.exec(
-        "CREATE INDEX IF NOT EXISTS connection_ticket_expiry ON connection_ticket(expires_at)",
-      );
-      this.ctx.storage.kv.put("schema-version", 1);
-    });
+    if (attachment.channel === "control") {
+      if (typeof message !== "string") {
+        closeProtocol(webSocket, "control channel requires text frames");
+        return;
+      }
+      if (message.length > MAX_CONTROL_MESSAGE_CHARS) {
+        closeProtocol(webSocket, "control frame is too large");
+        return;
+      }
+      if (attachment.peer === "host") {
+        await this.handleHostControl(webSocket, attachment, message);
+      } else {
+        await this.handleBrowserControl(webSocket, attachment, message);
+      }
+      return;
+    }
+
+    if (attachment.peer !== "host") {
+      closeProtocol(webSocket, "browser data channel is receive-only");
+      return;
+    }
+    if (typeof message === "string") {
+      closeProtocol(webSocket, "host data channel requires binary frames");
+      return;
+    }
+    if (message.byteLength > MAX_HOST_DATA_BYTES) {
+      this.failCurrentHost(attachment, "host data frame is too large");
+      return;
+    }
+    await this.handleHostData(webSocket, attachment, new Uint8Array(message));
+  }
+
+  webSocketClose(
+    webSocket: WebSocket,
+    _code: number,
+    _reason: string,
+    _wasClean: boolean,
+  ): Promise<void> {
+    return this.processWebSocketClose(webSocket).catch(() => undefined);
+  }
+
+  private async processWebSocketClose(webSocket: WebSocket): Promise<void> {
+    const attachment = readAttachment(webSocket);
+    if (attachment === undefined) return;
+
+    if (attachment.channel === "data") {
+      if (attachment.peer === "host") {
+        if (
+          !this.isCurrentHost(attachment) ||
+          matchingSocket(this.ctx, attachment, "control") === undefined ||
+          matchingSocket(this.ctx, attachment, "data", webSocket) !== undefined
+        ) {
+          return;
+        }
+        this.failCurrentHost(attachment, "host data channel disconnected");
+        return;
+      }
+
+      if (attachment.clientId === null) return;
+      const client = this.clientById(attachment.clientId);
+      const control = this.activeBrowserControl(attachment.clientId);
+      const controlAttachment = control === undefined ? undefined : readAttachment(control);
+      if (
+        client?.delivery_generation !== attachment.deliveryGeneration ||
+        this.browserDataByClient(attachment.clientId, webSocket) !== undefined ||
+        controlAttachment?.connectionSetId !== attachment.connectionSetId ||
+        controlAttachment.connectionId !== attachment.connectionId
+      ) {
+        return;
+      }
+      await this.resetBrowserDelivery(attachment.clientId, "data-disconnected", false);
+      return;
+    }
+
+    if (attachment.peer === "host") {
+      const session = this.session();
+      if (
+        session?.host_fence !== attachment.hostFence ||
+        matchingSocket(this.ctx, attachment, "control", webSocket) !== undefined
+      ) {
+        return;
+      }
+      this.failCurrentHost(attachment, "host control channel disconnected");
+      return;
+    }
+
+    if (attachment.clientId === null) return;
+    this.releaseWriterLease(attachment.clientId, attachment.leaseFence);
+    if (this.activeBrowserControl(attachment.clientId, webSocket) !== undefined) return;
+    this.connections.closeConnectionSet(attachment.connectionSetId);
+    this.closeSockets((candidate) => {
+      return candidate.peer === "browser" && candidate.clientId === attachment.clientId;
+    }, webSocket);
+  }
+
+  async webSocketError(webSocket: WebSocket, _error: unknown): Promise<void> {
+    try {
+      await this.processWebSocketClose(webSocket);
+    } catch {
+      // The lifecycle transition is best-effort during a runtime socket failure.
+    }
+    try {
+      if (webSocket.readyState < WebSocket.CLOSING) {
+        webSocket.close(1011, "relay socket error");
+      }
+    } catch {
+      // Workerd may already have released the errored native socket.
+    }
   }
 
   private async initializeSession(request: Request): Promise<Response> {
@@ -263,139 +415,49 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
 
     const peer = parsed.data.role === "host" ? "host" : "browser";
-    if (peer === "browser") {
-      const activeClients = new Set(
-        this.ctx.getWebSockets("peer:browser").flatMap((socket) => {
-          if (socket.readyState !== WebSocket.OPEN) return [];
-          const attachment = readAttachment(socket);
-          return attachment?.channel === "control" && attachment.clientId !== null
-            ? [attachment.clientId]
-            : [];
-        }),
-      );
-      const replacingActiveClient =
-        parsed.data.clientId !== undefined && activeClients.has(parsed.data.clientId);
-      if (activeClients.size >= MAX_BROWSER_CONNECTIONS && !replacingActiveClient) {
-        return json({ error: "too-many-clients" }, 429);
-      }
-    }
-
-    const browserRole =
-      parsed.data.role === "writer" || parsed.data.role === "observer"
-        ? parsed.data.role
-        : undefined;
-    const client =
-      peer === "browser" && browserRole !== undefined
-        ? await this.resolveClient(
-            parsed.data.clientId ?? randomId(),
-            parsed.data.subject,
-            browserRole,
-          )
-        : undefined;
-    if (client === undefined && peer === "browser") {
-      return json({ error: "client-owner-mismatch" }, 403);
-    }
-
     const connectionSetId = randomId();
     const connectionId = connectionSetId;
     const controlTicket = randomId(32);
     const dataTicket = randomId(32);
-    const [controlDigest, dataDigest] = await Promise.all([
+    const requestedClientId = peer === "browser" ? (parsed.data.clientId ?? randomId()) : null;
+    const [controlDigest, dataDigest, principalIdHash] = await Promise.all([
       sha256Hex(controlTicket),
       sha256Hex(dataTicket),
+      peer === "browser" ? sha256Hex(parsed.data.subject) : Promise.resolve(undefined),
     ]);
-    const expiresAt = Date.now() + TICKET_LIFETIME_MS;
-    const streamId = client?.stream_id ?? 0;
-    const deliveryGeneration = client?.delivery_generation ?? "0";
-    const clientId = peer === "browser" ? (parsed.data.clientId ?? client?.client_id) : null;
-
-    this.ctx.storage.transactionSync(() => {
-      this.sql.exec("DELETE FROM connection_ticket WHERE expires_at <= ?", Date.now());
-      for (const [ticketDigest, channel] of [
-        [controlDigest, "control"],
-        [dataDigest, "data"],
-      ] as const) {
-        this.sql.exec(
-          `INSERT INTO connection_ticket
-            (ticket_digest, connection_set_id, connection_id, peer, channel,
-             client_id, subject, role, stream_id, delivery_generation, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          ticketDigest,
-          connectionSetId,
-          connectionId,
-          peer,
-          channel,
-          clientId,
-          parsed.data.subject,
-          parsed.data.role,
-          streamId,
-          deliveryGeneration,
-          expiresAt,
-        );
-      }
+    const now = Date.now();
+    const expiresAt = now + TICKET_LIFETIME_MS;
+    const reservation = this.connections.reserveConnectionSet({
+      clientId: requestedClientId,
+      connectionId,
+      connectionSetId,
+      controlTicketDigest: controlDigest,
+      dataTicketDigest: dataDigest,
+      expiresAt,
+      now,
+      peer,
+      principalIdHash,
+      role: parsed.data.role,
+      subject: parsed.data.subject,
     });
+    if (!reservation.ok) {
+      return json(
+        { error: reservation.reason },
+        reservation.reason === "client-owner-mismatch" ? 403 : 429,
+      );
+    }
+    const client = reservation.client;
 
     return json({
       connectionSetId,
       connectionId,
-      clientId,
-      streamId,
-      deliveryGeneration,
+      clientId: requestedClientId,
+      streamId: client?.stream_id ?? 0,
+      deliveryGeneration: client?.delivery_generation ?? "0",
       expiresAt,
       controlTicket,
       dataTicket,
     });
-  }
-
-  private async resolveClient(
-    clientId: string,
-    subject: string,
-    role: "writer" | "observer",
-  ): Promise<(ClientRow & { client_id: string }) | undefined> {
-    const principalIdHash = await sha256Hex(subject);
-    const existing = this.sql
-      .exec("SELECT * FROM client_delivery WHERE client_id = ?", clientId)
-      .toArray()[0] as (ClientRow & { client_id: string }) | undefined;
-
-    if (existing !== undefined) {
-      return existing.principal_id_hash === principalIdHash && existing.role === role
-        ? existing
-        : undefined;
-    }
-
-    const session = this.session();
-    if (session === undefined) {
-      throw new Error("session disappeared while resolving client");
-    }
-    const streamId = session.next_stream_id;
-    if (streamId < 1 || streamId > 0xffff_ffff) {
-      throw new Error("stream id space exhausted");
-    }
-    const now = Date.now();
-    this.ctx.storage.transactionSync(() => {
-      this.sql.exec(
-        `INSERT INTO client_delivery
-          (client_id, principal_id_hash, role, stream_id, delivery_generation, updated_at)
-         VALUES (?, ?, ?, ?, '1', ?)`,
-        clientId,
-        principalIdHash,
-        role,
-        streamId,
-        now,
-      );
-      this.sql.exec(
-        "UPDATE session_state SET next_stream_id = ?, updated_at = ? WHERE singleton = 1",
-        streamId + 1,
-        now,
-      );
-    });
-    return {
-      client_id: clientId,
-      principal_id_hash: principalIdHash,
-      role,
-      stream_id: streamId,
-      delivery_generation: "1",
-    };
   }
 
   private async acceptSocket(request: Request, channel: Channel): Promise<Response> {
@@ -407,42 +469,99 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       return json({ error: "invalid-ticket" }, 401);
     }
     const ticketDigest = await sha256Hex(ticketValue);
-    const ticket = this.ticket(ticketDigest);
+    let ticket = this.ticket(ticketDigest);
     if (ticket === undefined || ticket.channel !== channel || ticket.expires_at <= Date.now()) {
       if (ticket?.expires_at !== undefined && ticket.expires_at <= Date.now()) {
-        this.sql.exec("DELETE FROM connection_ticket WHERE ticket_digest = ?", ticketDigest);
+        this.connections.expireTicket(ticketDigest, Date.now());
       }
       return json({ error: "invalid-ticket" }, 401);
     }
 
-    if (channel === "data" && !this.hasControlSocket(ticket.connection_set_id)) {
+    const eligibleControl = eligibleControlForDataTicket(
+      this.ctx,
+      ticket,
+      this.session()?.host_fence,
+    );
+    if (channel === "data" && eligibleControl === undefined) {
       return json({ error: "control-channel-required" }, 409);
+    }
+    if (ticket.peer === "browser" && channel === "control") {
+      const claimedTicket = this.connections.claimBrowserControl(ticket);
+      if (claimedTicket === undefined) {
+        this.connections.discardReservation(ticket);
+        return json({ error: "client-reservation-unavailable" }, 409);
+      }
+      ticket = claimedTicket;
     }
 
     let hostFence = ticket.host_fence;
     if (ticket.peer === "host" && channel === "control") {
-      this.closeTaggedSockets("peer:host");
-      hostFence = this.advanceHostFence(ticket.connection_set_id);
-    } else if (ticket.peer === "browser" && channel === "control" && ticket.client_id !== null) {
-      this.closeTaggedSockets(`client:${ticket.client_id}`);
+      hostFence = this.connections.advanceHostFence(ticket.connection_set_id);
+      this.closeSockets(
+        (candidate) => candidate.peer === "host" && candidate.hostFence !== hostFence,
+      );
+      this.broadcastBrowserControl({ type: "host-offline" });
+      this.markBrowserDataCatchingUp();
+    } else if (ticket.peer === "host" && channel === "data") {
+      hostFence = eligibleControl?.hostFence ?? null;
+      this.closeSockets((candidate) => {
+        return candidate.peer === "host" && candidate.channel === "data";
+      });
+    } else if (ticket.peer === "browser" && ticket.client_id !== null) {
+      const client = this.clientById(ticket.client_id);
+      if (
+        client === undefined ||
+        client.registered_at === null ||
+        client.delivery_generation !== ticket.delivery_generation
+      ) {
+        return json({ error: "stale-ticket" }, 409);
+      }
+      if (channel === "control") {
+        for (const socket of this.ctx.getWebSockets(`client:${ticket.client_id}`)) {
+          const previous = readAttachment(socket);
+          if (previous?.channel === "control") {
+            this.releaseWriterLease(ticket.client_id, previous.leaseFence);
+          }
+        }
+        this.closeSockets((candidate) => {
+          return candidate.peer === "browser" && candidate.clientId === ticket.client_id;
+        });
+      } else {
+        this.closeSockets((candidate) => {
+          return (
+            candidate.peer === "browser" &&
+            candidate.channel === "data" &&
+            candidate.clientId === ticket.client_id
+          );
+        });
+      }
     }
     if (ticket.peer === "host" && hostFence === null) {
       return json({ error: "host-control-channel-required" }, 409);
     }
 
-    this.sql.exec("DELETE FROM connection_ticket WHERE ticket_digest = ?", ticketDigest);
-
+    this.connections.consumeTicket(ticketDigest);
     const attachment = SocketAttachmentSchema.parse({
-      version: 1,
+      version: 2,
       peer: ticket.peer,
       channel,
       connectionSetId: ticket.connection_set_id,
       connectionId: ticket.connection_id,
+      subject: ticket.subject,
       clientId: ticket.client_id,
       role: ticket.role,
       streamId: ticket.stream_id,
       deliveryGeneration: ticket.delivery_generation,
       hostFence,
+      leaseFence: null,
+      controlState: ticket.peer === "browser" && channel === "control" ? "awaiting-attach" : null,
+      dataState: ticket.peer === "browser" && channel === "data" ? "catching-up" : null,
+      firstEventSeq: null,
+      ackedEventSeq: null,
+      sentEventSeq: null,
+      firstPtyOffset: null,
+      ackedPtyOffset: null,
+      sentPtyOffset: null,
     });
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -452,60 +571,855 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       `channel:${attachment.channel}`,
       `set:${attachment.connectionSetId}`,
     ];
-    if (attachment.clientId !== null) {
-      tags.push(`client:${attachment.clientId}`);
-    }
+    if (attachment.clientId !== null) tags.push(`client:${attachment.clientId}`);
+    if (attachment.streamId > 0) tags.push(`stream:${attachment.streamId}`);
     this.ctx.acceptWebSocket(server, tags);
-    server.serializeAttachment(attachment);
+    writeAttachment(server, attachment);
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  private async handleHostControl(
+    webSocket: WebSocket,
+    attachment: SocketAttachment,
+    message: string,
+  ): Promise<void> {
+    if (!this.isCurrentHost(attachment)) return;
+
+    let frame: z.output<typeof HostControlFrameSchema>;
+    try {
+      frame = decodeControlFrame(message, HostControlFrameSchema);
+    } catch {
+      closeProtocol(webSocket, "invalid host control frame");
+      return;
+    }
+
+    if (frame.type === "host-ready") {
+      const session = this.session();
+      const connection = connectionSockets(this.ctx, attachment);
+      if (
+        session === undefined ||
+        connection.control !== webSocket ||
+        connection.phase !== "paired" ||
+        frame.engineId !== session.engine_id ||
+        frame.sessionEpoch !== session.session_epoch ||
+        BigInt(frame.headEventSeq) < BigInt(session.head_event_seq) ||
+        BigInt(frame.nextPtyOffset) < BigInt(session.next_pty_offset)
+      ) {
+        this.failCurrentHost(attachment, "host state does not match session");
+        return;
+      }
+      this.sql.exec(
+        `UPDATE session_state
+         SET head_event_seq = ?, next_pty_offset = ?, updated_at = ?
+         WHERE singleton = 1`,
+        frame.headEventSeq,
+        frame.nextPtyOffset,
+        Date.now(),
+      );
+      writeAttachment(webSocket, { ...attachment, controlState: "active" });
+      const activeBrowsers = this.browserControlSockets().flatMap((browser) => {
+        const browserAttachment = readAttachment(browser);
+        return browserAttachment?.controlState === "active" && browserAttachment.clientId !== null
+          ? [{ browser, attachment: browserAttachment }]
+          : [];
+      });
+      await Promise.all(
+        activeBrowsers.map(({ attachment: browserAttachment }) => {
+          return this.resetBrowserDelivery(browserAttachment.clientId!, "host-reconnect", false, {
+            webSocket,
+            hostFence: attachment.hostFence!,
+          });
+        }),
+      );
+      const readyConnection = connectionSockets(this.ctx, attachment);
+      if (
+        webSocket.readyState !== WebSocket.OPEN ||
+        this.currentHostControl() !== webSocket ||
+        readyConnection.control !== webSocket ||
+        readyConnection.phase !== "ready"
+      ) {
+        return;
+      }
+      sendRelayControl(webSocket, {
+        type: "host-ready-ack",
+        sessionEpoch: frame.sessionEpoch,
+        headEventSeq: frame.headEventSeq,
+        nextPtyOffset: frame.nextPtyOffset,
+      });
+      return;
+    }
+
+    if (frame.type === "input-ack") {
+      const browser = this.browserControlByConnection(frame.connectionId);
+      if (browser === undefined) return;
+      const { connectionId: _connectionId, ...browserFrame } = frame;
+      sendServerControl(browser, browserFrame);
+      return;
+    }
+
+    const browser = this.browserControlByConnection(frame.connectionId);
+    const browserAttachment = browser === undefined ? undefined : readAttachment(browser);
+    if (browserAttachment?.clientId !== null && browserAttachment?.clientId !== undefined) {
+      await this.resetBrowserDelivery(browserAttachment.clientId, frame.reason, false);
+    }
+  }
+
+  private async handleBrowserControl(
+    webSocket: WebSocket,
+    attachment: SocketAttachment,
+    message: string,
+  ): Promise<void> {
+    let frame: z.output<typeof ClientControlFrameSchema>;
+    try {
+      frame = decodeControlFrame(message, ClientControlFrameSchema);
+    } catch {
+      closeProtocol(webSocket, "invalid browser control frame");
+      return;
+    }
+    if (attachment.clientId === null) {
+      closeProtocol(webSocket, "browser identity missing");
+      return;
+    }
+
+    if (frame.type === "attach") {
+      await this.attachBrowser(webSocket, attachment, frame);
+      return;
+    }
+    if (
+      webSocket.readyState !== WebSocket.OPEN ||
+      this.activeBrowserControl(attachment.clientId) !== webSocket
+    ) {
+      return;
+    }
+    if (frame.type === "ack") {
+      const client = this.clientById(attachment.clientId);
+      if (
+        attachment.controlState !== "active" ||
+        this.currentHostControl() === undefined ||
+        client?.delivery_generation !== frame.deliveryGeneration
+      ) {
+        return;
+      }
+      this.acknowledgeBrowser(webSocket, attachment, frame);
+      return;
+    }
+    if (attachment.controlState !== "active") {
+      this.rejectInput(webSocket, frame.inputEpoch, frame.clientInputSeq);
+      return;
+    }
+    const validLease =
+      attachment.role === "writer" &&
+      (await this.renewWriterLease(attachment.clientId, attachment.leaseFence, frame.writerLease));
+    const latestAttachment = readAttachment(webSocket);
+    if (
+      !validLease ||
+      webSocket.readyState !== WebSocket.OPEN ||
+      latestAttachment === undefined ||
+      latestAttachment.clientId !== attachment.clientId ||
+      latestAttachment.controlState !== "active" ||
+      latestAttachment.leaseFence !== attachment.leaseFence ||
+      this.activeBrowserControl(attachment.clientId) !== webSocket
+    ) {
+      this.rejectInput(webSocket, frame.inputEpoch, frame.clientInputSeq);
+      return;
+    }
+
+    const host = this.currentHostControl();
+    if (host === undefined) {
+      sendServerControl(webSocket, { type: "host-offline" });
+      this.rejectInput(webSocket, frame.inputEpoch, frame.clientInputSeq);
+      return;
+    }
+    sendRelayControl(host, {
+      ...frame,
+      connectionId: attachment.connectionId,
+      clientId: attachment.clientId,
+    });
+  }
+
+  private async attachBrowser(
+    webSocket: WebSocket,
+    attachment: SocketAttachment,
+    frame: Extract<z.output<typeof ClientControlFrameSchema>, { type: "attach" }>,
+  ): Promise<void> {
+    const initialResult = this.resolveBrowserAttachContext(webSocket, attachment, frame);
+    if (!initialResult.ok) {
+      this.rejectBrowserAttach(webSocket, initialResult);
+      return;
+    }
+    const initial = initialResult.value;
+
+    const existingLease = this.writerLease();
+    const retainedLeaseFence =
+      attachment.role === "writer" &&
+      attachment.leaseFence !== null &&
+      existingLease?.client_id === initial.controlAttachment.clientId &&
+      existingLease.fence === attachment.leaseFence &&
+      existingLease.expires_at > Date.now()
+        ? attachment.leaseFence
+        : null;
+    const lease =
+      attachment.role === "writer" && retainedLeaseFence === null
+        ? await this.acquireWriterLease(attachment.clientId!, Date.now())
+        : undefined;
+    const currentResult = this.resolveBrowserAttachContext(webSocket, attachment, frame);
+    if (!currentResult.ok) {
+      if (lease !== undefined) this.releaseWriterLease(attachment.clientId!, lease.fence);
+      return;
+    }
+    const current = currentResult.value;
+
+    const { type: _type, ...attachPayload } = frame;
+    const activeAttachment = SocketAttachmentSchema.parse({
+      ...current.controlAttachment,
+      deliveryGeneration: current.client.delivery_generation,
+      leaseFence: lease?.fence ?? retainedLeaseFence,
+      controlState: "active",
+    });
+    writeAttachment(webSocket, activeAttachment);
+    const baselineEventSeq = frame.hasLiveReplica ? frame.lastEventSeq : null;
+    const baselinePtyOffset = frame.hasLiveReplica ? frame.nextPtyOffset : null;
+    writeAttachment(current.dataSocket, {
+      ...current.dataAttachment,
+      dataState: "catching-up",
+      firstEventSeq: baselineEventSeq,
+      ackedEventSeq: baselineEventSeq,
+      sentEventSeq: baselineEventSeq,
+      firstPtyOffset: baselinePtyOffset,
+      ackedPtyOffset: baselinePtyOffset,
+      sentPtyOffset: baselinePtyOffset,
+    });
+    sendServerControl(webSocket, {
+      type: "welcome",
+      connectionId: current.controlAttachment.connectionId,
+      streamId: current.client.stream_id,
+      ...(lease === undefined ? {} : { writerLease: lease.token }),
+      engineId: current.session.engine_id,
+      sessionEpoch: current.session.session_epoch,
+      deliveryGeneration: current.client.delivery_generation,
+      headEventSeq: current.session.head_event_seq,
+      nextPtyOffset: current.session.next_pty_offset,
+    });
+
+    const host = this.currentHostControl();
+    if (host === undefined) {
+      sendServerControl(webSocket, { type: "host-offline" });
+      return;
+    }
+    sendRelayControl(host, {
+      type: "attach-request",
+      connectionId: current.controlAttachment.connectionId,
+      streamId: current.client.stream_id,
+      deliveryGeneration: current.client.delivery_generation,
+      ...attachPayload,
+    });
+  }
+
+  private resolveBrowserAttachContext(
+    webSocket: WebSocket,
+    attachment: SocketAttachment,
+    frame: Extract<z.output<typeof ClientControlFrameSchema>, { type: "attach" }>,
+  ): BrowserAttachContextResult {
+    if (attachment.clientId === null) return { ok: false, reason: "session-missing" };
+    const session = this.session();
+    const client = this.clientById(attachment.clientId);
+    if (session === undefined || client === undefined) {
+      return { ok: false, reason: "session-missing" };
+    }
+    const controlAttachment = readAttachment(webSocket);
+    if (
+      webSocket.readyState !== WebSocket.OPEN ||
+      controlAttachment?.clientId !== attachment.clientId ||
+      controlAttachment.connectionId !== attachment.connectionId ||
+      controlAttachment.connectionSetId !== attachment.connectionSetId ||
+      this.activeBrowserControl(attachment.clientId) !== webSocket
+    ) {
+      return { ok: false, client, reason: "stale-control" };
+    }
+    if (frame.engineId !== session.engine_id) {
+      return { ok: false, client, reason: "engine-mismatch" };
+    }
+    const dataSocket = this.browserDataByClient(attachment.clientId);
+    const dataAttachment = dataSocket === undefined ? undefined : readAttachment(dataSocket);
+    if (
+      dataSocket === undefined ||
+      dataAttachment?.connectionId !== attachment.connectionId ||
+      dataAttachment.connectionSetId !== attachment.connectionSetId ||
+      dataAttachment.deliveryGeneration !== client.delivery_generation
+    ) {
+      return { ok: false, client, reason: "data-missing" };
+    }
+    if (frame.hasLiveReplica && frame.lastSessionEpoch !== session.session_epoch) {
+      return { ok: false, client, reason: "epoch-changed" };
+    }
+    if (
+      frame.hasLiveReplica &&
+      (BigInt(frame.lastEventSeq) > BigInt(session.head_event_seq) ||
+        BigInt(frame.nextPtyOffset) > BigInt(session.next_pty_offset))
+    ) {
+      return { ok: false, client, reason: "cursor-ahead" };
+    }
+    return {
+      ok: true,
+      value: { client, controlAttachment, dataAttachment, dataSocket, session },
+    };
+  }
+
+  private rejectBrowserAttach(
+    webSocket: WebSocket,
+    result: Extract<BrowserAttachContextResult, { ok: false }>,
+  ): void {
+    if (result.reason === "stale-control") return;
+    if (
+      result.client !== undefined &&
+      (result.reason === "engine-mismatch" || result.reason === "epoch-changed")
+    ) {
+      sendServerControl(webSocket, {
+        type: "resync-required",
+        deliveryGeneration: result.client.delivery_generation,
+        reason: result.reason,
+      });
+      return;
+    }
+    closeProtocol(
+      webSocket,
+      result.reason === "cursor-ahead"
+        ? "replica cursor exceeds host head"
+        : "matching session data channel required before attach",
+    );
+  }
+
+  private acknowledgeBrowser(
+    webSocket: WebSocket,
+    attachment: SocketAttachment,
+    frame: Extract<z.output<typeof ClientControlFrameSchema>, { type: "ack" }>,
+  ): void {
+    if (attachment.clientId === null) return;
+    const session = this.session();
+    const client = this.clientById(attachment.clientId);
+    if (session === undefined || client === undefined) return;
+    if (frame.deliveryGeneration !== client.delivery_generation) return;
+    if (frame.sessionEpoch !== session.session_epoch) {
+      sendServerControl(webSocket, {
+        type: "resync-required",
+        deliveryGeneration: client.delivery_generation,
+        reason: "epoch-changed",
+      });
+      return;
+    }
+
+    const eventSeq = BigInt(frame.eventSeq);
+    const ptyOffset = BigInt(frame.nextPtyOffset);
+    if (eventSeq > BigInt(session.head_event_seq) || ptyOffset > BigInt(session.next_pty_offset)) {
+      closeProtocol(webSocket, "invalid acknowledgement cursor");
+      return;
+    }
+
+    const dataSocket = this.browserDataByClient(attachment.clientId);
+    const dataAttachment = dataSocket === undefined ? undefined : readAttachment(dataSocket);
+    if (
+      dataSocket === undefined ||
+      dataAttachment === undefined ||
+      dataAttachment.deliveryGeneration !== frame.deliveryGeneration ||
+      dataAttachment.sentEventSeq === null ||
+      dataAttachment.sentPtyOffset === null
+    ) {
+      closeProtocol(webSocket, "acknowledgement has no delivered data cursor");
+      return;
+    }
+    const sentEventSeq = BigInt(dataAttachment.sentEventSeq);
+    const sentPtyOffset = BigInt(dataAttachment.sentPtyOffset);
+    const ackedEventSeq =
+      dataAttachment.ackedEventSeq === null ? undefined : BigInt(dataAttachment.ackedEventSeq);
+    const ackedPtyOffset =
+      dataAttachment.ackedPtyOffset === null ? undefined : BigInt(dataAttachment.ackedPtyOffset);
+    if (
+      eventSeq > sentEventSeq ||
+      ptyOffset > sentPtyOffset ||
+      (ackedEventSeq !== undefined && eventSeq < ackedEventSeq) ||
+      (ackedPtyOffset !== undefined && ptyOffset < ackedPtyOffset)
+    ) {
+      closeProtocol(webSocket, "acknowledgement exceeds delivered cursor");
+      return;
+    }
+    if (eventSeq === ackedEventSeq && ptyOffset === ackedPtyOffset) return;
+    writeAttachment(dataSocket, {
+      ...dataAttachment,
+      ackedEventSeq: frame.eventSeq,
+      ackedPtyOffset: frame.nextPtyOffset,
+    });
+  }
+
+  private async handleHostData(
+    webSocket: WebSocket,
+    attachment: SocketAttachment,
+    encoded: Uint8Array,
+  ): Promise<void> {
+    if (webSocket.readyState !== WebSocket.OPEN || !this.isCurrentHost(attachment)) return;
+    const connection = connectionSockets(this.ctx, attachment);
+    if (connection.data !== webSocket) return;
+    if (
+      connection.phase !== "ready" ||
+      connection.control !== this.currentHostControl() ||
+      this.currentHostData() !== webSocket
+    ) {
+      this.failCurrentHost(attachment, "host data received before ready acknowledgement");
+      return;
+    }
+
+    let frame: DataFrame;
+    try {
+      frame = decodeDataFrame(encoded);
+    } catch {
+      this.failCurrentHost(attachment, "invalid host data frame");
+      return;
+    }
+    const session = this.session();
+    if (session === undefined || frame.sessionEpoch !== BigInt(session.session_epoch)) {
+      this.failCurrentHost(attachment, "host session epoch mismatch");
+      return;
+    }
+
+    if (frame.streamId === 0) {
+      if (frame.deliveryGeneration !== 0n || !this.commitCanonicalFrame(session, frame)) {
+        this.failCurrentHost(attachment, "canonical data sequence gap");
+        return;
+      }
+      const pendingResets: Promise<void>[] = [];
+      for (const browserData of this.browserDataSockets()) {
+        const browserAttachment = readAttachment(browserData);
+        if (browserAttachment?.dataState === "synced") {
+          const result = this.deliverToBrowser(browserData, browserAttachment, encoded, frame);
+          if (result === "sequence-error") {
+            if (browserAttachment.clientId !== null) {
+              pendingResets.push(
+                this.resetBrowserDelivery(browserAttachment.clientId, "journal-gap", false),
+              );
+            }
+          } else if (result !== undefined) {
+            pendingResets.push(result);
+          }
+        }
+      }
+      await Promise.all(pendingResets);
+      return;
+    }
+
+    const client = this.clientByStream(frame.streamId);
+    if (client === undefined || frame.deliveryGeneration !== BigInt(client.delivery_generation)) {
+      return;
+    }
+    if (!this.isDirectedFrameWithinCanonicalHead(session, frame)) {
+      this.failCurrentHost(attachment, "directed replay exceeds canonical head");
+      return;
+    }
+    const browserData = this.browserDataByClient(client.client_id);
+    const browserAttachment = browserData === undefined ? undefined : readAttachment(browserData);
+    if (
+      browserData === undefined ||
+      browserAttachment === undefined ||
+      browserAttachment.deliveryGeneration !== client.delivery_generation ||
+      browserAttachment.dataState === "synced"
+    ) {
+      return;
+    }
+    const result = this.deliverToBrowser(browserData, browserAttachment, encoded, frame);
+    if (result === "sequence-error") {
+      this.failCurrentHost(attachment, "directed replay sequence gap");
+    } else {
+      await result;
+    }
+  }
+
+  private isDirectedFrameWithinCanonicalHead(session: SessionRow, frame: DataFrame): boolean {
+    const headEventSeq = BigInt(session.head_event_seq);
+    const headPtyOffset = BigInt(session.next_pty_offset);
+    if (frame.kind === DataFrameKind.Reset) return false;
+    if (frame.kind === DataFrameKind.ReplayCommit) {
+      return frame.eventSeq === headEventSeq && frame.ptyOffset === headPtyOffset;
+    }
+    if (frame.eventSeq > headEventSeq || frame.ptyOffset > headPtyOffset) return false;
+    if (frame.kind === DataFrameKind.ResizeApplied) return true;
+    return (
+      frame.kind === DataFrameKind.PtyOutput &&
+      frame.ptyOffset <= MAX_U64 - BigInt(frame.payload.byteLength) &&
+      frame.ptyOffset + BigInt(frame.payload.byteLength) <= headPtyOffset
+    );
+  }
+
+  private commitCanonicalFrame(session: SessionRow, frame: DataFrame): boolean {
+    if (frame.kind !== DataFrameKind.PtyOutput && frame.kind !== DataFrameKind.ResizeApplied) {
+      return false;
+    }
+    if (
+      frame.eventSeq !== BigInt(session.head_event_seq) + 1n ||
+      frame.ptyOffset !== BigInt(session.next_pty_offset) ||
+      (frame.kind === DataFrameKind.ResizeApplied && frame.payload.byteLength !== 16) ||
+      (frame.kind === DataFrameKind.PtyOutput &&
+        frame.ptyOffset > MAX_U64 - BigInt(frame.payload.byteLength))
+    ) {
+      return false;
+    }
+    const nextPtyOffset =
+      frame.kind === DataFrameKind.PtyOutput
+        ? frame.ptyOffset + BigInt(frame.payload.byteLength)
+        : frame.ptyOffset;
+    this.sql.exec(
+      `UPDATE session_state
+       SET head_event_seq = ?, next_pty_offset = ?, updated_at = ?
+       WHERE singleton = 1 AND host_fence = ?`,
+      frame.eventSeq.toString(),
+      nextPtyOffset.toString(),
+      Date.now(),
+      session.host_fence,
+    );
+    return true;
+  }
+
+  private deliverToBrowser(
+    webSocket: WebSocket,
+    attachment: SocketAttachment,
+    encoded: Uint8Array,
+    frame: DataFrame,
+  ): Promise<void> | "sequence-error" | undefined {
+    if (attachment.clientId === null || webSocket.readyState !== WebSocket.OPEN) return;
+    const client = this.clientById(attachment.clientId);
+    if (
+      client === undefined ||
+      client.stream_id !== attachment.streamId ||
+      client.delivery_generation !== attachment.deliveryGeneration
+    ) {
+      return;
+    }
+    const cursor = advanceDeliveryCursor(attachment, frame);
+    if (cursor.kind === "sequence-error") return "sequence-error";
+    if (cursor.kind === "credit-exceeded") {
+      return this.resetBrowserDelivery(attachment.clientId, "slow-client", true);
+    }
+
+    const rewritten = rewriteDelivery(
+      encoded,
+      BigInt(client.delivery_generation),
+      client.stream_id,
+    );
+    webSocket.send(rewritten);
+    writeAttachment(webSocket, {
+      ...attachment,
+      ...cursor.nextState,
+    });
+  }
+
+  private rejectInput(webSocket: WebSocket, inputEpoch: string, clientInputSeq: string): void {
+    sendServerControl(webSocket, {
+      type: "input-ack",
+      inputEpoch,
+      clientInputSeq,
+      status: "rejected",
+      authorityEventSeq: this.session()?.head_event_seq ?? "0",
+    });
+  }
+
+  private async resetBrowserDelivery(
+    clientId: string,
+    reason:
+      | "journal-gap"
+      | "slow-client"
+      | "engine-mismatch"
+      | "epoch-changed"
+      | "data-disconnected"
+      | "host-reconnect",
+    notifyHost: boolean,
+    expectedHost?: { webSocket: WebSocket; hostFence: string },
+  ): Promise<void> {
+    const client = this.clientById(clientId);
+    if (client === undefined) return;
+    const issuingControl = this.activeBrowserControl(clientId);
+    const issuingAttachment =
+      issuingControl === undefined ? undefined : readAttachment(issuingControl);
+    if (issuingControl === undefined || issuingAttachment?.clientId !== clientId) return;
+    const nextGeneration = (BigInt(client.delivery_generation) + 1n).toString();
+    if (BigInt(nextGeneration) > MAX_U64) {
+      throw new Error("delivery generation space exhausted");
+    }
+    const dataTicket = randomId(32);
+    const ticketDigest = await sha256Hex(dataTicket);
+    const currentClient = this.clientById(clientId);
+    const currentControlAttachment = readAttachment(issuingControl);
+    const currentHostAttachment =
+      expectedHost === undefined ? undefined : readAttachment(expectedHost.webSocket);
+    if (
+      issuingControl.readyState !== WebSocket.OPEN ||
+      this.activeBrowserControl(clientId) !== issuingControl ||
+      currentClient?.delivery_generation !== client.delivery_generation ||
+      currentControlAttachment?.clientId !== clientId ||
+      currentControlAttachment.connectionId !== issuingAttachment.connectionId ||
+      currentControlAttachment.connectionSetId !== issuingAttachment.connectionSetId ||
+      (expectedHost !== undefined &&
+        (expectedHost.webSocket.readyState !== WebSocket.OPEN ||
+          currentHostAttachment?.hostFence !== expectedHost.hostFence ||
+          this.currentHostControl() !== expectedHost.webSocket))
+    ) {
+      return;
+    }
+
+    const expiresAt = Date.now() + TICKET_LIFETIME_MS;
+    if (
+      !this.connections.replaceBrowserDelivery({
+        clientId,
+        connectionId: currentControlAttachment.connectionId,
+        connectionSetId: currentControlAttachment.connectionSetId,
+        currentGeneration: client.delivery_generation,
+        expiresAt,
+        nextGeneration,
+        role: currentControlAttachment.role,
+        streamId: currentClient.stream_id,
+        subject: currentControlAttachment.subject,
+        ticketDigest,
+      })
+    ) {
+      return;
+    }
+
+    this.closeSockets(
+      (attachment) => {
+        return (
+          attachment.peer === "browser" &&
+          attachment.channel === "data" &&
+          attachment.clientId === clientId
+        );
+      },
+      undefined,
+      reason === "slow-client" ? SLOW_CLIENT : SOCKET_REPLACED,
+      reason,
+    );
+    const resetAttachment = SocketAttachmentSchema.parse({
+      ...currentControlAttachment,
+      deliveryGeneration: nextGeneration,
+      controlState: "awaiting-attach",
+    });
+    writeAttachment(issuingControl, resetAttachment);
+    sendServerControl(issuingControl, {
+      type: "resync-required",
+      deliveryGeneration: nextGeneration,
+      reason,
+      dataTicket,
+      expiresAt,
+    });
+
+    if (!notifyHost || reason !== "slow-client") return;
+    const host = this.currentHostControl();
+    if (host !== undefined) {
+      sendRelayControl(host, {
+        type: "delivery-reset",
+        connectionId: resetAttachment.connectionId,
+        streamId: client.stream_id,
+        deliveryGeneration: nextGeneration,
+        reason: "slow-client",
+      });
+    }
+  }
+
+  private async acquireWriterLease(
+    clientId: string,
+    now: number,
+  ): Promise<AcquiredLease | undefined> {
+    const existing = this.writerLease();
+    if (existing !== undefined && existing.expires_at > now) return undefined;
+    const token = randomId(32);
+    const digest = await sha256Hex(token);
+    const current = this.writerLease();
+    if (current !== undefined && current.expires_at > Date.now()) return undefined;
+    const currentFence = BigInt(current?.fence ?? "0");
+    if (currentFence >= MAX_U64) throw new Error("writer lease fence space exhausted");
+    const fence = (currentFence + 1n).toString();
+    this.sql.exec(
+      `INSERT INTO writer_lease (singleton, client_id, lease_digest, fence, expires_at)
+       VALUES (1, ?, ?, ?, ?)
+       ON CONFLICT(singleton) DO UPDATE SET
+         client_id = excluded.client_id,
+         lease_digest = excluded.lease_digest,
+         fence = excluded.fence,
+         expires_at = excluded.expires_at`,
+      clientId,
+      digest,
+      fence,
+      Date.now() + WRITER_LEASE_MS,
+    );
+    return { fence, token };
+  }
+
+  private async renewWriterLease(
+    clientId: string,
+    fence: string | null,
+    token: string,
+  ): Promise<boolean> {
+    if (fence === null || token.length > 256) return false;
+    const digest = await sha256Hex(token);
+    const lease = this.writerLease();
+    if (
+      lease === undefined ||
+      lease.client_id !== clientId ||
+      lease.fence !== fence ||
+      lease.lease_digest !== digest ||
+      lease.expires_at <= Date.now()
+    ) {
+      return false;
+    }
+    this.sql.exec(
+      `UPDATE writer_lease SET expires_at = ?
+       WHERE singleton = 1 AND client_id = ? AND fence = ? AND lease_digest = ?`,
+      Date.now() + WRITER_LEASE_MS,
+      clientId,
+      fence,
+      digest,
+    );
+    return true;
+  }
+
+  private releaseWriterLease(clientId: string, fence: string | null): void {
+    if (fence === null) return;
+    this.sql.exec(
+      `UPDATE writer_lease SET expires_at = 0
+       WHERE singleton = 1 AND client_id = ? AND fence = ?`,
+      clientId,
+      fence,
+    );
+  }
+
   private session(): SessionRow | undefined {
-    return this.sql.exec("SELECT * FROM session_state WHERE singleton = 1").toArray()[0] as
-      | SessionRow
-      | undefined;
+    return this.store.session();
+  }
+
+  private clientById(clientId: string): ClientRow | undefined {
+    return this.store.clientById(clientId);
+  }
+
+  private clientByStream(streamId: number): ClientRow | undefined {
+    return this.store.clientByStream(streamId);
+  }
+
+  private writerLease(): WriterLeaseRow | undefined {
+    return this.store.writerLease();
   }
 
   private ticket(ticketDigest: string): TicketRow | undefined {
-    return this.sql
-      .exec("SELECT * FROM connection_ticket WHERE ticket_digest = ?", ticketDigest)
-      .toArray()[0] as TicketRow | undefined;
+    return this.store.ticket(ticketDigest);
   }
 
-  private hasControlSocket(connectionSetId: string): boolean {
-    return this.ctx.getWebSockets(`set:${connectionSetId}`).some((socket) => {
+  private isCurrentHost(attachment: SocketAttachment): boolean {
+    return (
+      attachment.peer === "host" &&
+      attachment.hostFence !== null &&
+      attachment.hostFence === this.session()?.host_fence
+    );
+  }
+
+  private currentHostControl(except?: WebSocket): WebSocket | undefined {
+    const session = this.session();
+    if (session === undefined) return undefined;
+    return this.ctx.getWebSockets("peer:host").find((socket) => {
+      if (socket === except || socket.readyState !== WebSocket.OPEN) return false;
+      const attachment = readAttachment(socket);
+      return (
+        attachment?.channel === "control" &&
+        attachment.hostFence === session.host_fence &&
+        attachment.controlState === "active"
+      );
+    });
+  }
+
+  private currentHostData(except?: WebSocket): WebSocket | undefined {
+    const control = this.currentHostControl();
+    const controlAttachment = control === undefined ? undefined : readAttachment(control);
+    if (controlAttachment === undefined) return undefined;
+    return matchingSocket(this.ctx, controlAttachment, "data", except);
+  }
+
+  private activeBrowserControl(clientId: string, except?: WebSocket): WebSocket | undefined {
+    return this.ctx.getWebSockets(`client:${clientId}`).find((socket) => {
+      if (socket === except || socket.readyState !== WebSocket.OPEN) return false;
+      return readAttachment(socket)?.channel === "control";
+    });
+  }
+
+  private browserControlByConnection(connectionId: string): WebSocket | undefined {
+    return this.browserControlSockets().find((socket) => {
+      const attachment = readAttachment(socket);
+      return attachment?.connectionId === connectionId && attachment.controlState === "active";
+    });
+  }
+
+  private browserDataByClient(clientId: string, except?: WebSocket): WebSocket | undefined {
+    return this.ctx.getWebSockets(`client:${clientId}`).find((socket) => {
+      return (
+        socket !== except &&
+        socket.readyState === WebSocket.OPEN &&
+        readAttachment(socket)?.channel === "data"
+      );
+    });
+  }
+
+  private browserControlSockets(): WebSocket[] {
+    return this.ctx.getWebSockets("peer:browser").filter((socket) => {
       return socket.readyState === WebSocket.OPEN && readAttachment(socket)?.channel === "control";
     });
   }
 
-  private advanceHostFence(connectionSetId: string): string {
-    let nextFence = "0";
-    this.ctx.storage.transactionSync(() => {
-      const session = this.session();
-      if (session === undefined) {
-        throw new Error("session is not initialized");
-      }
-      nextFence = (BigInt(session.host_fence) + 1n).toString();
-      const now = Date.now();
-      this.sql.exec(
-        "UPDATE session_state SET host_fence = ?, updated_at = ? WHERE singleton = 1",
-        nextFence,
-        now,
-      );
-      this.sql.exec(
-        "UPDATE connection_ticket SET host_fence = ? WHERE connection_set_id = ?",
-        nextFence,
-        connectionSetId,
-      );
+  private browserDataSockets(): WebSocket[] {
+    return this.ctx.getWebSockets("peer:browser").filter((socket) => {
+      return socket.readyState === WebSocket.OPEN && readAttachment(socket)?.channel === "data";
     });
-    return nextFence;
   }
 
-  private closeTaggedSockets(tag: string, except?: WebSocket): void {
-    for (const socket of this.ctx.getWebSockets(tag)) {
-      if (socket !== except && socket.readyState < WebSocket.CLOSING) {
-        socket.close(4001, "connection replaced");
+  private markBrowserDataCatchingUp(): void {
+    for (const socket of this.browserDataSockets()) {
+      const attachment = readAttachment(socket);
+      if (attachment !== undefined) {
+        writeAttachment(socket, {
+          ...attachment,
+          dataState: "catching-up",
+        });
       }
+    }
+  }
+
+  private broadcastBrowserControl(frame: z.input<typeof ServerControlFrameSchema>): void {
+    for (const socket of this.browserControlSockets()) sendServerControl(socket, frame);
+  }
+
+  private failCurrentHost(attachment: SocketAttachment, reason: string): void {
+    if (!this.isCurrentHost(attachment) || attachment.hostFence === null) return;
+    const fence = attachment.hostFence;
+    const matchingControl = matchingSocket(this.ctx, attachment, "control");
+    const wasReady =
+      (attachment.channel === "control" && attachment.controlState === "active") ||
+      (matchingControl !== undefined && readAttachment(matchingControl)?.controlState === "active");
+    if (!this.connections.invalidateHostConnection(attachment.connectionSetId, fence)) return;
+    this.closeSockets(
+      (candidate) =>
+        candidate.peer === "host" &&
+        candidate.hostFence === fence &&
+        sameConnection(candidate, attachment),
+      undefined,
+      4400,
+      reason,
+    );
+    if (wasReady) {
+      this.broadcastBrowserControl({ type: "host-offline" });
+      this.markBrowserDataCatchingUp();
+    }
+  }
+
+  private closeSockets(
+    predicate: (attachment: SocketAttachment) => boolean,
+    except?: WebSocket,
+    code = SOCKET_REPLACED,
+    reason = "connection replaced",
+  ): void {
+    for (const socket of this.ctx.getWebSockets()) {
+      if (socket === except || socket.readyState >= WebSocket.CLOSING) continue;
+      const attachment = readAttachment(socket);
+      if (attachment !== undefined && predicate(attachment)) socket.close(code, reason);
     }
   }
 }
