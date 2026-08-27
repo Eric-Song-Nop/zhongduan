@@ -88,6 +88,15 @@ importers:
         specifier: 'catalog:'
         version: 4.4.3
 
+  packages/session-client:
+    dependencies:
+      '@zhongduan/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      fzstd:
+        specifier: 0.1.1
+        version: 0.1.1
+
   vendor/wterm/packages/@internal/ts: {}
 
   vendor/wterm/packages/@wterm/core:
@@ -1333,6 +1342,9 @@ packages:
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
     os: [darwin]
 
+  fzstd@0.1.1:
+    resolution: {integrity: sha512-dkuVSOKKwh3eas5VkJy1AW1vFpet8TA/fGmVA5krThl8YcOVE/8ZIoEA1+U1vEn5ckxxhLirSdY837azmbaNHA==, tarball: https://registry.npmmirror.com/fzstd/-/fzstd-0.1.1.tgz}
+
   js-tokens@4.0.0:
     resolution: {integrity: sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==, tarball: https://registry.npmmirror.com/js-tokens/-/js-tokens-4.0.0.tgz}
 
@@ -2561,6 +2573,8 @@ snapshots:
 
   fsevents@2.3.3:
     optional: true
+
+  fzstd@0.1.1: {}
 
   js-tokens@4.0.0: {}
 
