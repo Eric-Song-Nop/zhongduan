@@ -10,7 +10,7 @@ import {
 } from "@zhongduan/protocol";
 import { env, exports as workerExports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 interface CreatedSession {
   hostCapability: string;
@@ -136,6 +136,22 @@ async function injectServerSendFailure(
       configurable: true,
       value() {
         throw new Error(`injected browser ${channel} send failure`);
+      },
+    });
+  });
+}
+
+async function injectHostControlSendFailure(session: CreatedSession): Promise<void> {
+  await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+    const socket = state.getWebSockets("peer:host").find((candidate) => {
+      return (candidate.deserializeAttachment() as { channel?: string }).channel === "control";
+    });
+    if (socket === undefined) throw new Error("current Host control socket missing");
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    Object.defineProperty(socket, "send", {
+      configurable: true,
+      value() {
+        throw new Error("injected Host control send failure");
       },
     });
   });
@@ -381,20 +397,7 @@ async function attachBrowser(
     nextPtyOffset: "0",
   },
 ): Promise<{ request: Record<string, unknown>; welcome: Record<string, unknown> }> {
-  browser.control.socket.send(
-    JSON.stringify(
-      cursor === null
-        ? { type: "attach", engineId, hasLiveReplica: false }
-        : {
-            type: "attach",
-            engineId,
-            hasLiveReplica: true,
-            lastSessionEpoch: cursor.sessionEpoch,
-            lastEventSeq: cursor.eventSeq,
-            nextPtyOffset: cursor.nextPtyOffset,
-          },
-    ),
-  );
+  sendBrowserAttach(browser, cursor);
   await drainSession(session.sessionId);
   const [welcome, request] = await Promise.all([
     browser.control.inbox.nextJson<Record<string, unknown>>(),
@@ -406,6 +409,63 @@ async function attachBrowser(
     browser.connection.deliveryGeneration = welcome.deliveryGeneration;
   }
   return { welcome, request };
+}
+
+async function reattachBrowser(
+  session: CreatedSession,
+  host: HostEndpoint,
+  browser: BrowserEndpoint,
+  deliveryGeneration: string,
+  cursor: ReplicaCursor | null = {
+    sessionEpoch: "7",
+    eventSeq: "0",
+    nextPtyOffset: "0",
+  },
+): Promise<Record<string, unknown>> {
+  browser.connection.deliveryGeneration = deliveryGeneration;
+  sendBrowserAttach(browser, cursor);
+  await drainSession(session.sessionId);
+  expect(browser.control.inbox.pendingMessageCount).toBe(0);
+  const request = await host.control.inbox.nextJson<Record<string, unknown>>();
+  expect(request).toMatchObject({ type: "attach-request", deliveryGeneration });
+  return request;
+}
+
+function sendBrowserAttach(browser: BrowserEndpoint, cursor: ReplicaCursor | null): void {
+  browser.control.socket.send(
+    JSON.stringify(
+      cursor === null
+        ? {
+            type: "attach",
+            engineId,
+            deliveryGeneration: browser.connection.deliveryGeneration,
+            hasLiveReplica: false,
+          }
+        : {
+            type: "attach",
+            engineId,
+            deliveryGeneration: browser.connection.deliveryGeneration,
+            hasLiveReplica: true,
+            lastSessionEpoch: cursor.sessionEpoch,
+            lastEventSeq: cursor.eventSeq,
+            nextPtyOffset: cursor.nextPtyOffset,
+          },
+    ),
+  );
+}
+
+async function renewWriterLease(
+  session: CreatedSession,
+  browser: BrowserEndpoint,
+  writerLease: string,
+): Promise<{ active: boolean; expiresAt?: number; type: string }> {
+  browser.control.socket.send(JSON.stringify({ type: "writer-lease-renew", writerLease }));
+  await drainSession(session.sessionId);
+  return browser.control.inbox.nextJson<{
+    active: boolean;
+    expiresAt?: number;
+    type: string;
+  }>();
 }
 
 function ptyFrame(
@@ -477,6 +537,39 @@ function keyFrame(writerLease: string, inputEpoch: string, clientInputSeq: strin
   };
 }
 
+function recoveryInputFrames(writerLease: string) {
+  const identity = { writerLease, inputEpoch: "delivery_recovery" };
+  return [
+    {
+      type: "key",
+      ...identity,
+      clientInputSeq: "1",
+      observedEventSeq: "32",
+      code: "KeyC",
+      key: "c",
+      text: "c",
+      modifiers: 2,
+      action: "press",
+      altGraph: false,
+      composing: false,
+      consumedModifiers: 0,
+      unshiftedCodepoint: 0x63,
+    },
+    { type: "text", ...identity, clientInputSeq: "2", data: "input during recovery" },
+    { type: "paste", ...identity, clientInputSeq: "3", data: "pasted during recovery" },
+    { type: "focus", ...identity, clientInputSeq: "4", focused: false },
+    {
+      type: "resize-request",
+      ...identity,
+      clientInputSeq: "5",
+      cols: 120,
+      rows: 40,
+      widthPx: 1_200,
+      heightPx: 800,
+    },
+  ] as const;
+}
+
 describe("live Durable Object relay", () => {
   it("fails the current host pair before queueing an oversized data frame", async () => {
     const session = await createSession();
@@ -534,6 +627,111 @@ describe("live Durable Object relay", () => {
     expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
     expect(healthy.control.socket.readyState).toBe(WebSocket.OPEN);
     expect(healthy.data.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("fences a throwing Host sink and returns uncertain without dropping recovery input control", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.writerCapability);
+    const attached = await attachBrowser(session, host, browser);
+    const writerLease = String(attached.welcome.writerLease);
+
+    browser.data.socket.close(1000, "recover without data");
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "resync-required",
+      deliveryGeneration: "2",
+    });
+    await injectHostControlSendFailure(session);
+
+    const interrupt = {
+      ...keyFrame(writerLease, "throwing_host_input", "1"),
+      code: "KeyC",
+      key: "c",
+      text: "c",
+      modifiers: 2,
+      altGraph: false,
+      unshiftedCodepoint: 0x63,
+    };
+    browser.control.socket.send(JSON.stringify(interrupt));
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toEqual({
+      type: "host-offline",
+    });
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "input-ack",
+      inputEpoch: "throwing_host_input",
+      clientInputSeq: "1",
+      status: "uncertain",
+    });
+    expect((await host.control.inbox.nextClose()).code).toBe(4400);
+    expect((await host.data.inbox.nextClose()).code).toBe(4400);
+    expect(browser.control.socket.readyState).toBe(WebSocket.OPEN);
+    const lease = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      return state.storage.sql.exec("SELECT client_id, fence, expires_at FROM writer_lease").one();
+    });
+    expect(lease).toMatchObject({ client_id: browser.connection.clientId, fence: "1" });
+    expect(Number(lease.expires_at)).toBeGreaterThan(Date.now());
+  });
+
+  it("fences a throwing Host attach-request sink while preserving browser recovery state", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.writerCapability);
+    const attached = await attachBrowser(session, host, browser);
+    const writerLease = String(attached.welcome.writerLease);
+
+    browser.data.socket.close(1000, "replace browser data");
+    const resync = await browser.control.inbox.nextJson<{
+      dataTicket: string;
+      deliveryGeneration: string;
+      type: string;
+    }>();
+    browser.data = await upgrade(session.sessionId, "data", resync.dataTicket);
+    browser.connection.deliveryGeneration = resync.deliveryGeneration;
+    await injectHostControlSendFailure(session);
+
+    sendBrowserAttach(browser, { sessionEpoch: "7", eventSeq: "0", nextPtyOffset: "0" });
+    await drainSession(session.sessionId);
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toEqual({
+      type: "host-offline",
+    });
+    expect(browser.control.inbox.pendingMessageCount).toBe(0);
+    expect((await host.control.inbox.nextClose()).code).toBe(4400);
+    expect((await host.data.inbox.nextClose()).code).toBe(4400);
+    expect(browser.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(browser.data.socket.readyState).toBe(WebSocket.OPEN);
+
+    const recovery = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const sockets = state.getWebSockets(`client:${browser.connection.clientId}`);
+        const control = sockets.find((socket) => {
+          return (socket.deserializeAttachment() as { channel?: string }).channel === "control";
+        });
+        const data = sockets.find((socket) => {
+          return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+        });
+        return {
+          control: control?.deserializeAttachment(),
+          data: data?.deserializeAttachment(),
+        } as {
+          control: { controlState: string; deliveryGeneration: string; leaseFence: string };
+          data: { dataState: string; deliveryGeneration: string };
+        };
+      },
+    );
+    expect(recovery.control).toMatchObject({
+      controlState: "active",
+      deliveryGeneration: "2",
+      leaseFence: "1",
+    });
+    expect(recovery.data).toMatchObject({
+      dataState: "catching-up",
+      deliveryGeneration: "2",
+    });
+    expect(await renewWriterLease(session, browser, writerLease)).toMatchObject({
+      type: "writer-lease-status",
+      active: true,
+    });
   });
 
   it("continues host-offline broadcast after one browser control sink fails", async () => {
@@ -781,6 +979,7 @@ describe("live Durable Object relay", () => {
       JSON.stringify({
         type: "attach",
         engineId,
+        deliveryGeneration: "2",
         hasLiveReplica: true,
         lastSessionEpoch: "7",
         lastEventSeq: "3",
@@ -788,16 +987,103 @@ describe("live Durable Object relay", () => {
       }),
     );
     await drainSession(session.sessionId);
-    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
-      type: "welcome",
-      deliveryGeneration: "2",
-    });
+    expect(browser.control.inbox.pendingMessageCount).toBe(0);
     expect(await hostTwoControl.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
       type: "attach-request",
       hasLiveReplica: true,
       deliveryGeneration: "2",
       lastEventSeq: "3",
       nextPtyOffset: "11",
+    });
+  });
+
+  it("drops a delayed old-generation attach after a cross-channel Host reset", async () => {
+    const session = await createSession();
+    const firstHost = await openHost(session);
+    const browser = await openBrowser(session, session.writerCapability);
+    const attached = await attachBrowser(session, firstHost, browser);
+    const writerLease = String(attached.welcome.writerLease);
+
+    browser.data.socket.close(1000, "begin generation two recovery");
+    const generationTwo = await browser.control.inbox.nextJson<{
+      dataTicket: string;
+      deliveryGeneration: string;
+      type: string;
+    }>();
+    expect(generationTwo).toMatchObject({
+      type: "resync-required",
+      deliveryGeneration: "2",
+    });
+    browser.connection.deliveryGeneration = "2";
+
+    sendBrowserAttach(browser, { sessionEpoch: "7", eventSeq: "0", nextPtyOffset: "0" });
+    await drainSession(session.sessionId);
+    expect(browser.control.inbox.pendingMessageCount).toBe(0);
+    expect(firstHost.control.inbox.pendingMessageCount).toBe(0);
+
+    browser.data = await upgrade(session.sessionId, "data", generationTwo.dataTicket);
+    const secondHost = await openHost(session);
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toEqual({
+      type: "host-offline",
+    });
+    const generationThree = await browser.control.inbox.nextJson<{
+      dataTicket: string;
+      deliveryGeneration: string;
+      type: string;
+    }>();
+    expect(generationThree).toMatchObject({
+      type: "resync-required",
+      deliveryGeneration: "3",
+    });
+    expect((await browser.data.inbox.nextClose()).code).toBe(4001);
+
+    sendBrowserAttach(browser, { sessionEpoch: "7", eventSeq: "0", nextPtyOffset: "0" });
+    await drainSession(session.sessionId);
+    expect(browser.control.inbox.pendingMessageCount).toBe(0);
+    expect(secondHost.control.inbox.pendingMessageCount).toBe(0);
+
+    const recovering = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const control = state
+          .getWebSockets(`client:${browser.connection.clientId}`)
+          .find((socket) => {
+            return (socket.deserializeAttachment() as { channel?: string }).channel === "control";
+          });
+        return control?.deserializeAttachment() as {
+          controlState: string;
+          deliveryGeneration: string;
+          leaseFence: string | null;
+        };
+      },
+    );
+    expect(recovering).toMatchObject({
+      controlState: "active",
+      deliveryGeneration: "3",
+      leaseFence: "1",
+    });
+
+    const interrupt = {
+      ...keyFrame(writerLease, "reordered_attach", "1"),
+      code: "KeyC",
+      key: "c",
+      text: "c",
+      modifiers: 2,
+      altGraph: false,
+      unshiftedCodepoint: 0x63,
+    };
+    browser.control.socket.send(JSON.stringify(interrupt));
+    expect(await secondHost.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "key",
+      inputEpoch: "reordered_attach",
+      clientInputSeq: "1",
+    });
+
+    browser.data = await upgrade(session.sessionId, "data", generationThree.dataTicket);
+    const request = await reattachBrowser(session, secondHost, browser, "3");
+    expect(request).toMatchObject({
+      connectionId: browser.connection.connectionId,
+      deliveryGeneration: "3",
     });
   });
 
@@ -1045,6 +1331,86 @@ describe("live Durable Object relay", () => {
     expect((await secondReplacement.control.inbox.nextClose()).code).toBe(4400);
   });
 
+  it("keeps a writer lease alive across semantic idle with explicit ten-second renewals", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const startedAt = Date.now();
+    try {
+      const session = await createSession();
+      const host = await openHost(session);
+      const writer = await openBrowser(session, session.writerCapability);
+      const attached = await attachBrowser(session, host, writer);
+      const writerLease = String(attached.welcome.writerLease);
+
+      for (const elapsed of [10_000, 20_000, 30_000, 40_000]) {
+        vi.setSystemTime(startedAt + elapsed);
+        expect(await renewWriterLease(session, writer, writerLease)).toEqual({
+          type: "writer-lease-status",
+          active: true,
+          expiresAt: startedAt + elapsed + 30_000,
+        });
+      }
+
+      vi.setSystemTime(startedAt + 40_001);
+      writer.control.socket.send(JSON.stringify(keyFrame(writerLease, "idle_writer", "1")));
+      expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+        type: "key",
+        inputEpoch: "idle_writer",
+        clientInputSeq: "1",
+      });
+
+      vi.setSystemTime(startedAt + 70_002);
+      expect(await renewWriterLease(session, writer, writerLease)).toEqual({
+        type: "writer-lease-status",
+        active: false,
+      });
+      writer.control.socket.send(JSON.stringify(keyFrame(writerLease, "idle_writer", "2")));
+      expect(await writer.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+        type: "input-ack",
+        inputEpoch: "idle_writer",
+        clientInputSeq: "2",
+        status: "rejected",
+      });
+      expect(host.control.inbox.pendingMessageCount).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports a fenced writer lease as lost and releases the current fence on control close", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const first = await openBrowser(session, session.writerCapability);
+    const firstAttach = await attachBrowser(session, host, first);
+    const firstLease = String(firstAttach.welcome.writerLease);
+
+    await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      state.storage.sql.exec("UPDATE writer_lease SET expires_at = 0 WHERE singleton = 1");
+    });
+    const second = await openBrowser(session, session.writerCapability);
+    const secondAttach = await attachBrowser(session, host, second);
+    const secondLease = String(secondAttach.welcome.writerLease);
+    expect(secondLease).not.toBe(firstLease);
+
+    expect(await renewWriterLease(session, first, firstLease)).toEqual({
+      type: "writer-lease-status",
+      active: false,
+    });
+    const secondStatus = await renewWriterLease(session, second, secondLease);
+    expect(secondStatus).toMatchObject({ type: "writer-lease-status", active: true });
+    expect(Number(secondStatus.expiresAt)).toBeGreaterThan(Date.now());
+
+    second.control.socket.close(1000, "writer left");
+    await drainSession(session.sessionId);
+    const lease = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      return state.storage.sql.exec("SELECT client_id, fence, expires_at FROM writer_lease").one();
+    });
+    expect(lease).toMatchObject({
+      client_id: second.connection.clientId,
+      fence: "2",
+      expires_at: 0,
+    });
+  });
+
   it("forwards structured text, focus, and mouse input without terminal encoding", async () => {
     const session = await createSession();
     const host = await openHost(session);
@@ -1155,16 +1521,103 @@ describe("live Durable Object relay", () => {
     expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
   });
 
+  it("isolates a pre-attach data disconnect instead of leaving an unrecoverable control", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.writerCapability);
+
+    browser.data.socket.close(1000, "data closed before attach");
+    expect((await browser.control.inbox.nextClose()).code).toBe(4400);
+    await drainSession(session.sessionId);
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+    const state = await runInDurableObject(sessionStub(session.sessionId), (_instance, durable) => {
+      return {
+        leases: durable.storage.sql.exec("SELECT fence FROM writer_lease").toArray().length,
+        tickets: durable.storage.sql
+          .exec("SELECT ticket_digest FROM connection_ticket WHERE peer = 'browser'")
+          .toArray().length,
+      };
+    });
+    expect(state).toEqual({ leases: 0, tickets: 0 });
+  });
+
+  it("fails closed when a current-generation initial attach has no data channel", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const connection = await createConnectionSet(session.sessionId, session.writerCapability);
+    const control = await upgrade(session.sessionId, "control", connection.controlTicket);
+
+    control.socket.send(
+      JSON.stringify({
+        type: "attach",
+        engineId,
+        deliveryGeneration: connection.deliveryGeneration,
+        hasLiveReplica: true,
+        lastSessionEpoch: "7",
+        lastEventSeq: "0",
+        nextPtyOffset: "0",
+      }),
+    );
+    expect((await control.inbox.nextClose()).code).toBe(4400);
+    await drainSession(session.sessionId);
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.control.inbox.pendingMessageCount).toBe(0);
+    const leases = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      return state.storage.sql.exec("SELECT fence FROM writer_lease").toArray();
+    });
+    expect(leases).toHaveLength(0);
+  });
+
   it("isolates a repeated attach without replacing the generation baseline", async () => {
     const session = await createSession();
     const host = await openHost(session);
     const browser = await openBrowser(session, session.observerCapability);
+
+    const awaiting = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const dataSocket = state
+          .getWebSockets(`client:${browser.connection.clientId}`)
+          .find((socket) => {
+            return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+          });
+        return dataSocket?.deserializeAttachment() as {
+          dataState: string;
+          sentEventSeq: string | null;
+        };
+      },
+    );
+    expect(awaiting).toMatchObject({ dataState: "awaiting-attach", sentEventSeq: null });
+
     await attachBrowser(session, host, browser);
+    const attached = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const dataSocket = state
+          .getWebSockets(`client:${browser.connection.clientId}`)
+          .find((socket) => {
+            return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+          });
+        return dataSocket?.deserializeAttachment() as {
+          dataState: string;
+          firstEventSeq: string | null;
+          firstPtyOffset: string | null;
+        };
+      },
+    );
+    expect(attached).toMatchObject({
+      dataState: "catching-up",
+      firstEventSeq: "0",
+      firstPtyOffset: "0",
+    });
 
     browser.control.socket.send(
       JSON.stringify({
         type: "attach",
         engineId,
+        deliveryGeneration: browser.connection.deliveryGeneration,
         hasLiveReplica: true,
         lastSessionEpoch: "7",
         lastEventSeq: "0",
@@ -1191,6 +1644,7 @@ describe("live Durable Object relay", () => {
       JSON.stringify({
         type: "attach",
         engineId,
+        deliveryGeneration: writer.connection.deliveryGeneration,
         hasLiveReplica: true,
         lastSessionEpoch: "6",
         lastEventSeq: "0",
@@ -1201,6 +1655,10 @@ describe("live Durable Object relay", () => {
     expect(await writer.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
       type: "resync-required",
       reason: "epoch-changed",
+    });
+    expect(await renewWriterLease(session, writer, "lease_not_issued")).toEqual({
+      type: "writer-lease-status",
+      active: false,
     });
     expect(host.control.inbox.pendingMessageCount).toBe(0);
     const leases = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) =>
@@ -1214,8 +1672,36 @@ describe("live Durable Object relay", () => {
     const host = await openHost(session);
     const snapshotId = "snapshot_relay_seed_0001";
     await publishSnapshot(session, snapshotId);
-    const browser = await openBrowser(session, session.observerCapability);
-    await attachBrowser(session, host, browser, null);
+    const browser = await openBrowser(session, session.writerCapability);
+    const initialAttach = await attachBrowser(session, host, browser);
+    const writerLease = String(initialAttach.welcome.writerLease);
+
+    browser.data.socket.close(1000, "switch to cold recovery");
+    const resync = await browser.control.inbox.nextJson<{
+      dataTicket: string;
+      deliveryGeneration: string;
+      type: string;
+    }>();
+    expect(resync).toMatchObject({ type: "resync-required", deliveryGeneration: "2" });
+
+    const interrupt = {
+      ...recoveryInputFrames(writerLease)[0],
+      inputEpoch: "cold_recovery",
+      observedEventSeq: "0",
+    };
+    browser.control.socket.send(JSON.stringify(interrupt));
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toEqual({
+      ...interrupt,
+      connectionId: browser.connection.connectionId,
+      clientId: browser.connection.clientId,
+    });
+
+    browser.data = await upgrade(session.sessionId, "data", resync.dataTicket);
+    const coldRequest = await reattachBrowser(session, host, browser, "2", null);
+    expect(coldRequest).toMatchObject({
+      connectionId: browser.connection.connectionId,
+      hasLiveReplica: false,
+    });
 
     host.data.socket.send(ptyFrame(1n, 0n, textEncoder.encode("a")));
     host.data.socket.send(ptyFrame(2n, 1n, textEncoder.encode("b")));
@@ -1801,6 +2287,7 @@ describe("live Durable Object relay", () => {
       JSON.stringify({
         type: "attach",
         engineId,
+        deliveryGeneration: "2",
         hasLiveReplica: true,
         lastSessionEpoch: "7",
         lastEventSeq: "0",
@@ -1808,10 +2295,7 @@ describe("live Durable Object relay", () => {
       }),
     );
     await drainSession(session.sessionId);
-    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
-      type: "welcome",
-      deliveryGeneration: "2",
-    });
+    expect(browser.control.inbox.pendingMessageCount).toBe(0);
     browser.connection.deliveryGeneration = "2";
     expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
       type: "attach-request",
@@ -1913,12 +2397,90 @@ describe("live Durable Object relay", () => {
 
     const replacementData = await upgrade(session.sessionId, "data", resync.dataTicket);
     const replacement = { ...browser, data: replacementData };
-    const attached = await attachBrowser(session, host, replacement);
-    expect(attached.welcome).toMatchObject({ deliveryGeneration: "2" });
-    expect(attached.request).toMatchObject({
+    const request = await reattachBrowser(session, host, replacement, "2");
+    expect(request).toMatchObject({
       connectionId: browser.connection.connectionId,
       deliveryGeneration: "2",
     });
+  });
+
+  it("keeps writer control usable after a replacement ticket expires and permits full replacement", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.writerCapability);
+    const attached = await attachBrowser(session, host, browser);
+    const writerLease = String(attached.welcome.writerLease);
+
+    browser.data.socket.close(1000, "expire replacement ticket");
+    const resync = await browser.control.inbox.nextJson<{
+      dataTicket: string;
+      deliveryGeneration: string;
+      type: string;
+    }>();
+    expect(resync).toMatchObject({ type: "resync-required", deliveryGeneration: "2" });
+    await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      state.storage.sql.exec(
+        `UPDATE connection_ticket SET expires_at = 0
+         WHERE peer = 'browser' AND channel = 'data' AND client_id = ?`,
+        browser.connection.clientId,
+      );
+    });
+
+    const expired = await upgradeResponse(session.sessionId, "data", resync.dataTicket);
+    expect(expired.status).toBe(401);
+    await expired.text();
+
+    const input = {
+      ...keyFrame(writerLease, "expired_ticket", "1"),
+      code: "KeyC",
+      key: "c",
+      text: "c",
+      modifiers: 2,
+      altGraph: false,
+      unshiftedCodepoint: 0x63,
+    };
+    browser.control.socket.send(JSON.stringify(input));
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toEqual({
+      ...input,
+      connectionId: browser.connection.connectionId,
+      clientId: browser.connection.clientId,
+    });
+
+    const connection = await createConnectionSet(
+      session.sessionId,
+      session.writerCapability,
+      browser.connection.clientId ?? undefined,
+    );
+    expect(connection.deliveryGeneration).toBe("3");
+    const control = await upgrade(session.sessionId, "control", connection.controlTicket);
+    expect((await browser.control.inbox.nextClose()).code).toBe(4001);
+    const data = await upgrade(session.sessionId, "data", connection.dataTicket);
+    const replacement = { connection, control, data };
+    const replacementAttach = await attachBrowser(session, host, replacement);
+    const replacementLease = String(replacementAttach.welcome.writerLease);
+    expect(replacementAttach.welcome).toMatchObject({ deliveryGeneration: "3" });
+    expect(replacementLease).not.toBe(writerLease);
+
+    replacement.control.socket.send(JSON.stringify(keyFrame(writerLease, "full_replacement", "1")));
+    expect(await replacement.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "input-ack",
+      inputEpoch: "full_replacement",
+      clientInputSeq: "1",
+      status: "rejected",
+    });
+    replacement.control.socket.send(
+      JSON.stringify(keyFrame(replacementLease, "full_replacement", "2")),
+    );
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "key",
+      clientId: browser.connection.clientId,
+      inputEpoch: "full_replacement",
+      clientInputSeq: "2",
+    });
+    const lease = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      return state.storage.sql.exec("SELECT client_id, fence FROM writer_lease").one();
+    });
+    expect(lease).toMatchObject({ client_id: browser.connection.clientId, fence: "2" });
   });
 
   it("drops stale host fences and fails closed on a current host sequence gap", async () => {
@@ -1955,6 +2517,7 @@ describe("live Durable Object relay", () => {
       JSON.stringify({
         type: "attach",
         engineId,
+        deliveryGeneration: "2",
         hasLiveReplica: true,
         lastSessionEpoch: "7",
         lastEventSeq: "0",
@@ -1962,10 +2525,7 @@ describe("live Durable Object relay", () => {
       }),
     );
     await drainSession(session.sessionId);
-    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
-      type: "welcome",
-      deliveryGeneration: "2",
-    });
+    expect(browser.control.inbox.pendingMessageCount).toBe(0);
     expect(await currentHost.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
       type: "attach-request",
     });
@@ -1980,8 +2540,9 @@ describe("live Durable Object relay", () => {
   it("resets only slow data with a same-set single-use ticket and survives hibernation", async () => {
     const session = await createSession();
     const host = await openHost(session);
-    const browser = await openBrowser(session, session.observerCapability);
-    await attachBrowser(session, host, browser);
+    const browser = await openBrowser(session, session.writerCapability);
+    const initialAttach = await attachBrowser(session, host, browser);
+    const writerLease = String(initialAttach.welcome.writerLease);
 
     await beginWarmDelivery(session, host, browser, 0n, 0n);
     host.data.socket.send(
@@ -2028,6 +2589,53 @@ describe("live Durable Object relay", () => {
       reason: "slow-client",
     });
 
+    const recoveringControl = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const controlSocket = state
+          .getWebSockets(`client:${browser.connection.clientId}`)
+          .find((socket) => {
+            return (socket.deserializeAttachment() as { channel?: string }).channel === "control";
+          });
+        return controlSocket?.deserializeAttachment() as {
+          controlState: string;
+          deliveryGeneration: string;
+          leaseFence: string | null;
+        };
+      },
+    );
+    expect(recoveringControl).toMatchObject({
+      controlState: "active",
+      deliveryGeneration: "2",
+      leaseFence: "1",
+    });
+
+    for (const input of recoveryInputFrames(writerLease)) {
+      browser.control.socket.send(JSON.stringify(input));
+      expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toEqual({
+        ...input,
+        connectionId: browser.connection.connectionId,
+        clientId: browser.connection.clientId,
+      });
+    }
+    host.control.socket.send(
+      JSON.stringify({
+        type: "input-ack",
+        connectionId: browser.connection.connectionId,
+        inputEpoch: "delivery_recovery",
+        clientInputSeq: "1",
+        status: "written",
+        authorityEventSeq: "32",
+      }),
+    );
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toEqual({
+      type: "input-ack",
+      inputEpoch: "delivery_recovery",
+      clientInputSeq: "1",
+      status: "written",
+      authorityEventSeq: "32",
+    });
+
     const consumedInitialTicket = await upgradeResponse(
       session.sessionId,
       "data",
@@ -2054,19 +2662,71 @@ describe("live Durable Object relay", () => {
           });
         return socket?.deserializeAttachment() as {
           connectionSetId: string;
+          dataState: string;
           deliveryGeneration: string;
+          sentEventSeq: string | null;
         };
       },
     );
     expect(replacementAttachment).toMatchObject({
       connectionSetId: browser.connection.connectionSetId,
+      dataState: "awaiting-attach",
       deliveryGeneration: "2",
+      sentEventSeq: null,
     });
+
+    await evictDurableObject(sessionStub(session.sessionId), { webSockets: "hibernate" });
+    const postHibernateInput = {
+      ...recoveryInputFrames(writerLease)[1],
+      clientInputSeq: "6",
+    };
+    browser.control.socket.send(JSON.stringify(postHibernateInput));
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toEqual({
+      ...postHibernateInput,
+      connectionId: browser.connection.connectionId,
+      clientId: browser.connection.clientId,
+    });
+    const restoredAwaiting = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const sockets = state.getWebSockets(`client:${browser.connection.clientId}`);
+        const control = sockets.find((socket) => {
+          return (socket.deserializeAttachment() as { channel?: string }).channel === "control";
+        });
+        const data = sockets.find((socket) => {
+          return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+        });
+        return {
+          control: control?.deserializeAttachment(),
+          data: data?.deserializeAttachment(),
+        } as {
+          control: { controlState: string; deliveryGeneration: string; leaseFence: string };
+          data: { dataState: string; deliveryGeneration: string; sentEventSeq: string | null };
+        };
+      },
+    );
+    expect(restoredAwaiting.control).toMatchObject({
+      controlState: "active",
+      deliveryGeneration: "2",
+      leaseFence: "1",
+    });
+    expect(restoredAwaiting.data).toMatchObject({
+      dataState: "awaiting-attach",
+      deliveryGeneration: "2",
+      sentEventSeq: null,
+    });
+    const recoveryLeaseStatus = await renewWriterLease(session, browser, writerLease);
+    expect(recoveryLeaseStatus).toMatchObject({
+      type: "writer-lease-status",
+      active: true,
+    });
+    expect(Number(recoveryLeaseStatus.expiresAt)).toBeGreaterThan(Date.now());
 
     browser.control.socket.send(
       JSON.stringify({
         type: "attach",
-        engineId,
+        engineId: `${engineId}:mismatch`,
+        deliveryGeneration: "2",
         hasLiveReplica: true,
         lastSessionEpoch: "7",
         lastEventSeq: "31",
@@ -2074,13 +2734,54 @@ describe("live Durable Object relay", () => {
       }),
     );
     expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
-      type: "welcome",
+      type: "resync-required",
+      reason: "engine-mismatch",
       deliveryGeneration: "2",
     });
+    expect(host.control.inbox.pendingMessageCount).toBe(0);
+
+    browser.control.socket.send(
+      JSON.stringify({
+        type: "attach",
+        engineId,
+        deliveryGeneration: "2",
+        hasLiveReplica: true,
+        lastSessionEpoch: "7",
+        lastEventSeq: "31",
+        nextPtyOffset: String(31 * chunk.byteLength),
+      }),
+    );
+    await drainSession(session.sessionId);
+    expect(browser.control.inbox.pendingMessageCount).toBe(0);
     browser.connection.deliveryGeneration = "2";
     expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
       type: "attach-request",
       deliveryGeneration: "2",
+    });
+    const committedRecovery = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const sockets = state.getWebSockets(`client:${browser.connection.clientId}`);
+        const control = sockets.find((socket) => {
+          return (socket.deserializeAttachment() as { channel?: string }).channel === "control";
+        });
+        const data = sockets.find((socket) => {
+          return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+        });
+        return {
+          control: control?.deserializeAttachment(),
+          data: data?.deserializeAttachment(),
+        } as {
+          control: { controlState: string; leaseFence: string };
+          data: { dataState: string; firstEventSeq: string; firstPtyOffset: string };
+        };
+      },
+    );
+    expect(committedRecovery.control).toMatchObject({ controlState: "active", leaseFence: "1" });
+    expect(committedRecovery.data).toMatchObject({
+      dataState: "catching-up",
+      firstEventSeq: "31",
+      firstPtyOffset: String(31 * chunk.byteLength),
     });
     await beginWarmDelivery(session, host, browser, 32n, BigInt(32 * chunk.byteLength));
 

@@ -103,6 +103,15 @@ type ServerFrame =
       heightPx: number;
     })
   | {
+      type: "writer-lease-status";
+      active: true;
+      expiresAt: number;
+    }
+  | {
+      type: "writer-lease-status";
+      active: false;
+    }
+  | {
       type: "input-ack";
       inputEpoch: string;
       clientInputSeq: U64;
@@ -128,17 +137,23 @@ type ClientFrame =
   | {
       type: "attach";
       engineId: string;
+      deliveryGeneration: U64;
       hasLiveReplica: false;
     }
   | {
       type: "attach";
       engineId: string;
+      deliveryGeneration: U64;
 
       // 三个 cursor 来自发送 attach 这一刻的 active libghostty replica。
       hasLiveReplica: true;
       lastSessionEpoch: U64;
       lastEventSeq: U64;
       nextPtyOffset: U64;
+    }
+  | {
+      type: "writer-lease-renew";
+      writerLease: string;
     }
   | {
       type: "key";
@@ -224,9 +239,15 @@ Shift=1, Control=2, Alt=4, Super=8, CapsLock=16, NumLock=32
 
 `text.data` 与 `paste.data` 是 UTF-8 文本，分别最多 1 MiB；上限按编码后的 UTF-8 byte length 计算，不能按 JavaScript UTF-16 `length` 计算。`focus.focused` 只表达浏览器焦点状态。mouse 的 `buttons` 限于 `0..31`，`modifiers` 限于 `0x3f`，`surface.{x,y}` 是不超过 `1_000_000` 的非负整数 CSS px。press/release 的 `button` 必须为 `0..4`，move/wheel 必须为 `null`；wheel 至少携带一个有限、非零且绝对值不超过 `1_000_000` 的 delta，并必须携带 `deltaMode`，非 wheel 禁止携带 delta。cell、viewport 和 surface width/height 只作为 WTerm DOM adapter 的本地提示，不进入 wire；Host 只信自己的权威 geometry。Relay 不把这些输入编码成终端 bytes，只在现有 writer lease/input fence 验证后注入 `{connectionId, clientId}` 并转发给 Host。
 
-`ack` 只表示该 delivery generation 的 frame 已可靠到达，不代表 libghostty 已应用。共享 credit 公式固定为 `(sentPtyOffset - ackedPtyOffset) + (sentEventSeq - ackedEventSeq) * 64`，上限为 512 KiB；Cloud 和 Host scheduler 必须复用 protocol package 的同一常量与公式。ACK cursor 只保存在当前 data WebSocket 的 hibernation attachment 中，不写入 SQL，也不作为下一 connection set 的单调下界；full reconnect 必须以新 `attach` 的 live replica cursor 重新建立 credit baseline。Host 重连或浏览器 data 断线时，DO 会 bump generation、关闭旧 data、签发同一 connection set 的 30 秒单次 data ticket，并发送一个 `resync-required`。浏览器建立新 data 后，必须从当前 active replica 读取 cursor 并重新 `attach`；DO 不缓存 cursor 来自动 replay，从而消除“frame 已 apply、progress 尚未上报”的重复应用窗口。
+`ack` 只表示该 delivery generation 的 frame 已可靠到达，不代表 libghostty 已应用。共享 credit 公式固定为 `(sentPtyOffset - ackedPtyOffset) + (sentEventSeq - ackedEventSeq) * 64`，上限为 512 KiB；Cloud 和 Host scheduler 必须复用 protocol package 的同一常量与公式。ACK cursor 只保存在当前 data WebSocket 的 hibernation attachment 中，不写入 SQL，也不作为下一 connection set 的单调下界；full reconnect 必须以新 `attach` 的 live replica cursor 重新建立 credit baseline。Host 重连或浏览器 data 断线时，DO 会 bump generation、关闭旧 data、签发同一 connection set 的 30 秒单次 data ticket，并发送一个 `resync-required`；已激活 control 保持 `active`，只同步新的 delivery generation，writer lease fence 不变。浏览器建立新 data 后，必须从当前 active replica 读取 cursor 并重新 `attach`；DO 不缓存 cursor 来自动 replay，从而消除“frame 已 apply、progress 尚未上报”的重复应用窗口。replacement ticket 过期只使 data 恢复失败，不撤销 control 或 lease；浏览器可改走 full connection set replacement。
 
-每个 delivery generation 只允许一次 `attach`，且只允许 `awaiting-attach -> active`。重复 attach 不得重写 baseline 或 snapshot pin，只隔离该 browser connection set；writer lease 的重新获取不能借重复 attach 偷渡。`welcome` 只确认身份、generation 和 session head，本身不启动 directed delivery。
+Control activation 与 data delivery activation 是两个独立门闩。新 full control 只在首次成功 `attach` 时执行 `awaiting-attach -> active` 并决定是否授予 writer lease；每个新建或 replacement data socket 都从 `awaiting-attach` 开始，Client 的 `attach.deliveryGeneration` 必须显式声明它要提交的 generation，只有等于 SQL/current control/data generation 的一次成功 `attach` 才原子提交 baseline 并执行 `awaiting-attach -> catching-up`，`ReplayCommit` 再进入 `synced`。低于、高于或因跨通道重排而不再是 current generation 的 attach 一律静默丢弃，不能关闭 control 或释放 lease；active control 的 current-generation attach 如果已失去 matching data 也静默等待下一次恢复。只有首次尚未激活的 current-generation control 缺少 matching data 才 fail closed。重复 attach 不得重写 baseline 或 snapshot pin，只隔离该 browser connection set；data recovery attach 不得重新获取 writer lease，也不再发送第二个 `welcome`，只向 Host 发送新的 `attach-request`。`welcome` 只属于首次 control activation，用来确认身份、generation、session head 与初始 writer authority，本身不启动 directed delivery。
+
+Data 缺失、等待 attach 或 cold snapshot 恢复期间，已激活 writer control 仍按原 lease/input fence 转发 key、text、paste、focus 和 resize，因此持续输出导致的 slow reset 不能阻断 `Ctrl-C`。ACK 仍严格绑定当前 generation 已 attach 的 data socket 及其 sent cursor；旧 generation ACK 被忽略，当前 generation 在 baseline 提交前也不能伪造进度。Mouse 由 Browser 在 Ghostty 权威 mouse mode 与可信 surface geometry 就绪时本地放行；Relay 不使用 browser 派生 cell 做恢复期判断，Host 继续以自己的权威 geometry 校验。
+
+所有 Relay 到当前 Host control 的写入都经过同一个 fenced sink。若 socket 已有证据未处于可写 current 状态，Relay fail 该 Host pair，并把对应 semantic input 回为 `rejected`；若 `WebSocket.send()` 同步抛错，无法证明 frame 未进入运行时队列，Relay fail Host、广播 `host-offline`，并把 semantic input 回为 `uncertain`。两种情况都不能让异常冒回 Browser 入站队列，不能关闭 Browser control 或释放 writer lease；失败的 recovery `attach-request` 保留 Browser，等待新 Host 上线后由新的 generation 重试。Browser 不自动重试 `uncertain` input。
+
+Writer lease 是需要显式维持的 control-plane liveness，而不是 data progress。Browser 只在持有 token 且 control 已激活时每 10 秒发送一次 `writer-lease-renew`；DO 只允许相同 `{clientId, leaseFence, token digest}` 的 active writer control 把 30 秒 deadline 向后推进，并返回 `writer-lease-status {active: true, expiresAt}`。renew 不能获取 lease、改变 fence、转发 Host 或替代 semantic input；data reset/reattach 也不能隐式续租。token 已过期、被新 fence 取代、control 尚未激活或角色不是 writer 时返回 `{active: false}`，Browser 必须立即清除 token 并进入 waiting。control close 继续按 fence 释放 lease；WebSocket ping/pong 的运行时自动响应不构成续租，也不能依赖它唤醒 DO。
 
 `hasLiveReplica: false` 不提供 delivery baseline；`hasLiveReplica: true` 只采样完整三元 cursor。两者在 DO 接受同 Host data WebSocket 上的 `DeliveryBarrier` 前都不允许 directed mutation 或 `ReplayCommit`。warm barrier 以 attach cursor 为 base 并向 browser control 发送 `replay-start {streamId, generation, base, pinnedCommit}`；snapshot barrier 可以在尚未 pin/尚未发送 start 时覆盖 live attach baseline，以 finalize 后的 snapshot cut seed attachment 并发送 manifest。
 

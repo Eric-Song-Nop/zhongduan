@@ -27,6 +27,12 @@ function frame(overrides: Partial<DataFrame> = {}): DataFrame {
 }
 
 describe("delivery cursor validation", () => {
+  it("rejects delivery before the data attachment commits its baseline", () => {
+    expect(advanceDeliveryCursor({ ...baseline, dataState: "awaiting-attach" }, frame())).toEqual({
+      kind: "sequence-error",
+    });
+  });
+
   it("requires an explicit baseline and a zero-tail replay commit", () => {
     expect(
       advanceDeliveryCursor(
