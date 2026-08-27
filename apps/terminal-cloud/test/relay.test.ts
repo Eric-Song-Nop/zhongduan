@@ -886,6 +886,7 @@ describe("live Durable Object relay", () => {
       session.observerCapability,
       first.connection.clientId ?? undefined,
     );
+    expect(connection.deliveryGeneration).toBe("2");
     const control = await upgrade(session.sessionId, "control", connection.controlTicket);
     host.data.socket.send(ptyFrame(50n, 50n, textEncoder.encode("stale"), 1n, connection.streamId));
     await drainSession(session.sessionId);
@@ -1042,6 +1043,116 @@ describe("live Durable Object relay", () => {
       }),
     );
     expect((await secondReplacement.control.inbox.nextClose()).code).toBe(4400);
+  });
+
+  it("forwards structured text, focus, and mouse input without terminal encoding", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const writer = await openBrowser(session, session.writerCapability);
+    const observer = await openBrowser(session, session.observerCapability);
+    const writerAttach = await attachBrowser(session, host, writer);
+    await attachBrowser(session, host, observer);
+    const writerLease = String(writerAttach.welcome.writerLease);
+
+    const inputs = [
+      {
+        type: "text",
+        writerLease,
+        inputEpoch: "structured_input",
+        clientInputSeq: "1",
+        data: "你好, terminal",
+      },
+      {
+        type: "focus",
+        writerLease,
+        inputEpoch: "structured_input",
+        clientInputSeq: "2",
+        focused: false,
+      },
+      {
+        type: "mouse",
+        writerLease,
+        inputEpoch: "structured_input",
+        clientInputSeq: "3",
+        action: "wheel",
+        button: null,
+        buttons: 0,
+        modifiers: 3,
+        altGraph: true,
+        surface: { x: 120, y: 48 },
+        deltaX: 0,
+        deltaY: -12.5,
+        deltaMode: "pixel",
+      },
+    ] as const;
+
+    for (const input of inputs) {
+      writer.control.socket.send(JSON.stringify(input));
+      expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toEqual({
+        ...input,
+        connectionId: writer.connection.connectionId,
+        clientId: writer.connection.clientId,
+      });
+    }
+
+    host.control.socket.send(
+      JSON.stringify({
+        type: "input-ack",
+        connectionId: writer.connection.connectionId,
+        inputEpoch: "structured_input",
+        clientInputSeq: "3",
+        status: "written",
+        authorityEventSeq: "0",
+      }),
+    );
+    expect(await writer.control.inbox.nextJson<Record<string, unknown>>()).toEqual({
+      type: "input-ack",
+      inputEpoch: "structured_input",
+      clientInputSeq: "3",
+      status: "written",
+      authorityEventSeq: "0",
+    });
+
+    observer.control.socket.send(
+      JSON.stringify({
+        ...inputs[0],
+        writerLease: "observer_cannot_write",
+        inputEpoch: "observer_input",
+      }),
+    );
+    expect(await observer.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "input-ack",
+      inputEpoch: "observer_input",
+      clientInputSeq: "1",
+      status: "rejected",
+    });
+    expect(host.control.inbox.pendingMessageCount).toBe(0);
+  });
+
+  it("isolates malformed mouse input without affecting Host authority", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.observerCapability);
+
+    browser.control.socket.send(
+      JSON.stringify({
+        type: "mouse",
+        writerLease: "malformed_mouse",
+        inputEpoch: "malformed_mouse",
+        clientInputSeq: "1",
+        action: "move",
+        button: null,
+        buttons: 0,
+        modifiers: 0,
+        altGraph: false,
+        surface: { x: 1, y: 2 },
+        deltaY: 1,
+      }),
+    );
+    expect((await browser.control.inbox.nextClose()).code).toBe(4400);
+    expect((await browser.data.inbox.nextClose()).code).toBe(4001);
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
   });
 
   it("isolates a repeated attach without replacing the generation baseline", async () => {

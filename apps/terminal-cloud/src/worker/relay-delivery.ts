@@ -1,7 +1,10 @@
-import { DataFrameKind, MAX_U64, type DataFrame } from "@zhongduan/protocol";
-
-const DELIVERY_OVERHEAD_BYTES = 64n;
-export const MAX_UNACKED_BYTES = 512 * 1024;
+import {
+  DataFrameKind,
+  MAX_DELIVERY_OUTSTANDING_BYTES,
+  MAX_U64,
+  deliveryOutstandingBytes,
+  type DataFrame,
+} from "@zhongduan/protocol";
 
 export interface DeliveryCursorState {
   ackedEventSeq: string | null;
@@ -67,9 +70,11 @@ export function advanceDeliveryCursor(
   if (frame.eventSeq < ackedEvent || nextPtyOffset < ackedPty) {
     return { kind: "sequence-error" };
   }
-  const outstandingBytes =
-    nextPtyOffset - ackedPty + (frame.eventSeq - ackedEvent) * DELIVERY_OVERHEAD_BYTES;
-  if (outstandingBytes > BigInt(MAX_UNACKED_BYTES)) {
+  const outstandingBytes = deliveryOutstandingBytes(
+    { eventSeq: ackedEvent, nextPtyOffset: ackedPty },
+    { eventSeq: frame.eventSeq, nextPtyOffset },
+  );
+  if (outstandingBytes > BigInt(MAX_DELIVERY_OUTSTANDING_BYTES)) {
     return { kind: "credit-exceeded" };
   }
 

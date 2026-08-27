@@ -142,6 +142,136 @@ describe("control frame validation", () => {
     ).toThrow();
   });
 
+  it("validates text and focus as writer-fenced semantic input", () => {
+    const identity = {
+      writerLease: "lease_AAAAAAAAAAAA",
+      inputEpoch: "input_AAAAAAAAAAAA",
+      clientInputSeq: "45",
+    };
+    expect(
+      ClientControlFrameSchema.parse({ type: "text", ...identity, data: "中文输入" }),
+    ).toMatchObject({ type: "text", data: "中文输入" });
+    expect(
+      ClientControlFrameSchema.parse({ type: "focus", ...identity, focused: true }),
+    ).toMatchObject({ type: "focus", focused: true });
+    expect(() =>
+      ClientControlFrameSchema.parse({
+        type: "text",
+        ...identity,
+        data: "中".repeat(350_000),
+      }),
+    ).toThrow();
+    expect(() =>
+      ClientControlFrameSchema.parse({ type: "focus", ...identity, focused: true, mode: 1004 }),
+    ).toThrow();
+  });
+
+  it("carries bounded mouse surface input without client-derived cells", () => {
+    const identity = {
+      writerLease: "lease_AAAAAAAAAAAA",
+      inputEpoch: "input_AAAAAAAAAAAA",
+      clientInputSeq: "46",
+    };
+    const press = {
+      type: "mouse" as const,
+      ...identity,
+      action: "press" as const,
+      button: 0,
+      buttons: 1,
+      modifiers: KeyModifier.Control,
+      altGraph: false,
+      surface: { x: 120, y: 80 },
+    };
+    expect(ClientControlFrameSchema.parse(press)).toEqual(press);
+    expect(
+      ClientControlFrameSchema.parse({
+        ...press,
+        action: "wheel",
+        button: null,
+        buttons: 0,
+        deltaY: -120.5,
+        deltaMode: "pixel",
+      }),
+    ).toMatchObject({ action: "wheel", deltaY: -120.5 });
+    expect(() => ClientControlFrameSchema.parse({ ...press, cell: { col: 4, row: 2 } })).toThrow();
+    expect(() =>
+      ClientControlFrameSchema.parse({
+        ...press,
+        surface: { ...press.surface, width: 640 },
+      }),
+    ).toThrow();
+    expect(() => ClientControlFrameSchema.parse({ ...press, button: 5 })).toThrow();
+    expect(() => ClientControlFrameSchema.parse({ ...press, buttons: 32 })).toThrow();
+    expect(() => ClientControlFrameSchema.parse({ ...press, modifiers: 0x40 })).toThrow();
+    expect(() =>
+      ClientControlFrameSchema.parse({
+        ...press,
+        action: "move",
+        button: 0,
+      }),
+    ).toThrow();
+    expect(() =>
+      ClientControlFrameSchema.parse({
+        ...press,
+        action: "move",
+        button: null,
+        deltaX: 1,
+      }),
+    ).toThrow();
+    expect(() =>
+      ClientControlFrameSchema.parse({
+        ...press,
+        action: "wheel",
+        button: null,
+        buttons: 0,
+        deltaX: 0,
+        deltaY: 0,
+        deltaMode: "line",
+      }),
+    ).toThrow();
+    expect(() =>
+      ClientControlFrameSchema.parse({
+        ...press,
+        action: "wheel",
+        button: null,
+        buttons: 0,
+        deltaY: Number.POSITIVE_INFINITY,
+        deltaMode: "pixel",
+      }),
+    ).toThrow();
+  });
+
+  it("requires Relay-injected identity on every forwarded semantic input", () => {
+    const verified = {
+      connectionId: "connection_AAAAAAAAA",
+      clientId: "client_AAAAAAAAAAAAA",
+      writerLease: "lease_AAAAAAAAAAAA",
+      inputEpoch: "input_AAAAAAAAAAAA",
+      clientInputSeq: "47",
+    };
+    for (const frame of [
+      { type: "text", ...verified, data: "a" },
+      { type: "focus", ...verified, focused: false },
+      {
+        type: "mouse",
+        ...verified,
+        action: "move",
+        button: null,
+        buttons: 1,
+        modifiers: 0,
+        altGraph: false,
+        surface: { x: 1, y: 2 },
+      },
+    ]) {
+      expect(RelayToHostControlFrameSchema.parse(frame)).toMatchObject({
+        connectionId: verified.connectionId,
+        clientId: verified.clientId,
+      });
+      const { clientId: _clientId, ...unverified } = frame;
+      expect(() => RelayToHostControlFrameSchema.parse(unverified)).toThrow();
+    }
+  });
+
   it("echoes the input epoch in acknowledgements", () => {
     expect(
       ServerControlFrameSchema.parse({

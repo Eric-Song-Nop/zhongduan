@@ -1,9 +1,10 @@
+import { CapabilityRoleSchema, type CapabilityRole } from "@zhongduan/protocol";
 import { z } from "zod";
 
 const tokenId = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/);
 
-export const CapabilityRoleSchema = z.enum(["host", "writer", "observer"]);
-export type CapabilityRole = z.infer<typeof CapabilityRoleSchema>;
+export { CapabilityRoleSchema };
+export type { CapabilityRole };
 
 export const CapabilityClaimsSchema = z.strictObject({
   version: z.literal(1),

@@ -30,11 +30,15 @@ export interface BrowserDeliveryReplacement {
 }
 
 export type ConnectionSetReservationResult =
-  | { client: ClientRow | undefined; ok: true }
+  | { client: ClientRow | undefined; deliveryGeneration: string; ok: true }
   | {
       ok: false;
       reason: "client-owner-mismatch" | "too-many-clients" | "too-many-pending-connections";
     };
+
+type ClientReservationResult =
+  | { client: ClientRow; ok: true }
+  | { ok: false; reason: "client-owner-mismatch" | "too-many-clients" };
 
 export class RelayConnectionStore {
   constructor(
@@ -98,7 +102,7 @@ export class RelayConnectionStore {
       }
 
       const streamId = client?.stream_id ?? 0;
-      const deliveryGeneration = client?.delivery_generation ?? "0";
+      const deliveryGeneration = this.#reservedDeliveryGeneration(client);
       for (const [ticketDigest, channel] of [
         [input.controlTicketDigest, "control"],
         [input.dataTicketDigest, "data"],
@@ -121,7 +125,7 @@ export class RelayConnectionStore {
           input.expiresAt,
         );
       }
-      result = { client, ok: true };
+      result = { client, deliveryGeneration, ok: true };
     });
     if (result === undefined) throw new Error("connection reservation did not resolve");
     return result;
@@ -143,38 +147,43 @@ export class RelayConnectionStore {
         currentTicket.expires_at <= now ||
         currentTicket.connection_set_id !== ticket.connection_set_id ||
         client === undefined ||
-        client.role !== ticket.role ||
-        client.stream_id !== ticket.stream_id ||
-        client.delivery_generation !== ticket.delivery_generation ||
+        currentTicket.ticket_digest !== ticket.ticket_digest ||
+        currentTicket.channel !== "control" ||
+        currentTicket.client_id !== ticket.client_id ||
+        currentTicket.role !== ticket.role ||
+        currentTicket.stream_id !== ticket.stream_id ||
+        currentTicket.delivery_generation !== ticket.delivery_generation ||
+        client.role !== currentTicket.role ||
+        client.stream_id !== currentTicket.stream_id ||
         clientCount.value > this.maxBrowserClients
       ) {
         return;
       }
-      let deliveryGeneration = client.delivery_generation;
-      if (client.registered_at !== null) {
-        const currentGeneration = BigInt(client.delivery_generation);
-        if (currentGeneration >= MAX_U64) throw new Error("delivery generation space exhausted");
-        deliveryGeneration = (currentGeneration + 1n).toString();
-      }
+      const currentGeneration = BigInt(client.delivery_generation);
+      const reservedGeneration = BigInt(currentTicket.delivery_generation);
+      const expectedGeneration =
+        client.registered_at === null ? currentGeneration : currentGeneration + 1n;
+      if (reservedGeneration !== expectedGeneration || reservedGeneration > MAX_U64) return;
+      const registrationPredicate =
+        client.registered_at === null ? "registered_at IS NULL" : "registered_at IS NOT NULL";
       this.sql.exec(
         `UPDATE client_delivery
          SET delivery_generation = ?, registered_at = COALESCE(registered_at, ?),
              reservation_expires_at = NULL, updated_at = ?
-         WHERE client_id = ? AND delivery_generation = ?`,
-        deliveryGeneration,
+         WHERE client_id = ? AND delivery_generation = ? AND ${registrationPredicate}`,
+        currentTicket.delivery_generation,
         now,
         now,
         ticket.client_id,
         client.delivery_generation,
       );
-      this.sql.exec(
-        `UPDATE connection_ticket SET delivery_generation = ?
-         WHERE connection_set_id = ? AND client_id = ?`,
-        deliveryGeneration,
-        ticket.connection_set_id,
-        ticket.client_id,
-      );
-      claimed = this.store.ticket(ticket.ticket_digest);
+      const activatedClient = this.store.clientById(ticket.client_id!);
+      if (
+        activatedClient?.registered_at !== null &&
+        activatedClient?.delivery_generation === currentTicket.delivery_generation
+      ) {
+        claimed = this.store.ticket(ticket.ticket_digest);
+      }
     });
     return claimed;
   }
@@ -306,7 +315,7 @@ export class RelayConnectionStore {
     role: "writer" | "observer",
     expiresAt: number,
     now: number,
-  ): ConnectionSetReservationResult {
+  ): ClientReservationResult {
     const existing = this.store.clientById(clientId);
     if (existing !== undefined) {
       if (existing.principal_id_hash !== principalIdHash || existing.role !== role) {
@@ -321,7 +330,7 @@ export class RelayConnectionStore {
           clientId,
         );
       }
-      return { client: this.store.clientById(clientId), ok: true };
+      return { client: this.#requiredClient(clientId), ok: true };
     }
 
     let clientCount = this.sql.exec("SELECT COUNT(*) AS value FROM client_delivery").one() as {
@@ -358,7 +367,22 @@ export class RelayConnectionStore {
       streamId + 1,
       now,
     );
-    return { client: this.store.clientById(clientId), ok: true };
+    return { client: this.#requiredClient(clientId), ok: true };
+  }
+
+  #requiredClient(clientId: string): ClientRow {
+    const client = this.store.clientById(clientId);
+    if (client === undefined) throw new Error("reserved client disappeared");
+    return client;
+  }
+
+  #reservedDeliveryGeneration(client: ClientRow | undefined): string {
+    if (client === undefined || client.registered_at === null) {
+      return client?.delivery_generation ?? "0";
+    }
+    const currentGeneration = BigInt(client.delivery_generation);
+    if (currentGeneration >= MAX_U64) throw new Error("delivery generation space exhausted");
+    return (currentGeneration + 1n).toString();
   }
 
   #evictInactiveClient(now: number): boolean {
