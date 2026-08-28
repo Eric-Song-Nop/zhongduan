@@ -156,6 +156,90 @@ const browserBase = {
   clockKind: z.literal("browser-performance"),
 } as const;
 
+const browserSampledBase = {
+  schemaVersion: z.literal(2),
+  monotonicAtMs,
+  clockKind: z.literal("browser-performance"),
+  sampleWeight: z.literal(64),
+} as const;
+
+const BrowserInputKindSchema = z.enum(["key", "text", "paste", "focus", "mouse", "resize"]);
+
+const BrowserInputLifecycleAckEventSchema = z.strictObject({
+  ...browserSampledBase,
+  name: z.literal("browser.input.lifecycle"),
+  outcome: z.literal("ack-received"),
+  inputKind: BrowserInputKindSchema,
+  status: z.enum(["written", "duplicate", "rejected", "uncertain"]),
+  dispatchToSendDecisionMs: durationMs,
+  sendDecisionToAckMs: durationMs,
+  dispatchToAckMs: durationMs,
+  outstandingInputs: z.number().int().nonnegative().max(64).safe(),
+});
+
+const BrowserInputLifecycleTerminalEventSchema = z.strictObject({
+  ...browserSampledBase,
+  name: z.literal("browser.input.lifecycle"),
+  outcome: z.literal("terminal"),
+  inputKind: BrowserInputKindSchema,
+  reason: z.enum([
+    "not-writable",
+    "policy-rejected",
+    "validation-failed",
+    "send-returned-false",
+    "send-threw",
+    "coalesced",
+    "pending-capacity",
+    "deadline",
+    "input-epoch-ended",
+    "transport-replaced",
+    "session-closed",
+  ]),
+  stage: z.enum(["dispatch", "queued", "send-decision", "awaiting-ack"]),
+  observedDurationMs: durationMs,
+});
+
+const BrowserInputLifecycleEventSchema = z.union([
+  BrowserInputLifecycleAckEventSchema,
+  BrowserInputLifecycleTerminalEventSchema,
+]);
+
+const BrowserCanonicalPresentationReadyEventSchema = z.strictObject({
+  ...browserSampledBase,
+  name: z.literal("browser.presentation.canonical"),
+  outcome: z.literal("next-frame-opportunity"),
+  frameKind: z.enum(["pty-output", "resize-applied"]),
+  frameBytesBucket: byteSizeBucket,
+  ingressToReplicaApplyMs: durationMs,
+  replicaApplyToRenderCommitMs: durationMs,
+  renderCommitToFrameOpportunityMs: durationMs,
+  totalDurationMs: durationMs,
+});
+
+const BrowserCanonicalPresentationTerminalEventSchema = z.strictObject({
+  ...browserSampledBase,
+  name: z.literal("browser.presentation.canonical"),
+  outcome: z.literal("not-observed"),
+  frameKind: z.enum(["pty-output", "resize-applied"]),
+  frameBytesBucket: byteSizeBucket,
+  reason: z.enum([
+    "not-live",
+    "generation-ended",
+    "page-hidden",
+    "deadline",
+    "apply-failed",
+    "session-closed",
+    "capacity",
+  ]),
+  stage: z.enum(["ingress", "applied", "render-committed"]),
+  observedDurationMs: durationMs,
+});
+
+const BrowserCanonicalPresentationEventSchema = z.union([
+  BrowserCanonicalPresentationReadyEventSchema,
+  BrowserCanonicalPresentationTerminalEventSchema,
+]);
+
 const BrowserRelayRttSuccessEventSchema = z.strictObject({
   ...browserBase,
   name: z.literal("browser.relay.rtt"),
@@ -294,6 +378,8 @@ export const BrowserTelemetryEventSchema = z.union([
   BrowserRelayRttEventSchema,
   BrowserRecoveryAttachStartEventSchema,
   BrowserInputAckEventSchema,
+  BrowserInputLifecycleEventSchema,
+  BrowserCanonicalPresentationEventSchema,
   BrowserSnapshotLoadTotalEventSchema,
   BrowserSnapshotRestoreEventSchema,
   BrowserSnapshotBufferFlushEventSchema,

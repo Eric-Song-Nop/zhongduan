@@ -1,6 +1,6 @@
 # 高性能远程终端 Snapshot 与 Recovery v3 实施计划
 
-> 状态：根据 PR review 重写，等待分阶段实施
+> 状态：根据 PR review 重写，分阶段实施中
 >
 > 决策日期：2026-08-28
 >
@@ -69,9 +69,9 @@ margins 和未完成的 UTF-8/CSI/OSC/DCS parser continuation。它不承诺：
 - bell、clipboard、query 等瞬时 effect 的重放。
 
 固定 wterm submodule 当前仍使用完整同步 snapshot encode，见 pinned commit 的
-[WASM `encode_snapshot`](https://github.com/Eric-Song-Nop/wterm/blob/4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6/packages/%40wterm/ghostty/zig/src/wasm_api.zig#L560-L581)；
+[WASM `encode_snapshot`](https://github.com/Eric-Song-Nop/wterm/blob/bd7e930f41165f91b2b4863bc4d1b91db7b1c8a1/packages/%40wterm/ghostty/zig/src/wasm_api.zig#L560-L581)；
 passive restore 的 READY/history/FINISH ownership 见同一 commit 的
-[restore contract](https://github.com/Eric-Song-Nop/wterm/blob/4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6/packages/%40wterm/ghostty/README.md#passive-snapshot-restore)。
+[restore contract](https://github.com/Eric-Song-Nop/wterm/blob/bd7e930f41165f91b2b4863bc4d1b91db7b1c8a1/packages/%40wterm/ghostty/README.md#passive-snapshot-restore)。
 这些链接固定到 submodule SHA，不能用指向 `vendor/wterm/...` 的仓库内相对 GitHub 链接代替。
 
 ## CURRENT：data protocol v2 的正确性条件
@@ -498,14 +498,27 @@ generation，避免跨 attempt 拼接。
   decision，以及 writer attach acquire 和 heartbeat verify-renew；事件升级为 `workers-logs-v2`，但不改变 delivery、
   lease、reset、wire、SQLite 或 socket attachment 行为；
 - `observability/browser-recovery-latency` 是 Browser 本机事实切片：用独立 monotonic clock 记录 control/data
-  socket RTT、input send-return 到 ACK、attach matching/timeout/cancelled 终点，以及 snapshot load-total、restore、
-  buffer apply、adopt call 与最终 recovery outcome。事件只进入 256 条有界内存 ring，不写 console、storage 或网络；
+  socket RTT、当时的 input send-return 到 ACK、attach matching/timeout/cancelled 终点，以及 snapshot load-total、
+  restore、buffer apply、adopt call 与最终 recovery outcome。旧 `browser.input.ack` schema 仍供历史数据读取，
+  但当前 producer 已由后续 v2 lifecycle 取代；事件只进入 256 条有界内存 ring，不写 console、storage 或网络；
 - `observability/cloud-telemetry-query` 是 Cloud 查询契约切片：严格解析 Workers Logs flattened wrapper 与 v1/v2
   payload、固定每个版本的 producer sampling policy、执行前核验 exact key/type，并提供 Cloud-local report/smoke
   与显式 saved-query provisioning；它不上传 Browser/Host 事实，也不把 Cloud smoke 冒充性能 canary；
-- Phase 0 gate 仍未关闭：Browser render/presentation 与 synthetic E2E、Browser/Host 生产 export/跨 runtime
-  aggregation，以及同一 exact build 下启用/关闭插桩时 input latency/canonical throughput 不超过 5% 回归的
-  ABBA canary 必须由后续 stacked layer 补齐。Host/Browser relay RTT 都包含各自本地
+- `observability/browser-presentation-facts` 是 Browser 本机表示事实切片：它用精确
+  `browserDiagnostics=off|memory-v2` 运行时模式，在 `memory-v2` 中记录 semantic
+  dispatch→send decision→ACK，以及 canonical post-decode data callback→visible active replica exact
+  apply→WTerm render commit→next-frame opportunity。后一条只包含完成 frame decode 后 callback 进入时已经
+  处于 `live`/warm `replaying` 的 `PTY_OUTPUT` 与
+  `RESIZE_APPLIED`，不把 `restoring` 的 detached/buffered work 当成 visible presentation；
+- 新 Browser 序列在 outcome 之前分别做随机起始相位的固定无偏系统采样，
+  `sampleWeight=64`，共享 pending hard cap 64 与 2 秒 deadline。它们只写严格、content-free 的
+  Browser 内存 ring，不写 wire、journal/snapshot/replay、SQLite/attachment 或 export；`off` 不创建
+  tracker/ring、telemetry-only clock/maps/listener/WTerm hook/presentation timer/RAF，但 heartbeat
+  correctness 自身的 monotonic clock/deadline timer 仍保留；
+- Phase 0 gate 仍未关闭：synthetic E2E/SLO、Browser/Host 生产 export/跨 runtime aggregation，以及同一
+  exact build 下 `off`/`memory-v2` 的 input latency/canonical throughput 不超过 5% 回归的 ABBA
+  canary 必须由后续 stacked layer 补齐。WTerm render commit 和 next-frame opportunity 都绝不是 pixel
+  paint/composite；只有 Browser 提供可靠 paint 信号时才能在后续补这一层。Host/Browser relay RTT 都包含各自本地
   event-loop/socket queue 与 Cloud auto-response，不能冒充纯网络 RTT；`written` 也不是 child/app effect ACK。
 
 - 保留 v2 pause/barrier/pinned commit correctness invariant；
@@ -632,10 +645,21 @@ sampling counter/phase 只驻内存，不写 SQLite 或 WebSocket attachment，�
 hibernation 时丢失或重置，且不 backfill/replay。生产查询在 rollout/rollback 窗口必须同时接受 schema v1/v2；
 代码与精确 `CLOUD_TELEMETRY_MODE` 不匹配会关闭自定义出口并形成 blind window，因此必须成对发布并先验证 v2
 到达再退休 v1 query。原始 event count 不是完整流量计数，聚合必须使用 `sampleWeight`。Browser 本机事实使用
-`performance.now()`，其中 snapshot `load-total`
-包含 HTTP、完整性校验、解压和 worker transfer，`adopt call-returned` 也只表示本地调用返回；socket RTT 不等于
-纯网络 RTT，input ACK 不等于应用 effect，任何事件都不包含配对所用的 seq/epoch/generation 或输入内容。
-Browser ring 只驻内存且有硬上限，不进入 terminal snapshot、storage、console 或网络。
+`performance.now()`，其中 snapshot `load-total` 包含 HTTP、完整性校验、解压和 worker transfer，`adopt
+call-returned` 也只表示本地调用返回；socket RTT 不等于纯网络 RTT，input ACK 不等于应用
+effect。新 `browser.input.lifecycle` 补上 semantic dispatch 与 send decision 分段；新
+`browser.presentation.canonical` 只选择完成 frame decode 后 callback 进入时已经 `live`/warm `replaying` 的帧，并在
+active replica 的 canonical cursor 精确推进后串起 WTerm render
+commit 与 next-frame opportunity。Render commit 只表示同步 DOM/scroll/title/response 提交，RAF callback
+opportunity 也不证明 pixel 已 paint/composite。
+
+新 Browser 事实为 schema v2，固定 `sampleWeight=64`，在 outcome 前采样，随机 phase 失败时丢弃
+该序列；正常与 terminal outcome 使用同一权重。Tracker 对 input/canonical 合计最多保留 64 个
+pending probe，每个 2 秒 deadline；输出只包含枚举、monotonic duration、计数和 frame-size bucket。
+任何 Browser 事件都不包含配对所用的 seq/epoch/generation、cursor，也不包含 input/frame/cell/key
+内容、URL、error string 或这些值的 hash/digest。`memory-v2` ring 只驻内存且有硬上限，不进入
+terminal snapshot、storage、console 或网络；`off` 路径连 ring/tracker 和 telemetry-only 调度资源都不创建，
+但不移除 WebSocket heartbeat 的 correctness clock/timer。
 
 Cloud 查询契约固定平台 service/log-type 与 Zhongduan wrapper filter，并在运行 query 前用 keys API 验证 exact
 direct key/type。Producer volume 使用 `SUM(sampleWeight)`；raw row count 只表示 stored/query rows。Percentile 只允许
@@ -645,10 +669,10 @@ direct key/type。Producer volume 使用 `SUM(sampleWeight)`；raw row count 只
 不自动覆盖或删除。真实 staging source/key shape 与非 approximate aggregate 仍必须在部署时验证。
 
 Phase 0c 没有移除每次 semantic input 上的 writer token SHA-256 和 SQLite lease renewal，Phase A correctness/hot
-path 仍未完成。Cloud-local query contract 也不等于跨 runtime dashboard。Browser render/presentation、synthetic
-E2E/SLO、Browser/Host export/aggregation 和 exact-build telemetry off/on 的 `<=5%` performance canary 仍是开放的
-Phase 0 gate；这些观测切片也不改 wire、journal、snapshot、replay、SQLite
-schema 或 WebSocket attachment。
+path 仍未完成。Cloud-local query contract 也不等于跨 runtime dashboard。Browser presentation 分段事实已经
+补上，但 synthetic E2E/SLO、Browser/Host export/aggregation、exact-build `off`/`memory-v2` 的 `<=5%`
+performance ABBA canary，以及可靠信号可用时的真实 pixel paint 仍是开放的 Phase 0 gate。这些观测
+切片也不改 wire、journal、snapshot、replay、SQLite schema 或 WebSocket attachment。
 普通 directed recovery fanout 当前仍为 weight 1；先用本层事实量出实际体量，再在后续性能/简化 PR 对
 completed/stale/not-targeted outcome 做无偏 producer sampling，异常恢复转移继续保留，不在本 PR 猜测调参。
 

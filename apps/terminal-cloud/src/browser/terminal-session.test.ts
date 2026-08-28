@@ -18,6 +18,10 @@ import { describe, expect, it, vi } from "vitest";
 import { CapabilityManager } from "./capability";
 import { createBrowserDiagnostics, type BrowserDiagnostics } from "./diagnostics-ring";
 import { InputDispatcher } from "./input-dispatcher";
+import {
+  createBrowserPresentationDiagnostics,
+  type BrowserPresentationDiagnostics,
+} from "./presentation-diagnostics";
 import { ATTACH_START_TIMEOUT_MS, TerminalSession } from "./terminal-session";
 
 const SESSION_ID = "session_123456789";
@@ -242,6 +246,7 @@ interface DiagnosticHarnessOptions {
   liveReplica?: boolean;
   monotonicNow?: () => number;
   now?: () => number;
+  presentation?: BrowserPresentationDiagnostics;
   timers?: ManualTimers;
 }
 
@@ -280,11 +285,12 @@ async function createDiagnosticHarness(
     setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
     clearTimer: vi.fn(),
   });
+  const diagnostics = options.diagnostics ?? createBrowserDiagnostics();
   const input = new InputDispatcher({
     getObservedEventSeq: () => 0n,
     inputEpoch: "input_epoch_diagnostics",
+    ...(options.presentation === undefined ? {} : { presentation: options.presentation }),
   });
-  const diagnostics = options.diagnostics ?? createBrowserDiagnostics();
   const sockets: FakeSocket[] = [];
   const session = new TerminalSession({
     capabilities,
@@ -315,6 +321,7 @@ async function createDiagnosticHarness(
       return socket as unknown as WebSocket;
     },
     diagnostics,
+    ...(options.presentation === undefined ? {} : { presentation: options.presentation }),
     makeWebSocketUrl: (path) => path,
     ...(options.monotonicNow === undefined ? {} : { monotonicNow: options.monotonicNow }),
     ...(options.now === undefined ? {} : { now: options.now }),
@@ -1881,6 +1888,102 @@ describe("TerminalSession delivery activation", () => {
     harness.session.close();
   });
 
+  it("observes only an exact visible canonical apply before render and frame opportunity", async () => {
+    const timers = new ManualTimers();
+    const diagnostics = createBrowserDiagnostics();
+    const animationFrames: Array<(timestamp: number) => void> = [];
+    const presentation = createBrowserPresentationDiagnostics("memory-v2", {
+      telemetry: (event) => diagnostics.record(event),
+      monotonicNow: () => timers.now,
+      randomUint32: () => 0,
+      setTimer: timers.setTimer,
+      clearTimer: (handle) => timers.clearTimer(handle as ReturnType<typeof setTimeout>),
+      requestAnimationFrame: (callback) => {
+        animationFrames.push(callback);
+        return animationFrames.length;
+      },
+      cancelAnimationFrame: vi.fn(),
+    })!;
+    const harness = await createDiagnosticHarness({
+      diagnostics,
+      monotonicNow: () => timers.now,
+      presentation,
+      timers,
+    });
+    welcomeDiagnosticWriter(harness);
+    harness.control.message(
+      JSON.stringify({
+        type: "replay-start",
+        sessionEpoch: "1",
+        streamId: 7,
+        deliveryGeneration: "2",
+        baseEventSeq: "0",
+        basePtyOffset: "0",
+        commitEventSeq: "0",
+        commitPtyOffset: "0",
+      }),
+    );
+    harness.data.message(dataFrame(2n, 0n, 0n, [], DataFrameKind.ReplayCommit));
+    expect(harness.session.snapshot.phase).toBe("live");
+
+    await timers.advanceBy(10);
+    harness.data.message(dataFrame(2n, 1n, 0n, [65]));
+    presentation.renderCommitted();
+    expect(animationFrames).toHaveLength(1);
+    await timers.advanceBy(5);
+    animationFrames[0]!(timers.now);
+    await diagnostics.flush();
+
+    expect(
+      harness.session.diagnostics.events.filter(
+        (event) => event.name === "browser.presentation.canonical",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        schemaVersion: 2,
+        outcome: "next-frame-opportunity",
+        frameKind: "pty-output",
+        ingressToReplicaApplyMs: 0,
+        replicaApplyToRenderCommitMs: 0,
+        renderCommitToFrameOpportunityMs: 5,
+        totalDurationMs: 5,
+      }),
+    ]);
+    harness.session.close();
+  });
+
+  it("does not treat a detached snapshot candidate apply as visible presentation", async () => {
+    const timers = new ManualTimers();
+    const diagnostics = createBrowserDiagnostics();
+    const presentation = createBrowserPresentationDiagnostics("memory-v2", {
+      telemetry: (event) => diagnostics.record(event),
+      monotonicNow: () => timers.now,
+      randomUint32: () => 0,
+      setTimer: timers.setTimer,
+      clearTimer: (handle) => timers.clearTimer(handle as ReturnType<typeof setTimeout>),
+      requestAnimationFrame: vi.fn(() => 1),
+      cancelAnimationFrame: vi.fn(),
+    })!;
+    const harness = await createDiagnosticHarness({
+      diagnostics,
+      liveReplica: false,
+      monotonicNow: () => timers.now,
+      presentation,
+      timers,
+    });
+    harness.control.message(JSON.stringify(snapshotManifest(1n)));
+    harness.data.message(dataFrame(1n, 6n, 10n, [65]));
+    presentation.renderCommitted();
+    await diagnostics.flush();
+
+    expect(
+      harness.session.diagnostics.events.filter(
+        (event) => event.name === "browser.presentation.canonical",
+      ),
+    ).toEqual([]);
+    harness.session.close();
+  });
+
   it("pairs overlapping control and data heartbeat probes independently in FIFO order", async () => {
     const timers = new ManualTimers();
     const harness = await createDiagnosticHarness({ timers, monotonicNow: () => timers.now });
@@ -2233,100 +2336,21 @@ describe("TerminalSession delivery activation", () => {
     harness.session.close();
   });
 
-  it("pairs all semantic input kinds and ACK statuses without retaining input identity or content", async () => {
+  it("routes an accepted input ACK into one sampled local lifecycle fact", async () => {
     const timers = new ManualTimers();
-    const harness = await createDiagnosticHarness({ timers, monotonicNow: () => timers.now });
-    welcomeDiagnosticWriter(harness);
-    const before = controlFrames(harness.control).length;
-    harness.input.send(interruptKey());
-    harness.input.send({ type: "text", text: "secret-text", source: "input" });
-    harness.input.send({ type: "paste", text: "secret-paste" });
-    harness.input.send({ type: "focus", focused: true });
-    harness.input.send(RESIZE);
-    await vi.waitFor(() => expect(controlFrames(harness.control).length).toBe(before + 5));
-    harness.input.setReplicaCurrent(true);
-    harness.input.confirmAuthoritativeResize(RESIZE);
-    harness.input.send(mousePress());
-    await vi.waitFor(() => expect(controlFrames(harness.control).length).toBe(before + 6));
-    const inputs = controlFrames(harness.control).slice(before) as Array<{
-      type: string;
-      inputEpoch: string;
-      clientInputSeq: string;
-    }>;
-    const statuses = [
-      "written",
-      "duplicate",
-      "rejected",
-      "uncertain",
-      "written",
-      "duplicate",
-    ] as const;
-    await timers.advanceBy(40);
-    inputs.forEach((frame, index) => {
-      harness.control.message(
-        JSON.stringify({
-          type: "input-ack",
-          inputEpoch: frame.inputEpoch,
-          clientInputSeq: frame.clientInputSeq,
-          status: statuses[index],
-          authorityEventSeq: "0",
-        }),
-      );
-    });
-    harness.control.message(
-      JSON.stringify({
-        type: "input-ack",
-        inputEpoch: "stale_input_epoch",
-        clientInputSeq: "1",
-        status: "written",
-        authorityEventSeq: "0",
-      }),
-    );
-    harness.control.message(
-      JSON.stringify({
-        type: "input-ack",
-        inputEpoch: inputs[0]!.inputEpoch,
-        clientInputSeq: inputs[0]!.clientInputSeq,
-        status: "duplicate",
-        authorityEventSeq: "0",
-      }),
-    );
-    await harness.diagnostics.flush();
-
-    const inputEvents = harness.session.diagnostics.events.filter(
-      (event) => event.name === "browser.input.ack",
-    );
-    expect(
-      inputEvents.map((event) => ({
-        inputKind: event.inputKind,
-        status: event.status,
-        sendToAckMs: event.sendToAckMs,
-      })),
-    ).toEqual([
-      { inputKind: "key", status: "written", sendToAckMs: 40 },
-      { inputKind: "text", status: "duplicate", sendToAckMs: 40 },
-      { inputKind: "paste", status: "rejected", sendToAckMs: 40 },
-      { inputKind: "focus", status: "uncertain", sendToAckMs: 40 },
-      { inputKind: "resize", status: "written", sendToAckMs: 40 },
-      { inputKind: "mouse", status: "duplicate", sendToAckMs: 40 },
-    ]);
-    const encodedDiagnostics = JSON.stringify(inputEvents);
-    expect(encodedDiagnostics).not.toContain("secret-text");
-    expect(encodedDiagnostics).not.toContain("secret-paste");
-    expect(encodedDiagnostics).not.toContain("input_epoch_diagnostics");
-    expect(encodedDiagnostics).not.toContain("KeyC");
-    harness.session.close();
-  });
-
-  it("consumes an input probe even when the ACK diagnostic timestamp is unavailable", async () => {
-    const timers = new ManualTimers();
-    let clockAvailable = true;
+    const diagnostics = createBrowserDiagnostics();
+    const presentation = createBrowserPresentationDiagnostics("memory-v2", {
+      telemetry: (event) => diagnostics.record(event),
+      monotonicNow: () => timers.now,
+      randomUint32: () => 0,
+      setTimer: timers.setTimer,
+      clearTimer: (handle) => timers.clearTimer(handle as ReturnType<typeof setTimeout>),
+    })!;
     const harness = await createDiagnosticHarness({
+      diagnostics,
+      monotonicNow: () => timers.now,
+      presentation,
       timers,
-      monotonicNow: () => {
-        if (!clockAvailable) throw new Error("diagnostic clock unavailable");
-        return timers.now;
-      },
     });
     welcomeDiagnosticWriter(harness);
     harness.input.send(interruptKey());
@@ -2336,6 +2360,7 @@ describe("TerminalSession delivery activation", () => {
       );
     });
     const frame = controlFrames(harness.control).find((candidate) => candidate.type === "key")!;
+    await timers.advanceBy(40);
     const acknowledgement = JSON.stringify({
       type: "input-ack",
       inputEpoch: frame.inputEpoch,
@@ -2343,127 +2368,28 @@ describe("TerminalSession delivery activation", () => {
       status: "written",
       authorityEventSeq: "0",
     });
-
-    clockAvailable = false;
     harness.control.message(acknowledgement);
-    clockAvailable = true;
-    await timers.advanceBy(10);
     harness.control.message(acknowledgement);
-    await harness.diagnostics.flush();
+    await diagnostics.flush();
 
-    expect(
-      harness.session.diagnostics.events.filter((event) => event.name === "browser.input.ack"),
-    ).toEqual([]);
-    expect(harness.input.status).toMatchObject({ lastStatus: "written", pending: 0 });
-    harness.session.close();
-  });
-
-  it("preserves input probes across data-only replacement but clears them on lease transport replacement", async () => {
-    const timers = new ManualTimers();
-    let wallNow = 2_000_000_000_000;
-    const harness = await createDiagnosticHarness({
-      timers,
-      now: () => wallNow,
-      monotonicNow: () => timers.now,
-    });
-    welcomeDiagnosticWriter(harness);
-
-    harness.input.send(interruptKey());
-    await vi.waitFor(() => {
-      expect(controlFrames(harness.control).filter((frame) => frame.type === "key")).toHaveLength(
-        1,
-      );
-    });
-    const first = controlFrames(harness.control).find((frame) => frame.type === "key")!;
-    harness.control.message(
-      JSON.stringify({
-        type: "resync-required",
-        deliveryGeneration: "3",
-        reason: "data-disconnected",
-        dataTicket: "replacement_ticket_diagnostics",
-        expiresAt: wallNow + 30_000,
-      }),
+    const inputEvents = harness.session.diagnostics.events.filter(
+      (event) => event.name === "browser.input.lifecycle",
     );
-    await timers.advanceBy(25);
-    harness.control.message(
-      JSON.stringify({
-        type: "input-ack",
-        inputEpoch: first.inputEpoch,
-        clientInputSeq: first.clientInputSeq,
-        status: "written",
-        authorityEventSeq: "0",
-      }),
-    );
-
-    harness.input.send(interruptKey());
-    await vi.waitFor(() => {
-      expect(controlFrames(harness.control).filter((frame) => frame.type === "key")).toHaveLength(
-        2,
-      );
-    });
-    const second = controlFrames(harness.control)
-      .filter((frame) => frame.type === "key")
-      .at(-1)!;
-    welcomeDiagnosticWriter(
-      {
-        ...harness,
-        response: { ...harness.response, deliveryGeneration: "3" },
-      },
-      "writer_lease_diag02",
-    );
-    harness.control.message(
-      JSON.stringify({
-        type: "input-ack",
-        inputEpoch: second.inputEpoch,
-        clientInputSeq: second.clientInputSeq,
-        status: "written",
-        authorityEventSeq: "0",
-      }),
-    );
-    await harness.diagnostics.flush();
-
-    expect(
-      harness.session.diagnostics.events.filter((event) => event.name === "browser.input.ack"),
-    ).toEqual([expect.objectContaining({ status: "written", sendToAckMs: 25 })]);
-    wallNow += 1;
-    harness.session.close();
-  });
-
-  it("bounds input RTT probes to the dispatcher ACK window", async () => {
-    const timers = new ManualTimers();
-    const harness = await createDiagnosticHarness({ timers, monotonicNow: () => timers.now });
-    welcomeDiagnosticWriter(harness);
-
-    for (let index = 0; index < 1_025; index += 1) harness.input.send(interruptKey());
-    await vi.waitFor(() => {
-      expect(controlFrames(harness.control).filter((frame) => frame.type === "key")).toHaveLength(
-        1_025,
-      );
-    });
-    const keys = controlFrames(harness.control).filter((frame) => frame.type === "key");
-    await timers.advanceBy(10);
-    for (const frame of [keys[0]!, keys.at(-1)!]) {
-      harness.control.message(
-        JSON.stringify({
-          type: "input-ack",
-          inputEpoch: frame.inputEpoch,
-          clientInputSeq: frame.clientInputSeq,
-          status: "written",
-          authorityEventSeq: "0",
-        }),
-      );
-    }
-    await harness.diagnostics.flush();
-
-    expect(
-      harness.session.diagnostics.events.filter((event) => event.name === "browser.input.ack"),
-    ).toEqual([
+    expect(inputEvents).toEqual([
       expect.objectContaining({
+        schemaVersion: 2,
+        outcome: "ack-received",
         inputKind: "key",
         status: "written",
-        outstandingInputs: 1_023,
+        dispatchToSendDecisionMs: 0,
+        sendDecisionToAckMs: 40,
+        dispatchToAckMs: 40,
       }),
     ]);
+    const encodedDiagnostics = JSON.stringify(inputEvents);
+    expect(encodedDiagnostics).not.toContain("input_epoch_diagnostics");
+    expect(encodedDiagnostics).not.toContain("KeyC");
+    expect(encodedDiagnostics).not.toContain("writer_lease_diag01");
     harness.session.close();
   });
 

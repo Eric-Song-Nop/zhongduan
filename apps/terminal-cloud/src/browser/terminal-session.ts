@@ -3,10 +3,13 @@ import {
   CloudResourceIdSchema,
   ConnectionSetRequestSchema,
   ConnectionSetResponseSchema,
+  DataFrameKind,
   ServerControlFrameSchema,
+  applyMutationCursor,
   decodeDataFrame,
   type BrowserCapabilityRole,
   type ClientControlFrame,
+  type DataFrame,
   type ReplicaCursor,
   type ServerControlFrame,
 } from "@zhongduan/protocol";
@@ -20,12 +23,12 @@ import {
 import type { BrowserTelemetryEvent } from "@zhongduan/telemetry";
 
 import type { CapabilityManager } from "./capability";
-import {
-  createBrowserDiagnostics,
-  type BrowserDiagnostics,
-  type BrowserDiagnosticsSnapshot,
-} from "./diagnostics-ring";
+import type { BrowserDiagnostics, BrowserDiagnosticsSnapshot } from "./diagnostics-ring";
 import type { InputDispatcher } from "./input-dispatcher";
+import type {
+  BrowserCanonicalPresentationProbe,
+  BrowserPresentationDiagnostics,
+} from "./presentation-diagnostics";
 
 const CLIENT_ID_PREFIX = "zhongduan:browser-client:";
 const SOCKET_OPEN_TIMEOUT_MS = 10_000;
@@ -46,15 +49,7 @@ const SNAPSHOT_RETRY_MAX_MS = 30_000;
 // A legal 1 MiB input can expand to six bytes per byte when JSON escapes control characters.
 const MAX_CONTROL_FRAME_BYTES = 6 * 1024 * 1024 + 4_096;
 const MAX_CONTROL_QUEUE_BYTES = MAX_CONTROL_FRAME_BYTES;
-const MAX_INPUT_RTT_PROBES = 1_024;
 const textEncoder = new TextEncoder();
-
-type BrowserInputKind = "focus" | "key" | "mouse" | "paste" | "resize" | "text";
-
-type BrowserInputFrame = Exclude<
-  ClientControlFrame,
-  { type: "ack" | "attach" | "writer-lease-renew" }
->;
 
 interface AttachStartProbe {
   connectionEpoch: number;
@@ -63,11 +58,6 @@ interface AttachStartProbe {
   sentAt: number;
   startingReplica: "empty" | "live";
   streamId: number;
-}
-
-interface InputRttProbe {
-  inputKind: BrowserInputKind;
-  sentAt: number;
 }
 
 type SessionPhase =
@@ -104,6 +94,7 @@ export interface TerminalSessionOptions {
   fetch?: typeof fetch;
   createWebSocket?: (url: string) => WebSocket;
   diagnostics?: BrowserDiagnostics;
+  presentation?: BrowserPresentationDiagnostics;
   makeWebSocketUrl?: (path: string) => string;
   monotonicNow?: () => number;
   now?: () => number;
@@ -154,6 +145,15 @@ function frameMatchesDelivery(
   return BigInt(frame.deliveryGeneration) === generation && frame.streamId === streamId;
 }
 
+function sameReplicaCursor(left: ReplicaCursor, right: ReplicaCursor): boolean {
+  return (
+    left.sessionEpoch === right.sessionEpoch &&
+    left.deliveryGeneration === right.deliveryGeneration &&
+    left.lastEventSeq === right.lastEventSeq &&
+    left.nextPtyOffset === right.nextPtyOffset
+  );
+}
+
 export class TerminalSession {
   readonly #sessionId: string;
   readonly #engineId: string;
@@ -161,9 +161,10 @@ export class TerminalSession {
   readonly #input: InputDispatcher;
   readonly #fetch: typeof fetch;
   readonly #createWebSocket: NonNullable<TerminalSessionOptions["createWebSocket"]>;
-  readonly #diagnostics: BrowserDiagnostics;
+  readonly #diagnostics: BrowserDiagnostics | null;
   readonly #makeWebSocketUrl: NonNullable<TerminalSessionOptions["makeWebSocketUrl"]>;
   readonly #monotonicNow: () => number;
+  readonly #presentation: BrowserPresentationDiagnostics | undefined;
   readonly #wallNow: () => number;
   readonly #random: () => number;
   readonly #setTimer: NonNullable<TerminalSessionOptions["setTimer"]>;
@@ -203,7 +204,6 @@ export class TerminalSession {
   #dataHeartbeatPings: Array<number | null> = [];
   #dataHeartbeatRttEnabled = true;
   #attachStartProbe: AttachStartProbe | null = null;
-  readonly #inputRttProbes = new Map<string, InputRttProbe>();
   #automaticReconnectBlocked = false;
   #closed = false;
 
@@ -214,11 +214,12 @@ export class TerminalSession {
     this.#input = options.input;
     this.#fetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.#createWebSocket = options.createWebSocket ?? ((url) => new WebSocket(url));
-    this.#diagnostics = options.diagnostics ?? createBrowserDiagnostics();
+    this.#diagnostics = options.diagnostics ?? null;
     this.#makeWebSocketUrl = options.makeWebSocketUrl ?? defaultWebSocketUrl;
     this.#wallNow = options.now ?? Date.now;
     this.#monotonicNow =
       options.monotonicNow ?? globalThis.performance.now.bind(globalThis.performance);
+    this.#presentation = options.presentation;
     this.#random = options.random ?? Math.random;
     this.#setTimer =
       options.setTimer ?? ((callback, delayMs) => globalThis.setTimeout(callback, delayMs));
@@ -243,8 +244,12 @@ export class TerminalSession {
       onAcknowledge: (cursor) => this.#acknowledge(cursor),
       onReplicaProgress: () => this.#syncDeliveryState(),
       onResync: (reason) => this.#handleCoordinatorResync(reason),
-      monotonicNow: this.#monotonicNow,
-      telemetry: (event: BrowserTelemetryEvent) => this.#recordTelemetry(event),
+      ...(this.#diagnostics === null
+        ? {}
+        : {
+            monotonicNow: this.#monotonicNow,
+            telemetry: (event: BrowserTelemetryEvent) => this.#recordTelemetry(event),
+          }),
     });
   }
 
@@ -253,7 +258,13 @@ export class TerminalSession {
   }
 
   get diagnostics(): BrowserDiagnosticsSnapshot {
-    return this.#diagnostics.snapshot();
+    return (
+      this.#diagnostics?.snapshot() ?? {
+        events: [],
+        droppedEvents: 0,
+        pendingEvents: 0,
+      }
+    );
   }
 
   subscribe(listener: () => void): () => void {
@@ -280,6 +291,7 @@ export class TerminalSession {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#presentation?.close();
     this.#needsReconnect = false;
     this.#cancelReconnectTimer();
     this.#cancelSnapshotRetry(true);
@@ -327,7 +339,6 @@ export class TerminalSession {
   async #connectFull(signal: AbortSignal): Promise<void> {
     const connectionEpoch = ++this.#connectionEpoch;
     ++this.#dataEpoch;
-    this.#clearInputRttProbes();
     this.#input.detachTransport();
     this.#writerLease = null;
     this.#stopHeartbeat();
@@ -339,6 +350,7 @@ export class TerminalSession {
     const generation = BigInt(response.deliveryGeneration);
 
     // Activation is one synchronous fence before any replacement callback can run.
+    this.#presentation?.endPresentationGeneration("generation-ended");
     this.coordinator.fenceDeliveryGeneration(generation);
     ++this.#dataEpoch;
     this.#generation = generation;
@@ -428,7 +440,10 @@ export class TerminalSession {
     );
     socket.addEventListener("message", (event) => {
       if (!this.#isCurrentConnection(connectionEpoch) || socket !== this.#control) return;
-      this.#handleControlMessage(event.data, this.#readMonotonicNow());
+      this.#handleControlMessage(
+        event.data,
+        event.data === "pong" || this.#diagnostics !== null ? this.#readMonotonicNow() : undefined,
+      );
     });
     socket.addEventListener("close", () => {
       if (this.#intentionalSockets.has(socket) || !this.#isCurrentConnection(connectionEpoch))
@@ -475,7 +490,17 @@ export class TerminalSession {
           this.#protocolFailure();
           return;
         }
-        this.coordinator.acceptData(event.data);
+        const presentation = this.#beginCanonicalPresentation(frame, event.data.byteLength);
+        try {
+          const before = this.coordinator.activeCursor;
+          this.coordinator.acceptData(event.data);
+          this.#finishCanonicalPresentation(presentation, frame, before);
+        } catch (error) {
+          if (presentation !== undefined) {
+            this.#presentation?.replicaNotObserved(presentation, "apply-failed");
+          }
+          throw error;
+        }
         this.#syncDeliveryState();
       } catch {
         this.#protocolFailure();
@@ -501,6 +526,56 @@ export class TerminalSession {
       }, DATA_REPLACEMENT_GRACE_MS);
     });
     return this.#awaitOpen(socket, signal);
+  }
+
+  #beginCanonicalPresentation(
+    frame: DataFrame,
+    encodedBytes: number,
+  ): BrowserCanonicalPresentationProbe | undefined {
+    const state = this.coordinator.state;
+    if (
+      this.#presentation === undefined ||
+      (state !== "live" && state !== "replaying") ||
+      (frame.kind !== DataFrameKind.PtyOutput && frame.kind !== DataFrameKind.ResizeApplied)
+    ) {
+      return undefined;
+    }
+    return this.#presentation.beginCanonicalIngress(
+      frame.kind === DataFrameKind.PtyOutput ? "pty-output" : "resize-applied",
+      encodedBytes,
+    );
+  }
+
+  #finishCanonicalPresentation(
+    probe: BrowserCanonicalPresentationProbe | undefined,
+    frame: DataFrame,
+    before: ReplicaCursor | null,
+  ): void {
+    if (probe === undefined || this.#presentation === undefined) return;
+    if (before === null) {
+      this.#presentation.replicaNotObserved(probe, "not-live");
+      return;
+    }
+    let expected: ReplicaCursor;
+    try {
+      expected = applyMutationCursor(before, frame).cursor;
+    } catch {
+      this.#presentation.replicaNotObserved(probe, "apply-failed");
+      return;
+    }
+    const after = this.coordinator.activeCursor;
+    if (after !== null && sameReplicaCursor(after, expected)) {
+      this.#presentation.replicaApplied(probe);
+      return;
+    }
+    this.#presentation.replicaNotObserved(
+      probe,
+      after !== null && after.deliveryGeneration !== frame.deliveryGeneration
+        ? "generation-ended"
+        : this.coordinator.state === "live" || this.coordinator.state === "replaying"
+          ? "apply-failed"
+          : "not-live",
+    );
   }
 
   #awaitOpen(socket: WebSocket, signal?: AbortSignal): Promise<WebSocket> {
@@ -567,7 +642,7 @@ export class TerminalSession {
             nextPtyOffset: cursor.nextPtyOffset.toString(),
           };
     if (this.#sendControl(ClientControlFrameSchema.parse(frame), true)) {
-      const sentAt = this.#readMonotonicNow();
+      const sentAt = this.#diagnostics === null ? undefined : this.#readMonotonicNow();
       this.#startAttachStartWatchdog(generation);
       this.#attachStartProbe =
         sentAt === undefined
@@ -607,7 +682,6 @@ export class TerminalSession {
         return;
       case "input-ack":
         this.#input.acceptAcknowledgement(frame);
-        this.#recordInputRtt(frame, ingressAt);
         return;
       case "writer-lease-status":
         this.#acceptWriterLeaseStatus(frame);
@@ -704,6 +778,7 @@ export class TerminalSession {
       this.#cancelAttachStartWatchdog("generation-replaced");
     }
     this.#input.setReplicaCurrent(false);
+    this.#presentation?.endPresentationGeneration("generation-ended");
     this.coordinator.fenceDeliveryGeneration(generation);
     this.#syncDeliveryState();
     if (frame.dataTicket === undefined) {
@@ -724,6 +799,7 @@ export class TerminalSession {
     }
     this.#abortDataReplacement();
     // Fence first, then invalidate the old transport callback before opening replacement data.
+    this.#presentation?.endPresentationGeneration("generation-ended");
     this.coordinator.fenceDeliveryGeneration(generation);
     const dataEpoch = ++this.#dataEpoch;
     const abort = new AbortController();
@@ -869,7 +945,6 @@ export class TerminalSession {
     this.#needsReconnect = true;
     if (this.#snapshotRetryTimer !== null) return;
     if (this.#reconnectTimer !== null || this.#connectPromise !== null) return;
-    this.#clearInputRttProbes();
     this.#input.detachTransport();
     const exponent = Math.min(6, Math.max(0, this.#snapshot.attempt - 1));
     const base = Math.min(MAX_RECONNECT_DELAY_MS, 250 * 2 ** exponent);
@@ -915,9 +990,9 @@ export class TerminalSession {
       }
       try {
         control.send("ping");
-        const controlSentAt = this.#readMonotonicNow();
+        const controlSentAt = this.#diagnostics === null ? undefined : this.#readMonotonicNow();
         data.send("ping");
-        const dataSentAt = this.#readMonotonicNow();
+        const dataSentAt = this.#diagnostics === null ? undefined : this.#readMonotonicNow();
         if (
           control.bufferedAmount > MAX_CONTROL_QUEUE_BYTES ||
           data.bufferedAmount > MAX_CONTROL_QUEUE_BYTES
@@ -948,9 +1023,9 @@ export class TerminalSession {
       ) {
         return;
       }
-      const observedAt = this.#readMonotonicNow();
       const probe = this.#attachStartProbe;
       this.#attachStartProbe = null;
+      const observedAt = probe === null ? undefined : this.#readMonotonicNow();
       if (
         observedAt !== undefined &&
         probe !== null &&
@@ -1019,10 +1094,8 @@ export class TerminalSession {
   }
 
   #attachInputTransport(): void {
-    this.#clearInputRttProbes();
     this.#input.attachTransport((inputFrame) => {
       const sent = this.#sendControl(inputFrame);
-      if (sent) this.#rememberInputRttProbe(inputFrame);
       if (!sent) this.#failFullConnection();
       return sent;
     }, this.#writerLease ?? undefined);
@@ -1089,6 +1162,7 @@ export class TerminalSession {
   }
 
   #rememberHeartbeat(channel: "control" | "data", sentAt: number | undefined): void {
+    if (this.#diagnostics === null) return;
     const pings = channel === "control" ? this.#controlHeartbeatPings : this.#dataHeartbeatPings;
     const enabled =
       channel === "control" ? this.#controlHeartbeatRttEnabled : this.#dataHeartbeatRttEnabled;
@@ -1103,6 +1177,7 @@ export class TerminalSession {
   }
 
   #recordHeartbeatRtt(channel: "control" | "data", receivedAt: number | undefined): void {
+    if (this.#diagnostics === null) return;
     const pings = channel === "control" ? this.#controlHeartbeatPings : this.#dataHeartbeatPings;
     const enabled =
       channel === "control" ? this.#controlHeartbeatRttEnabled : this.#dataHeartbeatRttEnabled;
@@ -1127,6 +1202,7 @@ export class TerminalSession {
     lastPongAt: number,
     outstandingPings: number,
   ): void {
+    if (this.#diagnostics === null) return;
     this.#recordTelemetry({
       schemaVersion: 1,
       monotonicAtMs: observedAt,
@@ -1168,48 +1244,6 @@ export class TerminalSession {
     });
   }
 
-  #rememberInputRttProbe(frame: BrowserInputFrame): void {
-    const sentAt = this.#readMonotonicNow();
-    if (sentAt === undefined) return;
-    const key = this.#inputRttProbeKey(frame.inputEpoch, frame.clientInputSeq);
-    this.#inputRttProbes.set(key, {
-      inputKind: frame.type === "resize-request" ? "resize" : frame.type,
-      sentAt,
-    });
-    if (this.#inputRttProbes.size <= MAX_INPUT_RTT_PROBES) return;
-    const oldest = this.#inputRttProbes.keys().next().value as string | undefined;
-    if (oldest !== undefined) this.#inputRttProbes.delete(oldest);
-  }
-
-  #recordInputRtt(
-    frame: Extract<ServerControlFrame, { type: "input-ack" }>,
-    receivedAt: number | undefined,
-  ): void {
-    const key = this.#inputRttProbeKey(frame.inputEpoch, frame.clientInputSeq);
-    const probe = this.#inputRttProbes.get(key);
-    if (probe === undefined) return;
-    this.#inputRttProbes.delete(key);
-    if (receivedAt === undefined) return;
-    this.#recordTelemetry({
-      schemaVersion: 1,
-      monotonicAtMs: receivedAt,
-      clockKind: "browser-performance",
-      name: "browser.input.ack",
-      inputKind: probe.inputKind,
-      status: frame.status,
-      sendToAckMs: Math.max(0, receivedAt - probe.sentAt),
-      outstandingInputs: this.#inputRttProbes.size,
-    });
-  }
-
-  #inputRttProbeKey(inputEpoch: string, clientInputSeq: string): string {
-    return `${inputEpoch}\u0000${clientInputSeq}`;
-  }
-
-  #clearInputRttProbes(): void {
-    this.#inputRttProbes.clear();
-  }
-
   #readMonotonicNow(): number | undefined {
     try {
       const value = this.#monotonicNow();
@@ -1220,6 +1254,7 @@ export class TerminalSession {
   }
 
   #recordTelemetry(event: BrowserTelemetryEvent): void {
+    if (this.#diagnostics === null) return;
     try {
       this.#diagnostics.record(event);
     } catch {
@@ -1247,6 +1282,7 @@ export class TerminalSession {
   }
 
   #invalidateFullConnection(): void {
+    this.#presentation?.endPresentationGeneration("generation-ended");
     ++this.#connectionEpoch;
     ++this.#dataEpoch;
     this.#connectAbort?.abort(new DOMException("connection replaced", "AbortError"));
@@ -1256,7 +1292,6 @@ export class TerminalSession {
     this.#cancelAttachStartWatchdog(this.#closed ? "session-closed" : "connection-invalidated");
     this.#stopHeartbeat();
     this.#stopWriterLeaseRenewal();
-    this.#clearInputRttProbes();
     this.#input.detachTransport();
     this.#closeSocket(this.#control);
     this.#closeSocket(this.#data);

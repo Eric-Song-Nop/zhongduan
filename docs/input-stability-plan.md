@@ -1,6 +1,6 @@
 # 输入稳定性与高 RTT 交互实施计划
 
-> 状态：方向已确认，等待实施
+> 状态：方向已确认，分阶段实施中
 >
 > 决策日期：2026-08-28
 >
@@ -179,8 +179,8 @@ uncertainty。
 - Host canonical pause/queue：[`canonical-publisher.ts`](../apps/host-daemon/src/cloud/canonical-publisher.ts#L80-L165)、
   [`delivery-scheduler.ts`](../apps/host-daemon/src/cloud/delivery-scheduler.ts#L315-L639)
 - 固定 WTerm fork 的
-  [Ghostty input/mode ABI](https://github.com/Eric-Song-Nop/wterm/blob/4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6/packages/%40wterm/ghostty/zig/src/wasm_api.zig)、
-  [DOM renderer](https://github.com/Eric-Song-Nop/wterm/blob/4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6/packages/%40wterm/dom/src/renderer.ts)
+  [Ghostty input/mode ABI](https://github.com/Eric-Song-Nop/wterm/blob/bd7e930f41165f91b2b4863bc4d1b91db7b1c8a1/packages/%40wterm/ghostty/zig/src/wasm_api.zig)、
+  [DOM renderer](https://github.com/Eric-Song-Nop/wterm/blob/bd7e930f41165f91b2b4863bc4d1b91db7b1c8a1/packages/%40wterm/dom/src/renderer.ts)
 
 ## 外部方案给我们的启发
 
@@ -747,6 +747,31 @@ Workers Logs wrapper 与 v1/v2 payload，固定版本化 producer `sampleWeight`
 不上传 Browser/Host ring/stderr，不建立跨 runtime event join，也不把 Cloud query smoke 当成 telemetry off/on
 performance canary。
 
+`observability/browser-presentation-facts` 继续只建立 Browser 本机事实，不实施 prediction 或修改 input
+correctness。它用 URL 参数 `browserDiagnostics=off|memory-v2` 选择精确的运行时模式；缺失、空值
+或精确 `memory-v2` 开启本地有界 ring，未知值 fail closed 到 `off`。这个诊断模式与上文
+`Raw`/`Mirrored`/`Owned` 输入语义正交，关闭它不改变 terminal 行为。
+
+`memory-v2` 补上两条严格、content-free 的 lifecycle：
+
+- `browser.input.lifecycle` 从 semantic dispatch 入口量到 send decision，并在有 matching identity 时继续量到
+  ACK；未发出、不确定、coalesce、capacity/deadline、input epoch/transport/session 终止都只记录
+  封闭的 terminal reason/stage。它不是 keydown 起点，ACK 也不是 child read、app effect 或回显证明。
+- `browser.presentation.canonical` 只选择完成 frame decode 后、data callback 进入时已经 `live`/warm
+  `replaying` 的 canonical `PTY_OUTPUT`/`RESIZE_APPLIED`，量到 visible active replica 的精确 cursor 推进、WTerm 同步
+  DOM render commit，再量到
+  下一次 animation-frame callback opportunity。`restoring` 中的 detached candidate 与 buffered-only work 不是
+  visible apply。Render commit 与 next-frame opportunity 都绝不是 pixel paint/composite 证明。
+
+两条序列都在 outcome 产生前分别选取随机起始相位，做固定、无偏的系统采样，
+`sampleWeight=64`；正常与 terminal outcome 使用同一权重，安全随机相位失败时丢弃对应序列而
+不固定选首样本。Tracker 合计 hard-cap 64 个 pending probe，deadline 固定为 2 秒；事件只允许
+封闭枚举、monotonic duration、计数和大小 bucket，不允许 input/frame/cell 内容、key、原始标识符、
+cursor、URL、error string 或 hash/digest。`off` 不创建 tracker/ring、telemetry-only clock、maps、
+visibility listener、WTerm hook、presentation timer 或 RAF；WebSocket heartbeat correctness 自身的
+monotonic clock/deadline timer 仍保留。两种模式都不改 wire、journal/snapshot/replay、SQLite/attachment，也没有新增
+Browser export。
+
 - Browser 完整 validate/admit 后才分配 seq；
 - Host 使用 strict `nextExpectedSeq`；确定性 reject 消费 seq，`uncertain` 终止 epoch；
 - 建立单一 per-writer sequencer，明确 urgent cancellation 与 resize ordering；
@@ -852,11 +877,15 @@ WebSocket attachment；capacity、collector/runtime failure、版本切换、evi
 没有 backfill/replay。生产 query 在 rollout/rollback 期间必须同时接受 schema v1/v2；代码和精确 mode 分步发布或
 回滚不匹配会形成不可恢复的 telemetry blind window，因此必须成对发布并验证 v2 到达后再退休 v1 query。
 
-Browser 本机切片已经补齐 input send-return→ACK、socket RTT 与 snapshot load/restore/buffer apply/adopt，但还没有
-semantic-dispatch、canonical presentation/render commit 或真实 paint 信号。Cloud Phase 0c 与 Cloud query contract
-只补事实和 Cloud-local inspection；Browser/Host 生产 export 与跨 runtime aggregation、synthetic E2E/SLO，以及同一
-exact build 下插桩 off/on 的 input latency/canonical throughput `<=5%` 回归 gate 仍开放。下一帧机会也只能称
-presentation opportunity，不能冒充像素已经 composited。
+Browser 本机切片保留旧 `browser.input.ack` schema 供历史数据读取，但当前 producer 已由
+`browser.input.lifecycle` 取代；现有低频事实继续覆盖 socket RTT 和 snapshot load/restore/buffer apply/adopt。
+新切片补齐 semantic-dispatch→send decision→ACK 与 canonical post-decode data callback→visible replica
+apply→WTerm render commit→next-frame opportunity，并固定 `sampleWeight=64`、
+pending cap 64 和 2 秒 deadline，只进本地有界 ring。Render commit/next-frame opportunity 不能冒充
+pixel paint/composite；真实 paint 只能在 Browser 提供可靠信号时后续补充。Cloud Phase 0c 与 Cloud query
+contract 仍只补事实和 Cloud-local inspection。Phase 0 gate 没有关闭：Browser/Host 生产 export 与跨
+runtime aggregation、synthetic E2E/SLO、同一 exact build 下 `off`/`memory-v2` 的 input latency/canonical
+throughput `<=5%` ABBA 回归 gate，以及上述可靠真实 paint 信号仍开放。
 
 ### 初始发布门槛
 
@@ -963,8 +992,8 @@ ordered-input 或 sideband wire 语义的 kill switch 只能 fence/结束当前 
 - Cloud session relay：[`apps/terminal-cloud/src/worker/terminal-session-do.ts`](../apps/terminal-cloud/src/worker/terminal-session-do.ts)
 - Host session authority：[`apps/host-daemon/src/session.ts`](../apps/host-daemon/src/session.ts)
 - 固定 WTerm fork：
-  [Ghostty adapter](https://github.com/Eric-Song-Nop/wterm/blob/4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6/packages/%40wterm/ghostty/zig/src/wasm_api.zig)、
-  [DOM renderer](https://github.com/Eric-Song-Nop/wterm/blob/4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6/packages/%40wterm/dom/src/renderer.ts)
+  [Ghostty adapter](https://github.com/Eric-Song-Nop/wterm/blob/bd7e930f41165f91b2b4863bc4d1b91db7b1c8a1/packages/%40wterm/ghostty/zig/src/wasm_api.zig)、
+  [DOM renderer](https://github.com/Eric-Song-Nop/wterm/blob/bd7e930f41165f91b2b4863bc4d1b91db7b1c8a1/packages/%40wterm/dom/src/renderer.ts)
 - 固定 Ghostty fork 的 [semantic prompt](https://github.com/Eric-Song-Nop/ghostty/blob/fe317f850c3ab212f6638122c459b9b48b99a016/src/terminal/Terminal.zig#L2078-L2204)、
   [cell semantic API](https://github.com/Eric-Song-Nop/ghostty/blob/fe317f850c3ab212f6638122c459b9b48b99a016/src/terminal/c/cell.zig#L40-L95) 和
   [key encoding](https://github.com/Eric-Song-Nop/ghostty/blob/fe317f850c3ab212f6638122c459b9b48b99a016/src/input/key_encode.zig#L45-L75)

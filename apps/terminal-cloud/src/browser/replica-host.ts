@@ -17,6 +17,7 @@ export interface WTermReplicaHostOptions {
   wasmSource?: GhosttyWasmSource;
   onAdopt?: (cursor: ReplicaCursor) => void;
   onAuthoritativeResize?: (dimensions: ResizePayload) => void;
+  onRenderCommit?: () => void;
   onTitle?: (title: string) => void;
 }
 
@@ -132,6 +133,7 @@ export class WTermReplicaHost implements ReplicaHost {
       core,
       cursorBlink: true,
       inputSink: options.inputSink,
+      ...(options.onRenderCommit === undefined ? {} : { onRenderCommit: options.onRenderCommit }),
       ...(options.onTitle === undefined ? {} : { onTitle: options.onTitle }),
     });
     try {

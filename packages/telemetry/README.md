@@ -106,27 +106,70 @@ snapshot identifiers/cursors; URLs; error/exception strings; or hashes/digests o
 values. Sizes are bucketed. The Cloudflare log envelope can still add platform identifiers and must be
 handled as sensitive metadata.
 
-The Browser fact slice uses `clockKind=browser-performance` and records only same-page monotonic
-durations for control/data relay probes, semantic-input acknowledgement, attach-start terminal outcomes, snapshot load,
-passive restore, buffered-tail application, synchronous replica `adopt()` return, and the terminal recovery
-outcome. An adopt event is not proof that pixels were painted, and an input acknowledgement is not an
-application-effect acknowledgement. Input sequence, delivery generation, session/client identifiers,
-snapshot identifiers, credentials, URLs, terminal content, and error strings are not event fields.
+Browser facts use `clockKind=browser-performance` and only compare monotonic timestamps from the same
+page. Schema v1 remains accepted for read compatibility. Its historical `browser.input.ack` producer
+has been superseded by the schema-v2 lifecycle below; the current low-frequency v1 producers still
+record control/data relay probes, attach terminal outcomes, snapshot load, passive restore,
+buffered-tail application, synchronous replica `adopt()` return, and the terminal recovery outcome.
+An adopt return is not proof that pixels were painted, and an input acknowledgement is not a child-read
+or application-effect acknowledgement.
 
-`createBrowserDiagnostics()` is an in-memory-only sink. Admission is deferred behind a bounded queue;
-strict validation happens during its drain into a fixed-size circular ring. The pending queue and ring
-are each hard-bounded at 256 events (and may be configured smaller). A full pending queue, invalid event, scheduler failure, or overwritten ring
-entry increments the drop count without affecting terminal behavior. Snapshots are chronological copies;
-the sink never writes console, storage, or network output. Production aggregation/query and any
-operator-controlled export remain a separate layer.
+The schema-v2 Browser lifecycle/presentation slice adds two sampled, content-free lifecycles without
+changing terminal behavior:
+
+- `browser.input.lifecycle` starts at semantic dispatch, observes the local send decision, and, when
+  an identity was successfully assigned and sent, ends at the matching ACK. Not-writable, policy,
+  validation, send, coalescing, capacity/deadline, input-epoch, transport, and session terminal paths
+  expose only bounded reason/stage enums. This start is not raw DOM `keydown`.
+- `browser.presentation.canonical` selects canonical `PTY_OUTPUT` or `RESIZE_APPLIED` after frame
+  decode when that data callback entered with the session already `live` or warm `replaying`, requires
+  the visible active replica cursor to advance exactly, observes the synchronous WTerm DOM render
+  commit, and ends at the next animation-frame callback opportunity. Detached restore candidates and
+  buffered-only work while `restoring` are excluded.
+
+A WTerm render commit only means that synchronous DOM/scroll/title/response work committed. A
+next-frame opportunity only means that the browser invoked a subsequent animation-frame callback.
+Neither is, or may be labelled as, pixel paint/composite evidence. Real paint remains a later fact only
+if the Browser exposes a reliable signal.
+
+Input and canonical series each select a randomized starting phase and sample systematically before
+the outcome is known. Both success and terminal outcomes have the literal `sampleWeight=64`; if the
+secure random phase cannot be obtained, the corresponding series is dropped instead of selecting a
+biased first sample. Their tracker holds at most 64 pending probes in total and gives every probe a
+two-second deadline. It schedules at most the necessary earliest-deadline timer and coalesced
+animation-frame opportunity. Capacity admission produces one terminal fact; deadline, page-hidden,
+generation, and close paths terminate each owned probe exactly once. None can affect input, replica,
+recovery, or rendering decisions.
+
+Browser diagnostic mode is selected with the exact query value `browserDiagnostics=off|memory-v2`.
+Missing, empty, or exact `memory-v2` selects the bounded local-memory sink; unknown values fail closed
+to `off`. This diagnostic mode is independent of terminal input modes such as Raw or Mirrored. The
+`off` path creates no tracker, ring, telemetry-only clock work, map, page-visibility listener, WTerm
+observer, presentation timer, or animation-frame callback. The monotonic clock and deadline timer used
+for WebSocket heartbeat correctness remain active.
+
+In `memory-v2`, `createBrowserDiagnostics()` remains an in-memory-only sink. Admission is deferred
+behind a bounded queue; strict validation happens during its drain into a fixed-size circular ring.
+The pending queue and ring are each hard-bounded at 256 events (and may be configured smaller). A full
+pending queue, invalid event, scheduler failure, or overwritten ring entry increments the drop count
+without affecting terminal behavior. Snapshots are chronological copies; the sink never writes
+console, storage, terminal wire, journal/snapshot/replay, SQLite, WebSocket attachment, or network
+output. Production aggregation/query and any operator-controlled export remain a separate layer.
+
+The two schema-v2 strict events contain only bounded enums, same-page monotonic durations, counts, and
+bucketed frame sizes. Input/frame/cell/key content; session/client/connection/stream/generation/epoch/
+sequence or snapshot identifiers and cursors; credentials; URLs; error strings; and hashes/digests of
+these values are not fields.
 
 The Host stderr adapter stops writing while the stream reports backpressure and drops diagnostics
 until `drain`, so telemetry cannot grow an unbounded application-owned output queue. Phase 0c is only a
 Cloud fact layer: per-input SHA-256 plus SQLite lease renewal and the larger Phase A correctness/hot-path
 work remain unchanged. The Cloud query-contract layer makes these Cloud-local facts inspectable without
-claiming a cross-runtime dashboard: Browser/Host export, Browser render/presentation and synthetic
-end-to-end facts, and the exact-build instrumentation-off/on canary proving at most 5% regression remain
-open Phase 0 gates. Ordinary directed recovery fanout currently remains weight 1 as a deliberate
+claiming a cross-runtime dashboard. Browser presentation segmentation is now locally observable, but
+Phase 0 is not closed: synthetic end-to-end/SLO facts, Browser/Host production export and cross-runtime
+aggregation, an exact-build `off`/`memory-v2` ABBA canary proving no more than 5% input-latency or
+canonical-throughput regression, and real pixel paint if a reliable signal exists remain open gates.
+Ordinary directed recovery fanout currently remains weight 1 as a deliberate
 P1 follow-up: measure its volume first, then give successful/stale/not-targeted outcomes an unbiased
 producer sample without hiding bounded recovery failures. URL query-string redaction is also tracked
 as platform-envelope hardening in addition to keeping automatic invocation logs and traces disabled.

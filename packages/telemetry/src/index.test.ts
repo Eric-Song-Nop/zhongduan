@@ -1098,3 +1098,117 @@ describe("terminal telemetry", () => {
     expect(target).toHaveBeenCalledOnce();
   });
 });
+
+describe("sampled Browser input and presentation telemetry", () => {
+  const inputAck = {
+    schemaVersion: 2 as const,
+    monotonicAtMs: 24,
+    clockKind: "browser-performance" as const,
+    sampleWeight: 64 as const,
+    name: "browser.input.lifecycle" as const,
+    outcome: "ack-received" as const,
+    inputKind: "key" as const,
+    status: "written" as const,
+    dispatchToSendDecisionMs: 2,
+    sendDecisionToAckMs: 9,
+    dispatchToAckMs: 11,
+    outstandingInputs: 3,
+  };
+  const inputTerminal = {
+    schemaVersion: 2 as const,
+    monotonicAtMs: 25,
+    clockKind: "browser-performance" as const,
+    sampleWeight: 64 as const,
+    name: "browser.input.lifecycle" as const,
+    outcome: "terminal" as const,
+    inputKind: "paste" as const,
+    reason: "transport-replaced" as const,
+    stage: "awaiting-ack" as const,
+    observedDurationMs: 10,
+  };
+  const canonicalReady = {
+    schemaVersion: 2 as const,
+    monotonicAtMs: 40,
+    clockKind: "browser-performance" as const,
+    sampleWeight: 64 as const,
+    name: "browser.presentation.canonical" as const,
+    outcome: "next-frame-opportunity" as const,
+    frameKind: "pty-output" as const,
+    frameBytesBucket: "65-1024" as const,
+    ingressToReplicaApplyMs: 2,
+    replicaApplyToRenderCommitMs: 3,
+    renderCommitToFrameOpportunityMs: 4,
+    totalDurationMs: 9,
+  };
+  const canonicalTerminal = {
+    schemaVersion: 2 as const,
+    monotonicAtMs: 41,
+    clockKind: "browser-performance" as const,
+    sampleWeight: 64 as const,
+    name: "browser.presentation.canonical" as const,
+    outcome: "not-observed" as const,
+    frameKind: "resize-applied" as const,
+    frameBytesBucket: "9-64" as const,
+    reason: "page-hidden" as const,
+    stage: "applied" as const,
+    observedDurationMs: 7,
+  };
+
+  it.each([inputAck, inputTerminal, canonicalReady, canonicalTerminal])(
+    "accepts the strict sampled Browser event $name/$outcome",
+    (event) => {
+      expect(BrowserTelemetryEventSchema.parse(event)).toEqual(event);
+      expect(TerminalTelemetryEventSchema.parse(event)).toEqual(event);
+    },
+  );
+
+  it.each([inputAck, inputTerminal, canonicalReady, canonicalTerminal])(
+    "requires literal sampleWeight 64 for $name/$outcome",
+    (event) => {
+      expect(() => BrowserTelemetryEventSchema.parse({ ...event, sampleWeight: 1 })).toThrow();
+      expect(() => BrowserTelemetryEventSchema.parse({ ...event, schemaVersion: 1 })).toThrow();
+    },
+  );
+
+  it("bounds sampled outstanding input cardinality", () => {
+    expect(BrowserTelemetryEventSchema.parse({ ...inputAck, outstandingInputs: 64 })).toEqual({
+      ...inputAck,
+      outstandingInputs: 64,
+    });
+    expect(() =>
+      BrowserTelemetryEventSchema.parse({ ...inputAck, outstandingInputs: 65 }),
+    ).toThrow();
+  });
+
+  it.each([
+    "sessionId",
+    "clientId",
+    "connectionId",
+    "inputEpoch",
+    "clientInputSeq",
+    "deliveryGeneration",
+    "streamId",
+    "key",
+    "text",
+    "paste",
+    "command",
+    "cells",
+    "content",
+    "payload",
+    "capability",
+    "url",
+    "error",
+    "hash",
+    "paintMs",
+    "paintAt",
+  ])("rejects identity/content/url/error/hash/paint field %s", (field) => {
+    for (const event of [inputAck, inputTerminal, canonicalReady, canonicalTerminal]) {
+      expect(() =>
+        BrowserTelemetryEventSchema.parse({
+          ...event,
+          [field]: "must-not-leave-the-browser",
+        }),
+      ).toThrow();
+    }
+  });
+});

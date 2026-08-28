@@ -4,8 +4,13 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { InputDispatcherStatus } from "./input-dispatcher";
 import type { TerminalSessionSnapshot } from "./terminal-session";
 import { CapabilityManager, type BrowserCapabilityBootstrap } from "./capability";
+import { createBrowserDiagnostics } from "./diagnostics-ring";
 import { installTerminalDemo } from "./terminal-demo";
 import { InputDispatcher } from "./input-dispatcher";
+import {
+  createBrowserPresentationDiagnostics,
+  type BrowserDiagnosticsMode,
+} from "./presentation-diagnostics";
 import { WTermReplicaHost } from "./replica-host";
 import { TerminalSession } from "./terminal-session";
 import { WorkerSnapshotTransport } from "./worker-snapshot-transport";
@@ -40,6 +45,7 @@ interface AppRuntime {
 export interface TerminalAppProps {
   capability?: BrowserCapabilityBootstrap;
   capabilityError: boolean;
+  diagnosticsMode: BrowserDiagnosticsMode;
   onReload?: () => void;
 }
 
@@ -81,7 +87,12 @@ function useInputSnapshot(input: InputDispatcher | undefined): InputDispatcherSt
   );
 }
 
-export function TerminalApp({ capability, capabilityError, onReload }: TerminalAppProps) {
+export function TerminalApp({
+  capability,
+  capabilityError,
+  diagnosticsMode,
+  onReload,
+}: TerminalAppProps) {
   const terminalRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef<TerminalSession | null>(null);
   const [runtime, setRuntime] = useState<AppRuntime>();
@@ -98,11 +109,34 @@ export function TerminalApp({ capability, capabilityError, onReload }: TerminalA
     if (element === null) return;
     let cancelled = false;
     let ownedRuntime: AppRuntime | null = null;
+    let removeVisibilityListener = () => undefined;
+
+    let diagnostics: ReturnType<typeof createBrowserDiagnostics> | undefined;
+    let presentation: ReturnType<typeof createBrowserPresentationDiagnostics>;
+    let monotonicNow: (() => number) | undefined;
+    if (diagnosticsMode === "memory-v2") {
+      diagnostics = createBrowserDiagnostics();
+      const activeDiagnostics = diagnostics;
+      monotonicNow = globalThis.performance.now.bind(globalThis.performance);
+      presentation = createBrowserPresentationDiagnostics("memory-v2", {
+        telemetry: (event) => activeDiagnostics.record(event),
+        monotonicNow,
+      });
+      const handleVisibilityChange = () => {
+        presentation?.setPageVisible(document.visibilityState !== "hidden");
+      };
+      handleVisibilityChange();
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+      removeVisibilityListener = () => {
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+      };
+    }
 
     void (async () => {
       const dispatcher = new InputDispatcher({
         getObservedEventSeq: () =>
           sessionRef.current?.coordinator.activeCursor?.lastEventSeq ?? null,
+        ...(presentation === undefined ? {} : { presentation }),
       });
       let host: WTermReplicaHost;
       try {
@@ -113,13 +147,20 @@ export function TerminalApp({ capability, capabilityError, onReload }: TerminalA
           onAuthoritativeResize: (dimensions) => {
             dispatcher.confirmAuthoritativeResize(dimensions);
           },
+          ...(presentation === undefined
+            ? {}
+            : { onRenderCommit: () => presentation.renderCommitted() }),
           onTitle: (nextTitle) => setTitle(nextTitle || "Terminal"),
         });
       } catch {
+        presentation?.close();
+        removeVisibilityListener();
         if (!cancelled) setEngineFailed(true);
         return;
       }
       if (cancelled) {
+        presentation?.close();
+        removeVisibilityListener();
         host.dispose();
         return;
       }
@@ -153,6 +194,9 @@ export function TerminalApp({ capability, capabilityError, onReload }: TerminalA
         sessionId: capability.sessionId,
         snapshots,
         storage: window.sessionStorage,
+        ...(diagnostics === undefined ? {} : { diagnostics }),
+        ...(monotonicNow === undefined ? {} : { monotonicNow }),
+        ...(presentation === undefined ? {} : { presentation }),
       });
       sessionRef.current = nextSession;
       ownedRuntime = { host, input: dispatcher, session: nextSession };
@@ -165,9 +209,11 @@ export function TerminalApp({ capability, capabilityError, onReload }: TerminalA
       if (demo) delete window.__zhongduanE2E;
       sessionRef.current = null;
       ownedRuntime?.session?.close();
+      presentation?.close();
+      removeVisibilityListener();
       ownedRuntime?.host.dispose();
     };
-  }, [capability, demo]);
+  }, [capability, demo, diagnosticsMode]);
 
   useEffect(() => {
     document.title = title === "Terminal" ? "Zhongduan" : `${title} - Zhongduan`;

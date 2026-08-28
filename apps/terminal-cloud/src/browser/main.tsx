@@ -2,8 +2,13 @@ import { createRoot } from "react-dom/client";
 import "@wterm/dom/css";
 
 import { consumeBrowserCapability, type BrowserCapabilityBootstrap } from "./capability";
+import { resolveBrowserDiagnosticsMode } from "./presentation-diagnostics";
 import { TerminalApp } from "./terminal-app";
 import "./styles.css";
+
+const diagnosticsMode = resolveBrowserDiagnosticsMode(
+  new URLSearchParams(window.location.search).get("browserDiagnostics"),
+);
 
 let capability: BrowserCapabilityBootstrap | undefined;
 let capabilityError = false;
@@ -20,5 +25,6 @@ createRoot(root).render(
   <TerminalApp
     {...(capability === undefined ? {} : { capability })}
     capabilityError={capabilityError}
+    diagnosticsMode={diagnosticsMode}
   />,
 );

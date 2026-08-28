@@ -220,10 +220,12 @@ approximate 时都不能算 rollout gate 通过。只有人工确认 manifest �
 node scripts/cloud-telemetry-observability.mjs provision --apply
 ```
 
-这一层只完成 Cloud-local query contract，不代表 Phase 0 gate 关闭。Browser/Host 生产 export 与跨 runtime
-aggregation、Browser render/presentation 与 synthetic E2E/SLO、以及同一 exact build 下插桩 off/on 的 input latency/
-canonical throughput 不超过 5% 回归 canary 仍开放；
-诊断不得写入 terminal wire、journal、snapshot、replay、SQLite schema 或 WebSocket attachment。
+这一层只完成 Cloud-local query contract。后续 `observability/browser-presentation-facts` 只在 Browser 本地补上
+input lifecycle 与 canonical presentation opportunity 事实，也不代表 Phase 0 gate 关闭。Browser/Host
+生产 export 与跨 runtime aggregation、synthetic E2E/SLO、同一 exact build 下插桩 `off`/`memory-v2` 的
+input latency/canonical throughput 不超过 5% 回归 ABBA canary，以及可靠信号存在时的真实 pixel paint
+仍开放；诊断不得写入 terminal wire、journal、snapshot、replay、SQLite schema 或 WebSocket
+attachment。
 
 ## 5. 构建和启动 Host
 
@@ -284,17 +286,43 @@ fragment，并把凭据放进当前站点的 `sessionStorage`。完整链接和 
 浏览器 capability 初始有效期为 8 小时，在线客户端会在半寿命附近自动刷新。Host
 capability 初始有效期为 24 小时，并由 daemon 自动刷新或使用 bootstrap token 回收。
 
-Browser session 维护一个最多 256 条的本机诊断 ring，记录 control/data socket RTT、input send-return 到
-ACK、attach matching/timeout/cancelled 终点，以及 snapshot load-total、restore、buffer apply、adopt call 和最终
-recovery outcome。
-ring 只驻内存，不进入 console、`sessionStorage`/`localStorage`、terminal snapshot 或网络；容量满时覆盖最旧事件并
-累计 drop count。`TerminalSession.diagnostics` 返回按时间顺序复制的只读快照，主要供本机排障和测试使用。
+Browser 诊断由 session URL 上的 `browserDiagnostics` 参数选择，它与 `Raw`/`Mirrored`/`Owned`
+输入模式正交：
 
-这些 duration 使用 `performance.now()` 一类本机 monotonic clock；票据 `expiresAt` 仍只能与 wall clock 比较。
-`load-total` 包含 HTTP、完整性校验、解压和 worker transfer，不能称为纯下载；`adopt call-returned` 不证明浏览器
-已经 paint；socket RTT 包含 Browser event loop/socket queue 与 Cloud auto-response，也不是纯网络 RTT；input ACK
-仍不证明 child/app effect。事件不包含 session/client/connection、epoch/seq/generation、snapshot ID、URL、输入内容
-或异常文本。Browser 当前没有生产上传出口，跨节点聚合与 dashboard 属于后续显式 opt-in 的独立阶段。
+- 参数缺失、空值或精确为 `memory-v2` 时，开启本地内存诊断；
+- 精确为 `off` 时关闭；任何未知值也 fail closed 到 `off`。
+
+例如 Writer URL 可写为
+`<CLOUD_URL>/sessions/<sessionId>?browserDiagnostics=off#capability=<writerCapability>`。`off` 路径不创建
+diagnostics tracker/ring、telemetry-only clock、map、page-visibility listener、WTerm render-commit hook、
+presentation timer 或 `requestAnimationFrame`；WebSocket heartbeat correctness 自身的 monotonic clock 与
+deadline timer 仍保留。它不关闭 terminal，只是关闭这组观测。
+
+`memory-v2` 维护最多 256 条的本机诊断 ring，并保留原有 control/data socket RTT、attach 终点和
+snapshot/recovery 事实。新增两条只观测现有路径的有界 lifecycle：
+
+- input 从 semantic dispatch 入口经 send decision 到 matching ACK；未发出、不确定、epoch/
+  transport/session 终止等路径记录其本地 terminal reason；
+- canonical `PTY_OUTPUT`/`RESIZE_APPLIED` 只选择完成 frame decode 后、data callback 进入时已经处于
+  `live` 或 warm `replaying` 的帧，再经 visible active replica 的精确 cursor 推进、WTerm 同步 DOM render
+  commit，到下一次 animation-frame callback opportunity。Snapshot `restoring` 期间的 detached/buffered
+  work 不是这条 visible presentation 事实。
+
+两个序列都在知道 outcome 前使用随机起始相位的固定系统采样，`sampleWeight=64`；安全随机相位
+无法取得时丢弃该序列，不退回固定首样本。Tracker 合计最多保留 64 个 pending probe，每个
+deadline 为 2 秒；正常与 terminal outcome 使用同一权重。Ring 只驻内存，不进入 console、
+`sessionStorage`/`localStorage`、terminal snapshot 或网络；容量满时覆盖最旧事件并累计 drop
+count。`TerminalSession.diagnostics` 返回按时间顺序复制的只读快照，主要供本机排障和测试使用。
+
+这些 duration 使用 `performance.now()` 一类本机 monotonic clock；票据 `expiresAt` 仍只能与 wall clock
+比较。`load-total` 包含 HTTP、完整性校验、解压和 worker transfer，不能称为纯下载；`adopt
+call-returned` 不证明浏览器已经 paint；socket RTT 包含 Browser event loop/socket queue 与 Cloud
+auto-response，也不是纯网络 RTT；input ACK 仍不证明 child/app effect。WTerm render commit 只证明
+同步 DOM/scroll/title/response 工作已提交，下一帧 opportunity 只证明 Browser 调度了后续
+animation-frame callback；两者都绝不是 pixel paint/composite 证明。事件 schema 严格且 content-free：
+不包含 session/client/connection、epoch/seq/generation、snapshot ID/cursor、URL、输入/帧/cell 内容、key、异常文本
+或这些值的 hash/digest，大小只允许 bucket。Browser 当前没有生产上传出口，跨节点聚合与
+dashboard 属于后续显式 opt-in 的独立阶段。
 
 ## 7. 本地联调
 
