@@ -1,5 +1,9 @@
 # Wire Protocol V2
 
+> 本文只描述当前已实现的 v2 wire behavior。协议长期不变量、三逻辑平面和 Recovery v3 / 输入
+> sideband 的目标设计见[终端协议架构](terminal-protocol-architecture.md)。在完整 v3 handoff 取代
+> barrier 之前，v2 的 global canonical pause 与 pinned commit 仍是 correctness 条件，不能单独删除。
+
 ## 通道
 
 每个参与者建立两条 WebSocket：
@@ -9,7 +13,9 @@
   commit，以及 Host 到 relay 的 recovery barrier。
 - `snapshot`：受权 HTTP response 从私有 R2 对象直接流向浏览器，不经过 DO WebSocket。
 
-所有会改变 Ghostty replica 的 mutation 必须在 data 通道内排序。control 消息不能直接改变 replica。
+所有重建 Host authority 所必需的 terminal mutation 必须在 data 通道内排序并消耗 `eventSeq`；当前只有
+`PTY_OUTPUT` 与 `RESIZE_APPLIED`。input ACK、writer lease 和其他临时交互 metadata 不属于 terminal
+mutation，不能推进 replica cursor。control 消息不能直接改变 replica。
 
 ## Data Header
 
@@ -52,7 +58,7 @@ snapshot recovery 的 commit watermark。relay 接受 barrier 后才发送 `repl
 
 ## 输入幂等
 
-key、paste 与 resize request 共享 `(inputEpoch, clientInputSeq)` 序列。`inputEpoch` 由浏览器 controller 在一个输入序列开始时生成，并跨 WebSocket 重连保持不变；收到明确 ACK 后才能丢弃对应输入。DO 不信任客户端声明的身份，转发给 Host 时附加 capability 已认证的稳定 `clientId` 和单调 `writerFence`。Host 以 `(writerFence, clientId, inputEpoch, clientInputSeq)` 去重；更高 fence 会永久封住旧 writer，ACK 丢失后的同一 fence 重试不会再次写入 PTY。换 controller 或明确放弃 uncertain 输入时必须创建新的 `inputEpoch`。
+key、text、paste、resize request、focus 与 mouse 共享 `(inputEpoch, clientInputSeq)` 序列。`inputEpoch` 由浏览器 controller 在一个输入序列开始时生成；data-only delivery reconnect 不改变它，但 control WebSocket replacement 会把 outstanding 输入标为 uncertain 并创建新 epoch。收到明确 ACK 后才能丢弃对应输入。DO 不信任客户端声明的身份，转发给 Host 时附加 capability 已认证的稳定 `clientId` 和单调 `writerFence`。Host 以 `(writerFence, clientId, inputEpoch, clientInputSeq)` 去重；更高 fence 会永久封住旧 writer，ACK 丢失后的同一 fence 重试不会再次写入 PTY。换 controller 或明确放弃 uncertain 输入时必须创建新的 `inputEpoch`。
 
 ## Snapshot Cut
 
