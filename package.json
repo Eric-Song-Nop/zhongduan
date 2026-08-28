@@ -5,6 +5,8 @@
   "type": "module",
   "devDependencies": {
     "@types/node": "26.4.0",
+    "@zhongduan/protocol": "workspace:*",
+    "typescript": "6.0.3",
     "vite-plus": "0.3.0",
     "vitest": "4.1.11"
   },

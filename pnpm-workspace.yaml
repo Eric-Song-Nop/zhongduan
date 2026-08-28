@@ -3,5 +3,8 @@ packages:
   - "packages/*"
   - "vendor/wterm/packages/*"
 
+onlyBuiltDependencies:
+  - node-pty
+
 catalog:
   zod: 4.4.3
