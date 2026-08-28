@@ -3,9 +3,15 @@ import {
   HostControlFrameSchema,
   decodeControlFrame,
   decodeDataFrame,
+  decodeDeliveryBarrierPayload,
   type ConnectionSetResponse,
   type ResizePayload,
 } from "@zhongduan/protocol";
+import {
+  createBufferedTelemetrySink,
+  type TelemetrySink,
+  type TerminalTelemetryEvent,
+} from "@zhongduan/telemetry";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FakeTerminalAuthority } from "../fake-terminal-authority";
@@ -94,13 +100,18 @@ function createHarness(
     authority?: FakeTerminalAuthority;
     heartbeatIntervalMs?: number;
     heartbeatTimeoutMs?: number;
+    monotonicNow?: () => number;
     readyTimeoutMs?: number;
+    telemetry?: TelemetrySink;
   } = {},
 ) {
+  const telemetryBuffer =
+    options.telemetry === undefined ? undefined : createBufferedTelemetrySink(options.telemetry);
   const pty = new ManualPty();
   const session = new TerminalSession({
     authority: options.authority ?? new FakeTerminalAuthority(),
     journal: new EventJournal(),
+    ...(options.monotonicNow === undefined ? {} : { monotonicNow: options.monotonicNow }),
     pty,
     sessionEpoch: 1n,
   });
@@ -139,9 +150,11 @@ function createHarness(
     ...(options.heartbeatTimeoutMs === undefined
       ? {}
       : { heartbeatTimeoutMs: options.heartbeatTimeoutMs }),
+    ...(options.monotonicNow === undefined ? {} : { monotonicNow: options.monotonicNow }),
     ...(options.readyTimeoutMs === undefined ? {} : { readyTimeoutMs: options.readyTimeoutMs }),
     session,
     snapshotPublisher,
+    ...(telemetryBuffer === undefined ? {} : { telemetryBuffer }),
   });
   return { control, data, pair, pty, relay, session };
 }
@@ -305,6 +318,373 @@ describe("HostRelayConnection", () => {
     harness.session.dispose();
   });
 
+  it("records bounded Host control-queue and input-apply latency facts", async () => {
+    const events: TerminalTelemetryEvent[] = [];
+    const harness = createHarness({ telemetry: (event) => events.push(event) });
+    await acknowledgeReady(harness);
+    await settle();
+    events.length = 0;
+
+    harness.control.message(
+      JSON.stringify({
+        type: "text",
+        connectionId: "connection_browser_A",
+        clientId: "client_AAAAAAAAA",
+        writerLease: "writer-lease",
+        inputEpoch: "input-epoch",
+        clientInputSeq: "1",
+        writerFence: "1",
+        data: "must-not-enter-telemetry",
+      }),
+    );
+    harness.control.message(
+      JSON.stringify({
+        type: "focus",
+        connectionId: "connection_browser_A",
+        clientId: "client_AAAAAAAAA",
+        writerLease: "writer-lease",
+        inputEpoch: "input-epoch",
+        clientInputSeq: "2",
+        writerFence: "1",
+        focused: true,
+      }),
+    );
+    harness.control.message(
+      JSON.stringify({
+        type: "resize-request",
+        connectionId: "connection_browser_A",
+        clientId: "client_AAAAAAAAA",
+        writerLease: "writer-lease",
+        inputEpoch: "input-epoch",
+        clientInputSeq: "3",
+        writerFence: "1",
+        cols: 100,
+        rows: 30,
+        widthPx: 800,
+        heightPx: 600,
+      }),
+    );
+    await settle();
+
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "host.input.apply",
+          inputKind: "text",
+          outcome: "written",
+          effectStage: "completed",
+          encodeKind: "utf8",
+          ackSendOutcome: "send-returned",
+          ptyBytesBucket: "9-64",
+        }),
+        expect.objectContaining({
+          name: "host.input.apply",
+          inputKind: "focus",
+          outcome: "written",
+          effectStage: "completed",
+          ptyWriteAttempted: false,
+          ptyBytesBucket: "0",
+        }),
+        expect.objectContaining({
+          name: "host.input.apply",
+          inputKind: "resize",
+          outcome: "written",
+          effectStage: "completed",
+          ptyResizeAttempted: true,
+          effectWriteAttempted: false,
+          effectBytesBucket: "0",
+        }),
+        expect.objectContaining({
+          name: "host.control.queue",
+          messageClass: "input",
+          outcome: "handled",
+          queuedCount: 1,
+        }),
+      ]),
+    );
+    expect(JSON.stringify(events)).not.toContain("must-not-enter-telemetry");
+    harness.relay.close();
+    harness.session.dispose();
+  });
+
+  it("records a thrown input effect as uncertain without serializing the error", async () => {
+    const events: TerminalTelemetryEvent[] = [];
+    const authority = new (class extends FakeTerminalAuthority {
+      override encodeFocus(): Uint8Array {
+        throw new Error("secret encoder state");
+      }
+    })();
+    const harness = createHarness({ authority, telemetry: (event) => events.push(event) });
+    await acknowledgeReady(harness);
+    events.length = 0;
+
+    harness.control.message(
+      JSON.stringify({
+        type: "focus",
+        connectionId: "connection_browser_A",
+        clientId: "client_AAAAAAAAA",
+        writerLease: "writer-lease",
+        inputEpoch: "input-epoch",
+        clientInputSeq: "1",
+        writerFence: "1",
+        focused: true,
+      }),
+    );
+    await settle();
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        name: "host.input.apply",
+        inputKind: "focus",
+        outcome: "uncertain",
+        effectStage: "threw",
+        ptyWriteAttempted: false,
+      }),
+    );
+    expect(JSON.stringify(events)).not.toContain("secret encoder state");
+    harness.relay.close();
+    harness.session.dispose();
+  });
+
+  it("records independent control and data heartbeat RTT on the Host clock", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const events: TerminalTelemetryEvent[] = [];
+    const harness = createHarness({
+      heartbeatIntervalMs: 100,
+      heartbeatTimeoutMs: 300,
+      monotonicNow: () => now,
+      telemetry: (event) => events.push(event),
+    });
+    await acknowledgeReady(harness);
+    await Promise.resolve();
+    await Promise.resolve();
+    events.length = 0;
+
+    now = 100;
+    await vi.advanceTimersByTimeAsync(100);
+    now = 125;
+    harness.control.message("pong");
+    harness.data.message("pong");
+    for (let index = 0; index < 6; index += 1) await Promise.resolve();
+
+    expect(events.filter((event) => event.name === "host.relay.rtt")).toEqual([
+      {
+        schemaVersion: 1,
+        monotonicAtMs: 125,
+        name: "host.relay.rtt",
+        channel: "control",
+        outcome: "ok",
+        durationMs: 25,
+        outstandingPings: 0,
+      },
+      {
+        schemaVersion: 1,
+        monotonicAtMs: 125,
+        name: "host.relay.rtt",
+        channel: "data",
+        outcome: "ok",
+        durationMs: 25,
+        outstandingPings: 0,
+      },
+    ]);
+    harness.relay.close();
+    harness.session.dispose();
+  });
+
+  it("matches overlapping heartbeat probes in FIFO order without a wire nonce", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const events: TerminalTelemetryEvent[] = [];
+    const harness = createHarness({
+      heartbeatIntervalMs: 100,
+      heartbeatTimeoutMs: 300,
+      monotonicNow: () => now,
+      telemetry: (event) => events.push(event),
+    });
+    await acknowledgeReady(harness);
+    await Promise.resolve();
+    events.length = 0;
+
+    now = 100;
+    await vi.advanceTimersByTimeAsync(100);
+    now = 200;
+    await vi.advanceTimersByTimeAsync(100);
+    now = 225;
+    harness.control.message("pong");
+    harness.data.message("pong");
+    now = 250;
+    harness.control.message("pong");
+    harness.data.message("pong");
+    for (let index = 0; index < 6; index += 1) await Promise.resolve();
+
+    expect(
+      events
+        .filter((event) => event.name === "host.relay.rtt" && event.outcome === "ok")
+        .map((event) => ({
+          channel: event.channel,
+          durationMs: event.durationMs,
+          outstandingPings: event.outstandingPings,
+        })),
+    ).toEqual([
+      { channel: "control", durationMs: 125, outstandingPings: 1 },
+      { channel: "data", durationMs: 125, outstandingPings: 1 },
+      { channel: "control", durationMs: 50, outstandingPings: 0 },
+      { channel: "data", durationMs: 50, outstandingPings: 0 },
+    ]);
+    harness.relay.close();
+    harness.session.dispose();
+  });
+
+  it("keeps ACK, PTY effects, and relay frames identical with telemetry enabled", async () => {
+    const baseline = createHarness();
+    const observed = createHarness({ telemetry: () => undefined });
+    await acknowledgeReady(baseline);
+    await acknowledgeReady(observed);
+    const frame = JSON.stringify({
+      type: "text",
+      connectionId: "connection_browser_A",
+      clientId: "client_AAAAAAAAA",
+      writerLease: "writer-lease",
+      inputEpoch: "input-epoch",
+      clientInputSeq: "1",
+      writerFence: "1",
+      data: "same-input",
+    });
+
+    baseline.control.message(frame);
+    observed.control.message(frame);
+    await settle();
+
+    expect(observed.control.sent).toEqual(baseline.control.sent);
+    expect(observed.data.sent).toEqual(baseline.data.sent);
+    expect(observed.pty.writes).toEqual(baseline.pty.writes);
+    expect(observed.session.cursor).toEqual(baseline.session.cursor);
+    baseline.relay.close();
+    observed.relay.close();
+    baseline.session.dispose();
+    observed.session.dispose();
+  });
+
+  it("defers input diagnostics while the shared recovery buffer is paused", async () => {
+    const events: TerminalTelemetryEvent[] = [];
+    const harness = createHarness({ telemetry: (event) => events.push(event) });
+    await acknowledgeReady(harness);
+    await settle();
+    events.length = 0;
+
+    harness.control.message(
+      JSON.stringify({
+        type: "attach-request",
+        connectionId: "connection_browser_A",
+        streamId: 1,
+        deliveryGeneration: "1",
+        engineId: harness.session.engineId,
+        hasLiveReplica: false,
+      }),
+    );
+    await settle();
+    const barrierEncoded = harness.data.sent.find(
+      (value): value is Uint8Array =>
+        value instanceof Uint8Array &&
+        decodeDataFrame(value).kind === DataFrameKind.DeliveryBarrier,
+    );
+    expect(barrierEncoded).toBeDefined();
+
+    harness.control.message(
+      JSON.stringify({
+        type: "text",
+        connectionId: "connection_browser_A",
+        clientId: "client_AAAAAAAAA",
+        writerLease: "writer-lease",
+        inputEpoch: "input-epoch",
+        clientInputSeq: "1",
+        writerFence: "1",
+        data: "input-during-barrier",
+      }),
+    );
+    await settle();
+    expect(harness.pty.writes).toEqual([new TextEncoder().encode("input-during-barrier")]);
+    expect(events.some((event) => event.name === "host.input.apply")).toBe(false);
+
+    const barrier = decodeDataFrame(barrierEncoded!);
+    const payload = decodeDeliveryBarrierPayload(barrier.payload);
+    if (payload.mode !== "snapshot") throw new Error("expected snapshot barrier");
+    harness.control.message(
+      JSON.stringify({
+        type: "delivery-barrier-result",
+        status: "ready",
+        mode: "snapshot",
+        connectionId: payload.connectionId,
+        streamId: barrier.streamId,
+        deliveryGeneration: barrier.deliveryGeneration.toString(),
+        commitEventSeq: barrier.eventSeq.toString(),
+        commitPtyOffset: barrier.ptyOffset.toString(),
+        snapshotId: payload.snapshotId,
+      }),
+    );
+    await settle();
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        name: "host.input.apply",
+        outcome: "written",
+        ackSendOutcome: "send-returned",
+      }),
+    );
+    harness.relay.close();
+    harness.session.dispose();
+  });
+
+  it("releases deferred diagnostics when a paused recovery is disposed", async () => {
+    const events: TerminalTelemetryEvent[] = [];
+    const harness = createHarness({ telemetry: (event) => events.push(event) });
+    await acknowledgeReady(harness);
+    await settle();
+    events.length = 0;
+
+    harness.control.message(
+      JSON.stringify({
+        type: "attach-request",
+        connectionId: "connection_browser_A",
+        streamId: 1,
+        deliveryGeneration: "1",
+        engineId: harness.session.engineId,
+        hasLiveReplica: false,
+      }),
+    );
+    await settle();
+    expect(
+      harness.data.sent.some(
+        (value) =>
+          value instanceof Uint8Array &&
+          decodeDataFrame(value).kind === DataFrameKind.DeliveryBarrier,
+      ),
+    ).toBe(true);
+    harness.control.message(
+      JSON.stringify({
+        type: "text",
+        connectionId: "connection_browser_A",
+        clientId: "client_AAAAAAAAA",
+        writerLease: "writer-lease",
+        inputEpoch: "input-epoch",
+        clientInputSeq: "1",
+        writerFence: "1",
+        data: "input-before-dispose",
+      }),
+    );
+    await settle();
+    expect(events.some((event) => event.name === "host.input.apply")).toBe(false);
+
+    harness.relay.close();
+    await settle();
+
+    expect(events).toContainEqual(
+      expect.objectContaining({ name: "host.input.apply", outcome: "written" }),
+    );
+    harness.session.dispose();
+  });
+
   it("forwards focus and mouse through the shared exact ACK and dedup path", async () => {
     let mouseCalls = 0;
     const authority = new (class extends FakeTerminalAuthority {
@@ -390,7 +770,8 @@ describe("HostRelayConnection", () => {
   });
 
   it("bounds queued relay control before async input processing", async () => {
-    const harness = createHarness();
+    const events: TerminalTelemetryEvent[] = [];
+    const harness = createHarness({ telemetry: (event) => events.push(event) });
     await acknowledgeReady(harness);
     const frame = {
       type: "text",
@@ -410,6 +791,13 @@ describe("HostRelayConnection", () => {
 
     expect(harness.control.readyState).toBe(FakeWebSocket.CLOSED);
     expect(harness.data.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        name: "host.control.queue",
+        outcome: "capacity",
+        queuedCount: HOST_CONTROL_QUEUE_LIMITS.maxCount,
+      }),
+    );
     harness.session.dispose();
   });
 
@@ -430,7 +818,12 @@ describe("HostRelayConnection", () => {
     "fences a %s-only heartbeat blackhole without killing the PTY authority epoch",
     async (blackhole) => {
       vi.useFakeTimers();
-      const harness = createHarness({ heartbeatIntervalMs: 100, heartbeatTimeoutMs: 300 });
+      const events: TerminalTelemetryEvent[] = [];
+      const harness = createHarness({
+        heartbeatIntervalMs: 100,
+        heartbeatTimeoutMs: 300,
+        telemetry: (event) => events.push(event),
+      });
       await acknowledgeReady(harness);
 
       const live = blackhole === "control" ? harness.data : harness.control;
@@ -444,9 +837,18 @@ describe("HostRelayConnection", () => {
       await vi.advanceTimersByTimeAsync(99);
       expect(harness.control.readyState).toBe(FakeWebSocket.OPEN);
       await vi.advanceTimersByTimeAsync(1);
+      for (let index = 0; index < 4; index += 1) await Promise.resolve();
 
       expect(harness.control.readyState).toBe(FakeWebSocket.CLOSED);
       expect(harness.data.readyState).toBe(FakeWebSocket.CLOSED);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          name: "host.relay.rtt",
+          channel: blackhole,
+          outcome: "timeout",
+          silenceMs: 300,
+        }),
+      );
       expect(harness.pty.pid).toBe(42);
       expect(harness.session.sessionEpoch).toBe(1n);
       await expect(

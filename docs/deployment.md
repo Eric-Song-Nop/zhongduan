@@ -158,10 +158,11 @@ node "apps/host-daemon/dist/cli.mjs" cloud \
 
 虽然也支持 `ZHONGDUAN_BOOTSTRAP_TOKEN`，生产环境优先使用 token file 或 secret manager。
 
-可选设置 `ZHONGDUAN_TELEMETRY=stderr`，让 Host 输出一行一个 JSON 的低频恢复诊断事件。默认关闭；
-事件 schema 只允许本机 monotonic duration、bytes/frames 和封闭 outcome，不包含 terminal/input 内容、
-凭据、原始标识符或异常文本。诊断先进入有界 deferred queue；队列满或 stderr backpressure 时丢弃诊断，
-不阻塞 recovery，也不无限累积输出。该 Phase 0a 出口尚不等于跨 Host/Cloud/Browser 的统一 dashboard。
+可选设置 `ZHONGDUAN_TELEMETRY=stderr`，让 Host 输出一行一个 JSON 的 snapshot/recovery、control queue、
+input apply 与 relay RTT 诊断事件。默认关闭；事件 schema 只允许本机 monotonic duration、分桶后的 input/control
+大小、snapshot/journal bytes/frames 和封闭 outcome，不包含 terminal/input 内容、凭据、原始标识符或异常文本。
+诊断先进入一个 Host 进程拥有的有界 deferred queue；队列满或 stderr backpressure 时丢弃诊断，不阻塞 input
+或 recovery，也不无限累积输出。该 Host 出口尚不等于跨 Host/Cloud/Browser 的统一 dashboard。
 
 ## 6. 打开浏览器终端
 

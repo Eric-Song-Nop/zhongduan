@@ -5,6 +5,7 @@ import {
   createBufferedTelemetrySink,
   elapsedMs,
   emitTelemetry,
+  telemetryByteSizeBucket,
   type TelemetrySink,
 } from "./index";
 
@@ -23,6 +24,79 @@ describe("terminal telemetry", () => {
         oldestMutationAgeMs: 8,
       }),
     ).toMatchObject({ status: "exact", frames: 3 });
+  });
+
+  it.each([
+    {
+      schemaVersion: 1 as const,
+      monotonicAtMs: 20,
+      name: "host.control.queue" as const,
+      messageClass: "input" as const,
+      outcome: "handled" as const,
+      queueWaitMs: 3,
+      handlingMs: 4,
+      queuedBytesBucket: "65-1024" as const,
+      queuedCount: 2,
+    },
+    {
+      schemaVersion: 1 as const,
+      monotonicAtMs: 21,
+      name: "host.input.apply" as const,
+      inputKind: "key" as const,
+      outcome: "written" as const,
+      effectStage: "completed" as const,
+      encodeKind: "ghostty" as const,
+      ackSendOutcome: "send-returned" as const,
+      controlQueueWaitMs: 2,
+      controlQueueDepth: 1,
+      actorQueueWaitMs: 2,
+      actorProcessingMs: 1,
+      hostIngressToAckDecisionMs: 7,
+      inputEncodeMs: 0.5,
+      ptyWriteAttempted: true,
+      ptyWriteMs: 0.25,
+      ptyBytesBucket: "1-8" as const,
+    },
+    {
+      schemaVersion: 1 as const,
+      monotonicAtMs: 22,
+      name: "host.input.apply" as const,
+      inputKind: "resize" as const,
+      outcome: "written" as const,
+      effectStage: "completed" as const,
+      ackSendOutcome: "send-returned" as const,
+      controlQueueWaitMs: 2,
+      controlQueueDepth: 1,
+      actorQueueWaitMs: 2,
+      actorProcessingMs: 1,
+      hostIngressToAckDecisionMs: 7,
+      authorityResizeMs: 0.5,
+      ptyResizeAttempted: true,
+      ptyResizeMs: 0.25,
+      effectWriteAttempted: false,
+      effectWriteMs: 0,
+      effectBytesBucket: "0" as const,
+    },
+    {
+      schemaVersion: 1 as const,
+      monotonicAtMs: 23,
+      name: "host.relay.rtt" as const,
+      channel: "control" as const,
+      outcome: "ok" as const,
+      durationMs: 18,
+      outstandingPings: 0,
+    },
+    {
+      schemaVersion: 1 as const,
+      monotonicAtMs: 24,
+      name: "host.relay.rtt" as const,
+      channel: "data" as const,
+      outcome: "timeout" as const,
+      silenceMs: 45_000,
+      outstandingPings: 2,
+    },
+  ])("accepts bounded Host latency event $name", (event) => {
+    expect(TerminalTelemetryEventSchema.parse(event)).toEqual(event);
   });
 
   it.each(["text", "paste", "command", "cells", "capability", "sessionId"])(
@@ -44,6 +118,52 @@ describe("terminal telemetry", () => {
       ).toThrow();
     },
   );
+
+  it.each(["text", "key", "clientId", "connectionId", "inputEpoch", "error"])(
+    "rejects the input diagnostic identity/content field %s",
+    (field) => {
+      expect(() =>
+        TerminalTelemetryEventSchema.parse({
+          schemaVersion: 1,
+          monotonicAtMs: 21,
+          name: "host.input.apply",
+          inputKind: "text",
+          outcome: "written",
+          effectStage: "completed",
+          encodeKind: "utf8",
+          ackSendOutcome: "send-returned",
+          controlQueueWaitMs: 2,
+          controlQueueDepth: 1,
+          actorQueueWaitMs: 2,
+          actorProcessingMs: 1,
+          hostIngressToAckDecisionMs: 7,
+          inputEncodeMs: 0.5,
+          ptyWriteAttempted: true,
+          ptyWriteMs: 0.25,
+          ptyBytesBucket: "1-8",
+          [field]: "secret",
+        }),
+      ).toThrow();
+    },
+  );
+
+  it("buckets input and control byte counts without retaining exact lengths", () => {
+    expect([0, 1, 8, 9, 64, 65, 1_024, 1_025, 65_536, 65_537].map(telemetryByteSizeBucket)).toEqual(
+      [
+        "0",
+        "1-8",
+        "1-8",
+        "9-64",
+        "9-64",
+        "65-1024",
+        "65-1024",
+        "1025-65536",
+        "1025-65536",
+        "65537+",
+      ],
+    );
+    expect(() => telemetryByteSizeBucket(-1)).toThrow();
+  });
 
   it("contains sink and schema failures", () => {
     const sink = vi.fn(() => {

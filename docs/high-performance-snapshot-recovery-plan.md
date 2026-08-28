@@ -487,8 +487,12 @@ generation，避免跨 attempt 拼接。
 - `observability/recovery-serviceability` 是 Phase 0a：只建立严格 telemetry 基础、Host snapshot
   capture/publish timing，以及与真实 replay 绑定到同一 retained view 的 journal range 事实；这些事实不参与
   recovery 选择，不改变 v2 wire、barrier、TTL 或 admission；
-- Phase 0 gate 仍未关闭：Host/Cloud/Browser 的 queue、link RTT、input→PTY、restore/adopt、生产汇聚与可查询
-  dashboard 必须由后续 stacked layer 补齐。
+- `observability/terminal-latency-pipeline` 是后续 Host 事实切片：记录 control queue、session actor、authority
+  encode、PTY call 与 Host-observed control/data relay socket RTT；actor 只返回数字，Relay 在 ACK send attempt
+  后才向共享有界 buffer enqueue，schema/JSON/collector 不进入 actor 或 canonical-pause 临界区；
+- Phase 0 gate 仍未关闭：Cloud queue/lease、Browser link/restore/adopt、生产汇聚与可查询 dashboard 必须由后续
+  stacked layer 补齐。Host relay RTT 包含本地 event-loop/socket queue 与 Cloud auto-response，不能冒充纯网络
+  RTT；`written` 也不是 child/app effect ACK。
 
 - 保留 v2 pause/barrier/pinned commit correctness invariant；
 - 落地 `reason + retryScope`，修复 non-ready 被错误 complete 的 Browser freeze；

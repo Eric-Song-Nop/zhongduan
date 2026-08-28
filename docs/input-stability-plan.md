@@ -702,6 +702,12 @@ input-region-v1
 
 ### Phase A：input correctness 与 hot path
 
+实施进度（2026-08-29）：`observability/terminal-latency-pipeline` 只先建立 Host 侧事实。它把 control callback→
+ACK send decision、session actor wait、authority encode、`pty.write`/`pty.resize` call 和双 relay socket RTT
+拆开，并把 input/control 字节数分桶。TerminalSession actor 不调用 telemetry sink；Relay 尝试发送 ACK 后才向
+共享有界 deferred buffer enqueue。该切片不修改 input seq、dedup、lease、wire 或 recovery ordering，因此不代表
+Phase A correctness 已完成。
+
 - Browser 完整 validate/admit 后才分配 seq；
 - Host 使用 strict `nextExpectedSeq`；确定性 reject 消费 seq，`uncertain` 终止 epoch；
 - 建立单一 per-writer sequencer，明确 urgent cancellation 与 resize ordering；
@@ -782,6 +788,10 @@ Recovery v3、FrozenTerminalCut 和 rolling checkpoint 是并行工作流，phas
 - 资源：overlay cells/bytes/age、pending ACK、input queue、driver CPU/frame time。
 
 遥测只能记录枚举、大小、时延、digest 和计数，不能记录 text、paste、command、cell 内容或 key 明文。
+输入大小属于敏感行为元数据：Host input/control 事实只记录 bucket，不记录精确文本长度、writer/client/session
+标识或异常字符串。`host.input.apply` 中的 ACK send 只表示本地 WebSocket `send()` 返回；`written` 只表示现有
+Host input result，不证明 child read、应用 effect、canonical output 或 Browser paint。Host relay RTT 也只是该
+socket 到 Cloud auto-responder 的本机观测 RTT，不是 Browser↔Host 或纯网络 RTT。
 
 ### 初始发布门槛
 

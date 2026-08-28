@@ -1,6 +1,6 @@
 import type { HostControlFrame, RelayToHostControlFrame } from "@zhongduan/protocol";
 
-import type { SemanticInputIdentity, TerminalSession } from "../session";
+import type { SemanticInputIdentity, SubmittedInputTiming, TerminalSession } from "../session";
 import type { SemanticKey, SemanticMouse } from "../terminal-authority";
 
 export type ForwardedInput = Extract<
@@ -8,10 +8,15 @@ export type ForwardedInput = Extract<
   { type: "key" | "text" | "paste" | "focus" | "mouse" | "resize-request" }
 >;
 
+export interface DispatchedInput {
+  ack: Extract<HostControlFrame, { type: "input-ack" }>;
+  timing: SubmittedInputTiming;
+}
+
 export async function dispatchForwardedInput(
   session: TerminalSession,
   frame: ForwardedInput,
-): Promise<Extract<HostControlFrame, { type: "input-ack" }>> {
+): Promise<DispatchedInput> {
   const identity: SemanticInputIdentity = {
     clientId: frame.clientId,
     clientInputSeq: BigInt(frame.clientInputSeq),
@@ -20,14 +25,17 @@ export async function dispatchForwardedInput(
     ...(frame.type === "key" ? { observedEventSeq: BigInt(frame.observedEventSeq) } : {}),
   };
 
-  const ack = await submit(session, identity, frame);
+  const result = await submit(session, identity, frame);
   return {
-    type: "input-ack",
-    connectionId: frame.connectionId,
-    inputEpoch: ack.inputEpoch,
-    clientInputSeq: ack.clientInputSeq.toString(),
-    status: ack.status,
-    authorityEventSeq: ack.authorityEventSeq.toString(),
+    ack: {
+      type: "input-ack",
+      connectionId: frame.connectionId,
+      inputEpoch: result.inputEpoch,
+      clientInputSeq: result.clientInputSeq.toString(),
+      status: result.status,
+      authorityEventSeq: result.authorityEventSeq.toString(),
+    },
+    timing: result.timing,
   };
 }
 

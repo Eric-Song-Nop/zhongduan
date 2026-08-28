@@ -4,6 +4,7 @@ const durationMs = z.number().finite().nonnegative();
 const byteCount = z.number().int().nonnegative().safe();
 const frameCount = z.number().int().nonnegative().safe();
 const monotonicAtMs = z.number().finite().nonnegative();
+const byteSizeBucket = z.enum(["0", "1-8", "9-64", "65-1024", "1025-65536", "65537+"]);
 
 const base = {
   schemaVersion: z.literal(1),
@@ -73,6 +74,76 @@ const HostJournalRangeGapEventSchema = z.strictObject({
   reason: JournalGapReasonSchema,
 });
 
+const HostControlQueueEventSchema = z.strictObject({
+  ...base,
+  name: z.literal("host.control.queue"),
+  messageClass: z.enum(["host-ready", "recovery", "input", "unknown"]),
+  outcome: z.enum(["handled", "rejected", "failed", "capacity"]),
+  queueWaitMs: durationMs,
+  handlingMs: durationMs,
+  queuedBytesBucket: byteSizeBucket,
+  queuedCount: frameCount,
+});
+
+const hostInputApplyBase = {
+  ...base,
+  name: z.literal("host.input.apply"),
+  outcome: z.enum(["written", "duplicate", "rejected", "uncertain"]),
+  effectStage: z.enum(["not-attempted", "completed", "threw"]),
+  ackSendOutcome: z.enum(["send-returned", "not-attempted", "uncertain"]),
+  controlQueueWaitMs: durationMs,
+  controlQueueDepth: frameCount,
+  actorQueueWaitMs: durationMs,
+  actorProcessingMs: durationMs,
+  hostIngressToAckDecisionMs: durationMs,
+} as const;
+
+const HostInputWriteEventSchema = z.strictObject({
+  ...hostInputApplyBase,
+  inputKind: z.enum(["key", "text", "paste", "focus", "mouse"]),
+  encodeKind: z.enum(["ghostty", "utf8", "none"]),
+  inputEncodeMs: durationMs,
+  ptyWriteAttempted: z.boolean(),
+  ptyWriteMs: durationMs,
+  ptyBytesBucket: byteSizeBucket,
+});
+
+const HostInputResizeEventSchema = z.strictObject({
+  ...hostInputApplyBase,
+  inputKind: z.literal("resize"),
+  authorityResizeMs: durationMs,
+  ptyResizeAttempted: z.boolean(),
+  ptyResizeMs: durationMs,
+  effectWriteAttempted: z.boolean(),
+  effectWriteMs: durationMs,
+  effectBytesBucket: byteSizeBucket,
+});
+
+const HostInputApplyEventSchema = z.union([HostInputWriteEventSchema, HostInputResizeEventSchema]);
+
+const HostRelayRttReadyEventSchema = z.strictObject({
+  ...base,
+  name: z.literal("host.relay.rtt"),
+  channel: z.enum(["control", "data"]),
+  outcome: z.literal("ok"),
+  durationMs,
+  outstandingPings: frameCount,
+});
+
+const HostRelayRttTimeoutEventSchema = z.strictObject({
+  ...base,
+  name: z.literal("host.relay.rtt"),
+  channel: z.enum(["control", "data"]),
+  outcome: z.literal("timeout"),
+  silenceMs: durationMs,
+  outstandingPings: frameCount,
+});
+
+const HostRelayRttEventSchema = z.union([
+  HostRelayRttReadyEventSchema,
+  HostRelayRttTimeoutEventSchema,
+]);
+
 export const TerminalTelemetryEventSchema = z.union([
   HostSnapshotCaptureReadyEventSchema,
   HostSnapshotCaptureFailedEventSchema,
@@ -80,6 +151,9 @@ export const TerminalTelemetryEventSchema = z.union([
   HostSnapshotPublishPendingEventSchema,
   HostJournalRangeExactEventSchema,
   HostJournalRangeGapEventSchema,
+  HostControlQueueEventSchema,
+  HostInputApplyEventSchema,
+  HostRelayRttEventSchema,
 ]);
 
 export type TerminalTelemetryEvent = z.output<typeof TerminalTelemetryEventSchema>;
@@ -101,6 +175,18 @@ export interface BufferedTelemetrySinkOptions {
 }
 
 export const noopTelemetrySink: TelemetrySink = () => undefined;
+
+export type TelemetryByteSizeBucket = z.output<typeof byteSizeBucket>;
+
+export function telemetryByteSizeBucket(bytes: number): TelemetryByteSizeBucket {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("bytes must be non-negative");
+  if (bytes === 0) return "0";
+  if (bytes <= 8) return "1-8";
+  if (bytes <= 64) return "9-64";
+  if (bytes <= 1_024) return "65-1024";
+  if (bytes <= 65_536) return "1025-65536";
+  return "65537+";
+}
 
 export function elapsedMs(startedAt: number, finishedAt: number): number {
   return Math.max(0, finishedAt - startedAt);

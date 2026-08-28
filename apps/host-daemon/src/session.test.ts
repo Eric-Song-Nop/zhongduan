@@ -9,13 +9,14 @@ import { describe, expect, it } from "vitest";
 import { FakeTerminalAuthority } from "./fake-terminal-authority";
 import { EventJournal } from "./journal";
 import type { PtyProcess } from "./pty-process";
-import { TerminalSession } from "./session";
+import { TerminalSession, type SubmittedInputResult } from "./session";
 
 class ManualPty implements PtyProcess {
   readonly pid = 42;
   readonly writes: Uint8Array[] = [];
   readonly resizes: ResizePayload[] = [];
   resizeError: Error | undefined;
+  writeError: Error | undefined;
 
   #dataListener: ((data: Uint8Array) => void) | undefined;
   #exitListener: ((exitCode: number, signal: number) => void) | undefined;
@@ -35,6 +36,7 @@ class ManualPty implements PtyProcess {
   }
 
   write(data: Uint8Array): void {
+    if (this.writeError !== undefined) throw this.writeError;
     this.writes.push(data.slice());
   }
 
@@ -324,18 +326,24 @@ describe("TerminalSession", () => {
       { clientId: "client-1", clientInputSeq: 2n, inputEpoch: "writer-1", writerFence: 1n },
       "next",
     );
-    await expect(
-      session.submitKey(
-        {
-          clientId: "client-1",
-          clientInputSeq: 1n,
-          inputEpoch: "writer-1",
-          observedEventSeq: 0n,
-          writerFence: 1n,
-        },
-        enter,
-      ),
-    ).resolves.toMatchObject({ status: "uncertain" });
+    const evicted = await session.submitKey(
+      {
+        clientId: "client-1",
+        clientInputSeq: 1n,
+        inputEpoch: "writer-1",
+        observedEventSeq: 0n,
+        writerFence: 1n,
+      },
+      enter,
+    );
+    expect(evicted).toMatchObject({
+      status: "uncertain",
+      timing: {
+        effectStage: "not-attempted",
+        ptyWriteAttempted: false,
+        ptyBytes: 0,
+      },
+    });
     await expect(
       session.submitKey(
         {
@@ -447,13 +455,28 @@ describe("TerminalSession", () => {
     };
     const dimensions = { cols: 100, rows: 30, widthPx: 800, heightPx: 600 };
 
-    await expect(session.submitResize(identity, dimensions)).resolves.toMatchObject({
+    const written = await session.submitResize(identity, dimensions);
+    expect(written).toMatchObject({
       status: "written",
       authorityEventSeq: 1n,
+      timing: {
+        inputKind: "resize",
+        effectStage: "completed",
+        encodeKind: "resize",
+        ptyResizeAttempted: true,
+        ptyWriteAttempted: false,
+        ptyBytes: 0,
+      },
     });
-    await expect(session.submitResize(identity, dimensions)).resolves.toMatchObject({
+    const duplicate = await session.submitResize(identity, dimensions);
+    expect(duplicate).toMatchObject({
       status: "duplicate",
       authorityEventSeq: 1n,
+      timing: {
+        effectStage: "not-attempted",
+        ptyResizeAttempted: false,
+        ptyWriteAttempted: false,
+      },
     });
 
     expect(pty.resizes).toEqual([dimensions]);
@@ -593,17 +616,70 @@ describe("TerminalSession", () => {
       sessionEpoch: 1n,
     });
 
-    await expect(
-      session.submitFocus(
-        { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1", writerFence: 1n },
-        false,
-      ),
-    ).resolves.toMatchObject({ status: "uncertain" });
+    const result = await session.submitFocus(
+      { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1", writerFence: 1n },
+      false,
+    );
+    expect(result).toMatchObject({
+      status: "uncertain",
+      timing: {
+        effectStage: "threw",
+        encodeKind: "ghostty",
+        ptyWriteAttempted: false,
+        ptyBytes: 0,
+      },
+    });
     await expect(session.waitForExit()).resolves.toEqual({
       status: "failed",
       message: "focus encoder failed after entry",
     });
     expect(pty.writes).toEqual([]);
+  });
+
+  it("distinguishes zero-byte input from a failed PTY write attempt", async () => {
+    const zeroPty = new ManualPty();
+    const zeroSession = new TerminalSession({
+      authority: new FakeTerminalAuthority(),
+      journal: new EventJournal(),
+      pty: zeroPty,
+      sessionEpoch: 1n,
+    });
+    const zero = await zeroSession.submitFocus(
+      { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1", writerFence: 1n },
+      true,
+    );
+    expect(zero).toMatchObject({
+      status: "written",
+      timing: {
+        effectStage: "completed",
+        encodeKind: "ghostty",
+        ptyWriteAttempted: false,
+        ptyBytes: 0,
+      },
+    });
+
+    const failingPty = new ManualPty();
+    failingPty.writeError = new Error("secret PTY failure");
+    const failingSession = new TerminalSession({
+      authority: new FakeTerminalAuthority(),
+      journal: new EventJournal(),
+      pty: failingPty,
+      sessionEpoch: 2n,
+    });
+    const failed = await failingSession.submitText(
+      { clientId: "client-2", clientInputSeq: 1n, inputEpoch: "writer-2", writerFence: 1n },
+      "private",
+    );
+    expect(failed).toMatchObject({
+      status: "uncertain",
+      timing: {
+        effectStage: "threw",
+        encodeKind: "utf8",
+        ptyWriteAttempted: true,
+        ptyBytes: 7,
+      },
+    });
+    await expect(failingSession.waitForExit()).resolves.toMatchObject({ status: "failed" });
   });
 
   it("runs the snapshot fence before draining reentrant PTY output", async () => {
@@ -633,6 +709,115 @@ describe("TerminalSession", () => {
     expect(snapshot.cutEventSeq).toBe(1n);
     expect(order).toEqual(["event:1", "fence:1", "event:2"]);
     expect(pty.writes).toEqual([Uint8Array.of(0x03)]);
+  });
+
+  it("returns submitted input timing without observing terminal content in the actor", async () => {
+    let now = 0;
+    const pty = new ManualPty();
+    const session = new TerminalSession({
+      authority: new FakeTerminalAuthority(),
+      journal: new EventJournal(),
+      monotonicNow: () => now,
+      pty,
+      sessionEpoch: 1n,
+    });
+    const identity = {
+      clientId: "client-1",
+      clientInputSeq: 1n,
+      inputEpoch: "writer-1",
+      writerFence: 1n,
+    };
+    let input!: Promise<SubmittedInputResult>;
+
+    await session.captureSnapshotWithFence(() => {
+      now = 10;
+      input = session.submitText(identity, "secret-terminal-input");
+      now = 15;
+    });
+    const written = await input;
+    const duplicate = await session.submitText(identity, "must-not-be-recorded");
+
+    expect(written).toMatchObject({
+      status: "written",
+      timing: {
+        inputKind: "text",
+        effectStage: "completed",
+        encodeKind: "utf8",
+        actorQueueWaitMs: 5,
+        actorProcessingMs: 0,
+        inputEncodeMs: 0,
+        ptyBytes: new TextEncoder().encode("secret-terminal-input").byteLength,
+        ptyWriteAttempted: true,
+        ptyWriteMs: 0,
+      },
+    });
+    expect(duplicate).toMatchObject({
+      status: "duplicate",
+      timing: {
+        inputKind: "text",
+        effectStage: "not-attempted",
+        encodeKind: "utf8",
+        actorQueueWaitMs: 0,
+        actorProcessingMs: 0,
+        ptyBytes: 0,
+        ptyWriteAttempted: false,
+        ptyWriteMs: 0,
+      },
+    });
+    const serialized = JSON.stringify([written, duplicate], (_key, value) =>
+      typeof value === "bigint" ? value.toString() : value,
+    );
+    expect(serialized).not.toContain("secret-terminal-input");
+    expect(serialized).not.toContain("must-not-be-recorded");
+  });
+
+  it("separates authority encoding from the PTY write call on one Host clock", async () => {
+    let now = 0;
+    const authority = new (class extends FakeTerminalAuthority {
+      override encodeKey(input: Parameters<FakeTerminalAuthority["encodeKey"]>[0]): Uint8Array {
+        const encoded = super.encodeKey(input);
+        now += 2;
+        return encoded;
+      }
+    })();
+    const pty = new (class extends ManualPty {
+      override write(data: Uint8Array): void {
+        now += 3;
+        super.write(data);
+      }
+    })();
+    const session = new TerminalSession({
+      authority,
+      journal: new EventJournal(),
+      monotonicNow: () => now,
+      pty,
+      sessionEpoch: 1n,
+    });
+
+    const result = await session.submitKey(
+      { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1", writerFence: 1n },
+      {
+        action: "press",
+        altGraph: false,
+        code: "KeyA",
+        composing: false,
+        consumedModifiers: 0,
+        key: "a",
+        modifiers: 0,
+        text: "a",
+      },
+    );
+
+    expect(result).toMatchObject({
+      status: "written",
+      timing: {
+        actorProcessingMs: 5,
+        inputEncodeMs: 2,
+        ptyWriteAttempted: true,
+        ptyWriteMs: 3,
+        ptyBytes: 1,
+      },
+    });
   });
 
   it("fails the authority epoch when Ghostty snapshot encoding throws", async () => {

@@ -1,4 +1,4 @@
-import type { TelemetrySink } from "@zhongduan/telemetry";
+import type { BufferedTelemetrySink, TelemetrySink } from "@zhongduan/telemetry";
 
 import type { TerminalSession } from "../session";
 import {
@@ -34,6 +34,7 @@ export interface HostCloudRelayOptions {
   sessionId: string;
   snapshotPublisher?: SnapshotPublisherLike;
   stableConnectionMs?: number;
+  telemetryBuffer?: BufferedTelemetrySink;
   telemetry?: TelemetrySink;
   webSocketFactory?: RelayWebSocketFactory;
 }
@@ -52,6 +53,7 @@ export class HostCloudRelay {
   readonly #snapshotPublisher: SnapshotPublisherLike;
   readonly #stableConnectionMs: number;
   readonly #stopController = new AbortController();
+  readonly #telemetryBuffer: BufferedTelemetrySink | undefined;
   readonly #telemetry: TelemetrySink | undefined;
   readonly #webSocketFactory: RelayWebSocketFactory | undefined;
 
@@ -94,6 +96,7 @@ export class HostCloudRelay {
     if (!Number.isInteger(this.#stableConnectionMs) || this.#stableConnectionMs <= 0) {
       throw new RangeError("stableConnectionMs must be a positive integer");
     }
+    this.#telemetryBuffer = options.telemetryBuffer;
     this.#telemetry = options.telemetry;
     this.#webSocketFactory = options.webSocketFactory;
   }
@@ -151,7 +154,11 @@ export class HostCloudRelay {
           session: this.#session,
           snapshotCheckpointCache: this.#snapshotCheckpointCache,
           snapshotPublisher: this.#snapshotPublisher,
-          ...(this.#telemetry === undefined ? {} : { telemetry: this.#telemetry }),
+          ...(this.#telemetryBuffer === undefined
+            ? this.#telemetry === undefined
+              ? {}
+              : { telemetry: this.#telemetry }
+            : { telemetryBuffer: this.#telemetryBuffer }),
         });
         this.#connection = connection;
         await connection.start();

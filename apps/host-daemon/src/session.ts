@@ -21,6 +21,19 @@ const MAX_PTY_FRAME_BYTES = 16 * 1024;
 const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_U64 = (1n << 64n) - 1n;
 const textEncoder = new TextEncoder();
+export type SubmittedInputKind = "key" | "text" | "paste" | "focus" | "mouse" | "resize";
+export type SubmittedInputEncodeKind = "ghostty" | "utf8" | "resize" | "none";
+
+interface SubmittedInputProbe {
+  effectStage: "not-attempted" | "completed" | "threw";
+  encodeKind: SubmittedInputEncodeKind;
+  inputEncodeMs: number;
+  ptyBytes: number;
+  ptyResizeAttempted: boolean;
+  ptyResizeMs: number;
+  ptyWriteAttempted: boolean;
+  ptyWriteMs: number;
+}
 
 type SessionMessage =
   | { type: "pty-output"; data: Uint8Array }
@@ -31,9 +44,12 @@ type SessionMessage =
   | {
       type: "submitted-input";
       identity: SemanticInputIdentity;
+      inputKind: SubmittedInputKind;
+      queuedAt: number;
       validate?: () => void;
-      commit: () => void;
-      resolve: (ack: InputAck) => void;
+      commit: (probe: SubmittedInputProbe) => void;
+      initialProbe?: Partial<SubmittedInputProbe>;
+      resolve: (result: SubmittedInputResult) => void;
     }
   | {
       type: "snapshot";
@@ -103,6 +119,24 @@ export interface InputAck {
   clientInputSeq: bigint;
   inputEpoch: string;
   status: InputAckStatus;
+}
+
+export interface SubmittedInputTiming {
+  actorProcessingMs: number;
+  actorQueueWaitMs: number;
+  effectStage: "not-attempted" | "completed" | "threw";
+  encodeKind: SubmittedInputEncodeKind;
+  inputEncodeMs: number;
+  inputKind: SubmittedInputKind;
+  ptyBytes: number;
+  ptyResizeAttempted: boolean;
+  ptyResizeMs: number;
+  ptyWriteAttempted: boolean;
+  ptyWriteMs: number;
+}
+
+export interface SubmittedInputResult extends InputAck {
+  timing: SubmittedInputTiming;
 }
 
 export type SubscriptionResult =
@@ -294,56 +328,70 @@ export class TerminalSession {
     }
   }
 
-  submitKey(identity: SemanticInputIdentity, input: SemanticKey): Promise<InputAck> {
+  submitKey(identity: SemanticInputIdentity, input: SemanticKey): Promise<SubmittedInputResult> {
     const captured = { ...input };
-    return this.#submitInput(identity, () => {
-      const bytes = this.#authority.encodeKey(captured);
-      this.#writePty(bytes);
-    });
+    return this.#submitInput(identity, "key", (probe) =>
+      this.#encodeAndWriteSubmittedInput(probe, "ghostty", () =>
+        this.#authority.encodeKey(captured),
+      ),
+    );
   }
 
-  submitPaste(identity: SemanticInputIdentity, data: string): Promise<InputAck> {
-    return this.#submitInput(identity, () => {
-      const bytes = this.#authority.encodePaste(data);
-      this.#writePty(bytes);
-    });
+  submitPaste(identity: SemanticInputIdentity, data: string): Promise<SubmittedInputResult> {
+    return this.#submitInput(identity, "paste", (probe) =>
+      this.#encodeAndWriteSubmittedInput(probe, "ghostty", () => this.#authority.encodePaste(data)),
+    );
   }
 
-  submitText(identity: SemanticInputIdentity, data: string): Promise<InputAck> {
+  submitText(identity: SemanticInputIdentity, data: string): Promise<SubmittedInputResult> {
+    const encodingStartedAt = this.#monotonicNow();
     const encoded = textEncoder.encode(data);
+    const inputEncodeMs = elapsedMs(encodingStartedAt, this.#monotonicNow());
     return this.#submitInput(
       identity,
-      () => this.#writePty(encoded),
+      "text",
+      (probe) => this.#writeSubmittedInput(probe, encoded),
       () => {
         if (encoded.byteLength > MAX_TEXT_BYTES) {
           throw new RangeError(`text exceeds ${MAX_TEXT_BYTES} bytes`);
         }
       },
+      { encodeKind: "utf8", inputEncodeMs },
     );
   }
 
-  submitFocus(identity: SemanticInputIdentity, focused: boolean): Promise<InputAck> {
-    return this.#submitInput(identity, () => {
-      const bytes = this.#authority.encodeFocus(focused);
-      this.#writePty(bytes);
-    });
+  submitFocus(identity: SemanticInputIdentity, focused: boolean): Promise<SubmittedInputResult> {
+    return this.#submitInput(identity, "focus", (probe) =>
+      this.#encodeAndWriteSubmittedInput(probe, "ghostty", () =>
+        this.#authority.encodeFocus(focused),
+      ),
+    );
   }
 
-  submitMouse(identity: SemanticInputIdentity, mouse: SemanticMouse): Promise<InputAck> {
+  submitMouse(
+    identity: SemanticInputIdentity,
+    mouse: SemanticMouse,
+  ): Promise<SubmittedInputResult> {
     const captured = cloneMouse(mouse);
     return this.#submitInput(
       identity,
-      () => {
-        const bytes = this.#authority.encodeMouse(captured);
-        this.#writePty(bytes);
-      },
+      "mouse",
+      (probe) =>
+        this.#encodeAndWriteSubmittedInput(probe, "ghostty", () =>
+          this.#authority.encodeMouse(captured),
+        ),
       () => this.#authority.validateMouse(captured),
     );
   }
 
-  submitResize(identity: SemanticInputIdentity, dimensions: ResizePayload): Promise<InputAck> {
+  submitResize(
+    identity: SemanticInputIdentity,
+    dimensions: ResizePayload,
+  ): Promise<SubmittedInputResult> {
     const captured = { ...dimensions };
-    return this.#submitInput(identity, () => this.#commitResize(captured));
+    return this.#submitInput(identity, "resize", (probe) =>
+      this.#commitSubmittedResize(captured, probe),
+    );
   }
 
   captureSnapshot(): Promise<SnapshotCapture> {
@@ -412,7 +460,7 @@ export class TerminalSession {
             this.#writePty(this.#authority.encodePaste(next.data));
             break;
           case "submitted-input":
-            next.resolve(this.#commitSubmittedInput(next.identity, next.commit, next.validate));
+            next.resolve(this.#measureSubmittedInput(next));
             break;
           case "snapshot":
             try {
@@ -456,26 +504,57 @@ export class TerminalSession {
 
   #submitInput(
     identity: SemanticInputIdentity,
-    commit: () => void,
+    inputKind: SubmittedInputKind,
+    commit: (probe: SubmittedInputProbe) => void,
     validate?: () => void,
-  ): Promise<InputAck> {
+    initialProbe?: Partial<SubmittedInputProbe>,
+  ): Promise<SubmittedInputResult> {
     if (this.#disposed || this.#failure !== null || this.#ptyExited) {
-      return Promise.resolve(this.#inputAck(identity, "rejected"));
+      return Promise.resolve({
+        ...this.#inputAck(identity, "rejected"),
+        timing: this.#submittedInputTiming(inputKind, this.#newSubmittedInputProbe(initialProbe)),
+      });
     }
     return new Promise((resolve) => {
       this.#enqueue({
         type: "submitted-input",
         identity: { ...identity },
+        inputKind,
+        queuedAt: this.#monotonicNow(),
         commit,
+        ...(initialProbe === undefined ? {} : { initialProbe }),
         ...(validate === undefined ? {} : { validate }),
         resolve,
       });
     });
   }
 
+  #measureSubmittedInput(
+    message: Extract<SessionMessage, { type: "submitted-input" }>,
+  ): SubmittedInputResult {
+    const actorStartedAt = this.#monotonicNow();
+    const probe = this.#newSubmittedInputProbe(message.initialProbe);
+    const ack = this.#commitSubmittedInput(
+      message.identity,
+      () => message.commit(probe),
+      probe,
+      message.validate,
+    );
+    const actorFinishedAt = this.#monotonicNow();
+    return {
+      ...ack,
+      timing: {
+        ...this.#submittedInputTiming(message.inputKind, probe),
+        actorQueueWaitMs: elapsedMs(message.queuedAt, actorStartedAt),
+        actorProcessingMs: elapsedMs(actorStartedAt, actorFinishedAt),
+      },
+    };
+  }
+
   #commitSubmittedInput(
     identity: SemanticInputIdentity,
     commit: () => void,
+    probe: SubmittedInputProbe,
     validate?: () => void,
   ): InputAck {
     const ack = (status: InputAckStatus): InputAck => this.#inputAck(identity, status);
@@ -537,7 +616,9 @@ export class TerminalSession {
     };
 
     try {
+      probe.effectStage = "threw";
       commit();
+      probe.effectStage = "completed";
       this.#rememberInput(key, identity.clientInputSeq, "written");
       return ack("written");
     } catch (error) {
@@ -545,6 +626,99 @@ export class TerminalSession {
       this.#fail(error);
       return ack("uncertain");
     }
+  }
+
+  #newSubmittedInputProbe(initial: Partial<SubmittedInputProbe> | undefined): SubmittedInputProbe {
+    return {
+      effectStage: initial?.effectStage ?? "not-attempted",
+      encodeKind: initial?.encodeKind ?? "none",
+      inputEncodeMs: initial?.inputEncodeMs ?? 0,
+      ptyBytes: initial?.ptyBytes ?? 0,
+      ptyResizeAttempted: initial?.ptyResizeAttempted ?? false,
+      ptyResizeMs: initial?.ptyResizeMs ?? 0,
+      ptyWriteAttempted: initial?.ptyWriteAttempted ?? false,
+      ptyWriteMs: initial?.ptyWriteMs ?? 0,
+    };
+  }
+
+  #submittedInputTiming(
+    inputKind: SubmittedInputKind,
+    probe: SubmittedInputProbe,
+  ): SubmittedInputTiming {
+    return {
+      actorProcessingMs: 0,
+      actorQueueWaitMs: 0,
+      effectStage: probe.effectStage,
+      encodeKind: probe.encodeKind,
+      inputEncodeMs: probe.inputEncodeMs,
+      inputKind,
+      ptyBytes: probe.ptyBytes,
+      ptyResizeAttempted: probe.ptyResizeAttempted,
+      ptyResizeMs: probe.ptyResizeMs,
+      ptyWriteAttempted: probe.ptyWriteAttempted,
+      ptyWriteMs: probe.ptyWriteMs,
+    };
+  }
+
+  #encodeAndWriteSubmittedInput(
+    probe: SubmittedInputProbe,
+    encodeKind: Exclude<SubmittedInputEncodeKind, "none" | "resize">,
+    encode: () => Uint8Array,
+  ): void {
+    probe.encodeKind = encodeKind;
+    const encodeStartedAt = this.#monotonicNow();
+    let bytes: Uint8Array;
+    try {
+      bytes = encode();
+    } finally {
+      probe.inputEncodeMs += elapsedMs(encodeStartedAt, this.#monotonicNow());
+    }
+    this.#writeSubmittedInput(probe, bytes);
+  }
+
+  #writeSubmittedInput(probe: SubmittedInputProbe, data: Uint8Array): void {
+    probe.ptyBytes += data.byteLength;
+    if (data.byteLength === 0) return;
+    probe.ptyWriteAttempted = true;
+    const writeStartedAt = this.#monotonicNow();
+    try {
+      this.#pty.write(data);
+    } finally {
+      probe.ptyWriteMs += elapsedMs(writeStartedAt, this.#monotonicNow());
+    }
+  }
+
+  #commitSubmittedResize(dimensions: ResizePayload, probe: SubmittedInputProbe): void {
+    probe.encodeKind = "resize";
+    const authorityStartedAt = this.#monotonicNow();
+    let payload: Uint8Array;
+    let replies: readonly Uint8Array[];
+    try {
+      payload = encodeResizePayload(dimensions);
+      replies = this.#authority.resize(dimensions);
+    } finally {
+      probe.inputEncodeMs += elapsedMs(authorityStartedAt, this.#monotonicNow());
+    }
+
+    probe.ptyResizeAttempted = true;
+    const resizeStartedAt = this.#monotonicNow();
+    try {
+      this.#pty.resize(dimensions);
+    } finally {
+      probe.ptyResizeMs += elapsedMs(resizeStartedAt, this.#monotonicNow());
+    }
+    const frame = encodeDataFrame({
+      kind: DataFrameKind.ResizeApplied,
+      flags: DataFrameFlag.None,
+      sessionEpoch: this.#sessionEpoch,
+      deliveryGeneration: 0n,
+      eventSeq: ++this.#eventSeq,
+      ptyOffset: this.#nextPtyOffset,
+      streamId: 0,
+      payload,
+    });
+    this.#publish(frame);
+    for (const reply of replies) this.#writeSubmittedInput(probe, reply);
   }
 
   #rememberInput(key: string, clientInputSeq: bigint, result: "written" | "uncertain"): void {
@@ -653,7 +827,16 @@ export class TerminalSession {
     while ((queued = this.#queue.shift()) !== undefined) {
       if (queued.type === "snapshot") queued.reject(error);
       if (queued.type === "submitted-input") {
-        queued.resolve(this.#inputAck(queued.identity, "rejected"));
+        queued.resolve({
+          ...this.#inputAck(queued.identity, "rejected"),
+          timing: {
+            ...this.#submittedInputTiming(
+              queued.inputKind,
+              this.#newSubmittedInputProbe(queued.initialProbe),
+            ),
+            actorQueueWaitMs: elapsedMs(queued.queuedAt, this.#monotonicNow()),
+          },
+        });
       }
     }
   }

@@ -5,6 +5,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 import { DataFrameKind, decodeDataFrame } from "@zhongduan/protocol";
+import { createBufferedTelemetrySink } from "@zhongduan/telemetry";
 
 import { CloudApiClient } from "./cloud/cloud-api";
 import { HostCapabilityManager, type BootstrapTokenProvider } from "./cloud/capability-manager";
@@ -126,10 +127,11 @@ interface CloudArguments {
 
 export async function runCloud(argv: string[]): Promise<number> {
   let parsed: CloudArguments;
-  let telemetry: ReturnType<typeof telemetrySinkForTarget>;
+  let telemetryBuffer: ReturnType<typeof createBufferedTelemetrySink> | undefined;
   try {
     parsed = parseCloudArguments(argv);
-    telemetry = telemetrySinkForTarget(process.env.ZHONGDUAN_TELEMETRY, process.stderr);
+    const telemetry = telemetrySinkForTarget(process.env.ZHONGDUAN_TELEMETRY, process.stderr);
+    telemetryBuffer = telemetry === undefined ? undefined : createBufferedTelemetrySink(telemetry);
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     return 2;
@@ -243,7 +245,7 @@ export async function runCloud(argv: string[]): Promise<number> {
       capabilities,
       session,
       sessionId: created.sessionId,
-      ...(telemetry === undefined ? {} : { telemetry }),
+      ...(telemetryBuffer === undefined ? {} : { telemetryBuffer }),
     });
     const firstReady = await Promise.race([
       relay.start().then(

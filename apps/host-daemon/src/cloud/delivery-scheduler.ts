@@ -77,6 +77,7 @@ export interface HostDeliverySchedulerOptions {
   session: TerminalSession;
   snapshotCheckpointCache?: SnapshotCheckpointCache;
   snapshotPublisher: SnapshotPublisherLike;
+  telemetryBuffer?: BufferedTelemetrySink;
   telemetry?: TelemetrySink;
   yieldIo?: () => Promise<void>;
 }
@@ -125,7 +126,10 @@ export class HostDeliveryScheduler {
       options.snapshotCheckpointCache ?? new SnapshotCheckpointCache();
     this.#snapshotPublisher = options.snapshotPublisher;
     this.#telemetryBuffer =
-      options.telemetry === undefined ? undefined : createBufferedTelemetrySink(options.telemetry);
+      options.telemetryBuffer ??
+      (options.telemetry === undefined
+        ? undefined
+        : createBufferedTelemetrySink(options.telemetry));
     this.#telemetry = this.#telemetryBuffer?.sink;
     this.#yieldIo = options.yieldIo ?? (() => new Promise((resolve) => setImmediate(resolve)));
     this.#recoveryQueue = new DeliveryRecoveryQueue({
@@ -195,6 +199,7 @@ export class HostDeliveryScheduler {
     this.#failed = true;
     this.#ready = false;
     this.#canonicalPublisher.dispose();
+    this.#telemetryBuffer?.resume();
     this.#connectionAbort.abort(new Error(reason));
     this.#activeRecovery?.controller.abort(new Error(reason));
     this.#coldBuildInFlight?.controller.abort(new Error(reason));
@@ -827,7 +832,12 @@ export class HostDeliveryScheduler {
 
   async #pauseCanonical(): Promise<void> {
     this.#telemetryBuffer?.pause();
-    await this.#canonicalPublisher.pause();
+    try {
+      await this.#canonicalPublisher.pause();
+    } catch (error) {
+      this.#telemetryBuffer?.resume();
+      throw error;
+    }
   }
 
   #coldCaptureReadyAt(request: AttachRequest): number {
