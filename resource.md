@@ -237,7 +237,7 @@ Shift=1, Control=2, Alt=4, Super=8, CapsLock=16, NumLock=32
 `unshiftedCodepoint` 如果存在，必须是 Unicode scalar，不能落在 surrogate 区间。
 两个 modifier 字段只能使用 `0x3f` 内的位，并且 `consumedModifiers` 必须是 `modifiers` 的子集；AltGraph 合成出的 Ctrl/Alt 不应伪装成真实 modifier。
 
-`text.data` 与 `paste.data` 是 UTF-8 文本，分别最多 1 MiB；上限按编码后的 UTF-8 byte length 计算，不能按 JavaScript UTF-16 `length` 计算。`focus.focused` 只表达浏览器焦点状态。mouse 的 `buttons` 限于 `0..31`，`modifiers` 限于 `0x3f`，`surface.{x,y}` 是不超过 `1_000_000` 的非负整数 CSS px。press/release 的 `button` 必须为 `0..4`，move/wheel 必须为 `null`；wheel 至少携带一个有限、非零且绝对值不超过 `1_000_000` 的 delta，并必须携带 `deltaMode`，非 wheel 禁止携带 delta。cell、viewport 和 surface width/height 只作为 WTerm DOM adapter 的本地提示，不进入 wire；Host 只信自己的权威 geometry。Relay 不把这些输入编码成终端 bytes，只在现有 writer lease/input fence 验证后注入 `{connectionId, clientId}` 并转发给 Host。
+`text.data` 与 `paste.data` 是 UTF-8 文本，分别最多 1 MiB；上限按编码后的 UTF-8 byte length 计算，不能按 JavaScript UTF-16 `length` 计算。`focus.focused` 只表达浏览器焦点状态。mouse 的 `buttons` 限于 `0..31`，`modifiers` 限于 `0x3f`，`surface.{x,y}` 是不超过 `1_000_000` 的非负整数 CSS px。press/release 的 `button` 必须为 `0..4`，move/wheel 必须为 `null`；wheel 至少携带一个有限、非零且绝对值不超过 `1_000_000` 的 delta，并必须携带 `deltaMode`，非 wheel 禁止携带 delta。cell、viewport 和 surface width/height 只作为 WTerm DOM adapter 的本地提示，不进入 wire；Host 只信自己的权威 geometry。Relay 不把这些输入编码成终端 bytes，只在现有 writer lease/input fence 验证后从可信 socket attachment 注入 `{connectionId, clientId, writerFence}` 并转发给 Host。Browser 不能声明或覆盖 `writerFence`。
 
 `ack` 只表示该 delivery generation 的 frame 已可靠到达，不代表 libghostty 已应用。共享 credit 公式固定为 `(sentPtyOffset - ackedPtyOffset) + (sentEventSeq - ackedEventSeq) * 64`，上限为 512 KiB；Cloud 和 Host scheduler 必须复用 protocol package 的同一常量与公式。ACK cursor 只保存在当前 data WebSocket 的 hibernation attachment 中，不写入 SQL，也不作为下一 connection set 的单调下界；full reconnect 必须以新 `attach` 的 live replica cursor 重新建立 credit baseline。Host 重连或浏览器 data 断线时，DO 会 bump generation、关闭旧 data、签发同一 connection set 的 30 秒单次 data ticket，并发送一个 `resync-required`；已激活 control 保持 `active`，只同步新的 delivery generation，writer lease fence 不变。浏览器建立新 data 后，必须从当前 active replica 读取 cursor 并重新 `attach`；DO 不缓存 cursor 来自动 replay，从而消除“frame 已 apply、progress 尚未上报”的重复应用窗口。replacement ticket 过期只使 data 恢复失败，不撤销 control 或 lease；浏览器可改走 full connection set replacement。
 
@@ -249,6 +249,10 @@ Data 缺失、等待 attach 或 cold snapshot 恢复期间，已激活 writer co
 
 Writer lease 是需要显式维持的 control-plane liveness，而不是 data progress。Browser 只在持有 token 且 control 已激活时每 10 秒发送一次 `writer-lease-renew`；DO 只允许相同 `{clientId, leaseFence, token digest}` 的 active writer control 把 30 秒 deadline 向后推进，并返回 `writer-lease-status {active: true, expiresAt}`。renew 不能获取 lease、改变 fence、转发 Host 或替代 semantic input；data reset/reattach 也不能隐式续租。token 已过期、被新 fence 取代、control 尚未激活或角色不是 writer 时返回 `{active: false}`，Browser 必须立即清除 token 并进入 waiting。control close 继续按 fence 释放 lease；WebSocket ping/pong 的运行时自动响应不构成续租，也不能依赖它唤醒 DO。
 
+`writer_lease` singleton 同时是 session 内 writer fence 的持久 high-water。lease 过期或 client LRU 回收只能把 deadline 置为失效并删除 client row，不能删除 singleton；下一次成功获取必须在旧 fence 上加一，达到 `u64::MAX` 后 fail closed，绝不能回绕。Browser 每次收到携带新 `writerLease` 的 writer `welcome`，必须生成新的随机 `inputEpoch`，把 `clientInputSeq` 从 `1` 开始；data-only recovery 不发送第二个 welcome，继续使用原 fence、input epoch 和序列。
+
+DO 对所有 WebSocket 入站使用同一全局串行队列，因此 lease acquisition、fence 注入和向同一 Host control WebSocket 的 semantic input 发送保持同一顺序。Host 分开保存最高 `writerFence` 与该 fence 已绑定的 `{clientId, inputEpoch, highWater, bounded results}`：低 fence 一律 `rejected`；首次看到高 fence 时先原子推进 fence、清空旧 dedup 并保持 identity 未绑定，再校验输入。即使首帧的 seq、cursor 或纯 payload 校验失败，旧 fence 也已经永久失效，同时坏帧不会抢占新 fence；只有合法的 seq=1 可以完成 `{clientId, inputEpoch}` 绑定。绑定后，同 fence 改变 `clientId` 或 `inputEpoch` 一律 `rejected`。这使 Host 内存与 session 生命周期内累计 client/epoch 数量解耦，同时不会把被淘汰 client 的旧重传再次写入 PTY。
+
 `hasLiveReplica: false` 不提供 delivery baseline；`hasLiveReplica: true` 只采样完整三元 cursor。两者在 DO 接受同 Host data WebSocket 上的 `DeliveryBarrier` 前都不允许 directed mutation 或 `ReplayCommit`。warm barrier 以 attach cursor 为 base 并向 browser control 发送 `replay-start {streamId, generation, base, pinnedCommit}`；snapshot barrier 可以在尚未 pin/尚未发送 start 时覆盖 live attach baseline，以 finalize 后的 snapshot cut seed attachment 并发送 manifest。
 
 barrier 接受后，directed mutation 的上界和 `ReplayCommit` 的精确终点都使用 attachment 中不可变的 pinned commit，不再读取会继续变化的 session head。barrier 到 commit 之间出现 canonical frame、commit 不等于 pin、或当前 generation 的 delivery 被另一 barrier 冲突覆盖，都是 Host data 顺序违约并 fail closed。MVP 不接受 Host 发来的 directed `Reset`；合法 reset 只能走 DO 的 generation bump、关闭旧 data、签发 replacement ticket、control `resync-required` 这一条显式路径。
@@ -259,7 +263,27 @@ Hibernation socket 的 Error 事件直接执行同一套 fenced close lifecycle�
 
 Host 的 control/data 是两条独立 WebSocket，不存在跨通道顺序保证。Host 发送 `host-ready` 后必须等待 relay 在同一 control socket 返回 `host-ready-ack { sessionEpoch, headEventSeq, nextPtyOffset }`，再放行 data；DO 只在校验并提交 session head、将当前 fenced pair 切到 ready、完成现有 browser delivery reset 后返回 ACK。当前 fenced Host 在 barrier 前发送 data 会 fail closed，不能静默丢弃或在 DO 内隐式缓存。
 
+Host 在 control 和 data 两条连接上分别用原始文本 `ping`/`pong` 检测 silent half-open，不能为此新增 JSON control frame。DO 通过 `setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"))` 在 hibernation 下直接应答，不唤醒 handler；Host 为两条连接分别记录精确原始 `pong`，任一连接约 45 秒无响应就 fence 整个 pair 并重连。heartbeat 只替换网络 pair，不改变 PTY、authority 或 `sessionEpoch`。
+
 入站消息在进入串行处理队列前完成 channel/type/size 校验。队列全局限制为 2048 条/32 MiB；Host data 单 socket 为 1024 条/16 MiB，browser control 为 8 条/16 MiB。Host 超限会 fail 当前 fenced pair，browser 超限只隔离对应客户端。
+
+## Cloud session 创建必须可幂等恢复
+
+Host 在启动 PTY 后、第一次 Cloud 请求前生成一次稳定 `sessionId`，并在所有超时、断网和凭据轮换重试中复用：
+
+```http
+POST /api/v1/sessions
+Authorization: Bearer <bootstrap project token>
+Content-Type: application/json
+
+{ "sessionId": string, "engineId": string, "sessionEpoch": U64 }
+```
+
+Worker 直接以 `v1:${sessionId}` 命名 DO。首次精确 identity 初始化返回 `201`；同一 `{sessionId, engineId, sessionEpoch}` 重试命中同一 DO、返回新的 capabilities 和 `200`；同 ID 的 engine 或 epoch 冲突返回 `409`。因此即使 DO 已创建但 HTTP response 丢失，Host 也不会不断制造 orphan session。Host 必须校验响应 identity 与请求精确一致。
+
+bootstrap secret 不接受 argv 明文，只能来自 `ZHONGDUAN_BOOTSTRAP_TOKEN` 或 `--bootstrap-token-file` / `ZHONGDUAN_BOOTSTRAP_TOKEN_FILE`。create 和 reclaim 每次尝试都重新读取来源；401/403、文件轮换和临时 Cloud 故障进入有上限 degraded backoff，不能终止 PTY。
+
+Host capability 的半寿命+jitter 续期是 session 级 single-flight。每次共享续期有独立 10 秒 deadline，bootstrap provider、refresh 和 reclaim 都接收同一个 abort signal；Host 还必须在外层 race deadline，不能假设文件系统、fetch 或 response body 一定响应取消。单个调用者取消只退出自己的等待，不能取消其他调用者共享的续期。续期返回后必须再次校验 manager 生命周期、deadline 和 generation，过期操作不能迟到覆盖新 capability；旧 capability 尚未过期时可以短暂 fallback，已经过期则进入 degraded retry。
 
 ## Snapshot blob 使用私有 R2，由 session DO 协调 multipart 生命周期
 
@@ -285,6 +309,8 @@ Host 用 Host capability 上传：
 ```http
 PUT /api/v1/sessions/:sessionId/snapshots/:snapshotId
 ```
+
+从 zstd body 生成到收到精确发布响应之间，Host session 级 publisher 最多持有一个不超过 32 MiB 的 owned pending body，以及与它绑定的 immutable metadata/snapshotId。transport error、timeout、5xx、409、400、无效 2xx body 或 identity mismatch 都不能证明 Cloud 已清理对象，因此跨 delivery scheduler 和 Host pair 重连必须先用同一 ID/body 重试，禁止重新 capture/compress。只有精确匹配的 `200/201`，或 Cloud 在完成 multipart abort 与 object existence 收敛检查后返回的 `422 snapshot-checksum-mismatch`，才允许释放 pending。成功 checkpoint cache 仍只保留 metadata 和 `R` cursor，不保留 body。
 
 请求必须带规范的 `Content-Length`，且精确等于 `x-zhongduan-compressed-length`；不接受 chunked 或缺失长度上传。公开 Worker 只做 capability、path 和 metadata 校验，然后把同一个 request body stream 转交该 session DO。snapshot bytes 不进入 SQLite，也不在内存中聚合。
 
@@ -743,101 +769,33 @@ tail:                  ad
 
 # 五、snapshot 切点如何和新输出保持一致
 
-最简单的第一版可以短暂停止 terminal mutation。
+Host authority actor 串行处理 VT write、resize、语义输入和 snapshot encode。snapshot writer 是同步调用，因此在一个 actor turn 内捕获 snapshot cut `R`；返回后 authority 立即继续工作，Cloud canonical pump 也继续发送：
 
-```c
-typedef struct {
-  uint64_t session_epoch;
-  uint64_t event_seq;
-  uint64_t pty_offset;
-
-  GhosttyTerminal terminal;
-
-  bool snapshot_barrier;
-  EventQueue ingress_queue;
-  Journal journal;
-} Session;
-```
-
-正常 PTY 输出：
-
-```c
-static void commit_pty_output(
-    Session* session,
-    const uint8_t* bytes,
-    size_t len
-) {
-  assert(!session->snapshot_barrier);
-
-  const uint64_t start_offset = session->pty_offset;
-
-  // Host authoritative terminal 先应用。
-  ghostty_terminal_vt_write(session->terminal, bytes, len);
-
-  const uint64_t event_seq = ++session->event_seq;
-  session->pty_offset += len;
-
-  journal_append_pty_output(
-      &session->journal,
-      event_seq,
-      start_offset,
-      bytes,
-      len);
-
-  publish_pty_output(
-      session->session_epoch,
-      event_seq,
-      start_offset,
-      bytes,
-      len);
+```ts
+function captureSnapshot(): Promise<Snapshot> {
+  return actor.enqueue(() => {
+    return {
+      cutEventSeq: eventSeq,
+      nextPtyOffset,
+      bytes: ghostty.encodeSnapshot(),
+    };
+  });
 }
 ```
 
-生成 snapshot：
+`snapshot@R` 在 authority actor 外异步执行 level-1 zstd 和 immutable PUT；这段慢路径不占用 delivery barrier，也不暂停 canonical，因此其他已同步 TUI 和 semantic input 不受 R2 时延影响。发布完成后，scheduler 才短暂停 canonical pump，读取当前 cursor `C`，并要求 journal 的 `R..C` 连续且 directed tail 同时不超过 256 KiB / 512 帧。随后严格执行：
 
-```c
-typedef struct {
-  uint64_t cut_event_seq;
-  uint64_t next_pty_offset;
-  uint8_t* bytes;
-  size_t len;
-} Snapshot;
-
-static Snapshot take_snapshot(Session* session) {
-  // 此 barrier 期间：
-  // - PTY reader 可以继续从 fd 读，防止 kernel PTY buffer 填满；
-  // - 但读出的数据只能放 ingress_queue，不能写 terminal；
-  // - 用户输入和 resize 也排队。
-  session->snapshot_barrier = true;
-
-  Snapshot result = {
-    .cut_event_seq = session->event_seq,
-    .next_pty_offset = session->pty_offset,
-    .bytes = NULL,
-    .len = 0,
-  };
-
-  GhosttyResult rc = ghostty_snapshot_encode_alloc(
-      session->terminal,
-      NULL,
-      &result.bytes,
-      &result.len);
-
-  if (rc != GHOSTTY_SUCCESS) {
-    session->snapshot_barrier = false;
-    abort_snapshot(rc);
-  }
-
-  session->snapshot_barrier = false;
-
-  // 现在再按 ingress_queue 的全序继续处理事件。
-  drain_ingress_queue(session);
-
-  return result;
-}
+```text
+flush canonical through C
+DeliveryBarrier(snapshot R, pinned commit C)
+directed tail R+1..C
+ReplayCommit(C)
+resume canonical C+1
 ```
 
-这与当前 API 的约束一致：snapshot encode 期间调用方必须阻止 concurrent VT write、resize 和其他 terminal mutation，并且 writer 是同步调用。
+成功发布的 checkpoint 在 Host session 内只短暂缓存 30 秒，并可跨 Host relay pair 重连复用。缓存只包含 immutable snapshot metadata、engine 和 `R` cursor，不保留 Ghostty 原始 snapshot bytes 或 zstd body。每个 cold delivery 仍必须在发送 marker 前重新读取自己的 `C` 并验证 `R..C` 的 journal continuity 与 256 KiB / 512 帧预算；因此多个同时 cold 的 client 可以共享同一 snapshotId，但不能共享未经复核的 commit。短 TTL 也避免在 Browser 尚无 `snapshot-restore-failed` 回报时无限复用损坏对象。
+
+snapshot encode 的 5 秒 authority budget、HTTP publish deadline 和 marker ACK 的 5 秒 deadline 相互独立，不能用一个总 deadline 覆盖慢链路。如果发布后发现 journal gap 或 tail 超预算，Host 在发送 marker 前恢复 canonical、失效该 checkpoint 引用，并给失败 delivery 保留独立 backoff；session 级 quiet gate 只约束下一次 cold capture，输出安静后从更新的 `R` 单次重捕。其他可 warm delivery 可以越过这个 cold gate。marker 一旦发送而结果不确定，必须 fence 整个 Host pair，不能按 pre-marker 路径继续。
 
 错误实现是：
 
@@ -1523,18 +1481,51 @@ Ctrl-C 两次
 协议应明确：
 
 ```text
-同一 Agent epoch：
+同一 writerFence + inputEpoch：
   如果 Host 仍有 dedup 记录，重发 seq=77 只返回 duplicate ACK
+  如果逐条结果已被有界缓存淘汰，但 seq 不高于 high-water，则返回 uncertain
 
-Agent epoch 已变化：
-  未确认输入返回 uncertain
-  客户端不自动重发
+更高 writerFence：
+  必须使用新 inputEpoch，并从 seq=1 开始
+  Host 原子清除旧 fence 状态；旧 fence 的任何迟到输入都返回 rejected
+
+Host authority epoch 已变化：
+  未确认输入返回 uncertain，客户端不自动重发
 ```
 
 伪代码：
 
 ```ts
-function handleInput(input: ClientInput): void {
+function handleInput(input: ForwardedClientInput): void {
+  if (input.writerFence < currentWriterFence) {
+    sendInputAck(input.clientInputSeq, "rejected");
+    return;
+  }
+
+  if (input.writerFence > currentWriterFence) {
+    currentWriterFence = input.writerFence;
+    currentWriter = undefined;
+    inputDedup.clear();
+    inputHighWater = 0;
+  }
+
+  if (currentWriter === undefined) {
+    if (input.clientInputSeq !== 1 || !validatePureInput(input)) {
+      sendInputAck(input.clientInputSeq, "rejected");
+      return;
+    }
+    currentWriter = {
+      clientId: input.clientId,
+      inputEpoch: input.inputEpoch,
+    };
+  } else if (
+    input.clientId !== currentWriter.clientId ||
+    input.inputEpoch !== currentWriter.inputEpoch
+  ) {
+    sendInputAck(input.clientInputSeq, "rejected");
+    return;
+  }
+
   const previous = inputDedup.get(input.clientInputSeq);
 
   if (previous) {

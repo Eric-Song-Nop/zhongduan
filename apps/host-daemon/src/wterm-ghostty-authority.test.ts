@@ -177,6 +177,66 @@ describe("WtermGhosttyAuthority", () => {
     }
   });
 
+  it("encodes focus and mouse from authoritative modes and pixel geometry", async () => {
+    const authority = await WtermGhosttyAuthority.create({
+      cols: 80,
+      rows: 40,
+      widthPx: 800,
+      heightPx: 400,
+    });
+    try {
+      expect(authority.encodeFocus(true)).toEqual(new Uint8Array());
+      authority.applyOutput(encoder.encode("\u001b[?1004h\u001b[?1000h\u001b[?1006h"));
+      expect(decoder.decode(authority.encodeFocus(true))).toBe("\u001b[I");
+      expect(decoder.decode(authority.encodeFocus(false))).toBe("\u001b[O");
+
+      const press = {
+        action: "press" as const,
+        altGraph: true,
+        button: 0,
+        buttons: 1,
+        modifiers: KeyModifier.Control | KeyModifier.Alt,
+        surface: { x: 75, y: 45 },
+      };
+      authority.validateMouse(press);
+      expect(decoder.decode(authority.encodeMouse(press))).toBe("\u001b[<0;8;5M");
+      expect(
+        decoder.decode(
+          authority.encodeMouse({
+            action: "wheel",
+            altGraph: false,
+            button: null,
+            buttons: 0,
+            deltaMode: "line",
+            deltaY: -1,
+            modifiers: 0,
+            surface: { x: 95, y: 55 },
+          }),
+        ),
+      ).toBe("\u001b[<64;10;6M");
+    } finally {
+      authority.dispose();
+    }
+  });
+
+  it("rejects mouse before entering Ghostty when authoritative pixels are unavailable", async () => {
+    const authority = await WtermGhosttyAuthority.create(dimensions);
+    try {
+      expect(() =>
+        authority.validateMouse({
+          action: "press",
+          altGraph: false,
+          button: 0,
+          buttons: 1,
+          modifiers: 0,
+          surface: { x: 1, y: 1 },
+        }),
+      ).toThrow(/authoritative pixel geometry/);
+    } finally {
+      authority.dispose();
+    }
+  });
+
   it("passes Ghostty-layout modifiers and AltGraph semantics without remapping", async () => {
     const authority = await WtermGhosttyAuthority.create(dimensions);
     try {

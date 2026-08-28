@@ -7,9 +7,23 @@ import {
   ConnectionSetRequestSchema,
   ConnectionSetResponseSchema,
   HostCapabilityReclaimRequestSchema,
+  CreateSessionRequestSchema,
 } from "./cloud-api";
 
 describe("Cloud HTTP contracts", () => {
+  it("requires a stable caller-generated session resource id", () => {
+    expect(
+      CreateSessionRequestSchema.parse({
+        sessionId: "session_AAAAAAAAAAAA",
+        engineId: "engine",
+        sessionEpoch: "7",
+      }),
+    ).toMatchObject({ sessionId: "session_AAAAAAAAAAAA" });
+    expect(() =>
+      CreateSessionRequestSchema.parse({ engineId: "engine", sessionEpoch: "7" }),
+    ).toThrow();
+  });
+
   it("validates a generation-fenced connection-set response", () => {
     expect(ConnectionSetRequestSchema.parse({ clientId: "client_id_AAAAAAAAAAA" })).toEqual({
       clientId: "client_id_AAAAAAAAAAA",

@@ -417,11 +417,6 @@ export class RelayConnectionStore {
         now,
       );
       if (this.store.clientById(candidate.client_id) === undefined) {
-        this.sql.exec(
-          "DELETE FROM writer_lease WHERE client_id = ? AND expires_at <= ?",
-          candidate.client_id,
-          now,
-        );
         return true;
       }
     }

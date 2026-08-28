@@ -1,6 +1,9 @@
-import { ConnectionSetRequestSchema, PositiveDecimalU64Schema } from "@zhongduan/protocol";
-import { z } from "zod";
-import { AuthError, randomId, secretsEqual, verifyBearerCapability } from "./auth";
+import {
+  ConnectionSetRequestSchema,
+  CreateSessionRequestSchema,
+  CreateSessionResponseSchema,
+} from "@zhongduan/protocol";
+import { AuthError, secretsEqual, verifyBearerCapability } from "./auth";
 import { handleCapabilityRequest, issueSessionCapability } from "./capability-http";
 import type { CloudEnv } from "./env";
 import { handleSnapshotRequest } from "./snapshot-http";
@@ -29,11 +32,6 @@ const HostCapabilityReclaimRoute = new RegExp(
   `^/api/v1/sessions/(${sessionIdPattern})/capabilities/host/reclaim$`,
   "u",
 );
-
-const CreateSessionSchema = z.strictObject({
-  engineId: z.string().min(1).max(512),
-  sessionEpoch: PositiveDecimalU64Schema,
-});
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, {
@@ -64,21 +62,30 @@ async function createSession(request: Request, env: CloudEnv): Promise<Response>
   if (bootstrap === undefined || !(await secretsEqual(bootstrap, env.BOOTSTRAP_TOKEN))) {
     return json({ error: "unauthorized" }, 401);
   }
-  const input = CreateSessionSchema.safeParse(await requestJson(request));
+  const input = CreateSessionRequestSchema.safeParse(await requestJson(request));
   if (!input.success) {
     return json({ error: "invalid-session" }, 400);
   }
 
-  const sessionId = randomId();
+  const { sessionId } = input.data;
   const initialized = await sessionStub(env, sessionId).fetch(
     "https://do.internal/internal/initialize",
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionId, ...input.data }),
+      body: JSON.stringify(input.data),
     },
   );
+  if (initialized.status === 409) {
+    await initialized.body?.cancel();
+    return json({ error: "session-conflict" }, 409);
+  }
   if (!initialized.ok) {
+    await initialized.body?.cancel();
+    return json({ error: "session-initialization-failed" }, 503);
+  }
+  const initialization = (await initialized.json()) as { created?: unknown };
+  if (typeof initialization.created !== "boolean") {
     return json({ error: "session-initialization-failed" }, 503);
   }
 
@@ -88,15 +95,18 @@ async function createSession(request: Request, env: CloudEnv): Promise<Response>
     issueSessionCapability(env.CAPABILITY_SIGNING_KEY, sessionId, "observer"),
   ]);
   return json(
-    {
+    CreateSessionResponseSchema.parse({
       sessionId,
       engineId: input.data.engineId,
       sessionEpoch: input.data.sessionEpoch,
       hostCapability: hostCapability.capability,
+      hostCapabilityExpiresAt: hostCapability.expiresAt,
       writerCapability: writerCapability.capability,
+      writerCapabilityExpiresAt: writerCapability.expiresAt,
       observerCapability: observerCapability.capability,
-    },
-    201,
+      observerCapabilityExpiresAt: observerCapability.expiresAt,
+    }),
+    initialization.created ? 201 : 200,
   );
 }
 

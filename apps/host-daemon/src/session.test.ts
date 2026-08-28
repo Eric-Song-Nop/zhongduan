@@ -297,6 +297,7 @@ describe("TerminalSession", () => {
           clientInputSeq: 1n,
           inputEpoch: "writer-1",
           observedEventSeq: 0n,
+          writerFence: 1n,
         },
         enter,
       ),
@@ -308,12 +309,13 @@ describe("TerminalSession", () => {
           clientInputSeq: 1n,
           inputEpoch: "writer-1",
           observedEventSeq: 0n,
+          writerFence: 1n,
         },
         enter,
       ),
     ).resolves.toMatchObject({ status: "duplicate" });
     await session.submitPaste(
-      { clientId: "client-1", clientInputSeq: 2n, inputEpoch: "writer-1" },
+      { clientId: "client-1", clientInputSeq: 2n, inputEpoch: "writer-1", writerFence: 1n },
       "next",
     );
     await expect(
@@ -323,6 +325,7 @@ describe("TerminalSession", () => {
           clientInputSeq: 1n,
           inputEpoch: "writer-1",
           observedEventSeq: 0n,
+          writerFence: 1n,
         },
         enter,
       ),
@@ -334,6 +337,7 @@ describe("TerminalSession", () => {
           clientInputSeq: 3n,
           inputEpoch: "writer-1",
           observedEventSeq: 99n,
+          writerFence: 1n,
         },
         enter,
       ),
@@ -342,11 +346,42 @@ describe("TerminalSession", () => {
     expect(pty.writes).toEqual([new TextEncoder().encode("\r"), new TextEncoder().encode("next")]);
   });
 
-  it("bounds semantic input epoch tracking and fails closed at capacity", async () => {
+  it("accepts more than 256 monotonically increasing writer fences", async () => {
     const pty = new ManualPty();
     const session = new TerminalSession({
       authority: new FakeTerminalAuthority(),
-      inputDedupEpochs: 1,
+      journal: new EventJournal(),
+      pty,
+      sessionEpoch: 1n,
+    });
+
+    for (let fence = 1n; fence <= 300n; fence += 1n) {
+      await expect(
+        session.submitPaste(
+          {
+            clientId: `client-${fence}`,
+            clientInputSeq: 1n,
+            inputEpoch: `writer-${fence}`,
+            writerFence: fence,
+          },
+          `input-${fence}`,
+        ),
+      ).resolves.toMatchObject({ status: "written" });
+    }
+    await expect(
+      session.submitPaste(
+        { clientId: "client-299", clientInputSeq: 2n, inputEpoch: "writer-299", writerFence: 299n },
+        "stale",
+      ),
+    ).resolves.toMatchObject({ status: "rejected" });
+
+    expect(pty.writes).toHaveLength(300);
+  });
+
+  it("binds one input epoch to each fence and advances before rejecting a bad first sequence", async () => {
+    const pty = new ManualPty();
+    const session = new TerminalSession({
+      authority: new FakeTerminalAuthority(),
       journal: new EventJournal(),
       pty,
       sessionEpoch: 1n,
@@ -354,18 +389,39 @@ describe("TerminalSession", () => {
 
     await expect(
       session.submitPaste(
-        { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1" },
-        "accepted",
+        { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1", writerFence: 1n },
+        "first",
       ),
     ).resolves.toMatchObject({ status: "written" });
     await expect(
       session.submitPaste(
-        { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-2" },
-        "rejected",
+        { clientId: "client-1", clientInputSeq: 2n, inputEpoch: "changed", writerFence: 1n },
+        "same-fence-new-epoch",
       ),
     ).resolves.toMatchObject({ status: "rejected" });
+    await expect(
+      session.submitPaste(
+        { clientId: "client-2", clientInputSeq: 2n, inputEpoch: "writer-2", writerFence: 2n },
+        "bad-first-sequence",
+      ),
+    ).resolves.toMatchObject({ status: "rejected" });
+    await expect(
+      session.submitPaste(
+        { clientId: "client-1", clientInputSeq: 2n, inputEpoch: "writer-1", writerFence: 1n },
+        "old-fence",
+      ),
+    ).resolves.toMatchObject({ status: "rejected" });
+    await expect(
+      session.submitPaste(
+        { clientId: "client-2", clientInputSeq: 1n, inputEpoch: "writer-2", writerFence: 2n },
+        "second",
+      ),
+    ).resolves.toMatchObject({ status: "written" });
 
-    expect(pty.writes).toEqual([new TextEncoder().encode("accepted")]);
+    expect(pty.writes).toEqual([
+      new TextEncoder().encode("first"),
+      new TextEncoder().encode("second"),
+    ]);
   });
 
   it("deduplicates resize through the shared semantic input sequence", async () => {
@@ -381,6 +437,7 @@ describe("TerminalSession", () => {
       clientInputSeq: 1n,
       inputEpoch: "writer-1",
       observedEventSeq: 0n,
+      writerFence: 1n,
     };
     const dimensions = { cols: 100, rows: 30, widthPx: 800, heightPx: 600 };
 
@@ -397,6 +454,226 @@ describe("TerminalSession", () => {
     expect(session.eventSeq).toBe(1n);
   });
 
+  it("writes text as raw UTF-8 and shares dedup across text, focus, and mouse", async () => {
+    const pty = new ManualPty();
+    let focusCalls = 0;
+    let mouseCalls = 0;
+    const authority = new (class extends FakeTerminalAuthority {
+      override encodePaste(data: string): Uint8Array {
+        return new TextEncoder().encode(`[paste:${data}]`);
+      }
+
+      override encodeFocus(focused: boolean): Uint8Array {
+        focusCalls += 1;
+        return new TextEncoder().encode(focused ? "focus-in" : "focus-out");
+      }
+
+      override encodeMouse(): Uint8Array {
+        mouseCalls += 1;
+        return new TextEncoder().encode("mouse");
+      }
+    })();
+    const session = new TerminalSession({
+      authority,
+      journal: new EventJournal(),
+      pty,
+      sessionEpoch: 1n,
+    });
+    const first = {
+      clientId: "client-1",
+      clientInputSeq: 1n,
+      inputEpoch: "writer-1",
+      writerFence: 1n,
+    };
+    const second = { ...first, clientInputSeq: 2n };
+
+    await expect(session.submitText(first, "你好")).resolves.toMatchObject({ status: "written" });
+    await expect(session.submitFocus(first, true)).resolves.toMatchObject({ status: "duplicate" });
+    await expect(
+      session.submitMouse(second, {
+        action: "press",
+        altGraph: false,
+        button: 0,
+        buttons: 1,
+        modifiers: 0,
+        surface: { x: 10, y: 10 },
+      }),
+    ).resolves.toMatchObject({ status: "written" });
+    await expect(session.submitPaste(second, "ignored")).resolves.toMatchObject({
+      status: "duplicate",
+    });
+
+    expect(pty.writes).toEqual([
+      new TextEncoder().encode("你好"),
+      new TextEncoder().encode("mouse"),
+    ]);
+    expect(focusCalls).toBe(0);
+    expect(mouseCalls).toBe(1);
+  });
+
+  it("advances an unbound fence before payload validation and binds only a valid seq 1", async () => {
+    const pty = new ManualPty();
+    let mouseCalls = 0;
+    const authority = new (class extends FakeTerminalAuthority {
+      override encodeMouse(): Uint8Array {
+        mouseCalls += 1;
+        return Uint8Array.of(1);
+      }
+    })();
+    const session = new TerminalSession({
+      authority,
+      journal: new EventJournal(),
+      pty,
+      sessionEpoch: 1n,
+    });
+    session.resize({ cols: 80, rows: 24, widthPx: 0, heightPx: 0 });
+
+    await expect(
+      session.submitText(
+        { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1", writerFence: 1n },
+        "first",
+      ),
+    ).resolves.toMatchObject({ status: "written" });
+
+    await expect(
+      session.submitMouse(
+        { clientId: "client-2", clientInputSeq: 1n, inputEpoch: "malformed", writerFence: 2n },
+        {
+          action: "press",
+          altGraph: false,
+          button: 0,
+          buttons: 1,
+          modifiers: 0,
+          surface: { x: 10, y: 10 },
+        },
+      ),
+    ).resolves.toMatchObject({ status: "rejected" });
+    await expect(
+      session.submitText(
+        { clientId: "client-1", clientInputSeq: 2n, inputEpoch: "writer-1", writerFence: 1n },
+        "old-fence",
+      ),
+    ).resolves.toMatchObject({ status: "rejected" });
+    await expect(
+      session.submitText(
+        { clientId: "client-3", clientInputSeq: 1n, inputEpoch: "writer-2", writerFence: 2n },
+        "alive",
+      ),
+    ).resolves.toMatchObject({ status: "written" });
+    await expect(
+      session.submitText(
+        { clientId: "client-3", clientInputSeq: 2n, inputEpoch: "changed", writerFence: 2n },
+        "changed",
+      ),
+    ).resolves.toMatchObject({ status: "rejected" });
+
+    expect(mouseCalls).toBe(0);
+    expect(pty.writes).toEqual([
+      new TextEncoder().encode("first"),
+      new TextEncoder().encode("alive"),
+    ]);
+  });
+
+  it("marks a stateful encoder throw uncertain and fails the authority epoch closed", async () => {
+    const pty = new ManualPty();
+    const session = new TerminalSession({
+      authority: new (class extends FakeTerminalAuthority {
+        override encodeFocus(): Uint8Array {
+          throw new Error("focus encoder failed after entry");
+        }
+      })(),
+      journal: new EventJournal(),
+      pty,
+      sessionEpoch: 1n,
+    });
+
+    await expect(
+      session.submitFocus(
+        { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1", writerFence: 1n },
+        false,
+      ),
+    ).resolves.toMatchObject({ status: "uncertain" });
+    await expect(session.waitForExit()).resolves.toEqual({
+      status: "failed",
+      message: "focus encoder failed after entry",
+    });
+    expect(pty.writes).toEqual([]);
+  });
+
+  it("runs the snapshot fence before draining reentrant PTY output", async () => {
+    const pty = new ManualPty();
+    const order: string[] = [];
+    const authority = new (class extends FakeTerminalAuthority {
+      override encodeSnapshot(): Uint8Array {
+        const bytes = super.encodeSnapshot();
+        pty.emit(Uint8Array.of(0x42));
+        return bytes;
+      }
+    })();
+    const session = new TerminalSession({
+      authority,
+      journal: new EventJournal(),
+      pty,
+      sessionEpoch: 1n,
+    });
+    session.subscribe((encoded) => order.push(`event:${decodeDataFrame(encoded).eventSeq}`));
+    pty.emit(Uint8Array.of(0x41));
+
+    const snapshot = await session.captureSnapshotWithFence((capture) => {
+      order.push(`fence:${capture.cutEventSeq}`);
+      session.writeRawInput(Uint8Array.of(0x03));
+    });
+
+    expect(snapshot.cutEventSeq).toBe(1n);
+    expect(order).toEqual(["event:1", "fence:1", "event:2"]);
+    expect(pty.writes).toEqual([Uint8Array.of(0x03)]);
+  });
+
+  it("fails the authority epoch when Ghostty snapshot encoding throws", async () => {
+    const pty = new ManualPty();
+    const session = new TerminalSession({
+      authority: new (class extends FakeTerminalAuthority {
+        override encodeSnapshot(): Uint8Array {
+          throw new Error("snapshot encoder invariant failed");
+        }
+      })(),
+      journal: new EventJournal(),
+      pty,
+      sessionEpoch: 1n,
+    });
+
+    await expect(session.captureSnapshot()).rejects.toThrow("snapshot encoder invariant failed");
+    await expect(session.waitForExit()).resolves.toEqual({
+      status: "failed",
+      message: "snapshot encoder invariant failed",
+    });
+    await expect(
+      session.submitText(
+        { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1", writerFence: 1n },
+        "ignored",
+      ),
+    ).resolves.toMatchObject({ status: "rejected" });
+  });
+
+  it("fails the authority epoch when Ghostty returns an empty snapshot", async () => {
+    const session = new TerminalSession({
+      authority: new (class extends FakeTerminalAuthority {
+        override encodeSnapshot(): Uint8Array {
+          return new Uint8Array();
+        }
+      })(),
+      journal: new EventJournal(),
+      pty: new ManualPty(),
+      sessionEpoch: 1n,
+    });
+
+    await expect(session.captureSnapshot()).rejects.toThrow("empty snapshot");
+    await expect(session.waitForExit()).resolves.toEqual({
+      status: "failed",
+      message: "terminal authority returned an empty snapshot",
+    });
+  });
+
   it("rejects submitted input after the PTY exits", async () => {
     const pty = new ManualPty();
     const session = new TerminalSession({
@@ -409,7 +686,7 @@ describe("TerminalSession", () => {
 
     await expect(
       session.submitPaste(
-        { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1" },
+        { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1", writerFence: 1n },
         "ignored",
       ),
     ).resolves.toMatchObject({ status: "rejected" });
@@ -449,7 +726,7 @@ describe("TerminalSession", () => {
     });
     await expect(
       session.submitPaste(
-        { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1" },
+        { clientId: "client-1", clientInputSeq: 1n, inputEpoch: "writer-1", writerFence: 1n },
         "ignored",
       ),
     ).resolves.toMatchObject({ status: "rejected" });
