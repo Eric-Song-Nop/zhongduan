@@ -18,6 +18,7 @@ import {
   HostDeliveryScheduler,
   SNAPSHOT_ENCODE_BUDGET_MS,
   SNAPSHOT_PUBLISH_TIMEOUT_MS,
+  SNAPSHOT_RECOVERY_MAX_QUIET_WAIT_MS,
   SNAPSHOT_RECOVERY_QUIET_MS,
   WARM_REPLAY_MAX_FRAMES,
   type SnapshotPublisherLike,
@@ -462,6 +463,52 @@ describe("HostDeliveryScheduler", () => {
     await vi.advanceTimersByTimeAsync(SNAPSHOT_RECOVERY_QUIET_MS - 1);
     expect(publish).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(1);
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(barriers).toBe(2);
+    expect(
+      harness.data
+        .map(decodeDataFrame)
+        .filter((frame) => frame.kind === DataFrameKind.ReplayCommit),
+    ).toHaveLength(1);
+    expect(harness.closeReasons).toEqual([]);
+  });
+
+  it("refreshes a rejected cold checkpoint by a hard deadline during continuous output", async () => {
+    vi.useFakeTimers();
+    let publishCalls = 0;
+    const publish = vi.fn(async (snapshot: SnapshotCapture) => {
+      publishCalls += 1;
+      return publishedSnapshot(snapshot, publishCalls === 1 ? "A" : "B");
+    });
+    const harness = createHarness({ publish });
+    activate(harness);
+    let barriers = 0;
+    harness.setBarrierResponder((encoded) => {
+      barriers += 1;
+      answerBarrier(
+        harness,
+        encoded,
+        barriers === 1
+          ? {
+              status: "rejected",
+              reason: "snapshot-missing",
+              retryScope: "refresh-checkpoint",
+            }
+          : { status: "ready" },
+      );
+    });
+
+    attach(harness);
+    for (let turn = 0; turn < 16; turn += 1) await Promise.resolve();
+    expect(publish).toHaveBeenCalledOnce();
+    expect(barriers).toBe(1);
+
+    for (let elapsed = 0; elapsed < SNAPSHOT_RECOVERY_MAX_QUIET_WAIT_MS; elapsed += 100) {
+      harness.pty.emit(Uint8Array.of(elapsed & 0xff));
+      await vi.advanceTimersByTimeAsync(100);
+    }
     for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
 
     expect(publish).toHaveBeenCalledTimes(2);

@@ -15,7 +15,12 @@ function attach(streamId: number, deliveryGeneration = "1"): AttachRequest {
 }
 
 function queue(now: () => number): DeliveryRecoveryQueue {
-  return new DeliveryRecoveryQueue({ maxRetryMs: 5_000, monotonicNow: now, quietMs: 250 });
+  return new DeliveryRecoveryQueue({
+    maxQuietWaitMs: 5_000,
+    maxRetryMs: 5_000,
+    monotonicNow: now,
+    quietMs: 250,
+  });
 }
 
 describe("DeliveryRecoveryQueue", () => {
@@ -49,6 +54,18 @@ describe("DeliveryRecoveryQueue", () => {
     expect(recoveries.readyAt(request, 300)).toBe(550);
     now = 550;
     expect(recoveries.readyAt(request, 300)).toBe(now);
+  });
+
+  it("bounds the trailing quiet wait while canonical output remains continuous", () => {
+    let now = 100;
+    const recoveries = queue(() => now);
+    const request = attach(1);
+    recoveries.defer(request, 250);
+
+    now = 5_099;
+    expect(recoveries.readyAt(request, now)).toBe(5_100);
+    now = 5_100;
+    expect(recoveries.readyAt(request, now)).toBe(now);
   });
 
   it("applies per-delivery exponential failure backoff with a hard cap", () => {
