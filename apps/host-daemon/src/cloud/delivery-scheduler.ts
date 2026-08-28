@@ -34,6 +34,7 @@ export const SNAPSHOT_PUBLISH_TIMEOUT_MS = 120_000;
 export const DELIVERY_BARRIER_TIMEOUT_MS = 5_000;
 export const SNAPSHOT_RECOVERY_QUIET_MS = 250;
 export const SNAPSHOT_RECOVERY_MAX_RETRY_MS = 5_000;
+export const SNAPSHOT_RECOVERY_MAX_QUIET_WAIT_MS = 5_000;
 
 const PUMP_YIELD_BYTES = 256 * 1024;
 const PUMP_YIELD_FRAMES = 64;
@@ -91,6 +92,7 @@ export class HostDeliveryScheduler {
   #activeRecovery: ActiveRecovery | undefined;
   #coldBuildInFlight: ColdPreparation | undefined;
   #coldCaptureNotBefore: number | undefined;
+  #coldCaptureQuietDeadline: number | undefined;
   #failed = false;
   #lastCanonicalAt = Number.NEGATIVE_INFINITY;
   #ready = false;
@@ -109,6 +111,7 @@ export class HostDeliveryScheduler {
     this.#snapshotPublisher = options.snapshotPublisher;
     this.#yieldIo = options.yieldIo ?? (() => new Promise((resolve) => setImmediate(resolve)));
     this.#recoveryQueue = new DeliveryRecoveryQueue({
+      maxQuietWaitMs: SNAPSHOT_RECOVERY_MAX_QUIET_WAIT_MS,
       maxRetryMs: SNAPSHOT_RECOVERY_MAX_RETRY_MS,
       monotonicNow: this.#monotonicNow,
       quietMs: SNAPSHOT_RECOVERY_QUIET_MS,
@@ -452,6 +455,7 @@ export class HostDeliveryScheduler {
         preparation.checkpoint = this.#snapshotCheckpointCache.install(checkpoint);
         preparation.status = "ready";
         this.#coldCaptureNotBefore = undefined;
+        this.#coldCaptureQuietDeadline = undefined;
         this.#recoveryQueue.requeue(request);
         this.#schedulePendingRecoveries();
       },
@@ -749,17 +753,22 @@ export class HostDeliveryScheduler {
   #coldCaptureReadyAt(request: AttachRequest): number {
     const requestReadyAt = this.#recoveryQueue.readyAt(request, this.#lastCanonicalAt);
     if (this.#coldCaptureNotBefore === undefined) return requestReadyAt;
+    const quietDeadline = this.#coldCaptureQuietDeadline ?? this.#coldCaptureNotBefore;
     return Math.max(
       requestReadyAt,
       this.#coldCaptureNotBefore,
-      this.#lastCanonicalAt + SNAPSHOT_RECOVERY_QUIET_MS,
+      Math.min(this.#lastCanonicalAt + SNAPSHOT_RECOVERY_QUIET_MS, quietDeadline),
     );
   }
 
   #deferColdCaptures(delayMs: number): void {
-    this.#coldCaptureNotBefore = Math.max(
-      this.#coldCaptureNotBefore ?? 0,
-      this.#monotonicNow() + delayMs,
+    const now = this.#monotonicNow();
+    const notBefore = Math.max(this.#coldCaptureNotBefore ?? 0, now + delayMs);
+    this.#coldCaptureNotBefore = notBefore;
+    this.#coldCaptureQuietDeadline = Math.max(
+      this.#coldCaptureQuietDeadline ?? 0,
+      notBefore,
+      now + SNAPSHOT_RECOVERY_MAX_QUIET_WAIT_MS,
     );
   }
 

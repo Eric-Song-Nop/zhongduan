@@ -667,7 +667,7 @@ describe("TerminalSession delivery activation", () => {
     },
   );
 
-  it("fences a healthy socket pair when attach never receives a delivery start", async () => {
+  it("allows the maximum concurrent cold service window, then fences a lost attach", async () => {
     const timers = new ManualTimers();
     timers.now = 2_000_000_000_000;
     const response = {

@@ -14,6 +14,25 @@ export const RelayCapability = {
   deliveryBarrierOutcomeV1: "delivery-barrier-outcome-v1",
 } as const;
 export const RelayCapabilitySchema = z.enum([RelayCapability.deliveryBarrierOutcomeV1]);
+export type RelayCapability = z.infer<typeof RelayCapabilitySchema>;
+
+const MAX_RELAY_CAPABILITIES_HEADER_CHARS = 1_024;
+const MAX_RELAY_CAPABILITIES = 16;
+const relayCapabilityToken = /^[a-z0-9][a-z0-9-]{0,63}$/u;
+
+export function selectRelayCapabilities(header: string | null): RelayCapability[] | undefined {
+  if (header === null || header === "") return [];
+  if (header.length > MAX_RELAY_CAPABILITIES_HEADER_CHARS) return undefined;
+  const requested = header.split(",").map((entry) => entry.trim());
+  if (
+    requested.length > MAX_RELAY_CAPABILITIES ||
+    requested.some((entry) => !relayCapabilityToken.test(entry))
+  ) {
+    return undefined;
+  }
+  const requestedSet = new Set(requested);
+  return Object.values(RelayCapability).filter((capability) => requestedSet.has(capability));
+}
 
 export const CreateSessionRequestSchema = z.strictObject({
   sessionId: CloudResourceIdSchema,
@@ -77,6 +96,5 @@ export type CreateSessionRequest = z.infer<typeof CreateSessionRequestSchema>;
 export type CreateSessionResponse = z.infer<typeof CreateSessionResponseSchema>;
 export type ConnectionSetRequest = z.infer<typeof ConnectionSetRequestSchema>;
 export type ConnectionSetResponse = z.infer<typeof ConnectionSetResponseSchema>;
-export type RelayCapability = z.infer<typeof RelayCapabilitySchema>;
 export type CapabilityResponse = z.infer<typeof CapabilityResponseSchema>;
 export type SnapshotUploadResponse = z.infer<typeof SnapshotUploadResponseSchema>;

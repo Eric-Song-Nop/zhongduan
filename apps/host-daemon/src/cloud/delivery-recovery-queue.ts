@@ -3,6 +3,7 @@ import type { RelayToHostControlFrame } from "@zhongduan/protocol";
 export type AttachRequest = Extract<RelayToHostControlFrame, { type: "attach-request" }>;
 
 export interface DeliveryRecoveryQueueOptions {
+  maxQuietWaitMs: number;
   maxRetryMs: number;
   monotonicNow: () => number;
   quietMs: number;
@@ -11,15 +12,18 @@ export interface DeliveryRecoveryQueueOptions {
 export class DeliveryRecoveryQueue {
   readonly #attempts = new Map<string, number>();
   readonly #cold = new Set<string>();
+  readonly #maxQuietWaitMs: number;
   readonly #maxRetryMs: number;
   readonly #monotonicNow: () => number;
   readonly #notBefore = new Map<string, number>();
   readonly #order: number[] = [];
   readonly #pending = new Map<number, AttachRequest>();
   readonly #queuedStreams = new Set<number>();
+  readonly #quietDeadline = new Map<string, number>();
   readonly #quietMs: number;
 
   constructor(options: DeliveryRecoveryQueueOptions) {
+    this.#maxQuietWaitMs = options.maxQuietWaitMs;
     this.#maxRetryMs = options.maxRetryMs;
     this.#monotonicNow = options.monotonicNow;
     this.#quietMs = options.quietMs;
@@ -103,17 +107,22 @@ export class DeliveryRecoveryQueue {
   }
 
   readyAt(request: AttachRequest, lastCanonicalAt: number): number {
-    const notBefore = this.#notBefore.get(recoveryKey(request));
+    const key = recoveryKey(request);
+    const notBefore = this.#notBefore.get(key);
     if (notBefore === undefined) return 0;
-    return Math.max(notBefore, lastCanonicalAt + this.#quietMs);
+    const quietDeadline = this.#quietDeadline.get(key) ?? notBefore;
+    return Math.max(notBefore, Math.min(lastCanonicalAt + this.#quietMs, quietDeadline));
   }
 
   defer(request: AttachRequest, delayMs: number): void {
     const key = recoveryKey(request);
+    const now = this.#monotonicNow();
+    const notBefore = Math.max(this.#notBefore.get(key) ?? 0, now + delayMs);
     this.#cold.add(key);
-    this.#notBefore.set(
+    this.#notBefore.set(key, notBefore);
+    this.#quietDeadline.set(
       key,
-      Math.max(this.#notBefore.get(key) ?? 0, this.#monotonicNow() + delayMs),
+      Math.max(this.#quietDeadline.get(key) ?? 0, notBefore, now + this.#maxQuietWaitMs),
     );
   }
 
@@ -132,6 +141,7 @@ export class DeliveryRecoveryQueue {
     this.#attempts.delete(key);
     this.#cold.delete(key);
     this.#notBefore.delete(key);
+    this.#quietDeadline.delete(key);
   }
 
   reset(streamId: number, throughGeneration: string): string[] {
@@ -149,6 +159,7 @@ export class DeliveryRecoveryQueue {
     this.#attempts.clear();
     this.#cold.clear();
     this.#notBefore.clear();
+    this.#quietDeadline.clear();
     this.#order.length = 0;
     this.#pending.clear();
     this.#queuedStreams.clear();
@@ -165,7 +176,12 @@ export class DeliveryRecoveryQueue {
     matchesGeneration: (generation: bigint) => boolean,
   ): Set<string> {
     const removed = new Set<string>();
-    const keys = new Set([...this.#attempts.keys(), ...this.#cold, ...this.#notBefore.keys()]);
+    const keys = new Set([
+      ...this.#attempts.keys(),
+      ...this.#cold,
+      ...this.#notBefore.keys(),
+      ...this.#quietDeadline.keys(),
+    ]);
     for (const key of keys) {
       const separator = key.indexOf(":");
       if (
@@ -175,6 +191,7 @@ export class DeliveryRecoveryQueue {
         this.#attempts.delete(key);
         this.#cold.delete(key);
         this.#notBefore.delete(key);
+        this.#quietDeadline.delete(key);
         removed.add(key);
       }
     }

@@ -7,9 +7,11 @@ import {
   HostCapabilityReclaimRequestSchema,
   MAX_U64,
   PositiveDecimalU64Schema,
+  RELAY_CAPABILITIES_HEADER,
   RelayCapability,
   RelayCapabilitySchema,
   RelayToHostControlFrameSchema,
+  selectRelayCapabilities,
   ServerControlFrameSchema,
   decodeControlFrame,
   decodeDataFrame,
@@ -67,12 +69,11 @@ const VerifySessionIdentitySchema = HostCapabilityReclaimRequestSchema.extend({
   sessionId: identifier,
 });
 
-const CreateConnectionSetSchema = z.strictObject({
+export const CreateConnectionSetSchema = z.strictObject({
   sessionId: identifier,
   subject: identifier,
   role: z.enum(["host", "writer", "observer"]),
   clientId: identifier.optional(),
-  selectedCapabilities: z.array(RelayCapabilitySchema).max(16).optional(),
 });
 const RelayCapabilitiesSchema = z.array(RelayCapabilitySchema).max(16);
 
@@ -523,8 +524,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const controlTicket = randomId(32);
     const dataTicket = randomId(32);
     const requestedClientId = peer === "browser" ? (parsed.data.clientId ?? randomId()) : null;
-    const selectedCapabilities =
-      parsed.data.role === "host" ? (parsed.data.selectedCapabilities ?? []) : [];
+    const selectedCapabilitiesHeader = request.headers.get(RELAY_CAPABILITIES_HEADER);
+    const selectedCapabilitiesResult = selectRelayCapabilities(selectedCapabilitiesHeader);
+    if (selectedCapabilitiesResult === undefined) {
+      return json({ error: "invalid-connection-set" }, 400);
+    }
+    const selectedCapabilities = parsed.data.role === "host" ? selectedCapabilitiesResult : [];
     const [controlDigest, dataDigest, principalIdHash] = await Promise.all([
       sha256Hex(controlTicket),
       sha256Hex(dataTicket),

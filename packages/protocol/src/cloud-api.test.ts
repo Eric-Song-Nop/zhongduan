@@ -9,6 +9,7 @@ import {
   HostCapabilityReclaimRequestSchema,
   CreateSessionRequestSchema,
   RelayCapability,
+  selectRelayCapabilities,
 } from "./cloud-api";
 
 describe("Cloud HTTP contracts", () => {
@@ -74,6 +75,19 @@ describe("Cloud HTTP contracts", () => {
     expect(() =>
       HostCapabilityReclaimRequestSchema.parse({ engineId: "engine", sessionEpoch: "0" }),
     ).toThrow();
+  });
+
+  it("selects the known intersection from a bounded capability header", () => {
+    expect(
+      selectRelayCapabilities(
+        `future-relay-capability-v2,${RelayCapability.deliveryBarrierOutcomeV1}`,
+      ),
+    ).toEqual([RelayCapability.deliveryBarrierOutcomeV1]);
+    expect(selectRelayCapabilities("future-relay-capability-v2")).toEqual([]);
+    expect(selectRelayCapabilities("INVALID")).toBeUndefined();
+    expect(
+      selectRelayCapabilities(Array.from({ length: 17 }, () => "future-capability").join(",")),
+    ).toBeUndefined();
   });
 
   it("bounds issued capabilities", () => {
