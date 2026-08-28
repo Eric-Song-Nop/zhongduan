@@ -42,6 +42,7 @@ interface ControlHandlingResult {
 
 interface ControlQueueContext {
   handlingStartedAt: number;
+  ingressAt: number;
   queuedAt: number;
   queuedCount: number;
 }
@@ -200,6 +201,7 @@ export class HostRelayConnection {
   }
 
   readonly #onControlMessage = (event: MessageEvent) => {
+    const ingressAt = this.#monotonicNow();
     if (typeof event.data !== "string" || event.data.length > MAX_CONTROL_MESSAGE_CHARS) {
       this.#close(1002, "invalid relay control frame");
       return;
@@ -209,9 +211,8 @@ export class HostRelayConnection {
         this.#close(1002, "relay heartbeat arrived before host-ready ACK");
         return;
       }
-      const now = this.#monotonicNow();
-      this.#heartbeatLastControlAckAt = now;
-      this.#recordHeartbeatRtt("control", this.#heartbeatControlPings, now);
+      this.#heartbeatLastControlAckAt = ingressAt;
+      this.#recordHeartbeatRtt("control", this.#heartbeatControlPings, ingressAt);
       return;
     }
     const encoded = event.data;
@@ -223,6 +224,7 @@ export class HostRelayConnection {
       this.#emitControlQueue({
         messageClass: "unknown",
         outcome: "capacity",
+        admissionMs: elapsedMs(ingressAt, this.#monotonicNow()),
         queueWaitMs: 0,
         handlingMs: 0,
         queuedBytes: this.#queuedControlBytes,
@@ -239,7 +241,7 @@ export class HostRelayConnection {
     let handlingStartedAt = queuedAt;
     const next = this.#controlChain.then(() => {
       handlingStartedAt = this.#monotonicNow();
-      return this.#handleControl(encoded, { handlingStartedAt, queuedAt, queuedCount });
+      return this.#handleControl(encoded, { handlingStartedAt, ingressAt, queuedAt, queuedCount });
     });
     this.#controlChain = next.then(
       (result) => {
@@ -247,6 +249,7 @@ export class HostRelayConnection {
         this.#releaseQueuedControl(encodedBytes);
         this.#emitControlQueue({
           ...result,
+          admissionMs: elapsedMs(ingressAt, queuedAt),
           queueWaitMs: elapsedMs(queuedAt, handlingStartedAt),
           handlingMs: elapsedMs(handlingStartedAt, finishedAt),
           queuedBytes,
@@ -259,6 +262,7 @@ export class HostRelayConnection {
         this.#emitControlQueue({
           messageClass: "unknown",
           outcome: "failed",
+          admissionMs: elapsedMs(ingressAt, queuedAt),
           queueWaitMs: elapsedMs(queuedAt, handlingStartedAt),
           handlingMs: elapsedMs(handlingStartedAt, finishedAt),
           queuedBytes,
@@ -402,42 +406,7 @@ export class HostRelayConnection {
       ackSendOutcome = "uncertain";
       throw error;
     } finally {
-      const finishedAt = this.#monotonicNow();
-      const common = {
-        schemaVersion: 1,
-        monotonicAtMs: finishedAt,
-        name: "host.input.apply",
-        outcome: result.ack.status,
-        effectStage: result.timing.effectStage,
-        ackSendOutcome,
-        controlQueueWaitMs: elapsedMs(context.queuedAt, context.handlingStartedAt),
-        controlQueueDepth: context.queuedCount,
-        actorQueueWaitMs: result.timing.actorQueueWaitMs,
-        actorProcessingMs: result.timing.actorProcessingMs,
-        hostIngressToAckDecisionMs: elapsedMs(context.queuedAt, finishedAt),
-      } as const;
-      if (result.timing.inputKind === "resize") {
-        this.#enqueueTelemetry({
-          ...common,
-          inputKind: "resize",
-          authorityResizeMs: result.timing.inputEncodeMs,
-          ptyResizeAttempted: result.timing.ptyResizeAttempted,
-          ptyResizeMs: result.timing.ptyResizeMs,
-          effectWriteAttempted: result.timing.ptyWriteAttempted,
-          effectWriteMs: result.timing.ptyWriteMs,
-          effectBytesBucket: telemetryByteSizeBucket(result.timing.ptyBytes),
-        });
-      } else {
-        this.#enqueueTelemetry({
-          ...common,
-          inputKind: result.timing.inputKind,
-          encodeKind: result.timing.encodeKind === "resize" ? "none" : result.timing.encodeKind,
-          inputEncodeMs: result.timing.inputEncodeMs,
-          ptyWriteAttempted: result.timing.ptyWriteAttempted,
-          ptyWriteMs: result.timing.ptyWriteMs,
-          ptyBytesBucket: telemetryByteSizeBucket(result.timing.ptyBytes),
-        });
-      }
+      this.#recordInputApply(result, context, ackSendOutcome);
     }
   }
 
@@ -489,22 +458,76 @@ export class HostRelayConnection {
   #emitControlQueue(event: {
     messageClass: ControlMessageClass;
     outcome: "handled" | "rejected" | "failed" | "capacity";
+    admissionMs: number;
     queueWaitMs: number;
     handlingMs: number;
     queuedBytes: number;
     queuedCount: number;
   }): void {
-    this.#enqueueTelemetry({
-      schemaVersion: 1,
-      monotonicAtMs: this.#monotonicNow(),
-      name: "host.control.queue",
-      messageClass: event.messageClass,
-      outcome: event.outcome,
-      queueWaitMs: event.queueWaitMs,
-      handlingMs: event.handlingMs,
-      queuedBytesBucket: telemetryByteSizeBucket(event.queuedBytes),
-      queuedCount: event.queuedCount,
-    });
+    try {
+      this.#enqueueTelemetry({
+        schemaVersion: 1,
+        monotonicAtMs: this.#monotonicNow(),
+        name: "host.control.queue",
+        messageClass: event.messageClass,
+        outcome: event.outcome,
+        admissionMs: event.admissionMs,
+        queueWaitMs: event.queueWaitMs,
+        handlingMs: event.handlingMs,
+        queuedBytesBucket: telemetryByteSizeBucket(event.queuedBytes),
+        queuedCount: event.queuedCount,
+      });
+    } catch {
+      // Invalid diagnostic measurements must not alter control handling.
+    }
+  }
+
+  #recordInputApply(
+    result: Awaited<ReturnType<typeof dispatchForwardedInput>>,
+    context: ControlQueueContext,
+    ackSendOutcome: "send-returned" | "not-attempted" | "uncertain",
+  ): void {
+    try {
+      const finishedAt = this.#monotonicNow();
+      const common = {
+        schemaVersion: 1,
+        monotonicAtMs: finishedAt,
+        name: "host.input.apply",
+        outcome: result.ack.status,
+        effectStage: result.timing.effectStage,
+        ackSendOutcome,
+        controlAdmissionMs: elapsedMs(context.ingressAt, context.queuedAt),
+        controlQueueWaitMs: elapsedMs(context.queuedAt, context.handlingStartedAt),
+        controlQueueDepth: context.queuedCount,
+        actorQueueWaitMs: result.timing.actorQueueWaitMs,
+        actorProcessingMs: result.timing.actorProcessingMs,
+        hostIngressToAckDecisionMs: elapsedMs(context.ingressAt, finishedAt),
+      } as const;
+      if (result.timing.inputKind === "resize") {
+        this.#enqueueTelemetry({
+          ...common,
+          inputKind: "resize",
+          authorityResizeMs: result.timing.inputEncodeMs,
+          ptyResizeAttempted: result.timing.ptyResizeAttempted,
+          ptyResizeMs: result.timing.ptyResizeMs,
+          effectWriteAttempted: result.timing.ptyWriteAttempted,
+          effectWriteMs: result.timing.ptyWriteMs,
+          effectBytesBucket: telemetryByteSizeBucket(result.timing.ptyBytes),
+        });
+      } else {
+        this.#enqueueTelemetry({
+          ...common,
+          inputKind: result.timing.inputKind,
+          encodeKind: result.timing.encodeKind === "resize" ? "none" : result.timing.encodeKind,
+          inputEncodeMs: result.timing.inputEncodeMs,
+          ptyWriteAttempted: result.timing.ptyWriteAttempted,
+          ptyWriteMs: result.timing.ptyWriteMs,
+          ptyBytesBucket: telemetryByteSizeBucket(result.timing.ptyBytes),
+        });
+      }
+    } catch {
+      // Diagnostics run after the ACK attempt and cannot alter the input result.
+    }
   }
 
   #rememberHeartbeat(channel: "control" | "data", pings: number[], sentAt: number): void {
