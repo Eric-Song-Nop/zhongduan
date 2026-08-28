@@ -490,9 +490,12 @@ generation，避免跨 attempt 拼接。
 - `observability/terminal-latency-pipeline` 是后续 Host 事实切片：记录 control queue、session actor、authority
   encode、PTY call 与 Host-observed control/data relay socket RTT；actor 只返回数字，Relay 在 ACK send attempt
   后才向共享有界 buffer enqueue，schema/JSON/collector 不进入 actor 或 canonical-pause 临界区；
-- Phase 0 gate 仍未关闭：Cloud queue/lease、Browser link/restore/adopt、生产汇聚与可查询 dashboard 必须由后续
-  stacked layer 补齐。Host relay RTT 包含本地 event-loop/socket queue 与 Cloud auto-response，不能冒充纯网络
-  RTT；`written` 也不是 child/app effect ACK。
+- `observability/cloud-relay-latency` 是 Cloud Phase 0b：记录现有全局 relay queue、Browser input 的当前 lease
+  verify/renew 与 Host send decision、barrier、attach 和 delivery reset；它只产生 Workers I/O-clock 可见的本地
+  lower-bound，不改 wire、SQLite、socket attachment 或恢复状态机；
+- Phase 0 gate 仍未关闭：Host ACK/data 的 Cloud fanout、独立 lease acquire/heartbeat、Browser
+  link/restore/adopt、生产聚合与可查询 dashboard 必须由后续 stacked layer 补齐。Host relay RTT 包含本地
+  event-loop/socket queue 与 Cloud auto-response，不能冒充纯网络 RTT；`written` 也不是 child/app effect ACK。
 
 - 保留 v2 pause/barrier/pinned commit correctness invariant；
 - 落地 `reason + retryScope`，修复 non-ready 被错误 complete 的 Browser freeze；
@@ -588,6 +591,22 @@ Gate：持续 50–100 ms output、从不 quiet 时 cut 仍有界前进，且 in
 - `delivery_received_ordinal` 与 `replica_applied_event_seq` lag；
 - `input_ack_ms - measured_transport_rtt_ms`、Cloud/Host local queue、Ctrl-C 到 PTY write；
 - time-to-first-visible、time-to-current、fresh attach 与 same-page resync 分布。
+
+Cloud Phase 0b 只补 relay queue admission/wait/depth/capacity/completion、Browser input 中现有 lease
+verify/renew outcome 与 Host send decision、recovery barrier，以及 attach/delivery-reset transition 本地事实。
+Queue 从本地 admission 起算，input/attach/barrier 从 JavaScript message callback admission 起算；reset 从
+`resetBrowserDelivery()` 操作入口起算，因为 socket close 等非 message callback 也能触发它。Workers runtime
+clock 只在 I/O 边界推进，同步 CPU 工作可能不可见。量到 decision/handling 或 `WebSocket.send()` 返回的字段只是
+Cloud local lower-bound，不包含各自起点前的 edge/唤醒/调度，也不证明 Host/Browser 已收到。它们不能标成网络
+RTT、端到端 latency 或 CPU time，更不能与 Browser/Host 的 monotonic timestamp 直接相减。
+
+Cloud 自定义 event payload 不记录 terminal/input/frame、ticket/capability/lease、原始 session/client/connection
+标识或异常文本；自动 invocation logs 和 tracing 保持关闭，避免 query 中的 WebSocket ticket 和 path 中的
+session ID 被自动 URL telemetry 留存。该保证只覆盖 Zhongduan payload，Cloudflare 平台 envelope 仍可能带
+request/invocation/Durable Object 等平台标识。有界 best-effort producer sampling 的聚合必须使用 `sampleWeight`，
+原始 event count 不是完整流量计数。Host ACK 转发、Host data fanout、独立 lease acquire/heartbeat、Browser
+restore/adopt/paint、跨节点聚合/dashboard 和端到端 SLO 仍是开放的 Phase 0 gate；本层也不改 wire、journal、
+snapshot、replay、SQLite schema 或 WebSocket attachment。
 
 初始 gate：
 

@@ -105,6 +105,167 @@ describe("terminal telemetry", () => {
     expect(TerminalTelemetryEventSchema.parse(event)).toEqual(event);
   });
 
+  it.each([
+    {
+      schemaVersion: 1 as const,
+      monotonicAtMs: 30,
+      clockKind: "workers-io" as const,
+      sampleWeight: 64,
+      name: "cloud.relay.queue" as const,
+      lane: "host-data" as const,
+      queueProfile: "host-data" as const,
+      outcome: "completed" as const,
+      capacityReason: "not-applicable" as const,
+      observedAdmissionMs: 0,
+      observedQueueWaitMs: 4,
+      observedHandlingMs: 0,
+      frameBytesBucket: "1025-65536" as const,
+      globalQueuedBytesBucket: "65537+" as const,
+      socketQueuedBytesBucket: "65537+" as const,
+      globalQueuedCount: 8,
+      socketQueuedCount: 4,
+    },
+    {
+      schemaVersion: 1 as const,
+      monotonicAtMs: 31,
+      clockKind: "workers-io" as const,
+      sampleWeight: 1,
+      name: "cloud.relay.queue" as const,
+      lane: "browser-control" as const,
+      queueProfile: "browser-control" as const,
+      outcome: "capacity" as const,
+      capacityReason: "socket-count" as const,
+      observedAdmissionMs: 0,
+      observedQueueWaitMs: 0,
+      observedHandlingMs: 0,
+      frameBytesBucket: "65-1024" as const,
+      globalQueuedBytesBucket: "65537+" as const,
+      socketQueuedBytesBucket: "65537+" as const,
+      globalQueuedCount: 9,
+      socketQueuedCount: 8,
+    },
+    {
+      schemaVersion: 1 as const,
+      monotonicAtMs: 32,
+      clockKind: "workers-io" as const,
+      sampleWeight: 8,
+      name: "cloud.input.forward" as const,
+      inputKind: "key" as const,
+      leaseOutcome: "active" as const,
+      outcome: "send-returned" as const,
+      observedQueueWaitMs: 3,
+      observedIngressToLeaseDecisionMs: 4,
+      observedIngressToSendDecisionMs: 5,
+      frameBytesBucket: "65-1024" as const,
+      globalQueuedCount: 2,
+      socketQueuedCount: 1,
+    },
+    {
+      schemaVersion: 1 as const,
+      monotonicAtMs: 33,
+      clockKind: "workers-io" as const,
+      sampleWeight: 1,
+      name: "cloud.recovery.barrier" as const,
+      mode: "snapshot" as const,
+      outcome: "rejected" as const,
+      reason: "snapshot-missing" as const,
+      retryScope: "refresh-checkpoint" as const,
+      observedDurationMs: 1,
+    },
+    {
+      schemaVersion: 1 as const,
+      monotonicAtMs: 34,
+      clockKind: "workers-io" as const,
+      sampleWeight: 1,
+      name: "cloud.recovery.transition" as const,
+      transition: "attach" as const,
+      replica: "live" as const,
+      outcome: "host-request-send-returned" as const,
+      reason: "none" as const,
+      observedDurationMs: 2,
+    },
+    {
+      schemaVersion: 1 as const,
+      monotonicAtMs: 35,
+      clockKind: "workers-io" as const,
+      sampleWeight: 1,
+      name: "cloud.recovery.transition" as const,
+      transition: "reset" as const,
+      trigger: "journal-gap" as const,
+      outcome: "issued" as const,
+      hostNotifyOutcome: "not-requested" as const,
+      observedDurationMs: 3,
+    },
+  ])("accepts the content-free Cloud event $name", (event) => {
+    expect(TerminalTelemetryEventSchema.parse(event)).toEqual(event);
+  });
+
+  it("enforces the current queue lane/profile and capacity shape", () => {
+    const baseEvent = {
+      schemaVersion: 1,
+      monotonicAtMs: 30,
+      clockKind: "workers-io",
+      sampleWeight: 1,
+      name: "cloud.relay.queue",
+      lane: "browser-control",
+      queueProfile: "host-control",
+      outcome: "completed",
+      capacityReason: "not-applicable",
+      observedAdmissionMs: 0,
+      observedQueueWaitMs: 0,
+      observedHandlingMs: 0,
+      frameBytesBucket: "1-8",
+      globalQueuedBytesBucket: "1-8",
+      socketQueuedBytesBucket: "1-8",
+      globalQueuedCount: 1,
+      socketQueuedCount: 1,
+    };
+    expect(() => TerminalTelemetryEventSchema.parse(baseEvent)).toThrow();
+    expect(() =>
+      TerminalTelemetryEventSchema.parse({
+        ...baseEvent,
+        queueProfile: "browser-control",
+        outcome: "capacity",
+        capacityReason: "not-applicable",
+      }),
+    ).toThrow();
+  });
+
+  it.each([
+    "sessionId",
+    "clientId",
+    "connectionId",
+    "streamId",
+    "writerFence",
+    "writerLease",
+    "snapshotId",
+    "inputEpoch",
+    "text",
+    "paste",
+    "key",
+    "error",
+  ])("rejects the Cloud diagnostic identity/content field %s", (field) => {
+    expect(() =>
+      TerminalTelemetryEventSchema.parse({
+        schemaVersion: 1,
+        monotonicAtMs: 32,
+        clockKind: "workers-io",
+        sampleWeight: 8,
+        name: "cloud.input.forward",
+        inputKind: "text",
+        leaseOutcome: "active",
+        outcome: "send-returned",
+        observedQueueWaitMs: 3,
+        observedIngressToLeaseDecisionMs: 4,
+        observedIngressToSendDecisionMs: 5,
+        frameBytesBucket: "65-1024",
+        globalQueuedCount: 2,
+        socketQueuedCount: 1,
+        [field]: "must-not-leave-the-runtime",
+      }),
+    ).toThrow();
+  });
+
   it.each(["text", "paste", "command", "cells", "capability", "sessionId"])(
     "rejects the extra content-bearing field %s",
     (field) => {

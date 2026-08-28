@@ -5,6 +5,7 @@ const byteCount = z.number().int().nonnegative().safe();
 const frameCount = z.number().int().nonnegative().safe();
 const monotonicAtMs = z.number().finite().nonnegative();
 const byteSizeBucket = z.enum(["0", "1-8", "9-64", "65-1024", "1025-65536", "65537+"]);
+const sampleWeight = z.number().int().positive().safe();
 
 const base = {
   schemaVersion: z.literal(1),
@@ -147,6 +148,191 @@ const HostRelayRttEventSchema = z.union([
   HostRelayRttTimeoutEventSchema,
 ]);
 
+const cloudBase = {
+  ...base,
+  clockKind: z.literal("workers-io"),
+  sampleWeight,
+} as const;
+
+const CloudRelayQueueProcessedEventSchema = z.strictObject({
+  ...cloudBase,
+  name: z.literal("cloud.relay.queue"),
+  lane: z.enum(["browser-control", "host-control", "host-data"]),
+  queueProfile: z.enum(["browser-control", "host-control", "host-data"]),
+  outcome: z.enum(["completed", "failed"]),
+  capacityReason: z.literal("not-applicable"),
+  observedAdmissionMs: durationMs,
+  observedQueueWaitMs: durationMs,
+  observedHandlingMs: durationMs,
+  frameBytesBucket: byteSizeBucket,
+  globalQueuedBytesBucket: byteSizeBucket,
+  socketQueuedBytesBucket: byteSizeBucket,
+  globalQueuedCount: frameCount,
+  socketQueuedCount: frameCount,
+});
+
+const CloudRelayQueueCapacityEventSchema = z.strictObject({
+  ...cloudBase,
+  name: z.literal("cloud.relay.queue"),
+  lane: z.enum(["browser-control", "host-control", "host-data"]),
+  queueProfile: z.enum(["browser-control", "host-control", "host-data"]),
+  outcome: z.literal("capacity"),
+  capacityReason: z.enum([
+    "global-count",
+    "global-bytes",
+    "socket-count",
+    "socket-bytes",
+    "invalid-size",
+  ]),
+  observedAdmissionMs: durationMs,
+  observedQueueWaitMs: durationMs,
+  observedHandlingMs: durationMs,
+  frameBytesBucket: byteSizeBucket,
+  globalQueuedBytesBucket: byteSizeBucket,
+  socketQueuedBytesBucket: byteSizeBucket,
+  globalQueuedCount: frameCount,
+  socketQueuedCount: frameCount,
+});
+
+const CloudRelayQueueEventSchema = z
+  .union([CloudRelayQueueProcessedEventSchema, CloudRelayQueueCapacityEventSchema])
+  .superRefine((event, context) => {
+    if (event.lane !== event.queueProfile) {
+      context.addIssue({
+        code: "custom",
+        message: "queueProfile must match the current relay lane",
+        path: ["queueProfile"],
+      });
+    }
+  });
+
+const CloudInputForwardEventSchema = z.strictObject({
+  ...cloudBase,
+  name: z.literal("cloud.input.forward"),
+  inputKind: z.enum(["key", "text", "paste", "focus", "mouse", "resize"]),
+  leaseOutcome: z.enum(["active", "inactive", "not-attempted", "uncertain"]),
+  outcome: z.enum([
+    "send-returned",
+    "send-rejected",
+    "send-uncertain",
+    "lease-rejected",
+    "stale",
+    "host-offline",
+    "failed",
+  ]),
+  observedQueueWaitMs: durationMs,
+  observedIngressToLeaseDecisionMs: durationMs,
+  observedIngressToSendDecisionMs: durationMs,
+  frameBytesBucket: byteSizeBucket,
+  globalQueuedCount: frameCount,
+  socketQueuedCount: frameCount,
+});
+
+const CloudRecoveryBarrierEventSchema = z.strictObject({
+  ...cloudBase,
+  name: z.literal("cloud.recovery.barrier"),
+  mode: z.enum(["warm", "snapshot", "unknown"]),
+  outcome: z.enum([
+    "ready",
+    "stale",
+    "rejected",
+    "host-failed",
+    "result-send-rejected",
+    "result-send-uncertain",
+    "failed",
+  ]),
+  reason: z.enum([
+    "none",
+    "generation-fenced",
+    "client-gone",
+    "missing-live-seed",
+    "snapshot-missing",
+    "snapshot-metadata-mismatch",
+    "browser-control-send-failed",
+    "cloud-head-behind-cut",
+    "host-channels-not-current",
+    "invalid-payload",
+    "canonical-head-mismatch",
+    "active-delivery-conflict",
+    "pinned-delivery-conflict",
+    "snapshot-seed-conflict",
+    "unexpected",
+  ]),
+  retryScope: z.enum([
+    "not-applicable",
+    "same-generation",
+    "refresh-checkpoint",
+    "reset-generation",
+    "drop-client",
+  ]),
+  observedDurationMs: durationMs,
+});
+
+const CloudRecoveryAttachTransitionEventSchema = z.strictObject({
+  ...cloudBase,
+  name: z.literal("cloud.recovery.transition"),
+  transition: z.literal("attach"),
+  replica: z.enum(["live", "empty"]),
+  outcome: z.enum([
+    "host-request-send-returned",
+    "host-request-send-rejected",
+    "host-request-send-uncertain",
+    "host-offline",
+    "rejected",
+    "stale",
+    "failed",
+  ]),
+  reason: z.enum([
+    "none",
+    "already-attached",
+    "cursor-ahead",
+    "data-missing",
+    "engine-mismatch",
+    "epoch-changed",
+    "session-missing",
+    "stale-delivery",
+    "stale-control",
+    "welcome-send-failed",
+    "unexpected",
+  ]),
+  observedDurationMs: durationMs,
+});
+
+const CloudRecoveryResetTransitionEventSchema = z.strictObject({
+  ...cloudBase,
+  name: z.literal("cloud.recovery.transition"),
+  transition: z.literal("reset"),
+  trigger: z.enum([
+    "journal-gap",
+    "slow-client",
+    "engine-mismatch",
+    "epoch-changed",
+    "data-disconnected",
+    "host-reconnect",
+  ]),
+  outcome: z.enum(["issued", "not-applicable", "stale", "browser-send-failed", "failed"]),
+  hostNotifyOutcome: z.enum([
+    "not-requested",
+    "not-attempted",
+    "send-returned",
+    "send-rejected",
+    "send-uncertain",
+  ]),
+  observedDurationMs: durationMs,
+});
+
+const CloudRecoveryTransitionEventSchema = z.union([
+  CloudRecoveryAttachTransitionEventSchema,
+  CloudRecoveryResetTransitionEventSchema,
+]);
+
+export const CloudTelemetryEventSchema = z.union([
+  CloudRelayQueueEventSchema,
+  CloudInputForwardEventSchema,
+  CloudRecoveryBarrierEventSchema,
+  CloudRecoveryTransitionEventSchema,
+]);
+
 export const TerminalTelemetryEventSchema = z.union([
   HostSnapshotCaptureReadyEventSchema,
   HostSnapshotCaptureFailedEventSchema,
@@ -157,9 +343,11 @@ export const TerminalTelemetryEventSchema = z.union([
   HostControlQueueEventSchema,
   HostInputApplyEventSchema,
   HostRelayRttEventSchema,
+  CloudTelemetryEventSchema,
 ]);
 
 export type TerminalTelemetryEvent = z.output<typeof TerminalTelemetryEventSchema>;
+export type CloudTelemetryEvent = z.output<typeof CloudTelemetryEventSchema>;
 export type TelemetrySink = (event: TerminalTelemetryEvent) => void;
 export type MonotonicClock = () => number;
 

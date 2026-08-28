@@ -708,6 +708,16 @@ ACK send decision、session actor wait、authority encode、`pty.write`/`pty.res
 共享有界 deferred buffer enqueue。该切片不修改 input seq、dedup、lease、wire 或 recovery ordering，因此不代表
 Phase A correctness 已完成。
 
+`observability/cloud-relay-latency` 这个 Cloud Phase 0b 切片只增加 Durable Object 的 relay queue
+admission/wait/depth/capacity/completion、Browser input 中现有 lease verify/renew outcome 与 Host send decision、
+recovery barrier，以及 attach/delivery-reset transition 本地事实。Workers runtime clock 只在 I/O 边界推进；从
+Queue 从本地 admission 起算，input/attach/barrier 从 JavaScript message callback admission 起算；reset 从可被
+socket close 等路径调用的 `resetBrowserDelivery()` 操作入口起算。到 decision/handling 或 `WebSocket.send()` 返回
+的 duration 都只是 Cloud local lower-bound，同步 CPU 工作可能不可见，也不证明 Host/Browser 已接收。该切片不
+覆盖 Host ACK 转发或 Host data fanout，不单列 lease acquire/heartbeat，不拆 lane、不移除每键 hash/SQLite
+renewal，也不修改 wire、fence、dedup、journal、snapshot、replay 或 WebSocket attachment，所以同样不代表
+Phase A 已完成。
+
 - Browser 完整 validate/admit 后才分配 seq；
 - Host 使用 strict `nextExpectedSeq`；确定性 reject 消费 seq，`uncertain` 终止 epoch；
 - 建立单一 per-writer sequencer，明确 urgent cancellation 与 resize ordering；
@@ -792,6 +802,16 @@ Recovery v3、FrozenTerminalCut 和 rolling checkpoint 是并行工作流，phas
 标识或异常字符串。`host.input.apply` 中的 ACK send 只表示本地 WebSocket `send()` 返回；`written` 只表示现有
 Host input result，不证明 child read、应用 effect、canonical output 或 Browser paint。Host relay RTT 也只是该
 socket 到 Cloud auto-responder 的本机观测 RTT，不是 Browser↔Host 或纯网络 RTT。
+
+Cloud 自定义 event payload 同样不得包含 input/frame、ticket/capability/lease、原始 session/client/connection
+标识或异常文本。Cloudflare 自动 invocation logs 和 tracing 必须保持显式关闭，因为 WebSocket ticket 位于 query、
+session ID 位于 path；这个 payload 保证不延伸为“平台 envelope 匿名”，Workers Logs 仍可能附加平台 request、
+invocation 或 Durable Object 标识。Cloud queue wait 只从 `webSocketMessage` callback/local queue admission 起算；
+Browser input→Host send decision 与 barrier result send 只量到本地 decision/`send()` 返回。Workers runtime clock
+只在 I/O 边界推进，同步 CPU 工作可能不可见，所以这些字段全部是 Cloud local lower-bound，不能标成网络传输、
+对端接收、端到端 latency 或 CPU time。有界 best-effort producer sampling 的聚合必须使用 `sampleWeight`，原始
+event count 不是完整流量计数。Host ACK 转发、Host data fanout、独立 lease acquire/heartbeat、Browser
+paint/restore/adopt、跨节点聚合/dashboard 和端到端 SLO 仍是开放的 Phase 0 gate。
 
 ### 初始发布门槛
 

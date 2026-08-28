@@ -121,6 +121,36 @@ pnpm --filter "@zhongduan/terminal-cloud" exec wrangler deploy
 pnpm --filter "@zhongduan/terminal-cloud" exec wrangler deploy --dry-run
 ```
 
+### Cloud 诊断与日志隐私
+
+生产 Worker 只有在 `CLOUD_TELEMETRY_MODE` 精确为 `workers-logs-v1` 时才把自定义诊断写入
+Workers Logs；缺失、`off` 或未知值都关闭该出口，可作为无需更改协议或存储的 kill switch。仓库生产配置显式启用
+该版本，测试环境显式关闭；修改 mode 后需重新部署 Worker，DO 重启时允许丢弃尚未 drain 的 best-effort 诊断。
+
+生产配置关闭 Cloudflare 自动 invocation logs 和 automatic tracing。公开 WebSocket 握手当前把一次性 ticket
+放在 query string，session ID 也出现在 API path；自动 request log/trace 会把这些 URL 元数据带出 Zhongduan
+自定义诊断 schema。不要在 Dashboard 中重新开启它们，也不要在升级 compatibility date 时删除仓库中的显式关闭项。
+
+Cloud 自定义诊断 payload 只允许封闭枚举、分桶后的大小、计数和本机 monotonic duration，不包含 terminal/input
+内容、ticket/capability/lease、原始 session/client/connection ID 或异常文本。这个保证只约束 Zhongduan 提交给
+日志系统的 payload；Cloudflare 仍可能在平台 envelope 中附加 invocation/request/Durable Object 等平台标识符。
+因此 Workers Logs 仍是敏感运行元数据，访问、保留与导出权限必须按生产日志管理，不能把它当作匿名数据。
+
+本层的 Cloud 自定义事件只覆盖 relay queue、Browser input 中现有 lease verify/renew 与 Host send decision、
+recovery barrier，以及 attach/delivery-reset transition。Queue duration 从本地 queue admission 起算；input、
+attach 和 barrier duration 从 Durable Object JavaScript message callback admission 起算；reset duration 从
+`resetBrowserDelivery()` 操作入口起算，因为它也可由 socket close 等非 message callback 路径触发。各字段终点是
+对应的本地 decision/handling 或 `WebSocket.send()` 返回。Workers runtime 的 clock 只在 I/O 边界推进，因此这些
+字段即使位于同一 runtime 也只是 Cloud local lower-bound：同步 CPU 工作可能不可见，也不包括各自起点前的
+edge/唤醒/调度；`send()` 返回不证明帧已离开 socket queue 或被 Browser/Host 收到。不要把不同机器的时间戳
+相减，也不要把这些事件标成网络 RTT、端到端 latency 或 CPU time。
+
+事件是有界、best-effort 的；高频成功事件采用每个 DO/key 随机起始相位的系统采样，聚合估算必须使用
+`sampleWeight`，原始 event count 不是完整流量计数。安全随机相位无法取得时直接丢弃该采样序列，不使用有偏的固定
+首样本。这一层只提供部分 Phase 0 Cloud 本地事实。Host ACK 转发、Host data fanout、独立 lease
+acquire/heartbeat、Browser paint/restore/adopt、跨节点关联、聚合/dashboard 和端到端 SLO 仍未完成；诊断不得
+写入 terminal wire、journal、snapshot、replay、SQLite schema 或 WebSocket attachment。
+
 ## 5. 构建和启动 Host
 
 在实际持有 shell 的 Linux Host 上运行：
