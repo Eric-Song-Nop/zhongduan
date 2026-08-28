@@ -49,8 +49,8 @@ import {
   type TicketRow,
   type WriterLeaseRow,
 } from "./relay-store";
-import { FinalizedSnapshotSchema } from "./snapshot-contract";
 import { SnapshotStore } from "./snapshot-store";
+import { SnapshotUploadCoordinator } from "./snapshot-upload-coordinator";
 
 const identifier = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/);
 const engineId = z.string().min(1).max(512);
@@ -170,6 +170,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   private readonly store: RelayStore;
   private readonly connections: RelayConnectionStore;
   private readonly snapshots: SnapshotStore;
+  private readonly snapshotUploads: SnapshotUploadCoordinator;
   private readonly messageQueue = new BoundedSerialQueue<WebSocket>();
 
   constructor(ctx: DurableObjectState, env: CloudEnv) {
@@ -184,8 +185,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       MAX_BROWSER_CONNECTIONS,
       MAX_PENDING_CONNECTION_SETS,
     );
-    this.snapshots = new SnapshotStore(ctx, this.sql, this.store);
+    this.snapshots = new SnapshotStore(ctx, this.sql, this.store, MAX_BROWSER_CONNECTIONS);
+    this.snapshotUploads = new SnapshotUploadCoordinator(ctx, env.SNAPSHOTS, this.snapshots, () =>
+      this.pinnedSnapshotIds(),
+    );
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+    void this.ctx.blockConcurrencyWhile(() => this.snapshotUploads.initialize());
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -199,8 +204,8 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (request.method === "POST" && url.pathname === "/internal/connection-sets") {
       return this.createConnectionSet(request);
     }
-    if (request.method === "POST" && url.pathname === "/internal/snapshots/finalize") {
-      return this.finalizeSnapshot(request);
+    if (request.method === "POST" && url.pathname.startsWith("/internal/snapshots/upload/")) {
+      return this.uploadSnapshot(request, url.pathname.slice("/internal/snapshots/upload/".length));
     }
     if (request.method === "GET" && url.pathname.startsWith("/internal/snapshots/")) {
       return this.getPublishedSnapshot(url.pathname.slice("/internal/snapshots/".length));
@@ -230,6 +235,10 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     return processing.catch(() => {
       this.rejectInboundMessage(webSocket, inbound.attachment, "relay message failed");
     });
+  }
+
+  async alarm(): Promise<void> {
+    await this.snapshotUploads.maintain();
   }
 
   private validateInboundMessage(
@@ -346,6 +355,14 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const attachment = readAttachment(webSocket);
     if (attachment === undefined) return;
 
+    if (
+      attachment.peer === "browser" &&
+      attachment.channel === "data" &&
+      attachment.snapshotId !== null
+    ) {
+      this.snapshotUploads.scheduleMaintenance();
+    }
+
     if (attachment.channel === "data") {
       if (attachment.peer === "host") {
         if (
@@ -440,8 +457,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
 
     this.sql.exec(
       `INSERT INTO session_state
-        (singleton, session_id, session_epoch, engine_id, updated_at)
-       VALUES (1, ?, ?, ?, ?)`,
+        (singleton, session_id, session_epoch, engine_id, updated_at,
+         snapshot_recent_scan_done, snapshot_retention_backlog)
+       VALUES (1, ?, ?, ?, ?, 1, 0)`,
       parsed.data.sessionId,
       parsed.data.sessionEpoch,
       parsed.data.engineId,
@@ -466,17 +484,13 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     return json({ matches: true });
   }
 
-  private async finalizeSnapshot(request: Request): Promise<Response> {
-    const parsed = FinalizedSnapshotSchema.safeParse(await parseJson(request));
-    if (!parsed.success) return json({ error: "invalid-snapshot" }, 400);
-    const finalized = this.snapshots.finalize(parsed.data);
-    if (!finalized.ok) {
-      return json({ error: finalized.reason }, 409);
-    }
-    return json(
-      { created: finalized.created, snapshot: finalized.snapshot },
-      finalized.created ? 201 : 200,
-    );
+  private uploadSnapshot(request: Request, snapshotId: string): Promise<Response> {
+    const session = this.session();
+    const sessionId =
+      session !== undefined && identifier.safeParse(snapshotId).success
+        ? session.session_id
+        : undefined;
+    return this.snapshotUploads.upload(request, snapshotId, sessionId);
   }
 
   private getPublishedSnapshot(snapshotId: string): Response {
@@ -926,7 +940,10 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       };
     }
 
-    if (hasNoPin) writeAttachment(browserData, nextAttachment);
+    if (hasNoPin) {
+      writeAttachment(browserData, nextAttachment);
+      if (nextAttachment.snapshotId !== null) this.snapshotUploads.scheduleMaintenance();
+    }
     if (!this.sendBrowserControl(browserControl, browserFrame, "delivery start failed")) {
       this.sendDeliveryBarrierResult(hostControl, frame, payload, "rejected");
       return;
@@ -1955,10 +1972,33 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     code = SOCKET_REPLACED,
     reason = "connection replaced",
   ): void {
+    let releasedSnapshotPin = false;
     for (const socket of this.ctx.getWebSockets()) {
       if (socket === except || socket.readyState >= WebSocket.CLOSING) continue;
       const attachment = readAttachment(socket);
-      if (attachment !== undefined && predicate(attachment)) socket.close(code, reason);
+      if (attachment !== undefined && predicate(attachment)) {
+        if (
+          attachment.peer === "browser" &&
+          attachment.channel === "data" &&
+          attachment.snapshotId !== null
+        ) {
+          releasedSnapshotPin = true;
+        }
+        socket.close(code, reason);
+      }
     }
+    if (releasedSnapshotPin) this.snapshotUploads.scheduleMaintenance();
+  }
+
+  private pinnedSnapshotIds(): ReadonlySet<string> {
+    const pinned = new Set<string>();
+    for (const socket of this.ctx.getWebSockets("peer:browser")) {
+      if (socket.readyState !== WebSocket.OPEN) continue;
+      const attachment = readAttachment(socket);
+      if (attachment?.channel === "data" && attachment.snapshotId !== null) {
+        pinned.add(attachment.snapshotId);
+      }
+    }
+    return pinned;
   }
 }

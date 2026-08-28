@@ -1,28 +1,29 @@
-import {
-  SNAPSHOT_MEDIA_TYPE,
-  SnapshotHeader,
-  SnapshotMetadataSchema,
-  type SnapshotMetadata,
-} from "@zhongduan/protocol";
+import { SNAPSHOT_MEDIA_TYPE, SnapshotHeader, SnapshotMetadataSchema } from "@zhongduan/protocol";
 import { z } from "zod";
 import { AuthError, verifyBearerCapability, type CapabilityRole } from "./auth";
 import type { CloudEnv } from "./env";
 import {
   FinalizedSnapshotSchema,
-  hexToBytes,
   matchesSnapshotObject,
-  snapshotCustomMetadata,
-  snapshotObjectKey,
-  type FinalizedSnapshot,
+  parseSnapshotUploadMetadata,
+  snapshotUploadHeaders,
 } from "./snapshot-contract";
 
-const FinalizeResponseSchema = z.strictObject({
-  created: z.boolean(),
-  snapshot: FinalizedSnapshotSchema,
-});
-const PublicFinalizeResponseSchema = z.strictObject({
+const UploadResponseSchema = z.strictObject({
   created: z.boolean(),
   snapshot: SnapshotMetadataSchema,
+});
+
+const UploadErrorSchema = z.strictObject({
+  error: z.enum([
+    "invalid-snapshot-metadata",
+    "snapshot-checksum-mismatch",
+    "snapshot-conflict",
+    "snapshot-reservation-failed",
+    "snapshot-unavailable",
+    "snapshot-upload-failed",
+    "snapshot-upload-in-progress",
+  ]),
 });
 
 function json(data: unknown, status = 200): Response {
@@ -53,96 +54,13 @@ async function authorize(
   }
 }
 
-function uploadMetadata(
-  request: Request,
-  sessionId: string,
-  snapshotId: string,
-): SnapshotMetadata | undefined {
-  if (
-    request.headers.get("content-type") !== SNAPSHOT_MEDIA_TYPE ||
-    request.headers.has("content-encoding")
-  ) {
-    return undefined;
-  }
-  const parsed = SnapshotMetadataSchema.safeParse({
-    sessionId,
-    snapshotId,
-    engineId: request.headers.get(SnapshotHeader.engineId),
-    sessionEpoch: request.headers.get(SnapshotHeader.sessionEpoch),
-    cutEventSeq: request.headers.get(SnapshotHeader.cutEventSeq),
-    nextPtyOffset: request.headers.get(SnapshotHeader.nextPtyOffset),
-    compression: request.headers.get(SnapshotHeader.compression),
-    compressedLength: request.headers.get(SnapshotHeader.compressedLength),
-    uncompressedLength: request.headers.get(SnapshotHeader.uncompressedLength),
-    sha256: request.headers.get(SnapshotHeader.sha256),
-  });
-  if (!parsed.success) return undefined;
-  const contentLength = request.headers.get("content-length");
-  if (contentLength !== parsed.data.compressedLength) return undefined;
-  return parsed.data;
-}
-
-function r2ErrorCode(error: unknown): number | undefined {
-  if (typeof error === "object" && error !== null && "code" in error) {
-    const code = (error as { code?: unknown }).code;
-    if (typeof code === "number") return code;
-  }
-  if (!(error instanceof Error)) return undefined;
-  const match = /\((\d+)\)$/u.exec(error.message);
-  return match === null ? undefined : Number(match[1]);
-}
-
 async function cancelBody(body: ReadableStream | null, reason: string): Promise<void> {
   if (body === null || body.locked) return;
   try {
     await body.cancel(reason);
   } catch {
-    // The runtime may already have consumed or released the inbound stream.
+    // The downstream request may already own or have consumed the stream.
   }
-}
-
-async function finalizeSnapshot(env: CloudEnv, snapshot: FinalizedSnapshot): Promise<Response> {
-  let response: Response;
-  try {
-    response = await sessionStub(env, snapshot.sessionId).fetch(
-      "https://do.internal/internal/snapshots/finalize",
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(snapshot),
-      },
-    );
-  } catch {
-    return json({ error: "snapshot-finalize-failed" }, 503);
-  }
-  if (!response.ok) {
-    await response.body?.cancel();
-    return json(
-      { error: response.status === 409 ? "snapshot-conflict" : "snapshot-finalize-failed" },
-      response.status === 409 ? 409 : 503,
-    );
-  }
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
-    return json({ error: "snapshot-finalize-failed" }, 503);
-  }
-  const parsed = FinalizeResponseSchema.safeParse(body);
-  if (!parsed.success || parsed.data.snapshot.r2Version !== snapshot.r2Version) {
-    return json({ error: "snapshot-finalize-failed" }, 503);
-  }
-  const {
-    objectKey: _objectKey,
-    r2Version: _r2Version,
-    etag: _etag,
-    ...publicSnapshot
-  } = parsed.data.snapshot;
-  const published = PublicFinalizeResponseSchema.parse({
-    created: parsed.data.created,
-    snapshot: publicSnapshot,
-  });
-  return json(published, parsed.data.created ? 201 : 200);
 }
 
 async function putSnapshot(
@@ -156,74 +74,41 @@ async function putSnapshot(
     await cancelBody(request.body, "snapshot upload is not authorized");
     return unauthorized;
   }
-  const metadata = uploadMetadata(request, sessionId, snapshotId);
+  const metadata = parseSnapshotUploadMetadata(request, sessionId, snapshotId);
   if (metadata === undefined || request.body === null) {
     await cancelBody(request.body, "invalid snapshot metadata");
     return json({ error: "invalid-snapshot-metadata" }, 400);
   }
 
-  const objectKey = snapshotObjectKey(sessionId, snapshotId);
-  let object: R2Object | null;
+  let response: Response;
   try {
-    object = await env.SNAPSHOTS.head(objectKey);
+    response = await sessionStub(env, sessionId).fetch(
+      new Request(`https://do.internal/internal/snapshots/upload/${snapshotId}`, {
+        method: "POST",
+        headers: snapshotUploadHeaders(metadata),
+        body: request.body,
+      }),
+    );
   } catch {
-    await cancelBody(request.body, "snapshot storage is unavailable");
-    return json({ error: "snapshot-upload-failed" }, 503);
-  }
-  let createdObject = false;
-  if (object !== null) {
-    await cancelBody(request.body, "immutable snapshot already exists");
-    if (!matchesSnapshotObject(object, metadata)) {
-      return json({ error: "snapshot-conflict" }, 409);
-    }
-  } else {
-    try {
-      object = await env.SNAPSHOTS.put(objectKey, request.body, {
-        onlyIf: { etagDoesNotMatch: "*" },
-        sha256: hexToBytes(metadata.sha256),
-        httpMetadata: {
-          contentType: SNAPSHOT_MEDIA_TYPE,
-          cacheControl: "private, no-store",
-        },
-        customMetadata: snapshotCustomMetadata(metadata),
-      });
-      createdObject = object !== null;
-    } catch (error) {
-      await cancelBody(request.body, "snapshot upload failed");
-      const code = r2ErrorCode(error);
-      return json(
-        { error: code === 10037 ? "snapshot-checksum-mismatch" : "snapshot-upload-failed" },
-        code === 10037 || code === 10014 || code === 10013 ? 422 : 503,
-      );
-    }
-    if (object === null) {
-      try {
-        object = await env.SNAPSHOTS.head(objectKey);
-      } catch {
-        return json({ error: "snapshot-upload-failed" }, 503);
-      }
-    }
-    if (object === null || !matchesSnapshotObject(object, metadata)) {
-      if (createdObject) {
-        try {
-          await env.SNAPSHOTS.delete(objectKey);
-        } catch {
-          // A failed cleanup remains private because the DO pointer is not finalized.
-        }
-      }
-      return json({ error: "snapshot-conflict" }, 409);
-    }
+    return json({ error: "snapshot-finalize-failed" }, 503);
   }
 
-  return finalizeSnapshot(
-    env,
-    FinalizedSnapshotSchema.parse({
-      ...metadata,
-      objectKey,
-      r2Version: object.version,
-      etag: object.etag,
-    }),
-  );
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return json({ error: "snapshot-finalize-failed" }, 503);
+  }
+  if (response.ok) {
+    const parsed = UploadResponseSchema.safeParse(body);
+    return parsed.success
+      ? json(parsed.data, response.status === 201 ? 201 : 200)
+      : json({ error: "snapshot-finalize-failed" }, 503);
+  }
+  const parsed = UploadErrorSchema.safeParse(body);
+  return parsed.success
+    ? json(parsed.data, response.status)
+    : json({ error: "snapshot-finalize-failed" }, 503);
 }
 
 async function getSnapshot(
@@ -268,7 +153,7 @@ async function getSnapshot(
     object === null ||
     object.version !== pointer.data.r2Version ||
     object.etag !== pointer.data.etag ||
-    !matchesSnapshotObject(object, pointer.data)
+    !matchesSnapshotObject(object, pointer.data, pointer.data.uploadKind)
   ) {
     if (object !== null) await cancelBody(object.body, "snapshot pointer mismatch");
     return json({ error: "snapshot-unavailable" }, 503);

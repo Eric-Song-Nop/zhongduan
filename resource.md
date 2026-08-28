@@ -261,7 +261,7 @@ Host 的 control/data 是两条独立 WebSocket，不存在跨通道顺序保证
 
 入站消息在进入串行处理队列前完成 channel/type/size 校验。队列全局限制为 2048 条/32 MiB；Host data 单 socket 为 1024 条/16 MiB，browser control 为 8 条/16 MiB。Host 超限会 fail 当前 fenced pair，browser 超限只隔离对应客户端。
 
-## Snapshot blob 使用私有 R2 HTTP，不进入 WebSocket 或 DO
+## Snapshot blob 使用私有 R2，由 session DO 协调 multipart 生命周期
 
 snapshot 二进制采用统一公开契约：
 
@@ -286,16 +286,71 @@ Host 用 Host capability 上传：
 PUT /api/v1/sessions/:sessionId/snapshots/:snapshotId
 ```
 
-请求必须带规范的 `Content-Length`，且精确等于 `x-zhongduan-compressed-length`；不接受 chunked/缺失长度上传。Worker 将 request body 的 `ReadableStream` 直接传给 R2，并把 Host 声明的 SHA-256 交给 R2 校验，不在 Worker 或 Durable Object 中聚合 blob。R2 object key 是 immutable 的，写入使用 `etagDoesNotMatch: "*"`。流程固定为：
+请求必须带规范的 `Content-Length`，且精确等于 `x-zhongduan-compressed-length`；不接受 chunked 或缺失长度上传。公开 Worker 只做 capability、path 和 metadata 校验，然后把同一个 request body stream 转交该 session DO。snapshot bytes 不进入 SQLite，也不在内存中聚合。
+
+R2 写入只由 session DO 发起，流程固定为：
 
 ```text
-R2 conditional put 成功
-  -> 校验 size/checksum/httpMetadata/customMetadata
-  -> DO SQLite transaction 幂等 finalize metadata
-  -> 更新 latest_snapshot_id
+取得 snapshotId 的 per-ID exclusive owner
+  -> 持久化 recovery alarm
+  -> SQLite INSERT preparing reservation
+  -> 为本次 reservation 持久化 144-bit attempt-scoped object key
+  -> 有界 R2 HEAD exact attempt key
+  -> 有界 createMultipartUpload
+  -> SQLite preparing -> uploading，并持久化 uploadId
+  -> 取得每 session 唯一 body permit
+  -> 单次 pull-through stream：length + SHA-256 + MD5 -> uploadPart(1)
+  -> 校验 DigestStream.bytesWritten、声明 SHA-256、part ETag/MD5
+  -> SQLite uploading -> completing，并持久化 part ETag
+  -> 释放 body permit
+  -> 有界 complete multipart
+  -> 校验 version/etag/size/httpMetadata/customMetadata
+  -> SQLite completing -> completed，并持久化 R2 identity
+  -> SQLite transaction: completed -> servable，更新 latest 并 retire 超出保留集的 pointer
 ```
 
-finalize 失败时 object 只是私有 orphan，没有 DO serving pointer，因此浏览器不可见。乱序 finalize 不允许 latest pointer 回退；比较顺序是 `cutEventSeq`、`nextPtyOffset`、`createdAt`、`snapshotId`，前两个必须用 `BigInt`，不能依赖 SQLite TEXT 字典序。
+owner 在任何 `await` 之前同步取得；alarm 必须在 reservation 之前成功持久化，alarm 返回后又在下一个 R2 await 之前同步插入 reservation。任何 R2 `HEAD/create/uploadPart/complete` 都发生在 reservation 之后；alarm 写失败时没有 ledger row，也不触碰 R2。DO 为每个 `snapshotId` 使用同一把内存 owner，使 HTTP retry 与 maintenance 在任一 R2 await 前互斥；不同 ID 不互相阻塞。
+
+正常 body 上传另有每 session 一个 permit，但它只在 `uploadId` 已持久化后覆盖 inbound body、`uploadPart` 与 SHA-256/MD5 摘要阶段。initial HEAD/create、complete/finalize、published/completed HEAD、abort 与 GC 都不占这个 permit；因此任一非 body R2 Promise 永久 pending 也不会阻止不同 ID 处理 body。permit 已被占用时，新请求保留其 `uploading(uploadId)` fence、cancel body 并返回 503，由 maintenance abort，不释放为无账本对象。owner 最后释放时会再次驱动 maintenance，且已到期但仍 active 的 row 仍保留 watchdog alarm。
+
+公开 HTTP 上的 R2 HEAD/create/abort/complete 使用同一个 30 秒 typed deadline；超时 Promise 只挂 rejection observer，迟到结果绝不继续写 SQL 或执行 delete。HEAD timeout 可安全删除尚未触碰 R2 的 preparing row；create timeout 保留 preparing（最多遗留零 part MPU）；abort timeout 保留原 row；complete timeout 保留 completing。`uploadPart` 与 body pipeline 使用 10 分钟 reservation deadline。part/body 失败时主动 abort 本地 pipeline、digest writer 并观察所有迟到 rejection，但不等待可能永不 settle 的 FixedLengthStream、part 或 inline MPU abort；持久 `uploading(uploadId)` 交给 maintenance。这样失败请求有界返回并释放 body permit，同时所有可能存在的 part 仍有 durable fence。
+
+body 通过一个 `TransformStream` 顺序写入 SHA-256 与 MD5 `DigestStream`，再进入 `FixedLengthStream` 和单个 multipart part，不使用可能缓存整份 body 的 `tee()`。complete 前同时要求观测长度、两个 `bytesWritten` 精确等于声明长度、SHA-256 等于 manifest，并要求 R2 part ETag 等于本地 MD5。R2 multipart complete object 通常没有 SHA-256 checksum，所以新 row 持久标记为 `multipart-verified`；只有这个 kind 允许 object checksum 缺失，并仍强制 multipart `-1` ETag、size、HTTP metadata、完整 custom metadata、version 与 etag。旧的 `single-put-verified` row 和没有 `uploadKind` custom metadata 的历史对象继续按原契约读取，但必须具有匹配的 R2 SHA-256。GET 后 Browser 仍对下载 bytes 计算 manifest SHA-256，再交给 Ghostty restore。
+
+同一 `snapshotId`、同一 metadata 的 retry 幂等，不同 metadata 返回冲突。已处于 `published` 或 `completed` 的 retry 只允许 HEAD 并验证已持久化的 exact object identity，绝不能重建或覆盖 serving key。`cursor-ahead` 是 Host data WebSocket 与 HTTP 跨通道乱序的正常瞬态：complete object 和 `completed` row 保持不变；Host 等 head 追上后用同一 ID/body 重试，路径只做 HEAD + finalize，不再次 create/uploadPart。finalize 的 transport 或响应不确定同样保留 exact row/object。
+
+每次新 reservation 使用 `.../:snapshotId/attempts/:random144.bin`；同一 ledger row 的 retry 复用该 key，但 row 被安全删除后，同一 `snapshotId` 的下一次 reservation 必须生成新 key。`aborted` recovery 也只在 abort 成功且有界 HEAD 明确为 null 后，以 exact CAS 把旧 `{key, uploadId}` 轮换成 fresh attempt key，再允许任何新 R2 调用。旧 maintenance task 永远只操作它捕获的旧 key，所以跨 DO replacement 的迟到 delete 不能删除后续 attempt。schema 3 的 deterministic key 只用于读取和回收既有 `single-put-verified` pointer，不再用于新上传。
+
+公开 HTTP retry 不执行可能迟到的 destructive R2 delete。`uploading/completing` recovery 的 abort 必须在 deadline 内成功；随后有界 HEAD=null 才能把 `aborted` row 以 exact CAS 轮换到 fresh preparing attempt 并继续同一 body。abort/HEAD timeout、错误或 HEAD 非空都返回 503 并保留 ledger。声明 SHA-256 与实际 body 不符时也先释放 body permit，再在 per-ID owner 下执行有界 abort；只有 abort 成功、再次有界强一致 HEAD 明确为 null、且 exact aborted row 被同步删除后仍不存在同 ID replacement/published pointer，才返回 cleanup-safe 422 `snapshot-checksum-mismatch`。任一步失败都返回 503；HTTP 从不启动一个 timeout 后可能误删后续对象的 delete。
+
+上传 ledger 状态为：
+
+```text
+preparing -> uploading -> completing -> completed -> servable
+                     +-> aborted -> preparing(fresh attempt key)
+                     +-> uncertain
+preparing/completed --expiry--> retired
+```
+
+`preparing` 尚未上传 part；exact 同 ID retry 在 reservation 的 10 分钟期限内 fail closed，最坏需要等待该期限后才能重新上传，同时占用一个 upload 槽。到期后它先转 `retired`，再做 exact-key HEAD/delete/HEAD 并删除 row。如果 `createMultipartUpload` 已返回但 runtime 在 uploadId 持久化前终止，可能留下一个零 part MPU；它不含 snapshot bytes，不计入 1 GiB 对象上界，并由 R2 默认 7 天的 incomplete multipart auto-abort 回收，但相关 MPU metadata/Class A 操作不受 32-row 账本的绝对计数保证。Host 改用随机新 ID 也只能使用其余 upload 槽，不能绕过 4-row 上限。
+
+maintenance 先做只读 preflight；发现 expired/retired/recoverable/可淘汰候选后，必须在任何 SQLite 状态迁移或 R2 调用前持久化 `now + 30s` watchdog。alarm await 返回后重新采样 `now`、per-ID owners 与所有 active/hibernating attachment pins，再在同一无 await 调用栈内重验候选、执行 retired/reconcile 并抢占 candidate owners。alarm 失败时 SQL 不变且 R2 调用数为零。每次 constructor/request/alarm 触发的 `maintain()` 只启动一个最多 32 个 candidate 的批次；运行期间出现的新请求只合并并持久化下一次 alarm，不在当前 activation 递归续跑另一批。
+
+每个 retired 或 multipart recovery candidate 运行成独立 per-ID maintenance task。主调度器不等待其 R2 Promise，某个 ID 的 HEAD/delete/abort 永久 pending 只持续占该 ID owner/ledger，其他 ID 的 GC、recovery 与新上传继续运行。destructive HEAD/delete/HEAD task 不能 timeout 后脱离 owner；它必须持有 owner 到真实 settle，避免迟到 delete 删除同 key 的后续对象。task 异常在 watchdog 与 durable row 已存在的前提下收敛为有界 alarm retry，不泄漏为后台 unhandled rejection。
+
+对已持久化 uploadId 的 `uploading/completing`，maintenance 抢相同 per-ID owner 后重读 SQL identity，之后才允许 resume/abort/HEAD。abort 成功后仍执行 exact-key HEAD/delete/HEAD，确认 key 为空才删除 row；普通 R2 abort/delete 错误保留 row，并用 alarm backoff 重试。若 abort 返回 `NoSuchUpload` 且 HEAD 得到完全匹配的 object，先把 exact `{version, etag}` 持久化为 `completed`，随后统一走 completed retention/finalize；不能从 completing 直接跨 R2 与 SQLite 删除。
+
+若 abort 返回 `NoSuchUpload` 且强一致 HEAD 仍为 null 或 mismatch，DO 无法证明旧 complete 是否还可能落盘，必须持久转为 `uncertain` 并 fail closed。`uncertain` 继续计入 upload/总账本上限，不由 alarm 每 30 秒轮询；只有 Host 保留同一 `snapshotId` 和 body 的显式 retry 或运维动作重新 HEAD。HEAD exact 时可记录 completed 并 finalize，null/mismatch 时仍保留，不得 create、uploadPart 或释放槽。即使 abort 实际成功，runtime 在 R2 成功响应与 SQL `aborted` 提交之间终止，也可能永久消耗一个 upload 槽；这是跨系统事务无法消除的安全侧结果。MVP 不宣称所有异常都最终 GC，但任何路径都不能因此绕过硬上限或产生第 5 个 upload row。
+
+`snapshot_upload` 最多 4 行；`snapshot + snapshot_upload` 共用每 session 32 行硬上限。reservation 满或总账本满时必须在任何 R2 操作前返回 503。每个登记对象或 part 最多 32 MiB，所以除上述零 part MPU metadata 外，升级后由该 session ledger 拥有的 snapshot bytes 最多 1 GiB；该承诺不追溯扫描未发布旧实现可能遗留、且不在 SQLite ledger 中的 R2 key。极端终止最多让 4 个 upload 槽进入永久 `uncertain`；服务会拒绝新随机 ID，而不是释放未证明安全的 fence。Host 对除 cleanup-safe 422 以外的全部失败状态保留同一 ID/body；只有 200/201 成功，或 DO 已完成 abort、强一致 HEAD 明确旧 key 不存在且 exact ledger CAS 删除成功后返回的 422 `snapshot-checksum-mismatch`，才允许释放 pending body。
+
+Servable 保留集精确定义为：`latest_snapshot_id`、所有当前或 hibernating browser data WebSocket attachment 中非空的 `snapshotId`、正在验证 published pointer 的 public upload owners，以及 2 个额外 unpinned grace snapshot。grace recency 是持久语义：成功 finalize 或 exact published retry 会提升对应 snapshot；pin/owner 释放时，上一轮实际保留项进入候选，当前事务再选两个额外项。published retry 只有在 HEAD exact 后同步重读并校验完整 pointer、持久刷新 grace，才允许返回 200，覆盖 HTTP 成功到 Host delivery barrier 的间隙。`ReplayCommit` 只把 data attachment 切到 `synced`，不能清除 snapshot pin；data reset/close 通过 attachment 生命周期自然释放 pin，不增加 Browser release 协议。
+
+两个 grace 槽与最多 23 项的 previous-retained 候选集都持久化；容量对应 16 个 browser pins、最多 4 个 servable public upload owners、latest 与两个 grace。steady state 已有 32-row 硬界，每次 reconciliation 最多读取 33 行，按上一轮实际保留集、当前 pins/owners 和 finalize/refresh touch 重算两个槽并压缩候选集；因此槽被新 pin 吞掉或暂时为 null 后，刚释放的保护项仍能接替 grace。schema 3 大账本迁移使用同一 retained-union 语义，但通过单调 `rowid` 游标每轮只扫描 32 行；动态 pin/owner 变化不重置游标。真正的保护集始终只有当前 pins、servable public owners、latest 和选出的两个 grace，不会把全部候选都永久保留。latest 的比较仍只使用不可变的 `cutEventSeq`、`nextPtyOffset`、`createdAt`、`snapshotId`，前两个用 `BigInt`；grace refresh 不改写 latest 排序。
+
+schema 迁移只有基线 `v3 -> final v4`：给现有 snapshot pointer 增加默认 `single-put-verified` kind，给单行 session state 增加 bounded retention 状态，并创建空 multipart upload ledger/index。迁移不复制、不排序、不回填大表；cold constructor 在并发门内检查 backlog 并可靠持久化 alarm，首次 alarm 写失败会让 activation 失败，下一次 cold wake 重新尝试。迁移期间新 reservation fail closed，GET 仍可读取 servable pointer。
+
+Retention 在 finalize 的同一个 SQLite transaction 中先把最老非保留行改为 `retired`；从 transaction 提交起新的 GET 必须 404。R2 delete 在事务后异步执行，失败 tombstone 保持在 32-row 上限内并由 alarm 重试，成功后才按 exact row identity 删除 SQLite。GET 已取得 pointer 后与 GC 并发时允许 fail closed 为 503，但绝不能返回错误对象或让 retired pointer 重新可见。乱序 finalize 不允许 latest pointer 回退；比较顺序是 `cutEventSeq`、`nextPtyOffset`、`createdAt`、`snapshotId`，前两个必须用 `BigInt`。DO hibernation 后 pin 从 serialized WebSocket attachment 重建，ledger 与 alarm 来自持久化存储。
 
 Host、writer、observer 使用各自 capability 下载：
 
@@ -303,7 +358,7 @@ Host、writer、observer 使用各自 capability 下载：
 GET /api/v1/sessions/:sessionId/snapshots/:snapshotId
 ```
 
-Worker 先从 DO 读取已发布 pointer，再从 R2 读取 object。version、etag、size、checksum、HTTP metadata 或 custom metadata 任一不匹配时，先 cancel R2 body，再返回 503；绝不能返回部分对象。成功响应把 R2 `ReadableStream` 直接返回，并固定 `Cache-Control: private, no-store` 与 `X-Content-Type-Options: nosniff`。
+Worker 先从 DO 读取已发布 pointer，再从 R2 读取 object。version、etag、size、checksum policy、HTTP metadata 或 custom metadata 任一不匹配时，先 cancel R2 body，再返回 503；绝不能返回部分或错误对象。成功响应把 R2 `ReadableStream` 直接返回，并固定 `Cache-Control: private, no-store` 与 `X-Content-Type-Options: nosniff`。
 
 Capability 是 session-scoped HMAC bearer，不引入 IdP。Host capability 默认 24 小时，writer/observer 默认 8 小时；share URL 可以自然过期，但活跃 Host/Browser 应在 capability 半寿命附近加入 jitter 主动刷新：
 
@@ -2402,11 +2457,12 @@ journal = events 10001..900000
 → 原子替换 latestSnapshot
 ```
 
-旧 snapshot 不能立即删除，因为可能仍有客户端正在下载它。
+旧 snapshot 不能仅因 latest 更新就立即删除，因为可能仍被 data attachment pin 住，或处于 finalize 到 marker 之间的 recent grace 窗口。
 
 ```text
 S_old
-  保留到所有引用它的 delivery generation 结束
+  保留到所有引用它的 data socket reset/close
+  ReplayCommit 后仍保留 pin
 
 S_new
   成为新的 latestSnapshot

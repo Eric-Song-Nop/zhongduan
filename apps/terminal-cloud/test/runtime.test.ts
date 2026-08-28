@@ -1,6 +1,6 @@
 import { env, exports as workerExports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 interface CreatedSession {
   hostCapability: string;
@@ -19,6 +19,8 @@ interface ConnectionSet {
 }
 
 const origin = "https://terminal.example.test";
+const testSockets = new Set<WebSocket>();
+const testSocketSessions = new Set<string>();
 
 async function createSession(): Promise<CreatedSession> {
   const response = await workerExports.default.fetch(
@@ -77,6 +79,11 @@ async function upgrade(
   );
   const socket = response.webSocket ?? undefined;
   socket?.accept();
+  if (socket !== undefined) {
+    testSockets.add(socket);
+    testSocketSessions.add(sessionId);
+    socket.addEventListener("close", () => testSockets.delete(socket), { once: true });
+  }
   return { response, socket };
 }
 
@@ -92,6 +99,17 @@ async function drainSession(sessionId: string): Promise<void> {
   await runInDurableObject(stub, () => undefined);
 }
 
+afterEach(async () => {
+  for (const socket of testSockets) {
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      socket.close(1000, "test cleanup");
+    }
+  }
+  await Promise.all([...testSocketSessions].map((sessionId) => drainSession(sessionId)));
+  testSockets.clear();
+  testSocketSessions.clear();
+});
+
 describe("cloud relay runtime", () => {
   it("authenticates session and connection-set creation", async () => {
     const unauthorized = await workerExports.default.fetch(
@@ -105,6 +123,7 @@ describe("cloud relay runtime", () => {
       }),
     );
     expect(unauthorized.status).toBe(401);
+    await unauthorized.text();
 
     const session = await createSession();
     const writer = await createConnectionSet(session.sessionId, session.writerCapability);
@@ -123,6 +142,7 @@ describe("cloud relay runtime", () => {
       }),
     );
     expect(wrongSession.status).toBe(401);
+    await wrongSession.text();
   });
 
   it("rejects zero and overflowing session epochs", async () => {
@@ -190,6 +210,7 @@ describe("cloud relay runtime", () => {
 
     const earlyData = await upgrade(session.sessionId, "data", connection.dataTicket);
     expect(earlyData.response.status).toBe(409);
+    await earlyData.response.text();
 
     const control = await upgrade(session.sessionId, "control", connection.controlTicket);
     expect(control.response.status).toBe(101);
@@ -197,6 +218,7 @@ describe("cloud relay runtime", () => {
 
     const replayedControl = await upgrade(session.sessionId, "control", connection.controlTicket);
     expect(replayedControl.response.status).toBe(401);
+    await replayedControl.response.text();
 
     const data = await upgrade(session.sessionId, "data", connection.dataTicket);
     expect(data.response.status).toBe(101);
@@ -204,6 +226,7 @@ describe("cloud relay runtime", () => {
 
     const replayedData = await upgrade(session.sessionId, "data", connection.dataTicket);
     expect(replayedData.response.status).toBe(401);
+    await replayedData.response.text();
 
     control.socket?.close(1000, "test complete");
     data.socket?.close(1000, "test complete");
@@ -220,6 +243,7 @@ describe("cloud relay runtime", () => {
 
     const data = await upgrade(session.sessionId, "data", connection.dataTicket);
     expect(data.response.status).toBe(401);
+    await data.response.text();
   });
 
   it("binds a data ticket to the control socket from the same connection set", async () => {
@@ -245,6 +269,7 @@ describe("cloud relay runtime", () => {
 
     secondControl.socket?.close(1000, "test complete");
     currentData.socket?.close(1000, "test complete");
+    firstControl.socket?.close(1000, "test complete");
   });
 
   it("freezes one activation across each reserved browser connection set", async () => {
@@ -258,9 +283,9 @@ describe("cloud relay runtime", () => {
       first.clientId ?? undefined,
     );
     expect(replacedPending.deliveryGeneration).toBe("1");
-    expect((await upgrade(session.sessionId, "control", first.controlTicket)).response.status).toBe(
-      401,
-    );
+    const revokedFirstControl = await upgrade(session.sessionId, "control", first.controlTicket);
+    expect(revokedFirstControl.response.status).toBe(401);
+    await revokedFirstControl.response.text();
 
     const firstControl = await upgrade(session.sessionId, "control", replacedPending.controlTicket);
     const firstData = await upgrade(session.sessionId, "data", replacedPending.dataTicket);
@@ -298,15 +323,23 @@ describe("cloud relay runtime", () => {
       { channel: "data", delivery_generation: "2" },
     ]);
 
-    expect(
-      (await upgrade(session.sessionId, "control", staleReplacement.controlTicket)).response.status,
-    ).toBe(401);
-    expect(
-      (await upgrade(session.sessionId, "data", staleReplacement.dataTicket)).response.status,
-    ).toBe(401);
-    expect(
-      (await upgrade(session.sessionId, "data", currentReplacement.dataTicket)).response.status,
-    ).toBe(409);
+    const staleControl = await upgrade(
+      session.sessionId,
+      "control",
+      staleReplacement.controlTicket,
+    );
+    expect(staleControl.response.status).toBe(401);
+    await staleControl.response.text();
+    const staleData = await upgrade(session.sessionId, "data", staleReplacement.dataTicket);
+    expect(staleData.response.status).toBe(401);
+    await staleData.response.text();
+    const earlyReplacementData = await upgrade(
+      session.sessionId,
+      "data",
+      currentReplacement.dataTicket,
+    );
+    expect(earlyReplacementData.response.status).toBe(409);
+    await earlyReplacementData.response.text();
 
     const replacementControl = await upgrade(
       session.sessionId,
@@ -376,20 +409,34 @@ describe("cloud relay runtime", () => {
     expect(activeOverflow.status).toBe(429);
     await activeOverflow.text();
     for (const { socket } of controls) socket?.close(1000, "test complete");
+    await drainSession(session.sessionId);
   });
 
   it("reclaims fully disconnected clients instead of imposing a lifetime quota", async () => {
     const session = await createSession();
-    for (let index = 0; index < 17; index += 1) {
-      const connection = await createConnectionSet(session.sessionId, session.observerCapability);
-      const control = await upgrade(session.sessionId, "control", connection.controlTicket);
-      const data = await upgrade(session.sessionId, "data", connection.dataTicket);
-      expect(control.response.status).toBe(101);
-      expect(data.response.status).toBe(101);
-      control.socket?.close(1000, "client fully disconnected");
-      data.socket?.close(1000, "client fully disconnected");
-      await drainSession(session.sessionId);
+    const connections = await Promise.all(
+      Array.from({ length: 16 }, () =>
+        createConnectionSet(session.sessionId, session.observerCapability),
+      ),
+    );
+    const controls = await Promise.all(
+      connections.map((connection) =>
+        upgrade(session.sessionId, "control", connection.controlTicket),
+      ),
+    );
+    const data = await Promise.all(
+      connections.map((connection) => upgrade(session.sessionId, "data", connection.dataTicket)),
+    );
+    expect(controls.every(({ response }) => response.status === 101)).toBe(true);
+    expect(data.every(({ response }) => response.status === 101)).toBe(true);
+    for (const { socket } of [...controls, ...data]) {
+      socket?.close(1000, "client fully disconnected");
     }
+    await drainSession(session.sessionId);
+
+    await expect(
+      createConnectionSet(session.sessionId, session.observerCapability),
+    ).resolves.toMatchObject({ clientId: expect.any(String) });
 
     const clientCount = await runInDurableObject(
       env.TERMINAL_SESSIONS.get(env.TERMINAL_SESSIONS.idFromName(`v1:${session.sessionId}`)),

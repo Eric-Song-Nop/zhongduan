@@ -10,7 +10,8 @@ import {
 } from "@zhongduan/protocol";
 import { env, exports as workerExports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { installMiniflareMultipartEtagShim, storedSnapshotKey } from "./snapshot-test-helpers";
 
 interface CreatedSession {
   hostCapability: string;
@@ -55,6 +56,8 @@ interface ReplicaCursor {
 const origin = "https://terminal.example.test";
 const engineId = "ghostty:test+snapshot-v1+wterm:test";
 const textEncoder = new TextEncoder();
+const testSockets = new Set<WebSocket>();
+const testSocketSessions = new Set<string>();
 
 class SocketInbox {
   readonly #messages: unknown[] = [];
@@ -119,6 +122,17 @@ async function drainSession(sessionId: string): Promise<void> {
   await runInDurableObject(sessionStub(sessionId), () => undefined);
 }
 
+afterEach(async () => {
+  for (const socket of testSockets) {
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      socket.close(1000, "test cleanup");
+    }
+  }
+  await Promise.all([...testSocketSessions].map((sessionId) => drainSession(sessionId)));
+  testSockets.clear();
+  testSocketSessions.clear();
+});
+
 async function injectServerSendFailure(
   session: CreatedSession,
   browser: BrowserEndpoint,
@@ -169,7 +183,9 @@ async function createSession(): Promise<CreatedSession> {
     }),
   );
   expect(response.status).toBe(201);
-  return response.json<CreatedSession>();
+  const session = await response.json<CreatedSession>();
+  await installMiniflareMultipartEtagShim(session.sessionId);
+  return session;
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
@@ -347,6 +363,9 @@ async function upgrade(
   const socket = response.webSocket;
   if (socket === null) throw new Error("upgrade response did not include a WebSocket");
   socket.accept();
+  testSockets.add(socket);
+  testSocketSessions.add(sessionId);
+  socket.addEventListener("close", () => testSockets.delete(socket), { once: true });
   return { socket, inbox: new SocketInbox(socket) };
 }
 
@@ -1795,6 +1814,57 @@ describe("live Durable Object relay", () => {
       eventSeq: 3n,
       ptyOffset: 2n,
     });
+
+    const committedPin = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const dataSocket = state
+          .getWebSockets(`client:${browser.connection.clientId}`)
+          .find((socket) => {
+            return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+          });
+        return dataSocket?.deserializeAttachment() as {
+          dataState: string;
+          snapshotId: string;
+        };
+      },
+    );
+    expect(committedPin).toMatchObject({ dataState: "synced", snapshotId });
+
+    await evictDurableObject(sessionStub(session.sessionId));
+    for (const nextSnapshotId of [
+      "snapshot_retention_new_01",
+      "snapshot_retention_new_02",
+      "snapshot_retention_new_03",
+    ]) {
+      await publishSnapshot(session, nextSnapshotId);
+    }
+    const hibernatedPinState = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) =>
+        state.storage.sql.exec("SELECT state FROM snapshot WHERE snapshot_id = ?", snapshotId).one()
+          .state,
+    );
+    expect(hibernatedPinState).toBe("servable");
+    const pinnedObjectKey = await storedSnapshotKey(session.sessionId, snapshotId);
+
+    browser.data.socket.close(1000, "release snapshot pin");
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "resync-required",
+      reason: "data-disconnected",
+    });
+    await runInDurableObject(sessionStub(session.sessionId), async (instance) => {
+      await instance.alarm();
+    });
+    const released = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) =>
+        state.storage.sql
+          .exec("SELECT state FROM snapshot WHERE snapshot_id = ?", snapshotId)
+          .toArray()[0],
+    );
+    expect(released).toBeUndefined();
+    expect(await env.SNAPSHOTS.head(pinnedObjectKey)).toBeNull();
   });
 
   it("allows an unstarted live attach to fall back to a snapshot seed", async () => {
