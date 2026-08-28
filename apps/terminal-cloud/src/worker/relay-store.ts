@@ -23,6 +23,13 @@ export interface SessionRow {
   latest_snapshot_id: string | null;
   next_pty_offset: string;
   next_stream_id: number;
+  recent_snapshot_id_1: string | null;
+  recent_snapshot_id_2: string | null;
+  snapshot_created_clock: number;
+  snapshot_recent_candidates_json: string;
+  snapshot_recent_scan_before: number | null;
+  snapshot_recent_scan_done: number;
+  snapshot_retention_backlog: number;
   session_epoch: string;
   session_id: string;
 }
@@ -172,6 +179,54 @@ export function migrateRelayStore(state: DurableObjectState, sql: SqlStorage): v
       sql.exec("ALTER TABLE client_delivery ADD COLUMN reservation_expires_at INTEGER");
       sql.exec("UPDATE client_delivery SET registered_at = updated_at");
       state.storage.kv.put("schema-version", 3);
+    });
+    version = 3;
+  }
+
+  if (version < 4) {
+    state.storage.transactionSync(() => {
+      sql.exec(
+        "ALTER TABLE snapshot ADD COLUMN upload_kind TEXT NOT NULL DEFAULT 'single-put-verified'",
+      );
+      sql.exec(
+        "ALTER TABLE session_state ADD COLUMN snapshot_created_clock INTEGER NOT NULL DEFAULT 0",
+      );
+      sql.exec("ALTER TABLE session_state ADD COLUMN recent_snapshot_id_1 TEXT");
+      sql.exec("ALTER TABLE session_state ADD COLUMN recent_snapshot_id_2 TEXT");
+      sql.exec(
+        "ALTER TABLE session_state ADD COLUMN snapshot_recent_candidates_json TEXT NOT NULL DEFAULT '[]'",
+      );
+      sql.exec("ALTER TABLE session_state ADD COLUMN snapshot_recent_scan_before INTEGER");
+      sql.exec(
+        "ALTER TABLE session_state ADD COLUMN snapshot_recent_scan_done INTEGER NOT NULL DEFAULT 0",
+      );
+      sql.exec(
+        "ALTER TABLE session_state ADD COLUMN snapshot_retention_backlog INTEGER NOT NULL DEFAULT 1",
+      );
+      sql.exec(`
+        CREATE TABLE snapshot_upload (
+          snapshot_id TEXT PRIMARY KEY,
+          object_key TEXT NOT NULL UNIQUE,
+          metadata_json TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (
+            state IN (
+              'preparing', 'uploading', 'completing', 'uncertain',
+              'aborted', 'completed', 'retired'
+            )
+          ),
+          upload_id TEXT,
+          part_etag TEXT,
+          r2_version TEXT,
+          etag TEXT,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL
+        )
+      `);
+      sql.exec(`
+        CREATE INDEX snapshot_upload_state_expiry
+        ON snapshot_upload(state, expires_at)
+      `);
+      state.storage.kv.put("schema-version", 4);
     });
   }
 }

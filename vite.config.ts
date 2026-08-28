@@ -30,6 +30,7 @@ export default defineConfig({
         command: [
           "node scripts/prepare-wterm.mjs",
           "vp check",
+          "node scripts/verify-no-source-emit.mjs",
           "vp test --run",
           "vp run @zhongduan/terminal-cloud#test",
         ],
@@ -37,6 +38,10 @@ export default defineConfig({
       },
       "verify-clean-host": {
         command: "node scripts/verify-clean-host-build.mjs",
+        cache: false,
+      },
+      "verify-no-source-emit": {
+        command: "node scripts/verify-no-source-emit.mjs",
         cache: false,
       },
     },
