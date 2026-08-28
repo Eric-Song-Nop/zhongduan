@@ -70,8 +70,8 @@ Ghostty snapshot 只承担 checkpoint，不承担事件传输。它的 continuat
 | 每客户端发送队列         |           512 KiB |
 | Passive restore tail     |             2 MiB |
 | Passive restore deadline |               5 s |
-| Snapshot idle debounce   |            100 ms |
-| Snapshot 最小构建间隔    |               2 s |
+| Snapshot recovery quiet  |            250 ms |
+| Snapshot 最小构建间隔    |               1 s |
 
 客户端 ACK 只决定能否 warm replay，不会 pin journal。发送队列超限时只重置该客户端的 data WebSocket 并增加其 `deliveryGeneration`；control WebSocket 保持可用，因此 Ctrl-C 和重同步控制不会被历史输出阻塞。
 
