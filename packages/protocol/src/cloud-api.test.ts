@@ -8,6 +8,7 @@ import {
   ConnectionSetResponseSchema,
   HostCapabilityReclaimRequestSchema,
   CreateSessionRequestSchema,
+  RelayCapability,
 } from "./cloud-api";
 
 describe("Cloud HTTP contracts", () => {
@@ -42,8 +43,24 @@ describe("Cloud HTTP contracts", () => {
         expiresAt: 1_800_000_000_000,
         controlTicket: "control_ticket_AAAAAA",
         dataTicket: "data_ticket_AAAAAAAAA",
+        selectedCapabilities: [RelayCapability.deliveryBarrierOutcomeV1],
       }),
-    ).toMatchObject({ deliveryGeneration: "2" });
+    ).toMatchObject({
+      deliveryGeneration: "2",
+      selectedCapabilities: [RelayCapability.deliveryBarrierOutcomeV1],
+    });
+    expect(
+      ConnectionSetResponseSchema.parse({
+        connectionSetId: "connection_set_AAAAA",
+        connectionId: "connection_id_AAAAAA",
+        clientId: null,
+        streamId: 0,
+        deliveryGeneration: "0",
+        expiresAt: 1_800_000_000_000,
+        controlTicket: "control_ticket_AAAAAA",
+        dataTicket: "data_ticket_AAAAAAAAA",
+      }),
+    ).not.toHaveProperty("selectedCapabilities");
   });
 
   it("keeps capability roles and reclaim identity strict", () => {

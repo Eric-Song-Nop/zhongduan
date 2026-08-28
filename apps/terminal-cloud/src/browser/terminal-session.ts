@@ -23,6 +23,7 @@ import type { InputDispatcher } from "./input-dispatcher";
 
 const CLIENT_ID_PREFIX = "zhongduan:browser-client:";
 const SOCKET_OPEN_TIMEOUT_MS = 10_000;
+export const ATTACH_START_TIMEOUT_MS = 10_000;
 const DATA_REPLACEMENT_GRACE_MS = 350;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 45_000;
@@ -152,6 +153,7 @@ export class TerminalSession {
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   #dataFailureTimer: ReturnType<typeof setTimeout> | null = null;
   #heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  #attachStartTimer: ReturnType<typeof setTimeout> | null = null;
   #writerLeaseTimer: ReturnType<typeof setTimeout> | null = null;
   #snapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
   #snapshotFailureCount = 0;
@@ -506,7 +508,9 @@ export class TerminalSession {
             lastEventSeq: cursor.lastEventSeq.toString(),
             nextPtyOffset: cursor.nextPtyOffset.toString(),
           };
-    this.#sendControl(ClientControlFrameSchema.parse(frame), true);
+    if (this.#sendControl(ClientControlFrameSchema.parse(frame), true)) {
+      this.#startAttachStartWatchdog(generation);
+    }
   }
 
   #handleControlMessage(data: unknown): void {
@@ -543,12 +547,14 @@ export class TerminalSession {
         return;
       case "replay-start":
         if (!this.#matchesCurrentDelivery(frame)) return;
+        this.#cancelAttachStartWatchdog();
         this.#update({ hostOnline: true });
         this.coordinator.startWarmReplay(frame);
         this.#syncDeliveryState();
         return;
       case "snapshot-manifest":
         if (!this.#matchesCurrentDelivery(frame)) return;
+        this.#cancelAttachStartWatchdog();
         this.#update({ hostOnline: true, phase: "restoring" });
         void this.coordinator
           .startSnapshot(frame)
@@ -619,6 +625,7 @@ export class TerminalSession {
       return;
     }
     if (frame.dataTicket !== undefined) this.#cancelSnapshotRetry(false);
+    this.#cancelAttachStartWatchdog();
     this.#input.setReplicaCurrent(false);
     this.coordinator.fenceDeliveryGeneration(generation);
     this.#syncDeliveryState();
@@ -847,6 +854,28 @@ export class TerminalSession {
     this.#heartbeatTimer = this.#setTimer(tick, HEARTBEAT_INTERVAL_MS);
   }
 
+  #startAttachStartWatchdog(generation: bigint): void {
+    this.#cancelAttachStartWatchdog();
+    const connectionEpoch = this.#connectionEpoch;
+    const dataEpoch = this.#dataEpoch;
+    this.#attachStartTimer = this.#setTimer(() => {
+      this.#attachStartTimer = null;
+      if (
+        !this.#isCurrentData(connectionEpoch, dataEpoch, generation) ||
+        this.#snapshot.phase !== "attaching"
+      ) {
+        return;
+      }
+      this.#update({ lastError: "connection", phase: "reconnecting" });
+      this.#failFullConnection();
+    }, ATTACH_START_TIMEOUT_MS);
+  }
+
+  #cancelAttachStartWatchdog(): void {
+    if (this.#attachStartTimer !== null) this.#clearTimer(this.#attachStartTimer);
+    this.#attachStartTimer = null;
+  }
+
   #startWriterLeaseRenewal(): void {
     this.#stopWriterLeaseRenewal();
     const connectionEpoch = this.#connectionEpoch;
@@ -909,6 +938,7 @@ export class TerminalSession {
     this.#connectAbort = null;
     this.#abortDataReplacement();
     this.#cancelDataFailureTimer();
+    this.#cancelAttachStartWatchdog();
     this.#stopHeartbeat();
     this.#stopWriterLeaseRenewal();
     this.#input.detachTransport();

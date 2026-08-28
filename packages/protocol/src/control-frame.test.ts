@@ -391,6 +391,37 @@ describe("control frame validation", () => {
         status: "stale",
       }),
     ).toMatchObject({ mode: "warm", status: "stale" });
+    expect(
+      RelayToHostControlFrameSchema.parse({
+        ...commonAcknowledgement,
+        mode: "warm",
+        status: "stale",
+        reason: "generation-fenced",
+      }),
+    ).toMatchObject({ reason: "generation-fenced" });
+    expect(
+      RelayToHostControlFrameSchema.parse({
+        ...acknowledgement,
+        status: "rejected",
+        reason: "snapshot-missing",
+        retryScope: "refresh-checkpoint",
+      }),
+    ).toMatchObject({ reason: "snapshot-missing", retryScope: "refresh-checkpoint" });
+    expect(() =>
+      RelayToHostControlFrameSchema.parse({
+        ...acknowledgement,
+        status: "rejected",
+        reason: "snapshot-missing",
+      }),
+    ).toThrow();
+    expect(() =>
+      RelayToHostControlFrameSchema.parse({
+        ...acknowledgement,
+        status: "rejected",
+        reason: "snapshot-missing",
+        retryScope: "drop-client",
+      }),
+    ).toThrow();
     expect(() =>
       RelayToHostControlFrameSchema.parse({
         ...acknowledgement,

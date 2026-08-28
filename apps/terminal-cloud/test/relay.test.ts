@@ -3,6 +3,8 @@ import {
   DataFrameKind,
   SNAPSHOT_MEDIA_TYPE,
   SnapshotHeader,
+  RELAY_CAPABILITIES_HEADER,
+  RelayCapability,
   decodeDataFrame,
   encodeDeliveryBarrierPayload,
   encodeDataFrame,
@@ -28,6 +30,7 @@ interface ConnectionSet {
   dataTicket: string;
   deliveryGeneration: string;
   streamId: number;
+  selectedCapabilities?: string[];
 }
 
 interface SocketEndpoint {
@@ -328,6 +331,7 @@ async function createConnectionSet(
   sessionId: string,
   capability: string,
   clientId?: string,
+  relayCapabilities: string[] = [],
 ): Promise<ConnectionSet> {
   const response = await workerExports.default.fetch(
     new Request(`${origin}/api/v1/sessions/${sessionId}/connection-sets`, {
@@ -335,6 +339,9 @@ async function createConnectionSet(
       headers: {
         authorization: `Bearer ${capability}`,
         "content-type": "application/json",
+        ...(relayCapabilities.length === 0
+          ? {}
+          : { [RELAY_CAPABILITIES_HEADER]: relayCapabilities.join(",") }),
       },
       body: JSON.stringify(clientId === undefined ? {} : { clientId }),
     }),
@@ -375,8 +382,17 @@ async function openHost(
   session: CreatedSession,
   headEventSeq = "0",
   nextPtyOffset = "0",
+  negotiateOutcomeDetails = true,
 ): Promise<HostEndpoint> {
-  const connection = await createConnectionSet(session.sessionId, session.hostCapability);
+  const connection = await createConnectionSet(
+    session.sessionId,
+    session.hostCapability,
+    undefined,
+    negotiateOutcomeDetails ? [RelayCapability.deliveryBarrierOutcomeV1] : [],
+  );
+  expect(connection.selectedCapabilities).toEqual(
+    negotiateOutcomeDetails ? [RelayCapability.deliveryBarrierOutcomeV1] : undefined,
+  );
   const control = await upgrade(session.sessionId, "control", connection.controlTicket);
   const data = await upgrade(session.sessionId, "data", connection.dataTicket);
   control.socket.send(
@@ -2005,6 +2021,8 @@ describe("live Durable Object relay", () => {
       type: "delivery-barrier-result",
       status: "rejected",
       snapshotId,
+      reason: "browser-control-send-failed",
+      retryScope: "drop-client",
     });
     await drainSession(session.sessionId);
     expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
@@ -2206,6 +2224,8 @@ describe("live Durable Object relay", () => {
       type: "delivery-barrier-result",
       status: "rejected",
       snapshotId,
+      reason: "snapshot-metadata-mismatch",
+      retryScope: "refresh-checkpoint",
     });
     expect(browser.control.inbox.pendingMessageCount).toBe(0);
     expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
@@ -2226,9 +2246,32 @@ describe("live Durable Object relay", () => {
       type: "delivery-barrier-result",
       status: "stale",
       connectionId: browser.connection.connectionId,
+      reason: "client-gone",
     });
     expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
     expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("keeps barrier outcomes legacy-shaped when the Host did not negotiate details", async () => {
+    const session = await createSession();
+    const host = await openHost(session, "0", "0", false);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser);
+    const barrier = deliveryBarrier(browser, "warm", 0n, 0n);
+
+    browser.control.socket.close(1000, "browser left");
+    await drainSession(session.sessionId);
+    host.data.socket.send(barrier);
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toEqual({
+      type: "delivery-barrier-result",
+      status: "stale",
+      mode: "warm",
+      connectionId: browser.connection.connectionId,
+      streamId: browser.connection.streamId,
+      deliveryGeneration: browser.connection.deliveryGeneration,
+      commitEventSeq: "0",
+      commitPtyOffset: "0",
+    });
   });
 
   it("returns stale when a browser data reset fenced the barrier generation", async () => {
@@ -2248,6 +2291,7 @@ describe("live Durable Object relay", () => {
       type: "delivery-barrier-result",
       status: "stale",
       deliveryGeneration: "1",
+      reason: "generation-fenced",
     });
     expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
     expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
@@ -2273,6 +2317,7 @@ describe("live Durable Object relay", () => {
       type: "delivery-barrier-result",
       status: "stale",
       deliveryGeneration: "1",
+      reason: "generation-fenced",
     });
     expect(other.control.socket.readyState).toBe(WebSocket.OPEN);
     expect(other.data.socket.readyState).toBe(WebSocket.OPEN);
@@ -2322,6 +2367,24 @@ describe("live Durable Object relay", () => {
       snapshotId,
       firstEventSeq: "0",
       firstPtyOffset: "0",
+    });
+  });
+
+  it("retains negotiated barrier outcome details across hibernation", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser, null);
+
+    await evictDurableObject(sessionStub(session.sessionId), { webSockets: "hibernate" });
+    host.data.socket.send(deliveryBarrier(browser, "warm", 0n, 0n));
+
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "delivery-barrier-result",
+      status: "rejected",
+      mode: "warm",
+      reason: "missing-live-seed",
+      retryScope: "same-generation",
     });
   });
 

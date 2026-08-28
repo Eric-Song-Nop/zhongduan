@@ -9,6 +9,12 @@ export const BrowserCapabilityRoleSchema = z.enum(["writer", "observer"]);
 const engineId = z.string().min(1).max(512);
 const capability = z.string().min(1).max(4_096);
 
+export const RELAY_CAPABILITIES_HEADER = "x-zhongduan-relay-capabilities";
+export const RelayCapability = {
+  deliveryBarrierOutcomeV1: "delivery-barrier-outcome-v1",
+} as const;
+export const RelayCapabilitySchema = z.enum([RelayCapability.deliveryBarrierOutcomeV1]);
+
 export const CreateSessionRequestSchema = z.strictObject({
   sessionId: CloudResourceIdSchema,
   engineId,
@@ -40,6 +46,7 @@ export const ConnectionSetResponseSchema = z.strictObject({
   expiresAt: z.number().int().positive(),
   controlTicket: CloudResourceIdSchema,
   dataTicket: CloudResourceIdSchema,
+  selectedCapabilities: z.array(RelayCapabilitySchema).max(16).optional(),
 });
 
 export const CapabilityMintRequestSchema = z.strictObject({
@@ -70,5 +77,6 @@ export type CreateSessionRequest = z.infer<typeof CreateSessionRequestSchema>;
 export type CreateSessionResponse = z.infer<typeof CreateSessionResponseSchema>;
 export type ConnectionSetRequest = z.infer<typeof ConnectionSetRequestSchema>;
 export type ConnectionSetResponse = z.infer<typeof ConnectionSetResponseSchema>;
+export type RelayCapability = z.infer<typeof RelayCapabilitySchema>;
 export type CapabilityResponse = z.infer<typeof CapabilityResponseSchema>;
 export type SnapshotUploadResponse = z.infer<typeof SnapshotUploadResponseSchema>;

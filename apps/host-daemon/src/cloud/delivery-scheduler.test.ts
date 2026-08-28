@@ -161,13 +161,25 @@ function liveAttach(
 function answerBarrier(
   harness: Harness,
   encoded: Uint8Array,
-  status: "ready" | "stale" | "rejected" = "ready",
+  outcome:
+    | { status: "ready" }
+    | { status: "stale"; reason?: "generation-fenced" | "client-gone" }
+    | {
+        status: "rejected";
+        reason?:
+          | "missing-live-seed"
+          | "snapshot-missing"
+          | "snapshot-metadata-mismatch"
+          | "browser-control-send-failed"
+          | "cloud-head-behind-cut";
+        retryScope?: "same-generation" | "refresh-checkpoint" | "reset-generation" | "drop-client";
+      } = { status: "ready" },
 ): void {
   const frame = decodeDataFrame(encoded);
   const payload = decodeDeliveryBarrierPayload(frame.payload);
   const common = {
     type: "delivery-barrier-result" as const,
-    status,
+    ...outcome,
     connectionId: payload.connectionId,
     streamId: frame.streamId,
     deliveryGeneration: frame.deliveryGeneration.toString(),
@@ -377,6 +389,120 @@ describe("HostDeliveryScheduler", () => {
       .map(decodeDataFrame)
       .find((frame) => frame.kind === DataFrameKind.DeliveryBarrier);
     expect(decodeDeliveryBarrierPayload(barrier!.payload)).toMatchObject({ mode: "snapshot" });
+  });
+
+  it.each([
+    [
+      "enriched",
+      {
+        status: "rejected",
+        reason: "missing-live-seed",
+        retryScope: "same-generation",
+      } as const,
+    ],
+    ["legacy", { status: "rejected" } as const],
+  ])(
+    "retries a %s rejected warm barrier as cold in the same generation",
+    async (_name, outcome) => {
+      const publish = vi.fn(async (snapshot: SnapshotCapture) => publishedSnapshot(snapshot));
+      const harness = createHarness({ publish });
+      activate(harness);
+      harness.pty.emit(Uint8Array.of(0x41));
+      let barriers = 0;
+      harness.setBarrierResponder((encoded) => {
+        barriers += 1;
+        answerBarrier(harness, encoded, barriers === 1 ? outcome : { status: "ready" });
+      });
+
+      liveAttach(harness, { lastEventSeq: 0n, nextPtyOffset: 0n });
+      await settle();
+
+      const frames = harness.data.map(decodeDataFrame);
+      expect(
+        frames
+          .filter((frame) => frame.kind === DataFrameKind.DeliveryBarrier)
+          .map((frame) => decodeDeliveryBarrierPayload(frame.payload).mode),
+      ).toEqual(["warm", "snapshot"]);
+      expect(frames.filter((frame) => frame.kind === DataFrameKind.ReplayCommit)).toHaveLength(1);
+      expect(publish).toHaveBeenCalledOnce();
+      expect(harness.closeReasons).toEqual([]);
+    },
+  );
+
+  it.each([
+    [
+      "enriched",
+      {
+        status: "rejected",
+        reason: "snapshot-missing",
+        retryScope: "refresh-checkpoint",
+      } as const,
+    ],
+    ["legacy", { status: "rejected" } as const],
+  ])("refreshes a %s rejected cold checkpoint after bounded backoff", async (_name, outcome) => {
+    vi.useFakeTimers();
+    let publishCalls = 0;
+    const publish = vi.fn(async (snapshot: SnapshotCapture) => {
+      publishCalls += 1;
+      return publishedSnapshot(snapshot, publishCalls === 1 ? "A" : "B");
+    });
+    const harness = createHarness({ publish });
+    activate(harness);
+    let barriers = 0;
+    harness.setBarrierResponder((encoded) => {
+      barriers += 1;
+      answerBarrier(harness, encoded, barriers === 1 ? outcome : { status: "ready" });
+    });
+
+    attach(harness);
+    for (let turn = 0; turn < 16; turn += 1) await Promise.resolve();
+    expect(publish).toHaveBeenCalledOnce();
+    expect(barriers).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_RECOVERY_QUIET_MS - 1);
+    expect(publish).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(barriers).toBe(2);
+    expect(
+      harness.data
+        .map(decodeDataFrame)
+        .filter((frame) => frame.kind === DataFrameKind.ReplayCommit),
+    ).toHaveLength(1);
+    expect(harness.closeReasons).toEqual([]);
+  });
+
+  it("drops a rejected delivery whose browser connection was already isolated", async () => {
+    vi.useFakeTimers();
+    const publish = vi.fn(async (snapshot: SnapshotCapture) => publishedSnapshot(snapshot));
+    const harness = createHarness({ publish });
+    activate(harness);
+    harness.setBarrierResponder((encoded) =>
+      answerBarrier(harness, encoded, {
+        status: "rejected",
+        reason: "browser-control-send-failed",
+        retryScope: "drop-client",
+      }),
+    );
+
+    attach(harness);
+    for (let turn = 0; turn < 16; turn += 1) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_RECOVERY_QUIET_MS * 4);
+
+    expect(publish).toHaveBeenCalledOnce();
+    expect(
+      harness.data
+        .map(decodeDataFrame)
+        .filter((frame) => frame.kind === DataFrameKind.DeliveryBarrier),
+    ).toHaveLength(1);
+    expect(
+      harness.data
+        .map(decodeDataFrame)
+        .filter((frame) => frame.kind === DataFrameKind.ReplayCommit),
+    ).toHaveLength(0);
+    expect(harness.closeReasons).toEqual([]);
   });
 
   it("keeps canonical live during snapshot@R upload, then sends the R-to-C tail before C+1", async () => {
@@ -837,7 +963,10 @@ describe("HostDeliveryScheduler", () => {
     answerBarrier(harness, barriers[0]!);
     await settle();
     expect(barriers).toHaveLength(2);
-    answerBarrier(harness, barriers[1]!, "stale");
+    answerBarrier(harness, barriers[1]!, {
+      status: "stale",
+      reason: "generation-fenced",
+    });
     await settle();
 
     expect(

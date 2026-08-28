@@ -2,6 +2,8 @@ import {
   ConnectionSetRequestSchema,
   CreateSessionRequestSchema,
   CreateSessionResponseSchema,
+  RELAY_CAPABILITIES_HEADER,
+  RelayCapability,
 } from "@zhongduan/protocol";
 import { AuthError, secretsEqual, verifyBearerCapability } from "./auth";
 import { handleCapabilityRequest, issueSessionCapability } from "./capability-http";
@@ -32,6 +34,9 @@ const HostCapabilityReclaimRoute = new RegExp(
   `^/api/v1/sessions/(${sessionIdPattern})/capabilities/host/reclaim$`,
   "u",
 );
+const MAX_RELAY_CAPABILITIES_HEADER_CHARS = 1_024;
+const MAX_RELAY_CAPABILITIES = 16;
+const relayCapabilityToken = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, {
@@ -51,6 +56,22 @@ async function requestJson(request: Request): Promise<unknown> {
 function bearerToken(request: Request): string | undefined {
   const authorization = request.headers.get("authorization");
   return authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
+}
+
+function selectedRelayCapabilities(request: Request): string[] | undefined {
+  const header = request.headers.get(RELAY_CAPABILITIES_HEADER);
+  if (header === null || header === "") return [];
+  if (header.length > MAX_RELAY_CAPABILITIES_HEADER_CHARS) return undefined;
+  const requested = header.split(",").map((entry) => entry.trim());
+  if (
+    requested.length > MAX_RELAY_CAPABILITIES ||
+    requested.some((entry) => !relayCapabilityToken.test(entry))
+  ) {
+    return undefined;
+  }
+  return requested.includes(RelayCapability.deliveryBarrierOutcomeV1)
+    ? [RelayCapability.deliveryBarrierOutcomeV1]
+    : [];
 }
 
 function sessionStub(env: CloudEnv, sessionId: string) {
@@ -126,7 +147,12 @@ async function createConnectionSet(
   }
 
   const input = ConnectionSetRequestSchema.safeParse(await requestJson(request));
-  if (!input.success || (claims.role === "host" && input.data.clientId !== undefined)) {
+  const selectedCapabilities = selectedRelayCapabilities(request);
+  if (
+    !input.success ||
+    selectedCapabilities === undefined ||
+    (claims.role === "host" && input.data.clientId !== undefined)
+  ) {
     return json({ error: "invalid-connection-set" }, 400);
   }
   return sessionStub(env, sessionId).fetch("https://do.internal/internal/connection-sets", {
@@ -136,6 +162,9 @@ async function createConnectionSet(
       sessionId,
       subject: claims.subject,
       role: claims.role,
+      ...(claims.role === "host" && selectedCapabilities.length > 0
+        ? { selectedCapabilities }
+        : {}),
       ...(input.data.clientId === undefined ? {} : { clientId: input.data.clientId }),
     }),
   });
