@@ -1,0 +1,11 @@
+node_modules/
+.vite/
+.vite-plus/
+dist/
+coverage/
+.wrangler/
+*.log
+.env
+.env.*
+!.env.example
+
