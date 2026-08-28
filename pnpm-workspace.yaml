@@ -3,7 +3,6 @@ packages:
   - "packages/*"
   - "vendor/wterm/packages/@wterm/*"
   - "vendor/wterm/packages/@internal/*"
-  - "!vendor/wterm/packages/@wterm/dom"
   - "!vendor/wterm/packages/@wterm/just-bash"
   - "!vendor/wterm/packages/@wterm/markdown"
   - "!vendor/wterm/packages/@wterm/react"
