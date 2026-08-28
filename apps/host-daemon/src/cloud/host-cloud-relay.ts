@@ -1,3 +1,5 @@
+import type { TelemetrySink } from "@zhongduan/telemetry";
+
 import type { TerminalSession } from "../session";
 import {
   BootstrapTokenUnavailableError,
@@ -32,6 +34,7 @@ export interface HostCloudRelayOptions {
   sessionId: string;
   snapshotPublisher?: SnapshotPublisherLike;
   stableConnectionMs?: number;
+  telemetry?: TelemetrySink;
   webSocketFactory?: RelayWebSocketFactory;
 }
 
@@ -49,6 +52,7 @@ export class HostCloudRelay {
   readonly #snapshotPublisher: SnapshotPublisherLike;
   readonly #stableConnectionMs: number;
   readonly #stopController = new AbortController();
+  readonly #telemetry: TelemetrySink | undefined;
   readonly #webSocketFactory: RelayWebSocketFactory | undefined;
 
   #connection: HostRelayConnection | undefined;
@@ -90,6 +94,7 @@ export class HostCloudRelay {
     if (!Number.isInteger(this.#stableConnectionMs) || this.#stableConnectionMs <= 0) {
       throw new RangeError("stableConnectionMs must be a positive integer");
     }
+    this.#telemetry = options.telemetry;
     this.#webSocketFactory = options.webSocketFactory;
   }
 
@@ -141,10 +146,12 @@ export class HostCloudRelay {
             : { webSocketFactory: this.#webSocketFactory }),
         });
         const connection = new HostRelayConnection({
+          monotonicNow: this.#monotonicNow,
           pair,
           session: this.#session,
           snapshotCheckpointCache: this.#snapshotCheckpointCache,
           snapshotPublisher: this.#snapshotPublisher,
+          ...(this.#telemetry === undefined ? {} : { telemetry: this.#telemetry }),
         });
         this.#connection = connection;
         await connection.start();

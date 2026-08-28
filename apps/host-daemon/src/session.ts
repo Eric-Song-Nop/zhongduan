@@ -5,8 +5,15 @@ import {
   encodeResizePayload,
   type ResizePayload,
 } from "@zhongduan/protocol";
+import { elapsedMs } from "@zhongduan/telemetry";
 
-import type { EventJournal, JournalCursor, JournalReplay } from "./journal";
+import type {
+  EventJournal,
+  JournalCursor,
+  JournalMeasuredReplay,
+  JournalRangeMeasurement,
+  JournalReplay,
+} from "./journal";
 import type { PtyProcess } from "./pty-process";
 import type { SemanticKey, SemanticMouse, TerminalAuthority } from "./terminal-authority";
 
@@ -30,6 +37,7 @@ type SessionMessage =
     }
   | {
       type: "snapshot";
+      queuedAt: number;
       fence?: (snapshot: SnapshotCapture) => void;
       resolve: (snapshot: SnapshotCapture) => void;
       reject: (error: unknown) => void;
@@ -44,13 +52,22 @@ export interface TerminalSessionOptions {
   inputDedupEntries?: number;
 }
 
+export interface SnapshotCaptureTiming {
+  actorPauseMs: number;
+  authorityEncodeExportMs: number;
+  ownershipCopyMs: number;
+  queueWaitMs: number;
+}
+
 export interface SnapshotCapture {
   bytes: Uint8Array;
   cutEventSeq: bigint;
+  /** Legacy alias for timing.actorPauseMs until the final interface simplification. */
   encodeMs: number;
   engineId: string;
   nextPtyOffset: bigint;
   sessionEpoch: bigint;
+  timing: SnapshotCaptureTiming;
 }
 
 export type PtyExit =
@@ -68,6 +85,15 @@ export interface SemanticInputIdentity {
 
 export interface ReplayCursor extends JournalCursor {
   sessionEpoch: bigint;
+}
+
+export type ReplayRangeMeasurement =
+  | JournalRangeMeasurement
+  | { status: "gap"; reason: "epoch-mismatch" };
+
+export interface MeasuredReplay {
+  measurement: ReplayRangeMeasurement;
+  replay: JournalReplay;
 }
 
 export type InputAckStatus = "written" | "duplicate" | "rejected" | "uncertain";
@@ -184,6 +210,24 @@ export class TerminalSession {
       return { status: "gap" };
     }
     return this.#journal.replayThrough(base, commit);
+  }
+
+  measureReplayThrough(base: ReplayCursor, commit: ReplayCursor): ReplayRangeMeasurement {
+    if (base.sessionEpoch !== this.#sessionEpoch || commit.sessionEpoch !== this.#sessionEpoch) {
+      return { status: "gap", reason: "epoch-mismatch" };
+    }
+    return this.#journal.measureRange(base, commit);
+  }
+
+  replayAndMeasureThrough(base: ReplayCursor, commit: ReplayCursor): MeasuredReplay {
+    if (base.sessionEpoch !== this.#sessionEpoch || commit.sessionEpoch !== this.#sessionEpoch) {
+      return {
+        measurement: { status: "gap", reason: "epoch-mismatch" },
+        replay: { status: "gap" },
+      };
+    }
+    const result: JournalMeasuredReplay = this.#journal.replayAndMeasureThrough(base, commit);
+    return result;
   }
 
   subscribe(subscriber: (frame: Uint8Array) => void, cursor?: ReplayCursor): SubscriptionResult {
@@ -304,13 +348,19 @@ export class TerminalSession {
 
   captureSnapshot(): Promise<SnapshotCapture> {
     return new Promise((resolve, reject) => {
-      this.#enqueue({ type: "snapshot", resolve, reject });
+      this.#enqueue({ type: "snapshot", queuedAt: this.#monotonicNow(), resolve, reject });
     });
   }
 
   captureSnapshotWithFence(fence: (snapshot: SnapshotCapture) => void): Promise<SnapshotCapture> {
     return new Promise((resolve, reject) => {
-      this.#enqueue({ type: "snapshot", fence, resolve, reject });
+      this.#enqueue({
+        type: "snapshot",
+        queuedAt: this.#monotonicNow(),
+        fence,
+        resolve,
+        reject,
+      });
     });
   }
 
@@ -366,7 +416,7 @@ export class TerminalSession {
             break;
           case "snapshot":
             try {
-              const snapshot = this.#captureSnapshot();
+              const snapshot = this.#captureSnapshot(next.queuedAt);
               next.fence?.(snapshot);
               next.resolve(snapshot);
             } catch (error) {
@@ -527,19 +577,30 @@ export class TerminalSession {
     for (const reply of replies) this.#writePty(reply);
   }
 
-  #captureSnapshot(): SnapshotCapture {
+  #captureSnapshot(queuedAt: number): SnapshotCapture {
     const cutEventSeq = this.#eventSeq;
     const nextPtyOffset = this.#nextPtyOffset;
-    const startedAt = this.#monotonicNow();
-    const bytes = this.#authority.encodeSnapshot().slice();
+    const actorStartedAt = this.#monotonicNow();
+    const authorityStartedAt = this.#monotonicNow();
+    const encoded = this.#authority.encodeSnapshot();
+    const authorityFinishedAt = this.#monotonicNow();
+    const bytes = encoded.slice();
+    const actorFinishedAt = this.#monotonicNow();
     if (bytes.byteLength === 0) throw new Error("terminal authority returned an empty snapshot");
+    const timing = {
+      actorPauseMs: elapsedMs(actorStartedAt, actorFinishedAt),
+      authorityEncodeExportMs: elapsedMs(authorityStartedAt, authorityFinishedAt),
+      ownershipCopyMs: elapsedMs(authorityFinishedAt, actorFinishedAt),
+      queueWaitMs: elapsedMs(queuedAt, actorStartedAt),
+    };
     return {
       bytes,
       cutEventSeq,
-      encodeMs: this.#monotonicNow() - startedAt,
+      encodeMs: timing.actorPauseMs,
       engineId: this.#authority.engineId,
       nextPtyOffset,
       sessionEpoch: this.#sessionEpoch,
+      timing,
     };
   }
 

@@ -38,6 +38,9 @@ importers:
       '@zhongduan/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
+      '@zhongduan/telemetry':
+        specifier: workspace:*
+        version: link:../../packages/telemetry
       node-pty:
         specifier: 1.1.0
         version: 1.1.0
@@ -111,6 +114,12 @@ importers:
       fzstd:
         specifier: 0.1.1
         version: 0.1.1
+
+  packages/telemetry:
+    dependencies:
+      zod:
+        specifier: 'catalog:'
+        version: 4.4.3
 
   vendor/wterm/packages/@internal/ts: {}
 

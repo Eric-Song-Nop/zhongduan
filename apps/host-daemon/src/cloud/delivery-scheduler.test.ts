@@ -6,6 +6,7 @@ import {
   type RelayToHostControlFrame,
   type ResizePayload,
 } from "@zhongduan/protocol";
+import type { TelemetrySink, TerminalTelemetryEvent } from "@zhongduan/telemetry";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { FakeTerminalAuthority } from "../fake-terminal-authority";
@@ -81,6 +82,8 @@ function createHarness(
   authority: FakeTerminalAuthority = new FakeTerminalAuthority(),
   sessionMonotonicNow?: () => number,
   yieldIo: () => Promise<void> = () => Promise.resolve(),
+  telemetry?: TelemetrySink,
+  schedulerMonotonicNow?: () => number,
 ): Harness {
   const pty = new ManualPty();
   const session = new TerminalSession({
@@ -96,6 +99,7 @@ function createHarness(
   let barrierResponder: ((encoded: Uint8Array) => void) | undefined;
   const scheduler = new HostDeliveryScheduler({
     closePair: (reason) => closeReasons.push(reason),
+    ...(schedulerMonotonicNow === undefined ? {} : { monotonicNow: schedulerMonotonicNow }),
     sendControl: (frame) => controls.push(frame),
     sendData: (encoded) => {
       const copy = encoded.slice();
@@ -106,6 +110,7 @@ function createHarness(
     },
     session,
     snapshotPublisher,
+    ...(telemetry === undefined ? {} : { telemetry }),
     yieldIo,
   });
   scheduler.prepareHostReady();
@@ -604,7 +609,101 @@ describe("HostDeliveryScheduler", () => {
     expect(commit?.payload).toEqual(new Uint8Array());
   });
 
+  it("records privacy-safe capture, publish, and exact range facts without changing delivery", async () => {
+    const events: TerminalTelemetryEvent[] = [];
+    let now = 0;
+    const monotonicNow = () => now++;
+    const harness = createHarness(
+      immediatePublisher(),
+      new FakeTerminalAuthority(),
+      monotonicNow,
+      () => Promise.resolve(),
+      (event) => events.push(event),
+      monotonicNow,
+    );
+    harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
+    activate(harness);
+    harness.pty.emit(Uint8Array.of(0x41));
+
+    attach(harness);
+    await settle();
+
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "host.snapshot.capture",
+          outcome: "ready",
+          snapshotBytes: expect.any(Number),
+        }),
+        expect.objectContaining({
+          name: "host.snapshot.publish-total",
+          source: "fresh",
+          outcome: "ready",
+        }),
+        expect.objectContaining({
+          name: "host.journal.range",
+          mode: "snapshot",
+          status: "exact",
+          deliveryCreditBytes: 0,
+          frames: 0,
+        }),
+      ]),
+    );
+    expect(harness.data.map(describeData)).toEqual(["canonical:1:65", "barrier:1", "commit:1"]);
+    expect(harness.closeReasons).toEqual([]);
+  });
+
+  it("contains telemetry failures outside the authority actor", async () => {
+    const harness = createHarness(
+      immediatePublisher(),
+      new FakeTerminalAuthority(),
+      undefined,
+      () => Promise.resolve(),
+      () => {
+        throw new Error("collector unavailable");
+      },
+    );
+    harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
+    activate(harness);
+
+    attach(harness);
+    await settle();
+
+    expect(harness.data.map(describeData)).toEqual(["barrier:0", "commit:0"]);
+    expect(harness.closeReasons).toEqual([]);
+  });
+
+  it("records a failed snapshot capture without serializing the error", async () => {
+    const authority = new (class extends FakeTerminalAuthority {
+      override encodeSnapshot(): Uint8Array {
+        throw new Error("terminal content must not enter telemetry");
+      }
+    })();
+    const events: TerminalTelemetryEvent[] = [];
+    const harness = createHarness(
+      immediatePublisher(),
+      authority,
+      undefined,
+      () => Promise.resolve(),
+      (event) => events.push(event),
+    );
+    activate(harness);
+
+    attach(harness);
+    await settle();
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        name: "host.snapshot.capture",
+        outcome: "failed",
+      }),
+    );
+    expect(JSON.stringify(events)).not.toContain("terminal content");
+    expect(harness.closeReasons).toEqual(["terminal content must not enter telemetry"]);
+  });
+
   it("resumes a publisher-owned pending snapshot before capturing authority state", async () => {
+    const events: TerminalTelemetryEvent[] = [];
     let pending!: PublishedSnapshot;
     const publish = vi.fn(async (snapshot: SnapshotCapture) => publishedSnapshot(snapshot, "B"));
     const resumePending = vi.fn(async () => pending);
@@ -612,7 +711,13 @@ describe("HostDeliveryScheduler", () => {
       publish,
       resumePending,
     };
-    const harness = createHarness(publisher);
+    const harness = createHarness(
+      publisher,
+      new FakeTerminalAuthority(),
+      undefined,
+      () => Promise.resolve(),
+      (event) => events.push(event),
+    );
     const captureSnapshot = vi.spyOn(harness.session, "captureSnapshot");
     pending = publishedSnapshot({
       bytes: Uint8Array.of(1),
@@ -621,6 +726,12 @@ describe("HostDeliveryScheduler", () => {
       engineId: harness.session.engineId,
       nextPtyOffset: 0n,
       sessionEpoch: harness.session.sessionEpoch,
+      timing: {
+        actorPauseMs: 1,
+        authorityEncodeExportMs: 1,
+        ownershipCopyMs: 0,
+        queueWaitMs: 0,
+      },
     });
     harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
     activate(harness);
@@ -633,6 +744,13 @@ describe("HostDeliveryScheduler", () => {
     expect(publish).not.toHaveBeenCalled();
     expect(harness.data.map(describeData)).toEqual(["barrier:0", "commit:0"]);
     expect(harness.closeReasons).toEqual([]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        name: "host.snapshot.publish-total",
+        source: "pending",
+        outcome: "ready",
+      }),
+    );
   });
 
   it("recaptures without closing after Cloud confirms pending snapshot cleanup", async () => {
@@ -815,6 +933,7 @@ describe("HostDeliveryScheduler", () => {
 
   it("keeps the same delivery and retries after the independent publish timeout", async () => {
     vi.useFakeTimers();
+    const events: TerminalTelemetryEvent[] = [];
     let publishCalls = 0;
     const publisher: SnapshotPublisherLike = {
       publish(_snapshot, signal) {
@@ -824,7 +943,13 @@ describe("HostDeliveryScheduler", () => {
         });
       },
     };
-    const harness = createHarness(publisher);
+    const harness = createHarness(
+      publisher,
+      new FakeTerminalAuthority(),
+      undefined,
+      () => Promise.resolve(),
+      (event) => events.push(event),
+    );
     activate(harness);
     harness.pty.emit(Uint8Array.of(0x41));
     attach(harness);
@@ -845,6 +970,13 @@ describe("HostDeliveryScheduler", () => {
     expect(harness.data.map(describeData)).toEqual(["canonical:1:65", "canonical:2:66"]);
     expect(harness.pty.writes).toContainEqual(Uint8Array.of(0x03));
     expect(harness.closeReasons).toEqual([]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        name: "host.snapshot.publish-total",
+        source: "fresh",
+        outcome: "timeout",
+      }),
+    );
 
     await vi.advanceTimersByTimeAsync(SNAPSHOT_RECOVERY_QUIET_MS - 1);
     expect(publishCalls).toBe(1);

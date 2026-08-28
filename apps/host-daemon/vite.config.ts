@@ -9,7 +9,12 @@ export default defineConfig({
   },
   pack: {
     deps: {
-      alwaysBundle: ["@wterm/core", "@wterm/ghostty", "@zhongduan/protocol"],
+      alwaysBundle: [
+        "@wterm/core",
+        "@wterm/ghostty",
+        "@zhongduan/protocol",
+        "@zhongduan/telemetry",
+      ],
       neverBundle: ["node-pty"],
       onlyBundle: ["zod"],
       onlyImport: ["node-pty"],

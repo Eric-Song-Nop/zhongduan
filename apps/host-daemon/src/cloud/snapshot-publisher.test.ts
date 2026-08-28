@@ -26,6 +26,12 @@ function snapshot(byte = 0x41): SnapshotCapture {
     engineId: "ghostty/test",
     nextPtyOffset: BigInt(byte + 10),
     sessionEpoch: 7n,
+    timing: {
+      actorPauseMs: 1,
+      authorityEncodeExportMs: 1,
+      ownershipCopyMs: 0,
+      queueWaitMs: 0,
+    },
   };
 }
 

@@ -1,4 +1,4 @@
-import { DataFrameKind, decodeDataFrame } from "@zhongduan/protocol";
+import { DataFrameKind, decodeDataFrame, deliveryOutstandingBytes } from "@zhongduan/protocol";
 
 export const JOURNAL_DEFAULTS = {
   maxAgeMs: 60_000,
@@ -10,6 +10,8 @@ export const JOURNAL_DEFAULTS = {
 export interface EventJournalOptions {
   maxAgeMs?: number;
   maxBytes?: number;
+  monotonicNow?: () => number;
+  /** @deprecated Use monotonicNow. Retained for test and caller compatibility. */
   now?: () => number;
   segmentAgeMs?: number;
   segmentBytes?: number;
@@ -22,10 +24,34 @@ export interface JournalCursor {
 
 export type JournalReplay = { status: "ok"; frames: Uint8Array[] } | { status: "gap" };
 
+export type JournalRangeGapReason =
+  | "base-evicted"
+  | "reversed"
+  | "head-ahead"
+  | "base-cursor-mismatch"
+  | "head-cursor-mismatch";
+
+export type JournalRangeMeasurement =
+  | {
+      status: "exact";
+      deliveryCreditBytes: number;
+      encodedBytes: number;
+      frames: number;
+      oldestMutationAgeMs: number;
+    }
+  | { status: "gap"; reason: JournalRangeGapReason };
+
+export interface JournalMeasuredReplay {
+  measurement: JournalRangeMeasurement;
+  replay: JournalReplay;
+}
+
 interface JournalEntry {
+  appendedAt: number;
   eventSeq: bigint;
   frame: Uint8Array;
   nextPtyOffset: bigint;
+  segmentEncodedBytes: number;
 }
 
 interface JournalSegment {
@@ -51,7 +77,7 @@ export class EventJournal {
   constructor(options: EventJournalOptions = {}) {
     this.#maxAgeMs = positiveLimit(options.maxAgeMs ?? JOURNAL_DEFAULTS.maxAgeMs, "maxAgeMs");
     this.#maxBytes = positiveLimit(options.maxBytes ?? JOURNAL_DEFAULTS.maxBytes, "maxBytes");
-    this.#now = options.now ?? Date.now;
+    this.#now = options.monotonicNow ?? options.now ?? performance.now.bind(performance);
     this.#segmentAgeMs = positiveLimit(
       options.segmentAgeMs ?? JOURNAL_DEFAULTS.segmentAgeMs,
       "segmentAgeMs",
@@ -102,8 +128,15 @@ export class EventJournal {
       frame.kind === DataFrameKind.PtyOutput
         ? frame.ptyOffset + BigInt(frame.payload.byteLength)
         : frame.ptyOffset;
-    segment.entries.push({ eventSeq: frame.eventSeq, frame: stored, nextPtyOffset });
-    segment.byteLength += stored.byteLength;
+    const segmentEncodedBytes = segment.byteLength + stored.byteLength;
+    segment.entries.push({
+      appendedAt: now,
+      eventSeq: frame.eventSeq,
+      frame: stored,
+      nextPtyOffset,
+      segmentEncodedBytes,
+    });
+    segment.byteLength = segmentEncodedBytes;
     this.#totalBytes += stored.byteLength;
     this.#headCursor = { lastEventSeq: frame.eventSeq, nextPtyOffset };
 
@@ -126,6 +159,73 @@ export class EventJournal {
   replayThrough(cursor: JournalCursor, commit: JournalCursor): JournalReplay {
     this.#maintain();
     return this.#replayRange(cursor, commit);
+  }
+
+  measureRange(cursor: JournalCursor, commit: JournalCursor): JournalRangeMeasurement {
+    const now = this.#maintain();
+    return this.#measureRange(cursor, commit, now);
+  }
+
+  /** Atomically describes and materializes one range from the same retained in-memory view. */
+  replayAndMeasureThrough(cursor: JournalCursor, commit: JournalCursor): JournalMeasuredReplay {
+    const now = this.#maintain();
+    const measurement = this.#measureRange(cursor, commit, now);
+    return {
+      measurement,
+      replay:
+        measurement.status === "exact" ? this.#replayRange(cursor, commit) : { status: "gap" },
+    };
+  }
+
+  #measureRange(
+    cursor: JournalCursor,
+    commit: JournalCursor,
+    now: number,
+  ): JournalRangeMeasurement {
+    if (cursor.lastEventSeq < this.#evictedCursor.lastEventSeq) {
+      return { status: "gap", reason: "base-evicted" };
+    }
+    if (cursor.lastEventSeq > commit.lastEventSeq) {
+      return { status: "gap", reason: "reversed" };
+    }
+    if (commit.lastEventSeq > this.#headCursor.lastEventSeq) {
+      return { status: "gap", reason: "head-ahead" };
+    }
+
+    const baseOffset = this.#offsetAfter(cursor.lastEventSeq);
+    if (baseOffset === undefined || cursor.nextPtyOffset !== baseOffset) {
+      return { status: "gap", reason: "base-cursor-mismatch" };
+    }
+    const commitOffset = this.#offsetAfter(commit.lastEventSeq);
+    if (commitOffset === undefined || commit.nextPtyOffset !== commitOffset) {
+      return { status: "gap", reason: "head-cursor-mismatch" };
+    }
+
+    const frames = Number(commit.lastEventSeq - cursor.lastEventSeq);
+    if (!Number.isSafeInteger(frames)) {
+      return { status: "gap", reason: "head-cursor-mismatch" };
+    }
+    const first = frames === 0 ? undefined : this.#entryLocation(cursor.lastEventSeq + 1n);
+    const last = frames === 0 ? undefined : this.#entryLocation(commit.lastEventSeq);
+    if (frames > 0 && (first === undefined || last === undefined)) {
+      return { status: "gap", reason: "base-cursor-mismatch" };
+    }
+    const encodedBytes =
+      first === undefined || last === undefined ? 0 : this.#encodedBytesBetween(first, last);
+    const deliveryCredit = deliveryOutstandingBytes(
+      { eventSeq: cursor.lastEventSeq, nextPtyOffset: cursor.nextPtyOffset },
+      { eventSeq: commit.lastEventSeq, nextPtyOffset: commit.nextPtyOffset },
+    );
+    if (deliveryCredit > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new RangeError("journal measured range exceeds safe integer delivery credit bytes");
+    }
+    return {
+      status: "exact",
+      deliveryCreditBytes: Number(deliveryCredit),
+      encodedBytes,
+      frames,
+      oldestMutationAgeMs: first === undefined ? 0 : Math.max(0, now - first.entry.appendedAt),
+    };
   }
 
   #replayRange(cursor: JournalCursor, commit: JournalCursor): JournalReplay {
@@ -161,10 +261,11 @@ export class EventJournal {
     };
   }
 
-  #maintain(): void {
+  #maintain(): number {
     const now = this.#now();
     this.#sealAgedActive(now);
     this.#prune(now);
+    return now;
   }
 
   #sealAgedActive(now: number): void {
@@ -200,11 +301,65 @@ export class EventJournal {
     if (eventSeq === this.#headCursor.lastEventSeq) {
       return this.#headCursor.nextPtyOffset;
     }
-    for (const segment of this.#segments) {
-      const entry = segment.entries.find((candidate) => candidate.eventSeq === eventSeq);
-      if (entry !== undefined) return entry.nextPtyOffset;
+    return this.#entry(eventSeq)?.nextPtyOffset;
+  }
+
+  #entry(eventSeq: bigint): JournalEntry | undefined {
+    return this.#entryLocation(eventSeq)?.entry;
+  }
+
+  #entryLocation(
+    eventSeq: bigint,
+  ): { entry: JournalEntry; entryIndex: number; segmentIndex: number } | undefined {
+    let low = 0;
+    let high = this.#segments.length - 1;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const entries = this.#segments[middle]!.entries;
+      const first = entries[0];
+      const last = entries.at(-1);
+      if (first === undefined || last === undefined) return undefined;
+      if (eventSeq < first.eventSeq) {
+        high = middle - 1;
+        continue;
+      }
+      if (eventSeq > last.eventSeq) {
+        low = middle + 1;
+        continue;
+      }
+      const index = Number(eventSeq - first.eventSeq);
+      const entry = entries[index];
+      return entry?.eventSeq === eventSeq
+        ? { entry, entryIndex: index, segmentIndex: middle }
+        : undefined;
     }
     return undefined;
+  }
+
+  #encodedBytesBetween(
+    first: { entry: JournalEntry; entryIndex: number; segmentIndex: number },
+    last: { entry: JournalEntry; entryIndex: number; segmentIndex: number },
+  ): number {
+    const firstSegment = this.#segments[first.segmentIndex]!;
+    const beforeFirst = first.entry.segmentEncodedBytes - first.entry.frame.byteLength;
+    let total: number;
+    if (first.segmentIndex === last.segmentIndex) {
+      total = last.entry.segmentEncodedBytes - beforeFirst;
+    } else {
+      total = firstSegment.byteLength - beforeFirst;
+      for (
+        let segmentIndex = first.segmentIndex + 1;
+        segmentIndex < last.segmentIndex;
+        segmentIndex += 1
+      ) {
+        total += this.#segments[segmentIndex]!.byteLength;
+      }
+      total += last.entry.segmentEncodedBytes;
+    }
+    if (!Number.isSafeInteger(total)) {
+      throw new RangeError("journal measured range exceeds safe integer bytes");
+    }
+    return total;
   }
 }
 

@@ -9,8 +9,14 @@ import {
   type HostControlFrame,
   type RelayToHostControlFrame,
 } from "@zhongduan/protocol";
+import { elapsedMs, emitTelemetry, type TelemetrySink } from "@zhongduan/telemetry";
 
-import type { ReplayCursor, SnapshotCapture, TerminalSession } from "../session";
+import type {
+  ReplayCursor,
+  ReplayRangeMeasurement,
+  SnapshotCapture,
+  TerminalSession,
+} from "../session";
 import { CanonicalPublisher, HOST_CANONICAL_QUEUE_LIMITS } from "./canonical-publisher";
 import {
   DeliveryBarrierWaiter,
@@ -65,6 +71,7 @@ export interface HostDeliverySchedulerOptions {
   session: TerminalSession;
   snapshotCheckpointCache?: SnapshotCheckpointCache;
   snapshotPublisher: SnapshotPublisherLike;
+  telemetry?: TelemetrySink;
   yieldIo?: () => Promise<void>;
 }
 
@@ -85,6 +92,7 @@ export class HostDeliveryScheduler {
   readonly #session: TerminalSession;
   readonly #snapshotCheckpointCache: SnapshotCheckpointCache;
   readonly #snapshotPublisher: SnapshotPublisherLike;
+  readonly #telemetry: TelemetrySink | undefined;
   readonly #yieldIo: () => Promise<void>;
   readonly #coldPreparations = new Map<string, ColdPreparation>();
   readonly #recoveryQueue: DeliveryRecoveryQueue;
@@ -109,6 +117,7 @@ export class HostDeliveryScheduler {
     this.#snapshotCheckpointCache =
       options.snapshotCheckpointCache ?? new SnapshotCheckpointCache();
     this.#snapshotPublisher = options.snapshotPublisher;
+    this.#telemetry = options.telemetry;
     this.#yieldIo = options.yieldIo ?? (() => new Promise((resolve) => setImmediate(resolve)));
     this.#recoveryQueue = new DeliveryRecoveryQueue({
       maxQuietWaitMs: SNAPSHOT_RECOVERY_MAX_QUIET_WAIT_MS,
@@ -333,7 +342,9 @@ export class HostDeliveryScheduler {
         if (this.#failed) return;
         const commit = this.#session.cursor;
         const base = cursorFromAttach(request);
-        const replay = this.#session.replayThrough(base, commit);
+        const measuredReplay = this.#session.replayAndMeasureThrough(base, commit);
+        this.#emitRange("warm", measuredReplay.measurement);
+        const replay = measuredReplay.replay;
         if (
           replay.status === "ok" &&
           deliveryOutstandingBytes(
@@ -489,7 +500,7 @@ export class HostDeliveryScheduler {
     }
     const snapshot = await this.#captureSnapshot(preparation);
     preparation.controller.signal.throwIfAborted();
-    if (snapshot.encodeMs > SNAPSHOT_ENCODE_BUDGET_MS) {
+    if (snapshot.timing.actorPauseMs > SNAPSHOT_ENCODE_BUDGET_MS) {
       throw new SnapshotEncodeBudgetError();
     }
     const published = await this.#publishSnapshot(snapshot, preparation);
@@ -499,6 +510,7 @@ export class HostDeliveryScheduler {
   }
 
   #resumePendingSnapshot(preparation: ColdPreparation): Promise<PublishedSnapshot> | undefined {
+    const startedAt = this.#monotonicNow();
     const deadline = new AbortController();
     const timeout = setTimeout(
       () => deadline.abort(new DOMException("snapshot publish timed out", "TimeoutError")),
@@ -514,16 +526,37 @@ export class HostDeliveryScheduler {
       operation = this.#snapshotPublisher.resumePending?.(signal);
     } catch (error) {
       clearTimeout(timeout);
+      this.#emitPublishTotal(
+        "pending",
+        startedAt,
+        this.#publishOutcome(error, deadline, preparation),
+      );
       throw error;
     }
     if (operation === undefined) {
       clearTimeout(timeout);
       return undefined;
     }
-    return raceAbort(operation, signal).finally(() => clearTimeout(timeout));
+    return raceAbort(operation, signal)
+      .then(
+        (published) => {
+          this.#emitPublishTotal("pending", startedAt, "ready");
+          return published;
+        },
+        (error: unknown) => {
+          this.#emitPublishTotal(
+            "pending",
+            startedAt,
+            this.#publishOutcome(error, deadline, preparation),
+          );
+          throw error;
+        },
+      )
+      .finally(() => clearTimeout(timeout));
   }
 
   async #captureSnapshot(preparation: ColdPreparation): Promise<SnapshotCapture> {
+    const startedAt = this.#monotonicNow();
     const deadline = new AbortController();
     const timeout = setTimeout(
       () => deadline.abort(new SnapshotEncodeBudgetError()),
@@ -535,7 +568,30 @@ export class HostDeliveryScheduler {
       this.#connectionAbort.signal,
     ]);
     try {
-      return await raceAbort(this.#session.captureSnapshot(), signal);
+      const snapshot = await raceAbort(this.#session.captureSnapshot(), signal);
+      emitTelemetry(this.#telemetry, {
+        schemaVersion: 1,
+        monotonicAtMs: this.#monotonicNow(),
+        name: "host.snapshot.capture",
+        outcome: "ready",
+        ...snapshot.timing,
+        snapshotBytes: snapshot.bytes.byteLength,
+      });
+      return snapshot;
+    } catch (error) {
+      const finishedAt = this.#monotonicNow();
+      emitTelemetry(this.#telemetry, {
+        schemaVersion: 1,
+        monotonicAtMs: finishedAt,
+        name: "host.snapshot.capture",
+        outcome: deadline.signal.aborted
+          ? "timeout"
+          : preparation.controller.signal.aborted || this.#connectionAbort.signal.aborted
+            ? "cancelled"
+            : "failed",
+        totalDurationMs: elapsedMs(startedAt, finishedAt),
+      });
+      throw error;
     } finally {
       clearTimeout(timeout);
     }
@@ -545,6 +601,7 @@ export class HostDeliveryScheduler {
     snapshot: SnapshotCapture,
     preparation: ColdPreparation,
   ): Promise<PublishedSnapshot> {
+    const startedAt = this.#monotonicNow();
     const deadline = new AbortController();
     const timeout = setTimeout(
       () => deadline.abort(new DOMException("snapshot publish timed out", "TimeoutError")),
@@ -556,7 +613,17 @@ export class HostDeliveryScheduler {
       this.#connectionAbort.signal,
     ]);
     try {
-      return await raceAbort(this.#snapshotPublisher.publish(snapshot, signal), signal);
+      const published = await raceAbort(this.#snapshotPublisher.publish(snapshot, signal), signal);
+      this.#emitPublishTotal("fresh", startedAt, "ready", snapshot.bytes.byteLength);
+      return published;
+    } catch (error) {
+      this.#emitPublishTotal(
+        "fresh",
+        startedAt,
+        this.#publishOutcome(error, deadline, preparation),
+        snapshot.bytes.byteLength,
+      );
+      throw error;
     } finally {
       clearTimeout(timeout);
     }
@@ -631,7 +698,9 @@ export class HostDeliveryScheduler {
     active.controller.signal.throwIfAborted();
     const base = checkpoint.base;
     const commit = this.#session.cursor;
-    const replay = this.#session.replayThrough(base, commit);
+    const measuredReplay = this.#session.replayAndMeasureThrough(base, commit);
+    this.#emitRange("snapshot", measuredReplay.measurement);
+    const replay = measuredReplay.replay;
     if (
       replay.status !== "ok" ||
       deliveryOutstandingBytes(
@@ -775,6 +844,82 @@ export class HostDeliveryScheduler {
   #invalidateCheckpoint(checkpoint: SnapshotCheckpoint): void {
     this.#snapshotCheckpointCache.invalidate(checkpoint);
     this.#deferColdCaptures(SNAPSHOT_RECOVERY_QUIET_MS);
+  }
+
+  #emitRange(mode: "warm" | "snapshot", measurement: ReplayRangeMeasurement): void {
+    const monotonicAtMs = this.#monotonicNow();
+    emitTelemetry(
+      this.#telemetry,
+      measurement.status === "exact"
+        ? {
+            schemaVersion: 1,
+            monotonicAtMs,
+            name: "host.journal.range",
+            mode,
+            status: "exact",
+            deliveryCreditBytes: measurement.deliveryCreditBytes,
+            encodedBytes: measurement.encodedBytes,
+            frames: measurement.frames,
+            oldestMutationAgeMs: measurement.oldestMutationAgeMs,
+          }
+        : {
+            schemaVersion: 1,
+            monotonicAtMs,
+            name: "host.journal.range",
+            mode,
+            status: "gap",
+            reason: measurement.reason,
+          },
+    );
+  }
+
+  #emitPublishTotal(
+    source: "fresh" | "pending",
+    startedAt: number,
+    outcome: "ready" | "retry" | "unavailable" | "timeout" | "cancelled" | "failed",
+    snapshotBytes?: number,
+  ): void {
+    const finishedAt = this.#monotonicNow();
+    emitTelemetry(
+      this.#telemetry,
+      source === "fresh"
+        ? {
+            schemaVersion: 1,
+            monotonicAtMs: finishedAt,
+            name: "host.snapshot.publish-total",
+            source,
+            outcome,
+            totalDurationMs: elapsedMs(startedAt, finishedAt),
+            snapshotBytes: snapshotBytes!,
+          }
+        : {
+            schemaVersion: 1,
+            monotonicAtMs: finishedAt,
+            name: "host.snapshot.publish-total",
+            source,
+            outcome,
+            totalDurationMs: elapsedMs(startedAt, finishedAt),
+          },
+    );
+  }
+
+  #publishOutcome(
+    error: unknown,
+    deadline: AbortController,
+    preparation: ColdPreparation,
+  ): "retry" | "unavailable" | "timeout" | "cancelled" | "failed" {
+    if (deadline.signal.aborted) return "timeout";
+    if (preparation.controller.signal.aborted || this.#connectionAbort.signal.aborted) {
+      return "cancelled";
+    }
+    if (
+      error instanceof RetryableSnapshotPublishError ||
+      error instanceof SnapshotCleanupConfirmedError
+    ) {
+      return "retry";
+    }
+    if (error instanceof SnapshotUnavailableError) return "unavailable";
+    return "failed";
   }
 
   #sendData(frame: Uint8Array): void {

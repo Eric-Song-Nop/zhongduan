@@ -17,6 +17,7 @@
   "dependencies": {
     "@wterm/ghostty": "workspace:*",
     "@zhongduan/protocol": "workspace:*",
+    "@zhongduan/telemetry": "workspace:*",
     "node-pty": "1.1.0"
   },
   "engines": {

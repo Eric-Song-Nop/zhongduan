@@ -11,6 +11,7 @@ import { HostCapabilityManager, type BootstrapTokenProvider } from "./cloud/capa
 import { HostCloudRelay } from "./cloud/host-cloud-relay";
 import { startLocalSession } from "./local-session";
 import type { PtyExit } from "./session";
+import { telemetrySinkForTarget } from "./telemetry";
 
 export const CLOUD_CREATE_TIMEOUT_MS = 10_000;
 export const CLOUD_CREATE_RETRY_BASE_MS = 1_000;
@@ -125,8 +126,12 @@ interface CloudArguments {
 
 export async function runCloud(argv: string[]): Promise<number> {
   let parsed: CloudArguments;
+  let telemetry: ReturnType<typeof telemetrySinkForTarget>;
   try {
     parsed = parseCloudArguments(argv);
+    telemetry = telemetrySinkForTarget(process.env.ZHONGDUAN_TELEMETRY, (line) => {
+      process.stderr.write(line);
+    });
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     return 2;
@@ -240,6 +245,7 @@ export async function runCloud(argv: string[]): Promise<number> {
       capabilities,
       session,
       sessionId: created.sessionId,
+      ...(telemetry === undefined ? {} : { telemetry }),
     });
     const firstReady = await Promise.race([
       relay.start().then(

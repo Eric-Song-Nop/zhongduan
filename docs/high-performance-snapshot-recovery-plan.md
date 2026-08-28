@@ -480,6 +480,16 @@ generation，避免跨 attempt 拼接。
 
 ### Phase 0：修 CURRENT 活性并建立事实
 
+实施进度（2026-08-29）：
+
+- `stability/recovery-v2-liveness` 已完成 non-ready retry/reset 活性、attach-start watchdog、滚动部署兼容和
+  持续输出下的 bounded retry；
+- `observability/recovery-serviceability` 是 Phase 0a：只建立严格 telemetry 基础、Host snapshot
+  capture/publish timing，以及与真实 replay 绑定到同一 retained view 的 journal range 事实；这些事实不参与
+  recovery 选择，不改变 v2 wire、barrier、TTL 或 admission；
+- Phase 0 gate 仍未关闭：Host/Cloud/Browser 的 queue、link RTT、input→PTY、restore/adopt、生产汇聚与可查询
+  dashboard 必须由后续 stacked layer 补齐。
+
 - 保留 v2 pause/barrier/pinned commit correctness invariant；
 - 落地 `reason + retryScope`，修复 non-ready 被错误 complete 的 Browser freeze；
 - 增加 attach-start watchdog、明确 retry/reset/unavailable；

@@ -5,6 +5,7 @@ import {
   type HostControlFrame,
   type RelayToHostControlFrame,
 } from "@zhongduan/protocol";
+import type { TelemetrySink } from "@zhongduan/telemetry";
 
 import type { ReplayCursor, TerminalSession } from "../session";
 import {
@@ -36,6 +37,7 @@ export interface HostRelayConnectionOptions {
   session: TerminalSession;
   snapshotCheckpointCache?: SnapshotCheckpointCache;
   snapshotPublisher: SnapshotPublisherLike;
+  telemetry?: TelemetrySink;
 }
 
 export class HostRelayConnection {
@@ -97,6 +99,7 @@ export class HostRelayConnection {
     this.#scheduler = new HostDeliveryScheduler({
       bufferedAmount: () => this.#pair.data.bufferedAmount,
       closePair: (reason) => this.#close(1011, reason),
+      monotonicNow: this.#monotonicNow,
       sendControl: (frame) => this.#sendControl(frame),
       sendData: (frame) => this.#sendData(frame),
       session: this.#session,
@@ -104,6 +107,7 @@ export class HostRelayConnection {
         ? {}
         : { snapshotCheckpointCache: options.snapshotCheckpointCache }),
       snapshotPublisher: options.snapshotPublisher,
+      ...(options.telemetry === undefined ? {} : { telemetry: options.telemetry }),
     });
   }
 

@@ -5,4 +5,5 @@ export * from "./node-pty-process";
 export * from "./pty-process";
 export * from "./session";
 export * from "./terminal-authority";
+export * from "./telemetry";
 export * from "./wterm-ghostty-authority";

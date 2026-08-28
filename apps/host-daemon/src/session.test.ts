@@ -139,10 +139,16 @@ describe("TerminalSession", () => {
 
     expect(snapshot).toMatchObject({
       cutEventSeq: 1n,
-      encodeMs: 1,
+      encodeMs: 3,
       engineId: authority.engineId,
       nextPtyOffset: 1n,
       sessionEpoch: 3n,
+      timing: {
+        actorPauseMs: 3,
+        authorityEncodeExportMs: 1,
+        ownershipCopyMs: 1,
+        queueWaitMs: 1,
+      },
     });
     expect(JSON.parse(new TextDecoder().decode(snapshot.bytes))).toMatchObject({
       operations: [{ type: "output", data: [0x41] }],
