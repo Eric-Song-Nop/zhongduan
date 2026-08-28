@@ -1,11 +1,12 @@
-# Wire Protocol V1
+# Wire Protocol V2
 
 ## 通道
 
 每个参与者建立两条 WebSocket：
 
 - `control`：UTF-8 JSON，承载 attach、writer lease、语义 input、ACK、host 状态和 resync。
-- `data`：一条 WebSocket message 对应一个二进制 frame，只承载 PTY output、resize 和 replay commit。
+- `data`：一条 WebSocket message 对应一个二进制 frame，承载 PTY output、resize、replay
+  commit，以及 Host 到 relay 的 recovery barrier。
 - `snapshot`：受权 HTTP response 从私有 R2 对象直接流向浏览器，不经过 DO WebSocket。
 
 所有会改变 Ghostty replica 的 mutation 必须在 data 通道内排序。control 消息不能直接改变 replica。
@@ -17,7 +18,7 @@
 | Offset | Size | 字段                                           |
 | -----: | ---: | ---------------------------------------------- |
 |      0 |    4 | ASCII `ZTRM` magic，以 network order 读取      |
-|      4 |    1 | protocol version，当前为 1                     |
+|      4 |    1 | protocol version，当前为 2                     |
 |      5 |    1 | frame kind                                     |
 |      6 |    2 | flags                                          |
 |      8 |    8 | `sessionEpoch`                                 |
@@ -34,7 +35,12 @@ Kinds：
 2 RESIZE_APPLIED
 3 REPLAY_COMMIT
 4 RESET
+5 DELIVERY_BARRIER
 ```
+
+`DELIVERY_BARRIER` 由 Host 发给 relay，用于在目标 browser delivery 上固定 warm replay 或
+snapshot recovery 的 commit watermark。relay 接受 barrier 后才发送 `replay-start` 或
+`snapshot-manifest`，并在 `REPLAY_COMMIT` 到达前阻止该 delivery 越过固定 commit。
 
 `PTY_OUTPUT` 与 `RESIZE_APPLIED` 的 `eventSeq` 必须严格加一。两者的 `ptyOffset` 都必须等于客户端当前 `nextPtyOffset`；只有 `PTY_OUTPUT` 会按 payload 长度推进 offset。这样 resize 在 PTY byte stream 中的位置可被确定且验证。
 
@@ -46,7 +52,7 @@ Kinds：
 
 ## 输入幂等
 
-key、paste 与 resize request 共享 `(inputEpoch, clientInputSeq)` 序列。`inputEpoch` 由浏览器 controller 在一个输入序列开始时生成，并跨 WebSocket 重连保持不变；收到明确 ACK 后才能丢弃对应输入。DO 不信任客户端声明的身份，转发给 Host 时附加 capability 已认证的稳定 `clientId`。Host 以 `(clientId, inputEpoch, clientInputSeq)` 去重；ACK 丢失后的重试不会再次写入 PTY。换 controller 或明确放弃 uncertain 输入时必须创建新的 `inputEpoch`。
+key、paste 与 resize request 共享 `(inputEpoch, clientInputSeq)` 序列。`inputEpoch` 由浏览器 controller 在一个输入序列开始时生成，并跨 WebSocket 重连保持不变；收到明确 ACK 后才能丢弃对应输入。DO 不信任客户端声明的身份，转发给 Host 时附加 capability 已认证的稳定 `clientId` 和单调 `writerFence`。Host 以 `(writerFence, clientId, inputEpoch, clientInputSeq)` 去重；更高 fence 会永久封住旧 writer，ACK 丢失后的同一 fence 重试不会再次写入 PTY。换 controller 或明确放弃 uncertain 输入时必须创建新的 `inputEpoch`。
 
 ## Snapshot Cut
 
