@@ -77,6 +77,8 @@ interface AcquiredLease {
   token: string;
 }
 
+type HostControlSendResult = "sent" | "rejected" | "uncertain";
+
 interface BrowserAttachContext {
   client: ClientRow;
   controlAttachment: SocketAttachment;
@@ -97,6 +99,7 @@ type BrowserAttachContextResult =
         | "engine-mismatch"
         | "epoch-changed"
         | "session-missing"
+        | "stale-delivery"
         | "stale-control";
     };
 
@@ -136,14 +139,6 @@ function trySendServerControl(
   } catch {
     return false;
   }
-}
-
-function sendRelayControl(
-  webSocket: WebSocket,
-  frame: z.input<typeof RelayToHostControlFrameSchema>,
-): void {
-  if (webSocket.readyState !== WebSocket.OPEN) return;
-  webSocket.send(encodeControlFrame(RelayToHostControlFrameSchema.parse(frame)));
 }
 
 function closeProtocol(webSocket: WebSocket, reason: string): void {
@@ -371,9 +366,18 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       if (
         client?.delivery_generation !== attachment.deliveryGeneration ||
         this.browserDataByClient(attachment.clientId, webSocket) !== undefined ||
+        control === undefined ||
         controlAttachment?.connectionSetId !== attachment.connectionSetId ||
         controlAttachment.connectionId !== attachment.connectionId
       ) {
+        return;
+      }
+      if (controlAttachment.controlState !== "active") {
+        this.isolateBrowserConnection(
+          control,
+          controlAttachment,
+          "browser data disconnected before attach",
+        );
         return;
       }
       await this.resetBrowserDelivery(attachment.clientId, "data-disconnected", false);
@@ -638,7 +642,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       hostFence,
       leaseFence: null,
       controlState: ticket.peer === "browser" && channel === "control" ? "awaiting-attach" : null,
-      dataState: ticket.peer === "browser" && channel === "data" ? "catching-up" : null,
+      dataState: ticket.peer === "browser" && channel === "data" ? "awaiting-attach" : null,
       firstEventSeq: null,
       ackedEventSeq: null,
       sentEventSeq: null,
@@ -727,12 +731,16 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       ) {
         return;
       }
-      sendRelayControl(webSocket, {
-        type: "host-ready-ack",
-        sessionEpoch: frame.sessionEpoch,
-        headEventSeq: frame.headEventSeq,
-        nextPtyOffset: frame.nextPtyOffset,
-      });
+      this.sendHostControl(
+        webSocket,
+        {
+          type: "host-ready-ack",
+          sessionEpoch: frame.sessionEpoch,
+          headEventSeq: frame.headEventSeq,
+          nextPtyOffset: frame.nextPtyOffset,
+        },
+        "host ready acknowledgement delivery failed",
+      );
       return;
     }
 
@@ -941,11 +949,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       commitEventSeq: frame.eventSeq.toString(),
       commitPtyOffset: frame.ptyOffset.toString(),
     };
-    sendRelayControl(
+    this.sendHostControl(
       webSocket,
       payload.mode === "warm"
         ? { ...common, mode: "warm" }
         : { ...common, mode: "snapshot", snapshotId: payload.snapshotId },
+      "delivery barrier result delivery failed",
     );
   }
 
@@ -976,6 +985,34 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     ) {
       return;
     }
+    if (frame.type === "writer-lease-renew") {
+      const expiresAt =
+        attachment.controlState === "active" && attachment.role === "writer"
+          ? await this.renewWriterLease(
+              attachment.clientId,
+              attachment.leaseFence,
+              frame.writerLease,
+            )
+          : undefined;
+      const latestAttachment = readAttachment(webSocket);
+      const active =
+        expiresAt !== undefined &&
+        webSocket.readyState === WebSocket.OPEN &&
+        latestAttachment?.controlState === "active" &&
+        latestAttachment.clientId === attachment.clientId &&
+        latestAttachment.leaseFence === attachment.leaseFence &&
+        this.activeBrowserControl(attachment.clientId) === webSocket;
+      this.sendBrowserControl(
+        webSocket,
+        {
+          type: "writer-lease-status",
+          active,
+          ...(active ? { expiresAt } : {}),
+        },
+        "writer lease status delivery failed",
+      );
+      return;
+    }
     if (frame.type === "ack") {
       const client = this.clientById(attachment.clientId);
       if (
@@ -994,7 +1031,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
     const validLease =
       attachment.role === "writer" &&
-      (await this.renewWriterLease(attachment.clientId, attachment.leaseFence, frame.writerLease));
+      (await this.renewWriterLease(
+        attachment.clientId,
+        attachment.leaseFence,
+        frame.writerLease,
+      )) !== undefined;
     const latestAttachment = readAttachment(webSocket);
     if (
       !validLease ||
@@ -1019,11 +1060,23 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.rejectInput(webSocket, frame.inputEpoch, frame.clientInputSeq);
       return;
     }
-    sendRelayControl(host, {
-      ...frame,
-      connectionId: attachment.connectionId,
-      clientId: attachment.clientId,
-    });
+    const sendResult = this.sendHostControl(
+      host,
+      {
+        ...frame,
+        connectionId: attachment.connectionId,
+        clientId: attachment.clientId,
+      },
+      "semantic input delivery failed",
+    );
+    if (sendResult !== "sent") {
+      this.rejectInput(
+        webSocket,
+        frame.inputEpoch,
+        frame.clientInputSeq,
+        sendResult === "uncertain" ? "uncertain" : "rejected",
+      );
+    }
   }
 
   private async attachBrowser(
@@ -1037,18 +1090,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       return;
     }
     const initial = initialResult.value;
-
-    const existingLease = this.writerLease();
-    const retainedLeaseFence =
-      attachment.role === "writer" &&
-      attachment.leaseFence !== null &&
-      existingLease?.client_id === initial.controlAttachment.clientId &&
-      existingLease.fence === attachment.leaseFence &&
-      existingLease.expires_at > Date.now()
-        ? attachment.leaseFence
-        : null;
+    const initialActivation = initial.controlAttachment.controlState === "awaiting-attach";
     const lease =
-      attachment.role === "writer" && retainedLeaseFence === null
+      initialActivation && attachment.role === "writer"
         ? await this.acquireWriterLease(attachment.clientId!, Date.now())
         : undefined;
     const currentResult = this.resolveBrowserAttachContext(webSocket, attachment, frame);
@@ -1058,14 +1102,14 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
     const current = currentResult.value;
 
-    const { type: _type, ...attachPayload } = frame;
+    const { type: _type, deliveryGeneration: _deliveryGeneration, ...attachPayload } = frame;
     const activeAttachment = SocketAttachmentSchema.parse({
       ...current.controlAttachment,
       deliveryGeneration: current.client.delivery_generation,
-      leaseFence: lease?.fence ?? retainedLeaseFence,
+      leaseFence: lease?.fence ?? current.controlAttachment.leaseFence,
       controlState: "active",
     });
-    writeAttachment(webSocket, activeAttachment);
+    if (initialActivation) writeAttachment(webSocket, activeAttachment);
     const baselineEventSeq = frame.hasLiveReplica ? frame.lastEventSeq : null;
     const baselinePtyOffset = frame.hasLiveReplica ? frame.nextPtyOffset : null;
     writeAttachment(current.dataSocket, {
@@ -1083,6 +1127,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       replayCommitPtyOffset: null,
     });
     if (
+      initialActivation &&
       !this.sendBrowserControl(
         webSocket,
         {
@@ -1107,13 +1152,17 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.sendBrowserControl(webSocket, { type: "host-offline" }, "host status delivery failed");
       return;
     }
-    sendRelayControl(host, {
-      type: "attach-request",
-      connectionId: current.controlAttachment.connectionId,
-      streamId: current.client.stream_id,
-      deliveryGeneration: current.client.delivery_generation,
-      ...attachPayload,
-    });
+    this.sendHostControl(
+      host,
+      {
+        type: "attach-request",
+        connectionId: current.controlAttachment.connectionId,
+        streamId: current.client.stream_id,
+        deliveryGeneration: current.client.delivery_generation,
+        ...attachPayload,
+      },
+      "browser attach request delivery failed",
+    );
   }
 
   private resolveBrowserAttachContext(
@@ -1127,6 +1176,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (session === undefined || client === undefined) {
       return { ok: false, reason: "session-missing" };
     }
+    if (frame.deliveryGeneration !== client.delivery_generation) {
+      return { ok: false, client, reason: "stale-delivery" };
+    }
     const controlAttachment = readAttachment(webSocket);
     if (
       webSocket.readyState !== WebSocket.OPEN ||
@@ -1137,11 +1189,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     ) {
       return { ok: false, client, reason: "stale-control" };
     }
-    if (controlAttachment.controlState !== "awaiting-attach") {
-      return { ok: false, client, reason: "already-attached" };
-    }
-    if (frame.engineId !== session.engine_id) {
-      return { ok: false, client, reason: "engine-mismatch" };
+    if (
+      (controlAttachment.controlState !== "awaiting-attach" &&
+        controlAttachment.controlState !== "active") ||
+      controlAttachment.deliveryGeneration !== client.delivery_generation
+    ) {
+      return { ok: false, client, reason: "stale-control" };
     }
     const dataSocket = this.browserDataByClient(attachment.clientId);
     const dataAttachment = dataSocket === undefined ? undefined : readAttachment(dataSocket);
@@ -1151,7 +1204,18 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       dataAttachment.connectionSetId !== attachment.connectionSetId ||
       dataAttachment.deliveryGeneration !== client.delivery_generation
     ) {
-      return { ok: false, client, reason: "data-missing" };
+      return {
+        ok: false,
+        client,
+        reason:
+          controlAttachment.controlState === "awaiting-attach" ? "data-missing" : "stale-delivery",
+      };
+    }
+    if (dataAttachment.dataState !== "awaiting-attach") {
+      return { ok: false, client, reason: "already-attached" };
+    }
+    if (frame.engineId !== session.engine_id) {
+      return { ok: false, client, reason: "engine-mismatch" };
     }
     if (frame.hasLiveReplica && frame.lastSessionEpoch !== session.session_epoch) {
       return { ok: false, client, reason: "epoch-changed" };
@@ -1173,7 +1237,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     webSocket: WebSocket,
     result: Extract<BrowserAttachContextResult, { ok: false }>,
   ): void {
-    if (result.reason === "stale-control") return;
+    if (result.reason === "stale-control" || result.reason === "stale-delivery") return;
     if (result.reason === "already-attached") {
       const attachment = readAttachment(webSocket);
       if (attachment === undefined) closeProtocol(webSocket, "delivery is already attached");
@@ -1479,14 +1543,19 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     });
   }
 
-  private rejectInput(webSocket: WebSocket, inputEpoch: string, clientInputSeq: string): void {
+  private rejectInput(
+    webSocket: WebSocket,
+    inputEpoch: string,
+    clientInputSeq: string,
+    status: "rejected" | "uncertain" = "rejected",
+  ): void {
     this.sendBrowserControl(
       webSocket,
       {
         type: "input-ack",
         inputEpoch,
         clientInputSeq,
-        status: "rejected",
+        status,
         authorityEventSeq: this.session()?.head_event_seq ?? "0",
       },
       "input rejection delivery failed",
@@ -1510,7 +1579,13 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const issuingControl = this.activeBrowserControl(clientId);
     const issuingAttachment =
       issuingControl === undefined ? undefined : readAttachment(issuingControl);
-    if (issuingControl === undefined || issuingAttachment?.clientId !== clientId) return;
+    if (
+      issuingControl === undefined ||
+      issuingAttachment?.clientId !== clientId ||
+      issuingAttachment.controlState !== "active"
+    ) {
+      return;
+    }
     const nextGeneration = (BigInt(client.delivery_generation) + 1n).toString();
     if (BigInt(nextGeneration) > MAX_U64) {
       throw new Error("delivery generation space exhausted");
@@ -1526,6 +1601,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.activeBrowserControl(clientId) !== issuingControl ||
       currentClient?.delivery_generation !== client.delivery_generation ||
       currentControlAttachment?.clientId !== clientId ||
+      currentControlAttachment.controlState !== "active" ||
       currentControlAttachment.connectionId !== issuingAttachment.connectionId ||
       currentControlAttachment.connectionSetId !== issuingAttachment.connectionSetId ||
       (expectedHost !== undefined &&
@@ -1569,7 +1645,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const resetAttachment = SocketAttachmentSchema.parse({
       ...currentControlAttachment,
       deliveryGeneration: nextGeneration,
-      controlState: "awaiting-attach",
+      controlState: "active",
     });
     writeAttachment(issuingControl, resetAttachment);
     if (
@@ -1591,13 +1667,17 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (!notifyHost || reason !== "slow-client") return;
     const host = this.currentHostControl();
     if (host !== undefined) {
-      sendRelayControl(host, {
-        type: "delivery-reset",
-        connectionId: resetAttachment.connectionId,
-        streamId: client.stream_id,
-        deliveryGeneration: nextGeneration,
-        reason: "slow-client",
-      });
+      this.sendHostControl(
+        host,
+        {
+          type: "delivery-reset",
+          connectionId: resetAttachment.connectionId,
+          streamId: client.stream_id,
+          deliveryGeneration: nextGeneration,
+          reason: "slow-client",
+        },
+        "browser delivery reset notification failed",
+      );
     }
   }
 
@@ -1634,8 +1714,8 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     clientId: string,
     fence: string | null,
     token: string,
-  ): Promise<boolean> {
-    if (fence === null || token.length > 256) return false;
+  ): Promise<number | undefined> {
+    if (fence === null || token.length > 256) return undefined;
     const digest = await sha256Hex(token);
     const lease = this.writerLease();
     if (
@@ -1645,17 +1725,18 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       lease.lease_digest !== digest ||
       lease.expires_at <= Date.now()
     ) {
-      return false;
+      return undefined;
     }
+    const expiresAt = Date.now() + WRITER_LEASE_MS;
     this.sql.exec(
       `UPDATE writer_lease SET expires_at = ?
        WHERE singleton = 1 AND client_id = ? AND fence = ? AND lease_digest = ?`,
-      Date.now() + WRITER_LEASE_MS,
+      expiresAt,
       clientId,
       fence,
       digest,
     );
-    return true;
+    return expiresAt;
   }
 
   private releaseWriterLease(clientId: string, fence: string | null): void {
@@ -1759,9 +1840,43 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       if (attachment !== undefined) {
         writeAttachment(socket, {
           ...attachment,
-          dataState: "catching-up",
+          dataState: attachment.dataState === "awaiting-attach" ? "awaiting-attach" : "catching-up",
         });
       }
+    }
+  }
+
+  private sendHostControl(
+    webSocket: WebSocket,
+    frame: z.input<typeof RelayToHostControlFrameSchema>,
+    failureReason: string,
+  ): HostControlSendResult {
+    const attachment = readAttachment(webSocket);
+    if (
+      attachment?.peer !== "host" ||
+      attachment.channel !== "control" ||
+      !this.isCurrentHost(attachment)
+    ) {
+      return "rejected";
+    }
+    if (webSocket.readyState !== WebSocket.OPEN || this.currentHostControl() !== webSocket) {
+      this.failCurrentHost(attachment, failureReason);
+      return "rejected";
+    }
+
+    let encoded: string;
+    try {
+      encoded = encodeControlFrame(RelayToHostControlFrameSchema.parse(frame));
+    } catch {
+      this.failCurrentHost(attachment, failureReason);
+      return "rejected";
+    }
+    try {
+      webSocket.send(encoded);
+      return "sent";
+    } catch {
+      this.failCurrentHost(attachment, failureReason);
+      return "uncertain";
     }
   }
 

@@ -9,7 +9,7 @@ import {
 export interface DeliveryCursorState {
   ackedEventSeq: string | null;
   ackedPtyOffset: string | null;
-  dataState: "catching-up" | "synced" | null;
+  dataState: "awaiting-attach" | "catching-up" | "synced" | null;
   firstEventSeq: string | null;
   firstPtyOffset: string | null;
   sentEventSeq: string | null;
@@ -25,6 +25,9 @@ export function advanceDeliveryCursor(
   state: DeliveryCursorState,
   frame: DataFrame,
 ): DeliveryCursorResult {
+  if (state.dataState === null || state.dataState === "awaiting-attach") {
+    return { kind: "sequence-error" };
+  }
   if (
     frame.kind !== DataFrameKind.PtyOutput &&
     frame.kind !== DataFrameKind.ResizeApplied &&

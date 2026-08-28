@@ -16,6 +16,7 @@ describe("control frame validation", () => {
       JSON.stringify({
         type: "attach",
         engineId: "ghostty:f2d5758+snapshot-v1+wterm:local",
+        deliveryGeneration: "3",
         hasLiveReplica: true,
         lastSessionEpoch: "7",
         lastEventSeq: "19",
@@ -29,10 +30,18 @@ describe("control frame validation", () => {
 
   it("rejects unknown fields and unsafe uint64 encodings", () => {
     expect(() =>
+      ClientControlFrameSchema.parse({
+        type: "attach",
+        engineId: "engine",
+        hasLiveReplica: false,
+      }),
+    ).toThrow();
+    expect(() =>
       decodeControlFrame(
         JSON.stringify({
           type: "attach",
           engineId: "engine",
+          deliveryGeneration: "1",
           hasLiveReplica: false,
           lastEventSeq: 42,
           privilege: "host",
@@ -44,6 +53,7 @@ describe("control frame validation", () => {
       ClientControlFrameSchema.parse({
         type: "attach",
         engineId: "engine",
+        deliveryGeneration: "1",
         hasLiveReplica: true,
       }),
     ).toThrow();
@@ -51,6 +61,7 @@ describe("control frame validation", () => {
       ClientControlFrameSchema.parse({
         type: "attach",
         engineId: "engine",
+        deliveryGeneration: "1",
         hasLiveReplica: false,
         lastSessionEpoch: "7",
         lastEventSeq: "0",
@@ -101,6 +112,36 @@ describe("control frame validation", () => {
     });
     const { inputEpoch: _inputEpoch, ...missingEpoch } = input;
     expect(() => ClientControlFrameSchema.parse(missingEpoch)).toThrow();
+  });
+
+  it("models writer lease renewal separately from semantic input", () => {
+    expect(
+      ClientControlFrameSchema.parse({
+        type: "writer-lease-renew",
+        writerLease: "lease_AAAAAAAAAAAA",
+      }),
+    ).toEqual({ type: "writer-lease-renew", writerLease: "lease_AAAAAAAAAAAA" });
+    expect(
+      ServerControlFrameSchema.parse({
+        type: "writer-lease-status",
+        active: true,
+        expiresAt: 1_800_000_000_000,
+      }),
+    ).toMatchObject({ type: "writer-lease-status", active: true });
+    expect(ServerControlFrameSchema.parse({ type: "writer-lease-status", active: false })).toEqual({
+      type: "writer-lease-status",
+      active: false,
+    });
+    expect(() =>
+      ServerControlFrameSchema.parse({ type: "writer-lease-status", active: true }),
+    ).toThrow();
+    expect(() =>
+      ServerControlFrameSchema.parse({
+        type: "writer-lease-status",
+        active: false,
+        expiresAt: 1_800_000_000_000,
+      }),
+    ).toThrow();
   });
 
   it("preserves international keyboard metadata and rejects surrogate code points", () => {

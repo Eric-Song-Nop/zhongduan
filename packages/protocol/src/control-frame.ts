@@ -42,6 +42,7 @@ function boundedUtf8String(maximumBytes: number, label: string) {
 const attachBase = {
   type: z.literal("attach"),
   engineId,
+  deliveryGeneration: u64,
 };
 const attach = z.discriminatedUnion("hasLiveReplica", [
   z.strictObject({
@@ -152,9 +153,15 @@ const resizeRequest = z.strictObject({
   ...dimensions,
 });
 
+const writerLeaseRenew = z.strictObject({
+  type: z.literal("writer-lease-renew"),
+  writerLease: id,
+});
+
 export const ClientControlFrameSchema = z.union([
   attach,
   ack,
+  writerLeaseRenew,
   key,
   text,
   paste,
@@ -211,6 +218,16 @@ const welcome = z.strictObject({
 const hostOffline = z.strictObject({
   type: z.literal("host-offline"),
 });
+
+const writerLeaseStatus = z
+  .strictObject({
+    type: z.literal("writer-lease-status"),
+    active: z.boolean(),
+    expiresAt: z.number().int().positive().optional(),
+  })
+  .refine((frame) => frame.active === (frame.expiresAt !== undefined), {
+    message: "active writer lease status requires expiresAt",
+  });
 
 const resyncRequired = z
   .strictObject({
@@ -269,6 +286,7 @@ export const ServerControlFrameSchema = z.discriminatedUnion("type", [
   welcome,
   inputAck.omit({ connectionId: true }),
   hostOffline,
+  writerLeaseStatus,
   resyncRequired,
   replayStart,
   snapshotManifest,
