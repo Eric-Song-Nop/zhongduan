@@ -1,3 +1,8 @@
+> 本文是设计记录，不是独立的协议规范。已接受的产品目标和分阶段实施门槛见
+> [高性能远程终端 Snapshot 恢复实施计划](docs/high-performance-snapshot-recovery-plan.md)与
+> [输入稳定性与高 RTT 交互实施计划](docs/input-stability-plan.md)。其中的滚动 snapshot、短必要
+> tail、输入路径和交互 SLO 取代本文的历史调优建议。当前行为与常量以代码为准。
+
 可以。先把方案压缩成一个明确的复制模型：
 
 ```text

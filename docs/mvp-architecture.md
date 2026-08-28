@@ -1,5 +1,10 @@
 # MVP 架构
 
+> 已确认的演进方向以高性能、稳定的 browser terminal 体验为目标；滚动 snapshot 安全吸收
+> 旧历史，只传所选 cut 之后仍必要的 mutation。当前实现到目标状态的分阶段迁移见
+> [高性能远程终端 Snapshot 恢复实施计划](high-performance-snapshot-recovery-plan.md)和
+> [输入稳定性与高 RTT 交互实施计划](input-stability-plan.md)。
+
 ## 目标
 
 MVP 交付一个 Linux Host 上持续运行、可从浏览器附加和重连的远程终端。它必须正确运行 Vim、tmux、htop 等 TUI，并在网络抖动、浏览器刷新、Cloudflare Durable Object 休眠和持续高速输出下保持有界资源占用。
@@ -61,19 +66,29 @@ Ghostty snapshot 只承担 checkpoint，不承担事件传输。它的 continuat
 
 ## 有界策略
 
-| 项目                     |        MVP 默认值 |
-| ------------------------ | ----------------: |
-| Journal segment          | 256 KiB 或 250 ms |
-| Warm replay              |      60 s / 8 MiB |
-| Snapshot 理想 tail       |             2 MiB |
-| Snapshot 最大可服务 tail |             8 MiB |
-| 每客户端发送队列         |           512 KiB |
-| Passive restore tail     |             2 MiB |
-| Passive restore deadline |               5 s |
-| Snapshot recovery quiet  |            250 ms |
-| Snapshot 最小构建间隔    |               1 s |
+下表是当前实现的不同资源闸门，不是一个可互换的“tail budget”。这些值是实现保护条件，
+不是 wire compatibility 保证；恢复策略的目标值与迁移方式见高性能 Snapshot 计划。
 
-客户端 ACK 只决定能否 warm replay，不会 pin journal。发送队列超限时只重置该客户端的 data WebSocket 并增加其 `deliveryGeneration`；control WebSocket 保持可用，因此 Ctrl-C 和重同步控制不会被历史输出阻塞。
+| 层级/用途                         | 当前默认值                                                       |
+| --------------------------------- | ---------------------------------------------------------------- |
+| Journal segment                   | 256 KiB 或 250 ms                                                |
+| Journal retention                 | 60 s / 8 MiB                                                     |
+| Host warm replay admission        | 256 KiB / 512 frames                                             |
+| Host cold snapshot tail admission | 256 KiB / 512 frames                                             |
+| Relay delivery outstanding        | 512 KiB                                                          |
+| Host paused canonical queue       | 8 MiB / 1024 frames                                              |
+| Browser recovery tail buffer      | 2 MiB / 1024 frames                                              |
+| Browser passive restore deadline  | 5 s                                                              |
+| Snapshot metadata cache TTL       | 30 s                                                             |
+| Snapshot recovery quiet           | 250 ms                                                           |
+| Snapshot 最小构建间隔             | 1 s                                                              |
+| Snapshot blob                     | 32 MiB compressed / 128 MiB uncompressed                         |
+| Cloud snapshot/upload rows        | 32 total / 4 pending；保留集合为 latest + active pins + 2 recent |
+
+客户端 ACK 只决定能否 warm replay，不会 pin journal。发送队列超限时只重置该客户端的 data
+WebSocket 并增加其 `deliveryGeneration`，control WebSocket 保持可用。但当前 Cloud 仍使用跨 socket
+全局串行队列，Host recovery 也会全局 pause canonical publisher，因此 Ctrl-C、输入和可见回显仍可能发生
+head-of-line blocking；修复计划见[输入稳定性计划](input-stability-plan.md)。
 
 ## MVP 安全边界
 
