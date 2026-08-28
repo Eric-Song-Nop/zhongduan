@@ -130,14 +130,17 @@ Workers Logs；缺失、`off` 或未知值都关闭该出口，可作为无需�
 `workers-logs-v2` 是事实 schema 的不兼容版本边界，不是 terminal wire 版本。生产查询和 dashboard 在发布与回滚
 窗口内必须同时接受 `schemaVersion=1` 和 `schemaVersion=2`，并按版本解释字段；确认 v2 持续到达后才能移除 v1
 查询。仓库的 `CloudTelemetryWriteEventSchema` 只允许 v2 producer；`CloudTelemetryReadEventSchema` 则保留四种
-Phase 0b v1 shape 并同时接受 v2，供兼容窗口的 ingestion 使用。该 read schema 只解析 ingestion 已核验并剥离
-`type=zhongduan.telemetry`、`runtime=cloud-do` wrapper 后的 event payload；完整 wrapped-record schema 与真实日志
-fixture 留给 query/aggregation 层。新 Phase 0c event name 不允许伪装成 v1。当前
+Phase 0b v1 shape 并同时接受 v2，供兼容窗口的 ingestion 使用。`CloudTelemetryReadLogRecordSchema` 严格核验
+flattened `type=zhongduan.telemetry`、`runtime=cloud-do` wrapper、event payload 与版本化 producer
+`sampleWeight`；`CloudflareCloudTelemetryLogEventSchema` 只从 Workers Logs envelope 投影 `event.source`，不会把
+平台 metadata 带入应用查询结果。新 Phase 0c event name 不允许伪装成 v1，改变 producer sampling policy 也必须
+升级 event schema version。当前
 Worker 只识别与自身代码配套的精确 mode，若代码与 binding 分步发布或回滚成不匹配组合，自定义诊断会
 静默关闭并形成 telemetry blind window。代码和 binding 应作为同一版本发布，同时对事件缺口告警；该窗口不改变
 terminal relay、authority 或恢复行为，也不能靠重放补回。
 
-生产配置关闭 Cloudflare 自动 invocation logs 和 automatic tracing。公开 WebSocket 握手当前把一次性 ticket
+生产配置显式打开 custom-log persistence、把 Workers Logs head sampling 固定为 1，同时关闭 Cloudflare 自动
+invocation logs 和 automatic tracing。公开 WebSocket 握手当前把一次性 ticket
 放在 query string，session ID 也出现在 API path；自动 request log/trace 会把这些 URL 元数据带出 Zhongduan
 自定义诊断 schema。不要在 Dashboard 中重新开启它们，也不要在升级 compatibility date 时删除仓库中的显式关闭项。
 
@@ -179,8 +182,47 @@ frame 在进入 Browser fanout loop 前按 weight 64 固定选择，未选中的
 Cloud 事件；pending event、drop 状态和 sampling phase/counter 都只驻内存，不写 SQLite 或 WebSocket attachment，
 可在队列满、版本切换、eviction/hibernation 或 runtime failure 时丢失或重置，也不 backfill/replay。
 
-这一层只完成 Phase 0c 的 Cloud 事实采集，不代表 Phase 0 gate 关闭。生产 query/aggregation/dashboard、Browser
-paint 与跨节点 E2E/SLO、以及启用插桩后 input latency/canonical throughput 不超过 5% 回归的 canary 仍开放；
+`observability/cloud-telemetry-query` 在这些事实之上只增加 source-controlled 查询契约与本地工具：所有查询都固定
+过滤 Cloudflare service/log type 和 Zhongduan wrapper，并在执行前通过 keys API 核验 exact direct key/type；流量
+估算使用 `SUM(sampleWeight)`，raw row count 只表示被保存/查询的行数。任何 percentile 查询都必须额外固定一个
+producer `sampleWeight`，不得把不同采样率的成功/失败路径混在同一个 p95/p99。若查询结果的
+`sampleInterval != 1` 或 `abr_level != 1`，报告必须标为 approximate，不能据此通过 rollout/SLO hard gate，也不能
+盲目再次乘 `sampleInterval`。
+
+本地 `validate` 不需要凭据；只读意图的 smoke/report 使用独立的
+`CLOUDFLARE_OBSERVABILITY_TOKEN` 与 `CLOUDFLARE_OBSERVABILITY_ACCOUNT_ID`，不得复用或输出 deploy token。
+Cloudflare 当前 run-query API 仍要求 account-scoped Observability Write permission，因此 token 必须按写权限管理。
+Saved-query provisioning 只有显式 `--apply` 才能执行：缺失项可创建、同名同内容 no-op、同名漂移 fail closed，
+不得自动覆盖或删除 account-level state。上线前必须在隔离 staging 窗口验证真实 Workers Logs source shape、exact
+keys/types、v1/v2 strict parse 与非 approximate 聚合；仓库中的 synthetic/sanitized fixture 不能替代这个 gate。
+
+本地契约检查不会读取凭据或访问网络：
+
+```bash
+node scripts/cloud-telemetry-observability.mjs validate
+node scripts/cloud-telemetry-observability.mjs fixture-gate
+```
+
+当前仓库 fixture 明确标记为 synthetic，第二条命令会以非零状态要求 staging-captured sanitized replacement。取得
+专用 observability token 后，可对指定毫秒或 ISO 时间窗运行 Cloud-local report 和 arrival smoke：
+
+```bash
+export CLOUDFLARE_OBSERVABILITY_ACCOUNT_ID="<account-id>"
+export CLOUDFLARE_OBSERVABILITY_TOKEN="<dedicated-token>"
+node scripts/cloud-telemetry-observability.mjs report --from "<from>" --to "<to>"
+node scripts/cloud-telemetry-observability.mjs arrival-smoke --from "<from>" --to "<to>"
+```
+
+`arrival-smoke` 输出固定包含 `performanceGate: false`；exact key/type 缺失、无 v2 arrival、或平台采样使结果
+approximate 时都不能算 rollout gate 通过。只有人工确认 manifest 与 account-level state 后才执行：
+
+```bash
+node scripts/cloud-telemetry-observability.mjs provision --apply
+```
+
+这一层只完成 Cloud-local query contract，不代表 Phase 0 gate 关闭。Browser/Host 生产 export 与跨 runtime
+aggregation、Browser render/presentation 与 synthetic E2E/SLO、以及同一 exact build 下插桩 off/on 的 input latency/
+canonical throughput 不超过 5% 回归 canary 仍开放；
 诊断不得写入 terminal wire、journal、snapshot、replay、SQLite schema 或 WebSocket attachment。
 
 ## 5. 构建和启动 Host

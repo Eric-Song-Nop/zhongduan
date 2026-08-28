@@ -740,6 +740,13 @@ attach matching/timeout/cancelled 终点，以及 snapshot load/restore/buffer a
 input epoch/seq，但事件不得带出这些标识或 key/text/paste；所有记录只进入 256 条有界内存 ring，不写 console、
 storage 或网络。这里的 ACK 仍不是 child read/app effect，socket RTT 也不是纯网络 RTT。
 
+`observability/cloud-telemetry-query` 只把现有 Cloud-local 事实变成严格、source-controlled 的查询契约：它解析
+Workers Logs wrapper 与 v1/v2 payload，固定版本化 producer `sampleWeight`，在查询前核验 exact direct key/type，
+并提供 report/smoke 与显式 saved-query provisioning。Volume 使用 `SUM(sampleWeight)`；percentile 必须过滤到一个
+固定 producer weight。`sampleInterval` 或 `abr_level` 不为 1 的结果只标 approximate，不通过 hard gate。这个切片
+不上传 Browser/Host ring/stderr，不建立跨 runtime event join，也不把 Cloud query smoke 当成 telemetry off/on
+performance canary。
+
 - Browser 完整 validate/admit 后才分配 seq；
 - Host 使用 strict `nextExpectedSeq`；确定性 reject 消费 seq，`uncertain` 终止 epoch；
 - 建立单一 per-writer sequencer，明确 urgent cancellation 与 resize ordering；
@@ -846,8 +853,10 @@ WebSocket attachment；capacity、collector/runtime failure、版本切换、evi
 回滚不匹配会形成不可恢复的 telemetry blind window，因此必须成对发布并验证 v2 到达后再退休 v1 query。
 
 Browser 本机切片已经补齐 input send-return→ACK、socket RTT 与 snapshot load/restore/buffer apply/adopt，但还没有
-keydown、canonical match 或真实 paint 信号。Cloud Phase 0c 只补事实层；生产 query/aggregation/dashboard、
-Browser paint、跨节点 E2E/SLO，以及启用插桩后 input latency/canonical throughput `<=5%` 回归 gate 仍开放。
+semantic-dispatch、canonical presentation/render commit 或真实 paint 信号。Cloud Phase 0c 与 Cloud query contract
+只补事实和 Cloud-local inspection；Browser/Host 生产 export 与跨 runtime aggregation、synthetic E2E/SLO，以及同一
+exact build 下插桩 off/on 的 input latency/canonical throughput `<=5%` 回归 gate 仍开放。下一帧机会也只能称
+presentation opportunity，不能冒充像素已经 composited。
 
 ### 初始发布门槛
 

@@ -1,0 +1,713 @@
+{
+  "manifestVersion": 1,
+  "apiContract": "cloudflare-workers-observability-v1",
+  "datasets": ["cloudflare-workers"],
+  "platformKeyTypes": {
+    "$metadata.service": "string",
+    "$metadata.type": "string"
+  },
+  "directKeyTypes": {
+    "type": "string",
+    "runtime": "string",
+    "schemaVersion": "number",
+    "name": "string",
+    "sampleWeight": "number",
+    "lane": "string",
+    "capacityReason": "string",
+    "observedQueueWaitMs": "number",
+    "inputKind": "string",
+    "leaseOutcome": "string",
+    "status": "string",
+    "path": "string",
+    "outcome": "string",
+    "reason": "string",
+    "operation": "string",
+    "mode": "string",
+    "retryScope": "string",
+    "transition": "string",
+    "observedIngressToSendDecisionMs": "number",
+    "observedIngressToFanoutDecisionMs": "number",
+    "observedLeaseOutcomeMs": "number",
+    "observedDurationMs": "number"
+  },
+  "baseFilters": [
+    {
+      "kind": "filter",
+      "key": "$metadata.service",
+      "operation": "eq",
+      "type": "string",
+      "value": "zhongduan-terminal-cloud"
+    },
+    {
+      "kind": "filter",
+      "key": "$metadata.type",
+      "operation": "eq",
+      "type": "string",
+      "value": "cf-worker-log"
+    },
+    {
+      "kind": "filter",
+      "key": "type",
+      "operation": "eq",
+      "type": "string",
+      "value": "zhongduan.telemetry"
+    },
+    { "kind": "filter", "key": "runtime", "operation": "eq", "type": "string", "value": "cloud-do" }
+  ],
+  "queries": [
+    {
+      "id": "cloud-v2-arrival",
+      "name": "[zhongduan] Cloud v2 telemetry arrival",
+      "description": "Producer-weighted v2 event arrival smoke; this is not a performance regression canary.",
+      "uses": ["report", "arrival"],
+      "metricAlias": "weighted_v2_events",
+      "unit": "events",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "schemaVersion",
+          "operation": "eq",
+          "type": "number",
+          "value": 2
+        }
+      ],
+      "calculation": {
+        "operator": "sum",
+        "alias": "weighted_v2_events",
+        "key": "sampleWeight",
+        "keyType": "number"
+      },
+      "groupBys": [],
+      "limit": 1
+    },
+    {
+      "id": "cloud-event-volume",
+      "name": "[zhongduan] Cloud telemetry volume",
+      "description": "Producer-weighted Cloud telemetry volume grouped by schema version and event name.",
+      "uses": ["report"],
+      "metricAlias": "weighted_events",
+      "unit": "events",
+      "filters": [],
+      "calculation": {
+        "operator": "sum",
+        "alias": "weighted_events",
+        "key": "sampleWeight",
+        "keyType": "number"
+      },
+      "groupBys": [
+        { "type": "number", "value": "schemaVersion" },
+        { "type": "string", "value": "name" }
+      ],
+      "limit": 100
+    },
+    {
+      "id": "cloud-queue-volume",
+      "name": "[zhongduan] Cloud relay queue outcomes",
+      "description": "Producer-weighted relay queue decisions grouped by lane and bounded outcome.",
+      "uses": ["report"],
+      "metricAlias": "weighted_queue_events",
+      "unit": "events",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.relay.queue"
+        }
+      ],
+      "calculation": {
+        "operator": "sum",
+        "alias": "weighted_queue_events",
+        "key": "sampleWeight",
+        "keyType": "number"
+      },
+      "groupBys": [
+        { "type": "string", "value": "lane" },
+        { "type": "string", "value": "outcome" },
+        { "type": "string", "value": "capacityReason" }
+      ],
+      "limit": 100
+    },
+    {
+      "id": "cloud-browser-control-queue-wait-p95",
+      "name": "[zhongduan] Cloud Browser control queue wait p95",
+      "description": "Fixed-weight successful Browser-control queue wait lower-bound.",
+      "uses": ["report"],
+      "metricAlias": "p95_queue_wait_ms",
+      "unit": "milliseconds",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.relay.queue"
+        },
+        {
+          "kind": "filter",
+          "key": "lane",
+          "operation": "eq",
+          "type": "string",
+          "value": "browser-control"
+        },
+        {
+          "kind": "filter",
+          "key": "outcome",
+          "operation": "eq",
+          "type": "string",
+          "value": "completed"
+        },
+        {
+          "kind": "filter",
+          "key": "sampleWeight",
+          "operation": "eq",
+          "type": "number",
+          "value": 16
+        }
+      ],
+      "calculation": {
+        "operator": "p95",
+        "alias": "p95_queue_wait_ms",
+        "key": "observedQueueWaitMs",
+        "keyType": "number"
+      },
+      "groupBys": [],
+      "limit": 1
+    },
+    {
+      "id": "cloud-host-control-queue-wait-p95",
+      "name": "[zhongduan] Cloud Host control queue wait p95",
+      "description": "Fixed-weight successful Host-control queue wait lower-bound.",
+      "uses": ["report"],
+      "metricAlias": "p95_queue_wait_ms",
+      "unit": "milliseconds",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.relay.queue"
+        },
+        {
+          "kind": "filter",
+          "key": "lane",
+          "operation": "eq",
+          "type": "string",
+          "value": "host-control"
+        },
+        {
+          "kind": "filter",
+          "key": "outcome",
+          "operation": "eq",
+          "type": "string",
+          "value": "completed"
+        },
+        {
+          "kind": "filter",
+          "key": "sampleWeight",
+          "operation": "eq",
+          "type": "number",
+          "value": 16
+        }
+      ],
+      "calculation": {
+        "operator": "p95",
+        "alias": "p95_queue_wait_ms",
+        "key": "observedQueueWaitMs",
+        "keyType": "number"
+      },
+      "groupBys": [],
+      "limit": 1
+    },
+    {
+      "id": "cloud-host-data-queue-wait-p95",
+      "name": "[zhongduan] Cloud Host data queue wait p95",
+      "description": "Fixed-weight successful Host-data queue wait lower-bound.",
+      "uses": ["report"],
+      "metricAlias": "p95_queue_wait_ms",
+      "unit": "milliseconds",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.relay.queue"
+        },
+        {
+          "kind": "filter",
+          "key": "lane",
+          "operation": "eq",
+          "type": "string",
+          "value": "host-data"
+        },
+        {
+          "kind": "filter",
+          "key": "outcome",
+          "operation": "eq",
+          "type": "string",
+          "value": "completed"
+        },
+        {
+          "kind": "filter",
+          "key": "sampleWeight",
+          "operation": "eq",
+          "type": "number",
+          "value": 64
+        }
+      ],
+      "calculation": {
+        "operator": "p95",
+        "alias": "p95_queue_wait_ms",
+        "key": "observedQueueWaitMs",
+        "keyType": "number"
+      },
+      "groupBys": [],
+      "limit": 1
+    },
+    {
+      "id": "cloud-input-volume",
+      "name": "[zhongduan] Cloud input outcomes",
+      "description": "Producer-weighted input decisions grouped by kind, lease outcome, and send outcome.",
+      "uses": ["report"],
+      "metricAlias": "weighted_input_events",
+      "unit": "events",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.input.forward"
+        }
+      ],
+      "calculation": {
+        "operator": "sum",
+        "alias": "weighted_input_events",
+        "key": "sampleWeight",
+        "keyType": "number"
+      },
+      "groupBys": [
+        { "type": "string", "value": "inputKind" },
+        { "type": "string", "value": "leaseOutcome" },
+        { "type": "string", "value": "outcome" }
+      ],
+      "limit": 100
+    },
+    {
+      "id": "cloud-input-forward-p95",
+      "name": "[zhongduan] Cloud input forward p95",
+      "description": "Fixed-weight successful input ingress-to-Host-send local I/O-clock lower-bound.",
+      "uses": ["report"],
+      "metricAlias": "p95_ingress_to_send_ms",
+      "unit": "milliseconds",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.input.forward"
+        },
+        {
+          "kind": "filter",
+          "key": "outcome",
+          "operation": "eq",
+          "type": "string",
+          "value": "send-returned"
+        },
+        {
+          "kind": "filter",
+          "key": "sampleWeight",
+          "operation": "eq",
+          "type": "number",
+          "value": 16
+        }
+      ],
+      "calculation": {
+        "operator": "p95",
+        "alias": "p95_ingress_to_send_ms",
+        "key": "observedIngressToSendDecisionMs",
+        "keyType": "number"
+      },
+      "groupBys": [],
+      "limit": 1
+    },
+    {
+      "id": "cloud-ack-volume",
+      "name": "[zhongduan] Cloud input ACK outcomes",
+      "description": "Producer-weighted Host ACK decisions grouped by status and send outcome.",
+      "uses": ["report"],
+      "metricAlias": "weighted_ack_events",
+      "unit": "events",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.input.ack-forward"
+        }
+      ],
+      "calculation": {
+        "operator": "sum",
+        "alias": "weighted_ack_events",
+        "key": "sampleWeight",
+        "keyType": "number"
+      },
+      "groupBys": [
+        { "type": "string", "value": "status" },
+        { "type": "string", "value": "outcome" }
+      ],
+      "limit": 100
+    },
+    {
+      "id": "cloud-ack-forward-p95",
+      "name": "[zhongduan] Cloud input ACK forward p95",
+      "description": "Fixed-weight successful Host ACK ingress-to-Browser-send local I/O-clock lower-bound.",
+      "uses": ["report"],
+      "metricAlias": "p95_ingress_to_send_ms",
+      "unit": "milliseconds",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.input.ack-forward"
+        },
+        {
+          "kind": "filter",
+          "key": "outcome",
+          "operation": "eq",
+          "type": "string",
+          "value": "send-returned"
+        },
+        {
+          "kind": "filter",
+          "key": "sampleWeight",
+          "operation": "eq",
+          "type": "number",
+          "value": 16
+        }
+      ],
+      "calculation": {
+        "operator": "p95",
+        "alias": "p95_ingress_to_send_ms",
+        "key": "observedIngressToSendDecisionMs",
+        "keyType": "number"
+      },
+      "groupBys": [],
+      "limit": 1
+    },
+    {
+      "id": "cloud-fanout-volume",
+      "name": "[zhongduan] Cloud fanout outcomes",
+      "description": "Producer-weighted fanout decisions grouped by path, outcome, and bounded reason.",
+      "uses": ["report"],
+      "metricAlias": "weighted_fanout_events",
+      "unit": "events",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.data.fanout"
+        }
+      ],
+      "calculation": {
+        "operator": "sum",
+        "alias": "weighted_fanout_events",
+        "key": "sampleWeight",
+        "keyType": "number"
+      },
+      "groupBys": [
+        { "type": "string", "value": "path" },
+        { "type": "string", "value": "outcome" },
+        { "type": "string", "value": "reason" }
+      ],
+      "limit": 100
+    },
+    {
+      "id": "cloud-canonical-fanout-p95",
+      "name": "[zhongduan] Cloud canonical fanout p95",
+      "description": "Fixed-weight canonical ingress-to-fanout-decision local I/O-clock lower-bound.",
+      "uses": ["report"],
+      "metricAlias": "p95_ingress_to_fanout_ms",
+      "unit": "milliseconds",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.data.fanout"
+        },
+        {
+          "kind": "filter",
+          "key": "path",
+          "operation": "eq",
+          "type": "string",
+          "value": "canonical"
+        },
+        {
+          "kind": "filter",
+          "key": "outcome",
+          "operation": "eq",
+          "type": "string",
+          "value": "completed"
+        },
+        {
+          "kind": "filter",
+          "key": "sampleWeight",
+          "operation": "eq",
+          "type": "number",
+          "value": 64
+        }
+      ],
+      "calculation": {
+        "operator": "p95",
+        "alias": "p95_ingress_to_fanout_ms",
+        "key": "observedIngressToFanoutDecisionMs",
+        "keyType": "number"
+      },
+      "groupBys": [],
+      "limit": 1
+    },
+    {
+      "id": "cloud-lease-volume",
+      "name": "[zhongduan] Cloud writer lease outcomes",
+      "description": "Producer-weighted writer lease outcomes; mixed weights are used only for weighted counts.",
+      "uses": ["report"],
+      "metricAlias": "weighted_lease_events",
+      "unit": "events",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.writer.lease"
+        }
+      ],
+      "calculation": {
+        "operator": "sum",
+        "alias": "weighted_lease_events",
+        "key": "sampleWeight",
+        "keyType": "number"
+      },
+      "groupBys": [
+        { "type": "string", "value": "operation" },
+        { "type": "string", "value": "outcome" }
+      ],
+      "limit": 100
+    },
+    {
+      "id": "cloud-lease-renew-p95",
+      "name": "[zhongduan] Cloud writer lease renew p95",
+      "description": "Fixed-weight successful current-writer heartbeat verify-renew lower-bound.",
+      "uses": ["report"],
+      "metricAlias": "p95_lease_outcome_ms",
+      "unit": "milliseconds",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.writer.lease"
+        },
+        {
+          "kind": "filter",
+          "key": "operation",
+          "operation": "eq",
+          "type": "string",
+          "value": "verify-renew"
+        },
+        {
+          "kind": "filter",
+          "key": "outcome",
+          "operation": "eq",
+          "type": "string",
+          "value": "renewed-current"
+        },
+        {
+          "kind": "filter",
+          "key": "sampleWeight",
+          "operation": "eq",
+          "type": "number",
+          "value": 64
+        }
+      ],
+      "calculation": {
+        "operator": "p95",
+        "alias": "p95_lease_outcome_ms",
+        "key": "observedLeaseOutcomeMs",
+        "keyType": "number"
+      },
+      "groupBys": [],
+      "limit": 1
+    },
+    {
+      "id": "cloud-barrier-volume",
+      "name": "[zhongduan] Cloud recovery barrier outcomes",
+      "description": "Recovery barrier outcomes grouped by mode, outcome, and retry scope.",
+      "uses": ["report"],
+      "metricAlias": "weighted_barrier_events",
+      "unit": "events",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.recovery.barrier"
+        }
+      ],
+      "calculation": {
+        "operator": "sum",
+        "alias": "weighted_barrier_events",
+        "key": "sampleWeight",
+        "keyType": "number"
+      },
+      "groupBys": [
+        { "type": "string", "value": "mode" },
+        { "type": "string", "value": "outcome" },
+        { "type": "string", "value": "retryScope" }
+      ],
+      "limit": 100
+    },
+    {
+      "id": "cloud-barrier-duration-p95",
+      "name": "[zhongduan] Cloud recovery barrier duration p95",
+      "description": "Fixed-weight recovery barrier handling lower-bound across bounded terminal outcomes.",
+      "uses": ["report"],
+      "metricAlias": "p95_barrier_duration_ms",
+      "unit": "milliseconds",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.recovery.barrier"
+        },
+        { "kind": "filter", "key": "sampleWeight", "operation": "eq", "type": "number", "value": 1 }
+      ],
+      "calculation": {
+        "operator": "p95",
+        "alias": "p95_barrier_duration_ms",
+        "key": "observedDurationMs",
+        "keyType": "number"
+      },
+      "groupBys": [],
+      "limit": 1
+    },
+    {
+      "id": "cloud-transition-volume",
+      "name": "[zhongduan] Cloud recovery transition outcomes",
+      "description": "Recovery attach/reset outcomes grouped without retaining identifiers.",
+      "uses": ["report"],
+      "metricAlias": "weighted_transition_events",
+      "unit": "events",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.recovery.transition"
+        }
+      ],
+      "calculation": {
+        "operator": "sum",
+        "alias": "weighted_transition_events",
+        "key": "sampleWeight",
+        "keyType": "number"
+      },
+      "groupBys": [
+        { "type": "string", "value": "transition" },
+        { "type": "string", "value": "outcome" }
+      ],
+      "limit": 100
+    },
+    {
+      "id": "cloud-attach-transition-duration-p95",
+      "name": "[zhongduan] Cloud recovery attach duration p95",
+      "description": "Fixed-weight recovery attach transition handling lower-bound.",
+      "uses": ["report"],
+      "metricAlias": "p95_transition_duration_ms",
+      "unit": "milliseconds",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.recovery.transition"
+        },
+        {
+          "kind": "filter",
+          "key": "transition",
+          "operation": "eq",
+          "type": "string",
+          "value": "attach"
+        },
+        { "kind": "filter", "key": "sampleWeight", "operation": "eq", "type": "number", "value": 1 }
+      ],
+      "calculation": {
+        "operator": "p95",
+        "alias": "p95_transition_duration_ms",
+        "key": "observedDurationMs",
+        "keyType": "number"
+      },
+      "groupBys": [],
+      "limit": 1
+    },
+    {
+      "id": "cloud-reset-transition-duration-p95",
+      "name": "[zhongduan] Cloud recovery reset duration p95",
+      "description": "Fixed-weight recovery reset transition handling lower-bound.",
+      "uses": ["report"],
+      "metricAlias": "p95_transition_duration_ms",
+      "unit": "milliseconds",
+      "filters": [
+        {
+          "kind": "filter",
+          "key": "name",
+          "operation": "eq",
+          "type": "string",
+          "value": "cloud.recovery.transition"
+        },
+        {
+          "kind": "filter",
+          "key": "transition",
+          "operation": "eq",
+          "type": "string",
+          "value": "reset"
+        },
+        { "kind": "filter", "key": "sampleWeight", "operation": "eq", "type": "number", "value": 1 }
+      ],
+      "calculation": {
+        "operator": "p95",
+        "alias": "p95_transition_duration_ms",
+        "key": "observedDurationMs",
+        "keyType": "number"
+      },
+      "groupBys": [],
+      "limit": 1
+    }
+  ],
+  "arrivalChecks": [
+    {
+      "id": "cloud-v2-query-smoke",
+      "queryId": "cloud-v2-arrival",
+      "metricAlias": "weighted_v2_events",
+      "minimumValue": 1,
+      "requiresExact": true
+    }
+  ]
+}

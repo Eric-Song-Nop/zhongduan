@@ -7,6 +7,9 @@ const monotonicAtMs = z.number().finite().nonnegative();
 const byteSizeBucket = z.enum(["0", "1-8", "9-64", "65-1024", "1025-65536", "65537+"]);
 const sampleWeight = z.number().int().positive().safe();
 
+export const CLOUD_TELEMETRY_RECORD_TYPE = "zhongduan.telemetry";
+export const CLOUD_TELEMETRY_RUNTIME = "cloud-do";
+
 const base = {
   schemaVersion: z.literal(1),
   monotonicAtMs,
@@ -676,6 +679,106 @@ export const CloudTelemetryReadEventSchema = z.union([
   CloudTelemetryWriteEventSchema,
 ]);
 
+// Sampling is part of each producer schema version. Add a new version instead of silently changing
+// a weight in an existing branch: historical weighted aggregates depend on these exact values.
+function cloudTelemetryProducerSampleWeight(
+  event: z.output<typeof CloudTelemetryReadEventSchema>,
+): number {
+  switch (event.schemaVersion) {
+    case 1:
+      switch (event.name) {
+        case "cloud.relay.queue":
+          return event.outcome === "completed" ? (event.lane === "host-data" ? 64 : 16) : 1;
+        case "cloud.input.forward":
+          return event.outcome === "send-returned" ? 16 : 1;
+        case "cloud.recovery.barrier":
+        case "cloud.recovery.transition":
+          return 1;
+      }
+      break;
+    case 2:
+      switch (event.name) {
+        case "cloud.relay.queue":
+          return event.outcome === "completed" ? (event.lane === "host-data" ? 64 : 16) : 1;
+        case "cloud.input.forward":
+          return event.outcome === "send-returned" ? 16 : 1;
+        case "cloud.input.ack-forward":
+          return 16;
+        case "cloud.data.fanout":
+          return event.path === "canonical" ? 64 : 1;
+        case "cloud.writer.lease":
+          return event.operation === "verify-renew" &&
+            (event.outcome === "renewed-current" || event.outcome === "inactive-current")
+            ? 64
+            : 1;
+        case "cloud.recovery.barrier":
+        case "cloud.recovery.transition":
+          return 1;
+      }
+      break;
+  }
+  throw new Error("unreachable Cloud telemetry producer sample policy");
+}
+
+export const CloudTelemetryProducerSamplePolicySchema = CloudTelemetryReadEventSchema.superRefine(
+  (event, context) => {
+    const expected = cloudTelemetryProducerSampleWeight(event);
+    if (event.sampleWeight !== expected) {
+      context.addIssue({
+        code: "custom",
+        message: `sampleWeight must be ${expected} for this schemaVersion and producer outcome`,
+        path: ["sampleWeight"],
+      });
+    }
+  },
+);
+
+const CloudTelemetryLogRecordInputSchema = z.looseObject({
+  type: z.literal(CLOUD_TELEMETRY_RECORD_TYPE),
+  runtime: z.literal(CLOUD_TELEMETRY_RUNTIME),
+});
+
+export const CloudTelemetryReadLogRecordSchema = CloudTelemetryLogRecordInputSchema.transform(
+  (record, context) => {
+    const { type: _type, runtime: _runtime, ...eventInput } = record;
+    const result = CloudTelemetryProducerSamplePolicySchema.safeParse(eventInput);
+    if (!result.success) {
+      for (const issue of result.error.issues) {
+        context.addIssue({
+          code: "custom",
+          message: issue.message,
+          path: issue.path,
+        });
+      }
+      return z.NEVER;
+    }
+    return {
+      type: CLOUD_TELEMETRY_RECORD_TYPE,
+      runtime: CLOUD_TELEMETRY_RUNTIME,
+      ...result.data,
+    };
+  },
+);
+
+const CloudflareApiEventEnvelopeSchema = z.object({ source: z.unknown() });
+
+export const CloudflareCloudTelemetryLogEventSchema = CloudflareApiEventEnvelopeSchema.transform(
+  (envelope, context) => {
+    const result = CloudTelemetryReadLogRecordSchema.safeParse(envelope.source);
+    if (!result.success) {
+      for (const issue of result.error.issues) {
+        context.addIssue({
+          code: "custom",
+          message: issue.message,
+          path: ["source", ...issue.path],
+        });
+      }
+      return z.NEVER;
+    }
+    return result.data;
+  },
+);
+
 export const TerminalTelemetryEventSchema = z.union([
   HostSnapshotCaptureReadyEventSchema,
   HostSnapshotCaptureFailedEventSchema,
@@ -694,6 +797,7 @@ export type TerminalTelemetryEvent = z.output<typeof TerminalTelemetryEventSchem
 export type CloudTelemetryEvent = z.output<typeof CloudTelemetryEventSchema>;
 export type BrowserTelemetryEvent = z.output<typeof BrowserTelemetryEventSchema>;
 export type CloudTelemetryReadEvent = z.output<typeof CloudTelemetryReadEventSchema>;
+export type CloudTelemetryLogRecord = z.output<typeof CloudTelemetryReadLogRecordSchema>;
 export type TelemetrySink = (event: TerminalTelemetryEvent) => void;
 export type BrowserTelemetrySink = (event: BrowserTelemetryEvent) => void;
 export type MonotonicClock = () => number;

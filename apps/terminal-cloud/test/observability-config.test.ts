@@ -4,7 +4,12 @@ import { describe, expect, it } from "vitest";
 interface WranglerObservabilityConfig {
   vars?: { CLOUD_TELEMETRY_MODE?: string };
   observability?: {
-    logs?: { invocation_logs?: boolean };
+    logs?: {
+      enabled?: boolean;
+      persist?: boolean;
+      head_sampling_rate?: number;
+      invocation_logs?: boolean;
+    };
     traces?: { enabled?: boolean };
   };
 }
@@ -18,6 +23,9 @@ describe("production observability configuration", () => {
   it("does not retain request URLs through automatic logs or traces", () => {
     const config = parseRepositoryConfig(wranglerConfigSource);
 
+    expect(config.observability?.logs?.enabled).toBe(true);
+    expect(config.observability?.logs?.persist).toBe(true);
+    expect(config.observability?.logs?.head_sampling_rate).toBe(1);
     expect(config.observability?.logs?.invocation_logs).toBe(false);
     expect(config.observability?.traces?.enabled).toBe(false);
     expect(config.vars?.CLOUD_TELEMETRY_MODE).toBe("workers-logs-v2");

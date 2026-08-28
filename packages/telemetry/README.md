@@ -71,14 +71,32 @@ Queries and dashboards must accept both historical/in-flight `schemaVersion=1` r
 `schemaVersion=2` records throughout rollout and rollback, and interpret each version independently.
 `CloudTelemetryWriteEventSchema` is the strict v2 producer boundary;
 `CloudTelemetryReadEventSchema` retains the four v1 Phase 0b shapes alongside all v2 shapes for
-ingestion during that compatibility window. It validates the event payload after ingestion has
-projected and checked the `type=zhongduan.telemetry` / `runtime=cloud-do` log wrapper; a strict
-record-level read schema and wrapped-log integration fixture remain a query-layer follow-up. New
-Phase 0c event names are never accepted with v1.
+ingestion during that compatibility window. `CloudTelemetryReadLogRecordSchema` validates the
+flattened `type=zhongduan.telemetry` / `runtime=cloud-do` record and the versioned producer
+`sampleWeight`; `CloudflareCloudTelemetryLogEventSchema` projects only `event.source` from a Workers
+Logs envelope and never returns platform metadata. New Phase 0c event names are never accepted with
+v1, and changing a producer sampling policy requires a new event schema version.
 The runtime gate itself accepts only the mode paired with its code. Separately deploying or rolling
 back code and `CLOUD_TELEMETRY_MODE` can therefore disable custom logging and create an irrecoverable
 telemetry blind window; code and binding should ship as one version, and v1 queries should remain until
 v2 arrival is verified.
+
+The source-controlled Cloud observability manifest is a query contract, not a terminal protocol. Every
+query includes fixed platform service/log-type filters plus the custom wrapper filters, and a preflight
+must discover the exact direct key names and types before executing it. Producer-volume estimates sum
+`sampleWeight`; raw row counts only describe stored/query rows. A percentile query is valid only when
+its filters select one fixed producer weight, so differently sampled success and failure paths are
+never mixed into one percentile. Cloudflare `sampleInterval` and `abr_level` are reported as quality
+signals: if either differs from one, the result is approximate and cannot close a hard rollout or SLO
+gate. The client does not blindly multiply an aggregate by `sampleInterval` a second time.
+
+Local validation is credential-free. Query smoke/report operations use a dedicated account-scoped
+observability token and are read-intent operations even though the current Cloudflare run-query API
+requires Observability Write permission. Saved-query provisioning is a separate explicit `--apply`
+operation: missing definitions may be created, identical definitions are no-ops, and same-name drift
+fails closed instead of overwriting or deleting account-level state. No token, raw log source, platform
+envelope, or API error body is printed. Real staging key/source-shape validation and saved-query
+provisioning remain deployment gates; repository fixtures and unit tests cannot substitute for them.
 
 Automatic invocation logs and tracing remain explicitly disabled because request URLs contain terminal
 session metadata and one-time WebSocket tickets. Strict custom event payloads must not contain terminal,
@@ -105,8 +123,9 @@ operator-controlled export remain a separate layer.
 The Host stderr adapter stops writing while the stream reports backpressure and drops diagnostics
 until `drain`, so telemetry cannot grow an unbounded application-owned output queue. Phase 0c is only a
 Cloud fact layer: per-input SHA-256 plus SQLite lease renewal and the larger Phase A correctness/hot-path
-work remain unchanged. Browser paint/end-to-end facts, production aggregation/query/dashboard, and the
-enabled-instrumentation input-latency/canonical-throughput canary proving at most 5% regression remain
+work remain unchanged. The Cloud query-contract layer makes these Cloud-local facts inspectable without
+claiming a cross-runtime dashboard: Browser/Host export, Browser render/presentation and synthetic
+end-to-end facts, and the exact-build instrumentation-off/on canary proving at most 5% regression remain
 open Phase 0 gates. Ordinary directed recovery fanout currently remains weight 1 as a deliberate
 P1 follow-up: measure its volume first, then give successful/stale/not-targeted outcomes an unbiased
 producer sample without hiding bounded recovery failures. URL query-string redaction is also tracked

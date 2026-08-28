@@ -1,11 +1,12 @@
 import {
+  CLOUD_TELEMETRY_RECORD_TYPE,
+  CLOUD_TELEMETRY_RUNTIME,
   CloudTelemetryWriteEventSchema,
   createBufferedTelemetrySink,
   type CloudTelemetryEvent,
 } from "@zhongduan/telemetry";
 
-export const CLOUD_TELEMETRY_RECORD_TYPE = "zhongduan.telemetry";
-export const CLOUD_TELEMETRY_RUNTIME = "cloud-do";
+export { CLOUD_TELEMETRY_RECORD_TYPE, CLOUD_TELEMETRY_RUNTIME };
 
 export type CloudTelemetryLogRecord = CloudTelemetryEvent & {
   type: typeof CLOUD_TELEMETRY_RECORD_TYPE;

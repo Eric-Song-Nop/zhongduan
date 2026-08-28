@@ -500,8 +500,12 @@ generation，避免跨 attempt 拼接。
 - `observability/browser-recovery-latency` 是 Browser 本机事实切片：用独立 monotonic clock 记录 control/data
   socket RTT、input send-return 到 ACK、attach matching/timeout/cancelled 终点，以及 snapshot load-total、restore、
   buffer apply、adopt call 与最终 recovery outcome。事件只进入 256 条有界内存 ring，不写 console、storage 或网络；
-- Phase 0 gate 仍未关闭：Browser paint/E2E、生产 query/aggregation/dashboard，以及启用插桩后 input latency/
-  canonical throughput 不超过 5% 回归的 canary 必须由后续 stacked layer 补齐。Host/Browser relay RTT 都包含各自本地
+- `observability/cloud-telemetry-query` 是 Cloud 查询契约切片：严格解析 Workers Logs flattened wrapper 与 v1/v2
+  payload、固定每个版本的 producer sampling policy、执行前核验 exact key/type，并提供 Cloud-local report/smoke
+  与显式 saved-query provisioning；它不上传 Browser/Host 事实，也不把 Cloud smoke 冒充性能 canary；
+- Phase 0 gate 仍未关闭：Browser render/presentation 与 synthetic E2E、Browser/Host 生产 export/跨 runtime
+  aggregation，以及同一 exact build 下启用/关闭插桩时 input latency/canonical throughput 不超过 5% 回归的
+  ABBA canary 必须由后续 stacked layer 补齐。Host/Browser relay RTT 都包含各自本地
   event-loop/socket queue 与 Cloud auto-response，不能冒充纯网络 RTT；`written` 也不是 child/app effect ACK。
 
 - 保留 v2 pause/barrier/pinned commit correctness invariant；
@@ -633,9 +637,17 @@ hibernation 时丢失或重置，且不 backfill/replay。生产查询在 rollou
 纯网络 RTT，input ACK 不等于应用 effect，任何事件都不包含配对所用的 seq/epoch/generation 或输入内容。
 Browser ring 只驻内存且有硬上限，不进入 terminal snapshot、storage、console 或网络。
 
+Cloud 查询契约固定平台 service/log-type 与 Zhongduan wrapper filter，并在运行 query 前用 keys API 验证 exact
+direct key/type。Producer volume 使用 `SUM(sampleWeight)`；raw row count 只表示 stored/query rows。Percentile 只允许
+在一个固定 producer weight 的子群内计算，不能混合不同采样率的 success/failure。Cloudflare 返回的
+`sampleInterval` 与 `abr_level` 是 query quality signal；任一不为 1 时结果标为 approximate，不通过 hard gate，
+也不盲目二次乘 `sampleInterval`。Saved query 是 account-level state，只有显式 apply 才创建；同名漂移 fail closed，
+不自动覆盖或删除。真实 staging source/key shape 与非 approximate aggregate 仍必须在部署时验证。
+
 Phase 0c 没有移除每次 semantic input 上的 writer token SHA-256 和 SQLite lease renewal，Phase A correctness/hot
-path 仍未完成。Browser paint、跨节点 E2E/SLO、生产 query/aggregation/dashboard 和启用插桩后的 `<=5%`
-performance canary 仍是开放的 Phase 0 gate；这些观测切片也不改 wire、journal、snapshot、replay、SQLite
+path 仍未完成。Cloud-local query contract 也不等于跨 runtime dashboard。Browser render/presentation、synthetic
+E2E/SLO、Browser/Host export/aggregation 和 exact-build telemetry off/on 的 `<=5%` performance canary 仍是开放的
+Phase 0 gate；这些观测切片也不改 wire、journal、snapshot、replay、SQLite
 schema 或 WebSocket attachment。
 普通 directed recovery fanout 当前仍为 weight 1；先用本层事实量出实际体量，再在后续性能/简化 PR 对
 completed/stale/not-targeted outcome 做无偏 producer sampling，异常恢复转移继续保留，不在本 PR 猜测调参。

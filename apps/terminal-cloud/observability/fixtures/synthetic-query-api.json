@@ -1,0 +1,56 @@
+{
+  "fixtureVersion": 1,
+  "status": "synthetic-sanitized",
+  "sanitized": true,
+  "requiresStagingReplacement": true,
+  "keysResult": [
+    { "key": "$metadata.service", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "$metadata.type", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "type", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "runtime", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "schemaVersion", "lastSeenAt": 1787932800000, "type": "number" },
+    { "key": "name", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "sampleWeight", "lastSeenAt": 1787932800000, "type": "number" },
+    { "key": "lane", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "capacityReason", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "observedQueueWaitMs", "lastSeenAt": 1787932800000, "type": "number" },
+    { "key": "inputKind", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "leaseOutcome", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "status", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "path", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "outcome", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "reason", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "operation", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "mode", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "retryScope", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "transition", "lastSeenAt": 1787932800000, "type": "string" },
+    { "key": "observedIngressToSendDecisionMs", "lastSeenAt": 1787932800000, "type": "number" },
+    { "key": "observedIngressToFanoutDecisionMs", "lastSeenAt": 1787932800000, "type": "number" },
+    { "key": "observedLeaseOutcomeMs", "lastSeenAt": 1787932800000, "type": "number" },
+    { "key": "observedDurationMs", "lastSeenAt": 1787932800000, "type": "number" }
+  ],
+  "queryResult": {
+    "statistics": {
+      "bytes_read": 4096,
+      "elapsed": 0.01,
+      "rows_read": 64,
+      "abr_level": 1
+    },
+    "calculations": [
+      {
+        "calculation": "sum(sampleWeight)",
+        "alias": "weighted_v2_events",
+        "aggregates": [
+          {
+            "count": 1,
+            "interval": 1,
+            "sampleInterval": 1,
+            "value": 64,
+            "groups": []
+          }
+        ],
+        "series": []
+      }
+    ]
+  }
+}

@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   BrowserTelemetryEventSchema,
+  CLOUD_TELEMETRY_RECORD_TYPE,
+  CLOUD_TELEMETRY_RUNTIME,
+  CloudflareCloudTelemetryLogEventSchema,
+  CloudTelemetryProducerSamplePolicySchema,
   CloudTelemetryReadEventSchema,
+  CloudTelemetryReadLogRecordSchema,
   CloudTelemetryWriteEventSchema,
   TerminalTelemetryEventSchema,
   createBufferedTelemetrySink,
@@ -13,6 +18,43 @@ import {
   type TelemetrySink,
   type TerminalTelemetryEvent,
 } from "./index";
+
+const cloudRelayQueueEvent = {
+  schemaVersion: 2 as const,
+  monotonicAtMs: 30,
+  clockKind: "workers-io" as const,
+  sampleWeight: 64,
+  name: "cloud.relay.queue" as const,
+  lane: "host-data" as const,
+  queueProfile: "host-data" as const,
+  outcome: "completed" as const,
+  capacityReason: "not-applicable" as const,
+  observedAdmissionMs: 0,
+  observedQueueWaitMs: 4,
+  observedHandlingMs: 0,
+  frameBytesBucket: "1025-65536" as const,
+  globalQueuedBytesBucket: "65537+" as const,
+  socketQueuedBytesBucket: "65537+" as const,
+  globalQueuedCount: 8,
+  socketQueuedCount: 4,
+};
+
+const cloudInputForwardEvent = {
+  schemaVersion: 2 as const,
+  monotonicAtMs: 32,
+  clockKind: "workers-io" as const,
+  sampleWeight: 16,
+  name: "cloud.input.forward" as const,
+  inputKind: "key" as const,
+  leaseOutcome: "active" as const,
+  outcome: "send-returned" as const,
+  observedQueueWaitMs: 3,
+  observedIngressToLeaseDecisionMs: 4,
+  observedIngressToSendDecisionMs: 5,
+  frameBytesBucket: "65-1024" as const,
+  globalQueuedCount: 2,
+  socketQueuedCount: 1,
+};
 
 const cloudInputAckForwardEvent = {
   schemaVersion: 2 as const,
@@ -72,6 +114,73 @@ const cloudWriterLeaseRenewEvent = {
   outcome: "renewed-current" as const,
   observedLeaseOutcomeMs: 1,
 };
+
+const cloudRecoveryBarrierEvent = {
+  schemaVersion: 2 as const,
+  monotonicAtMs: 40,
+  clockKind: "workers-io" as const,
+  sampleWeight: 1,
+  name: "cloud.recovery.barrier" as const,
+  mode: "snapshot" as const,
+  outcome: "rejected" as const,
+  reason: "snapshot-missing" as const,
+  retryScope: "refresh-checkpoint" as const,
+  observedDurationMs: 1,
+};
+
+const cloudRecoveryAttachEvent = {
+  schemaVersion: 2 as const,
+  monotonicAtMs: 41,
+  clockKind: "workers-io" as const,
+  sampleWeight: 1,
+  name: "cloud.recovery.transition" as const,
+  transition: "attach" as const,
+  replica: "live" as const,
+  outcome: "host-request-send-returned" as const,
+  reason: "none" as const,
+  observedDurationMs: 2,
+};
+
+const cloudRecoveryResetEvent = {
+  schemaVersion: 2 as const,
+  monotonicAtMs: 42,
+  clockKind: "workers-io" as const,
+  sampleWeight: 1,
+  name: "cloud.recovery.transition" as const,
+  transition: "reset" as const,
+  trigger: "journal-gap" as const,
+  outcome: "issued" as const,
+  hostNotifyOutcome: "not-requested" as const,
+  observedDurationMs: 3,
+};
+
+const cloudV2ProducerEvents = [
+  cloudRelayQueueEvent,
+  cloudInputForwardEvent,
+  cloudInputAckForwardEvent,
+  cloudDataFanoutEvent,
+  cloudWriterLeaseAcquireEvent,
+  cloudWriterLeaseRenewEvent,
+  cloudRecoveryBarrierEvent,
+  cloudRecoveryAttachEvent,
+  cloudRecoveryResetEvent,
+] as const;
+
+const cloudV1ProducerEvents = [
+  { ...cloudRelayQueueEvent, schemaVersion: 1 as const },
+  { ...cloudInputForwardEvent, schemaVersion: 1 as const },
+  { ...cloudRecoveryBarrierEvent, schemaVersion: 1 as const },
+  { ...cloudRecoveryAttachEvent, schemaVersion: 1 as const },
+  { ...cloudRecoveryResetEvent, schemaVersion: 1 as const },
+] as const;
+
+function cloudTelemetryRecord(event: object) {
+  return {
+    type: CLOUD_TELEMETRY_RECORD_TYPE,
+    runtime: CLOUD_TELEMETRY_RUNTIME,
+    ...event,
+  };
+}
 
 describe("terminal telemetry", () => {
   it("accepts the privacy-safe recovery event shapes", () => {
@@ -526,6 +635,132 @@ describe("terminal telemetry", () => {
         schemaVersion: 1,
       }),
     ).toThrow();
+  });
+
+  it.each([...cloudV1ProducerEvents, ...cloudV2ProducerEvents])(
+    "strictly parses the wrapped Cloud producer record $schemaVersion/$name",
+    (event) => {
+      const record = cloudTelemetryRecord(event);
+      expect(CloudTelemetryReadLogRecordSchema.parse(record)).toEqual(record);
+      expect(CloudTelemetryProducerSamplePolicySchema.parse(event)).toEqual(event);
+    },
+  );
+
+  it("extracts only a strict record from a Cloudflare API event envelope", () => {
+    const record = cloudTelemetryRecord(cloudDataFanoutEvent);
+    const parsed = CloudflareCloudTelemetryLogEventSchema.parse({
+      source: record,
+      id: "platform-invocation-id",
+      url: "https://example.invalid/terminal/session-secret?ticket=one-time-secret",
+      metadata: {
+        durableObjectId: "platform-do-id",
+        request: { url: "https://example.invalid/also-sensitive" },
+      },
+    });
+
+    expect(parsed).toEqual(record);
+    expect(parsed).not.toHaveProperty("id");
+    expect(parsed).not.toHaveProperty("url");
+    expect(parsed).not.toHaveProperty("metadata");
+  });
+
+  it("rejects an invalid or missing Cloud telemetry log wrapper", () => {
+    const record = cloudTelemetryRecord(cloudInputForwardEvent);
+    for (const invalid of [
+      { ...record, type: "console.log" },
+      { ...record, runtime: "host-daemon" },
+      Object.fromEntries(Object.entries(record).filter(([key]) => key !== "type")),
+      Object.fromEntries(Object.entries(record).filter(([key]) => key !== "runtime")),
+    ]) {
+      expect(() => CloudTelemetryReadLogRecordSchema.parse(invalid)).toThrow();
+    }
+  });
+
+  it("never accepts a Phase 0c event as a legacy v1 wrapped record", () => {
+    for (const event of [
+      cloudInputAckForwardEvent,
+      cloudDataFanoutEvent,
+      cloudWriterLeaseAcquireEvent,
+      cloudWriterLeaseRenewEvent,
+    ]) {
+      expect(() =>
+        CloudTelemetryReadLogRecordSchema.parse(
+          cloudTelemetryRecord({ ...event, schemaVersion: 1 }),
+        ),
+      ).toThrow();
+    }
+  });
+
+  it.each([
+    "sessionId",
+    "clientId",
+    "connectionId",
+    "writerLease",
+    "leaseDigest",
+    "snapshotId",
+    "url",
+    "payload",
+    "text",
+    "error",
+  ])("rejects the extra wrapped-record identity/content field %s", (field) => {
+    expect(() =>
+      CloudTelemetryReadLogRecordSchema.parse({
+        ...cloudTelemetryRecord(cloudDataFanoutEvent),
+        [field]: "must-not-enter-query-output",
+      }),
+    ).toThrow();
+  });
+
+  it.each([
+    { ...cloudRelayQueueEvent, schemaVersion: 1 as const, sampleWeight: 16 },
+    { ...cloudInputForwardEvent, schemaVersion: 1 as const, sampleWeight: 1 },
+    { ...cloudRecoveryBarrierEvent, schemaVersion: 1 as const, sampleWeight: 16 },
+    { ...cloudRecoveryAttachEvent, schemaVersion: 1 as const, sampleWeight: 16 },
+    { ...cloudRelayQueueEvent, sampleWeight: 16 },
+    { ...cloudInputForwardEvent, sampleWeight: 1 },
+    { ...cloudInputAckForwardEvent, sampleWeight: 1 },
+    { ...cloudDataFanoutEvent, sampleWeight: 1 },
+    { ...cloudDataFanoutEvent, path: "directed" as const, sampleWeight: 64 },
+    { ...cloudWriterLeaseAcquireEvent, sampleWeight: 64 },
+    { ...cloudWriterLeaseRenewEvent, sampleWeight: 1 },
+    {
+      ...cloudWriterLeaseRenewEvent,
+      outcome: "renewed-stale" as const,
+      sampleWeight: 64,
+    },
+    { ...cloudRecoveryBarrierEvent, sampleWeight: 16 },
+    { ...cloudRecoveryResetEvent, sampleWeight: 16 },
+  ])("rejects the wrong producer sample policy for $schemaVersion/$name", (event) => {
+    expect(() => CloudTelemetryProducerSamplePolicySchema.parse(event)).toThrow();
+    expect(() => CloudTelemetryReadLogRecordSchema.parse(cloudTelemetryRecord(event))).toThrow();
+  });
+
+  it.each([
+    {
+      ...cloudRelayQueueEvent,
+      lane: "browser-control" as const,
+      queueProfile: "browser-control" as const,
+      sampleWeight: 16,
+    },
+    {
+      ...cloudRelayQueueEvent,
+      outcome: "failed" as const,
+      sampleWeight: 1,
+    },
+    {
+      ...cloudInputForwardEvent,
+      outcome: "lease-rejected" as const,
+      leaseOutcome: "inactive" as const,
+      sampleWeight: 1,
+    },
+    { ...cloudDataFanoutEvent, path: "directed" as const, sampleWeight: 1 },
+    {
+      ...cloudWriterLeaseRenewEvent,
+      outcome: "renewed-stale" as const,
+      sampleWeight: 1,
+    },
+  ])("accepts the outcome-specific v2 sample policy for $name", (event) => {
+    expect(CloudTelemetryProducerSamplePolicySchema.parse(event)).toEqual(event);
   });
 
   it("rejects impossible data fanout outcome and reason combinations", () => {
