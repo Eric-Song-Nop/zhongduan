@@ -9,7 +9,13 @@ import {
   type HostControlFrame,
   type RelayToHostControlFrame,
 } from "@zhongduan/protocol";
-import { elapsedMs, emitTelemetry, type TelemetrySink } from "@zhongduan/telemetry";
+import {
+  createBufferedTelemetrySink,
+  elapsedMs,
+  emitTelemetry,
+  type BufferedTelemetrySink,
+  type TelemetrySink,
+} from "@zhongduan/telemetry";
 
 import type {
   ReplayCursor,
@@ -93,6 +99,7 @@ export class HostDeliveryScheduler {
   readonly #snapshotCheckpointCache: SnapshotCheckpointCache;
   readonly #snapshotPublisher: SnapshotPublisherLike;
   readonly #telemetry: TelemetrySink | undefined;
+  readonly #telemetryBuffer: BufferedTelemetrySink | undefined;
   readonly #yieldIo: () => Promise<void>;
   readonly #coldPreparations = new Map<string, ColdPreparation>();
   readonly #recoveryQueue: DeliveryRecoveryQueue;
@@ -117,7 +124,9 @@ export class HostDeliveryScheduler {
     this.#snapshotCheckpointCache =
       options.snapshotCheckpointCache ?? new SnapshotCheckpointCache();
     this.#snapshotPublisher = options.snapshotPublisher;
-    this.#telemetry = options.telemetry;
+    this.#telemetryBuffer =
+      options.telemetry === undefined ? undefined : createBufferedTelemetrySink(options.telemetry);
+    this.#telemetry = this.#telemetryBuffer?.sink;
     this.#yieldIo = options.yieldIo ?? (() => new Promise((resolve) => setImmediate(resolve)));
     this.#recoveryQueue = new DeliveryRecoveryQueue({
       maxQuietWaitMs: SNAPSHOT_RECOVERY_MAX_QUIET_WAIT_MS,
@@ -813,9 +822,11 @@ export class HostDeliveryScheduler {
 
   #resumeCanonical(): void {
     this.#canonicalPublisher.resume();
+    this.#telemetryBuffer?.resume();
   }
 
   async #pauseCanonical(): Promise<void> {
+    this.#telemetryBuffer?.pause();
     await this.#canonicalPublisher.pause();
   }
 

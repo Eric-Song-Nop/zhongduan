@@ -86,6 +86,20 @@ export type TerminalTelemetryEvent = z.output<typeof TerminalTelemetryEventSchem
 export type TelemetrySink = (event: TerminalTelemetryEvent) => void;
 export type MonotonicClock = () => number;
 
+export interface BufferedTelemetrySink {
+  readonly droppedEvents: number;
+  readonly pendingEvents: number;
+  readonly sink: TelemetrySink;
+  flush(): Promise<void>;
+  pause(): void;
+  resume(): void;
+}
+
+export interface BufferedTelemetrySinkOptions {
+  maxPendingEvents?: number;
+  schedule?: (task: () => void) => void;
+}
+
 export const noopTelemetrySink: TelemetrySink = () => undefined;
 
 export function elapsedMs(startedAt: number, finishedAt: number): number {
@@ -102,4 +116,92 @@ export function emitTelemetry(
   } catch {
     // Telemetry is observational and must never alter terminal authority or recovery.
   }
+}
+
+export function createBufferedTelemetrySink(
+  target: TelemetrySink,
+  options: BufferedTelemetrySinkOptions = {},
+): BufferedTelemetrySink {
+  const maxPendingEvents = options.maxPendingEvents ?? 256;
+  if (!Number.isSafeInteger(maxPendingEvents) || maxPendingEvents <= 0) {
+    throw new RangeError("maxPendingEvents must be a positive safe integer");
+  }
+  const schedule = options.schedule ?? queueMicrotask;
+  const queue: TerminalTelemetryEvent[] = [];
+  const flushWaiters: Array<() => void> = [];
+  let droppedEvents = 0;
+  let paused = false;
+  let scheduled = false;
+
+  const settleFlush = () => {
+    if (scheduled || queue.length > 0) return;
+    for (const resolve of flushWaiters.splice(0)) resolve();
+  };
+  const dropQueue = () => {
+    droppedEvents += queue.length;
+    queue.length = 0;
+    settleFlush();
+  };
+  const scheduleNext = () => {
+    if (paused || scheduled || queue.length === 0) return;
+    scheduled = true;
+    try {
+      schedule(() => {
+        scheduled = false;
+        if (paused) return;
+        const event = queue.shift();
+        if (event !== undefined) {
+          try {
+            const result = (target as (sample: TerminalTelemetryEvent) => unknown)(event);
+            if (isPromiseLike(result)) void Promise.resolve(result).catch(() => undefined);
+          } catch {
+            // A collector failure only drops this diagnostic event.
+          }
+        }
+        if (queue.length > 0) scheduleNext();
+        else settleFlush();
+      });
+    } catch {
+      scheduled = false;
+      dropQueue();
+    }
+  };
+  const sink: TelemetrySink = (event) => {
+    if (queue.length >= maxPendingEvents) {
+      droppedEvents += 1;
+      return;
+    }
+    queue.push({ ...event });
+    scheduleNext();
+  };
+
+  return {
+    get droppedEvents() {
+      return droppedEvents;
+    },
+    get pendingEvents() {
+      return queue.length;
+    },
+    sink,
+    flush() {
+      if (!scheduled && queue.length === 0) return Promise.resolve();
+      return new Promise((resolve) => flushWaiters.push(resolve));
+    },
+    pause() {
+      paused = true;
+    },
+    resume() {
+      if (!paused) return;
+      paused = false;
+      scheduleNext();
+      settleFlush();
+    },
+  };
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    ((typeof value === "object" && value !== null) || typeof value === "function") &&
+    "then" in value
+  );
 }

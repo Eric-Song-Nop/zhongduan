@@ -621,7 +621,10 @@ describe("HostDeliveryScheduler", () => {
       (event) => events.push(event),
       monotonicNow,
     );
-    harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
+    harness.setBarrierResponder((encoded) => {
+      expect(events.some((event) => event.name === "host.journal.range")).toBe(false);
+      answerBarrier(harness, encoded);
+    });
     activate(harness);
     harness.pty.emit(Uint8Array.of(0x41));
 

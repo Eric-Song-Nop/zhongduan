@@ -129,9 +129,7 @@ export async function runCloud(argv: string[]): Promise<number> {
   let telemetry: ReturnType<typeof telemetrySinkForTarget>;
   try {
     parsed = parseCloudArguments(argv);
-    telemetry = telemetrySinkForTarget(process.env.ZHONGDUAN_TELEMETRY, (line) => {
-      process.stderr.write(line);
-    });
+    telemetry = telemetrySinkForTarget(process.env.ZHONGDUAN_TELEMETRY, process.stderr);
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     return 2;

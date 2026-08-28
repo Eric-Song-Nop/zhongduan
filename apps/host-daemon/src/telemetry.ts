@@ -2,12 +2,42 @@ import { TerminalTelemetryEventSchema, type TelemetrySink } from "@zhongduan/tel
 
 export const HOST_TELEMETRY_ENV = "ZHONGDUAN_TELEMETRY";
 
-export function createNdjsonTelemetrySink(writeLine: (line: string) => void): TelemetrySink {
+export interface TelemetryLineWriter {
+  once(event: "drain" | "error", listener: () => void): unknown;
+  write(line: string): boolean;
+}
+
+export function createNdjsonTelemetrySink(writer: TelemetryLineWriter): TelemetrySink {
+  let failed = false;
+  let writable = true;
+  try {
+    writer.once("error", () => {
+      failed = true;
+      writable = false;
+    });
+  } catch {
+    failed = true;
+    writable = false;
+  }
   return (event) => {
+    if (!writable) return;
+    let line: string;
     try {
       const parsed = TerminalTelemetryEventSchema.parse(event);
-      writeLine(`${JSON.stringify({ type: "zhongduan.telemetry", ...parsed })}\n`);
+      line = `${JSON.stringify({ type: "zhongduan.telemetry", ...parsed })}\n`;
     } catch {
+      return;
+    }
+    try {
+      if (!writer.write(line)) {
+        writable = false;
+        writer.once("drain", () => {
+          if (!failed) writable = true;
+        });
+      }
+    } catch {
+      failed = true;
+      writable = false;
       // Diagnostics must never alter terminal authority, recovery, or process lifetime.
     }
   };
@@ -15,9 +45,9 @@ export function createNdjsonTelemetrySink(writeLine: (line: string) => void): Te
 
 export function telemetrySinkForTarget(
   target: string | undefined,
-  writeLine: (line: string) => void,
+  writer: TelemetryLineWriter,
 ): TelemetrySink | undefined {
   if (target === undefined || target.length === 0) return undefined;
-  if (target === "stderr") return createNdjsonTelemetrySink(writeLine);
+  if (target === "stderr") return createNdjsonTelemetrySink(writer);
   throw new Error(`${HOST_TELEMETRY_ENV} must be unset or "stderr"`);
 }
