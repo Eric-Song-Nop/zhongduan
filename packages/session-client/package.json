@@ -1,0 +1,13 @@
+{
+  "name": "@zhongduan/session-client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@zhongduan/protocol": "workspace:*",
+    "fzstd": "0.1.1"
+  }
+}
