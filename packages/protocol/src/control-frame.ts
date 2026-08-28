@@ -12,6 +12,9 @@ const dimensions = {
   heightPx: z.number().int().min(0).max(1_000_000),
 };
 const MAX_PASTE_BYTES = 1024 * 1024;
+const MAX_TEXT_BYTES = 1024 * 1024;
+const MAX_SURFACE_COORDINATE = 1_000_000;
+const MAX_WHEEL_DELTA = 1_000_000;
 const textEncoder = new TextEncoder();
 const inputIdentity = {
   writerLease: id,
@@ -24,6 +27,17 @@ const unicodeScalar = z
   .min(0)
   .max(0x10ffff)
   .refine((value) => value < 0xd800 || value > 0xdfff, "must be a Unicode scalar value");
+
+function boundedUtf8String(maximumBytes: number, label: string) {
+  return z
+    .string()
+    .max(maximumBytes)
+    .superRefine((value, context) => {
+      if (value.length <= maximumBytes && textEncoder.encode(value).byteLength > maximumBytes) {
+        context.addIssue({ code: "custom", message: `${label} exceeds UTF-8 byte limit` });
+      }
+    });
+}
 
 const attachBase = {
   type: z.literal("attach"),
@@ -78,18 +92,59 @@ const key = z
 const paste = z.strictObject({
   type: z.literal("paste"),
   ...inputIdentity,
-  data: z
-    .string()
-    .max(MAX_PASTE_BYTES)
-    .superRefine((value, context) => {
-      if (
-        value.length <= MAX_PASTE_BYTES &&
-        textEncoder.encode(value).byteLength > MAX_PASTE_BYTES
-      ) {
-        context.addIssue({ code: "custom", message: "paste exceeds UTF-8 byte limit" });
-      }
-    }),
+  data: boundedUtf8String(MAX_PASTE_BYTES, "paste"),
 });
+
+const text = z.strictObject({
+  type: z.literal("text"),
+  ...inputIdentity,
+  data: boundedUtf8String(MAX_TEXT_BYTES, "text"),
+});
+
+const focus = z.strictObject({
+  type: z.literal("focus"),
+  ...inputIdentity,
+  focused: z.boolean(),
+});
+
+const mouseBase = {
+  type: z.literal("mouse"),
+  ...inputIdentity,
+  buttons: z.number().int().min(0).max(31),
+  modifiers: z.number().int().min(0).max(0x3f),
+  altGraph: z.boolean(),
+  surface: z.strictObject({
+    x: z.number().int().min(0).max(MAX_SURFACE_COORDINATE),
+    y: z.number().int().min(0).max(MAX_SURFACE_COORDINATE),
+  }),
+};
+const mouseButton = z.discriminatedUnion("action", [
+  z.strictObject({
+    ...mouseBase,
+    action: z.literal("press"),
+    button: z.number().int().min(0).max(4),
+  }),
+  z.strictObject({
+    ...mouseBase,
+    action: z.literal("release"),
+    button: z.number().int().min(0).max(4),
+  }),
+  z.strictObject({ ...mouseBase, action: z.literal("move"), button: z.null() }),
+]);
+const wheelDelta = z.number().finite().min(-MAX_WHEEL_DELTA).max(MAX_WHEEL_DELTA).optional();
+const mouseWheel = z
+  .strictObject({
+    ...mouseBase,
+    action: z.literal("wheel"),
+    button: z.null(),
+    deltaX: wheelDelta,
+    deltaY: wheelDelta,
+    deltaMode: z.enum(["pixel", "line", "page"]),
+  })
+  .refine((frame) => (frame.deltaX ?? 0) !== 0 || (frame.deltaY ?? 0) !== 0, {
+    message: "wheel input requires a non-zero delta",
+  });
+const mouse = z.union([mouseButton, mouseWheel]);
 
 const resizeRequest = z.strictObject({
   type: z.literal("resize-request"),
@@ -97,7 +152,16 @@ const resizeRequest = z.strictObject({
   ...dimensions,
 });
 
-export const ClientControlFrameSchema = z.union([attach, ack, key, paste, resizeRequest]);
+export const ClientControlFrameSchema = z.union([
+  attach,
+  ack,
+  key,
+  text,
+  paste,
+  focus,
+  mouse,
+  resizeRequest,
+]);
 
 export type ClientControlFrame = z.infer<typeof ClientControlFrameSchema>;
 
@@ -235,7 +299,13 @@ const attachRequest = z.discriminatedUnion("hasLiveReplica", [
 
 const verifiedClient = { connectionId: id, clientId: id };
 const forwardedKey = key.safeExtend(verifiedClient);
+const forwardedText = text.extend(verifiedClient);
 const forwardedPaste = paste.extend(verifiedClient);
+const forwardedFocus = focus.extend(verifiedClient);
+const forwardedMouse = z.union([
+  ...mouseButton.options.map((option) => option.extend(verifiedClient)),
+  mouseWheel.safeExtend(verifiedClient),
+]);
 const forwardedResize = resizeRequest.extend(verifiedClient);
 const deliveryReset = z.strictObject({
   type: z.literal("delivery-reset"),
@@ -276,7 +346,10 @@ export const RelayToHostControlFrameSchema = z.union([
   deliveryBarrierResult,
   attachRequest,
   forwardedKey,
+  forwardedText,
   forwardedPaste,
+  forwardedFocus,
+  forwardedMouse,
   forwardedResize,
   deliveryReset,
 ]);

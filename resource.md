@@ -102,11 +102,13 @@ type ServerFrame =
       widthPx: number;
       heightPx: number;
     })
-  | (Common & {
+  | {
       type: "input-ack";
+      inputEpoch: string;
       clientInputSeq: U64;
       status: "written" | "duplicate" | "rejected" | "uncertain";
-    })
+      authorityEventSeq: U64;
+    }
   | (Common & {
       type: "resync-required";
       reason:
@@ -155,11 +157,40 @@ type ClientFrame =
       unshiftedCodepoint?: number;
     }
   | {
+      type: "text";
+      writerLease: string;
+      inputEpoch: string;
+      clientInputSeq: U64;
+      data: string;
+    }
+  | {
       type: "paste";
       writerLease: string;
       inputEpoch: string;
       clientInputSeq: U64;
-      data: Uint8Array;
+      data: string;
+    }
+  | {
+      type: "focus";
+      writerLease: string;
+      inputEpoch: string;
+      clientInputSeq: U64;
+      focused: boolean;
+    }
+  | {
+      type: "mouse";
+      writerLease: string;
+      inputEpoch: string;
+      clientInputSeq: U64;
+      action: "press" | "release" | "move" | "wheel";
+      button: 0 | 1 | 2 | 3 | 4 | null;
+      buttons: number;
+      modifiers: number;
+      altGraph: boolean;
+      surface: { x: number; y: number };
+      deltaX?: number;
+      deltaY?: number;
+      deltaMode?: "pixel" | "line" | "page";
     }
   | {
       type: "resize-request";
@@ -191,7 +222,9 @@ Shift=1, Control=2, Alt=4, Super=8, CapsLock=16, NumLock=32
 `unshiftedCodepoint` 如果存在，必须是 Unicode scalar，不能落在 surrogate 区间。
 两个 modifier 字段只能使用 `0x3f` 内的位，并且 `consumedModifiers` 必须是 `modifiers` 的子集；AltGraph 合成出的 Ctrl/Alt 不应伪装成真实 modifier。
 
-`ack` 只表示该 delivery generation 的 frame 已可靠到达，用于 512 KiB credit 计算，不代表 libghostty 已应用。ACK cursor 只保存在当前 data WebSocket 的 hibernation attachment 中，不写入 SQL，也不作为下一 connection set 的单调下界；full reconnect 必须以新 `attach` 的 live replica cursor 重新建立 credit baseline。Host 重连或浏览器 data 断线时，DO 会 bump generation、关闭旧 data、签发同一 connection set 的 30 秒单次 data ticket，并发送一个 `resync-required`。浏览器建立新 data 后，必须从当前 active replica 读取 cursor 并重新 `attach`；DO 不缓存 cursor 来自动 replay，从而消除“frame 已 apply、progress 尚未上报”的重复应用窗口。
+`text.data` 与 `paste.data` 是 UTF-8 文本，分别最多 1 MiB；上限按编码后的 UTF-8 byte length 计算，不能按 JavaScript UTF-16 `length` 计算。`focus.focused` 只表达浏览器焦点状态。mouse 的 `buttons` 限于 `0..31`，`modifiers` 限于 `0x3f`，`surface.{x,y}` 是不超过 `1_000_000` 的非负整数 CSS px。press/release 的 `button` 必须为 `0..4`，move/wheel 必须为 `null`；wheel 至少携带一个有限、非零且绝对值不超过 `1_000_000` 的 delta，并必须携带 `deltaMode`，非 wheel 禁止携带 delta。cell、viewport 和 surface width/height 只作为 WTerm DOM adapter 的本地提示，不进入 wire；Host 只信自己的权威 geometry。Relay 不把这些输入编码成终端 bytes，只在现有 writer lease/input fence 验证后注入 `{connectionId, clientId}` 并转发给 Host。
+
+`ack` 只表示该 delivery generation 的 frame 已可靠到达，不代表 libghostty 已应用。共享 credit 公式固定为 `(sentPtyOffset - ackedPtyOffset) + (sentEventSeq - ackedEventSeq) * 64`，上限为 512 KiB；Cloud 和 Host scheduler 必须复用 protocol package 的同一常量与公式。ACK cursor 只保存在当前 data WebSocket 的 hibernation attachment 中，不写入 SQL，也不作为下一 connection set 的单调下界；full reconnect 必须以新 `attach` 的 live replica cursor 重新建立 credit baseline。Host 重连或浏览器 data 断线时，DO 会 bump generation、关闭旧 data、签发同一 connection set 的 30 秒单次 data ticket，并发送一个 `resync-required`。浏览器建立新 data 后，必须从当前 active replica 读取 cursor 并重新 `attach`；DO 不缓存 cursor 来自动 replay，从而消除“frame 已 apply、progress 尚未上报”的重复应用窗口。
 
 每个 delivery generation 只允许一次 `attach`，且只允许 `awaiting-attach -> active`。重复 attach 不得重写 baseline 或 snapshot pin，只隔离该 browser connection set；writer lease 的重新获取不能借重复 attach 偷渡。`welcome` 只确认身份、generation 和 session head，本身不启动 directed delivery。
 
@@ -199,7 +232,7 @@ Shift=1, Control=2, Alt=4, Super=8, CapsLock=16, NumLock=32
 
 barrier 接受后，directed mutation 的上界和 `ReplayCommit` 的精确终点都使用 attachment 中不可变的 pinned commit，不再读取会继续变化的 session head。barrier 到 commit 之间出现 canonical frame、commit 不等于 pin、或当前 generation 的 delivery 被另一 barrier 冲突覆盖，都是 Host data 顺序违约并 fail closed。MVP 不接受 Host 发来的 directed `Reset`；合法 reset 只能走 DO 的 generation bump、关闭旧 data、签发 replacement ticket、control `resync-required` 这一条显式路径。
 
-connection set 遵循 `reserved -> control-open/data-open -> paired -> ready -> replaced/closed`。每次转换都同时校验 `{peer, connectionSetId, connectionId, hostFence | (clientId, deliveryGeneration)}`。未消费 reservation 与已注册 browser identity 共用 16-client 原子 quota；同一 browser identity 或 Host subject 最多保留一个 pending set，新签会撤销旧票。quota 满时只按 LRU 回收同时满足“无 open/hibernating socket、无 pending ticket、无有效 writer lease”的断连 identity。这样“只签票不连 WS”和“批量签完再消费”都不能绕过限额，也不会把 16 变成 session 终身 clientId 上限。
+connection set 遵循 `reserved -> control-open/data-open -> paired -> ready -> replaced/closed`。reservation 必须先冻结 activation：未注册 client 使用当前 generation，已注册 client 使用 `current + 1`；HTTP 响应、control ticket 与 data ticket 都直接携带这一相同值。control claim 只允许以预留值执行 CAS 激活，不得在 WebSocket open 时重新选择 generation；data ticket 自身不能激活 client，且必须等待同 connection set 的 control。相同 browser identity 的新 pending set 会撤销旧票，但在旧 set 尚未 claim 时复用相同 activation。每次转换都同时校验 `{peer, connectionSetId, connectionId, hostFence | (clientId, deliveryGeneration)}`。未消费 reservation 与已注册 browser identity 共用 16-client 原子 quota；同一 browser identity 或 Host subject 最多保留一个 pending set，新签会撤销旧票。quota 满时只按 LRU 回收同时满足“无 open/hibernating socket、无 pending ticket、无有效 writer lease”的断连 identity。这样“只签票不连 WS”和“批量签完再消费”都不能绕过限额，也不会把 16 变成 session 终身 clientId 上限。
 
 Hibernation socket 的 Error 事件直接执行同一套 fenced close lifecycle，不能假设 workerd 随后还会派发 Close。Host data error 会使当前 pair 下线；browser data error 会 bump generation 并签发 replacement ticket。后到的 Close 只会命中已推进的 fence/generation 并被幂等忽略。
 
@@ -250,6 +283,36 @@ GET /api/v1/sessions/:sessionId/snapshots/:snapshotId
 ```
 
 Worker 先从 DO 读取已发布 pointer，再从 R2 读取 object。version、etag、size、checksum、HTTP metadata 或 custom metadata 任一不匹配时，先 cancel R2 body，再返回 503；绝不能返回部分对象。成功响应把 R2 `ReadableStream` 直接返回，并固定 `Cache-Control: private, no-store` 与 `X-Content-Type-Options: nosniff`。
+
+Capability 是 session-scoped HMAC bearer，不引入 IdP。Host capability 默认 24 小时，writer/observer 默认 8 小时；share URL 可以自然过期，但活跃 Host/Browser 应在 capability 半寿命附近加入 jitter 主动刷新：
+
+```http
+POST /api/v1/sessions/:sessionId/capabilities
+Authorization: Bearer <host capability>
+Content-Type: application/json
+
+{ "role": "writer" | "observer" }
+
+POST /api/v1/sessions/:sessionId/capabilities/refresh
+Authorization: Bearer <still-valid host | writer | observer capability>
+Content-Type: application/json
+
+{}
+```
+
+mint 只接受 Host bearer，subject 必须由服务端生成，浏览器不能指定 subject 或签发其他 capability。refresh 必须保持原来的 `{sessionId, role, subject}`，只生成新的 `tokenId`、`issuedAt` 和 `expiresAt`；过期、伪造、跨 session 的 token 都不能 refresh，也不能通过 body 改 role。统一响应为 `{ capability, expiresAt, role }`，其中 `expiresAt` 是 Unix epoch seconds。Host 可以用有效 Host capability 随时生成新的短期分享链接。
+
+Host sleep 超过 24 小时后只允许 bootstrap project token 恢复 Host authority：
+
+```http
+POST /api/v1/sessions/:sessionId/capabilities/host/reclaim
+Authorization: Bearer <bootstrap project token>
+Content-Type: application/json
+
+{ "engineId": string, "sessionEpoch": U64 }
+```
+
+Worker 必须向对应 DO 只读校验已存在 session 的 `{sessionId, engineId, sessionEpoch}` 精确相等后，签发新的 Host capability；这个 endpoint 不创建 session、不接受 browser capability，也不返回实际 session identity。capability 和 bootstrap secret 不进入日志。
 
 Warm replay 与 snapshot recovery 共用同一个 data-plane barrier。Host 暂停新的 canonical frame，把 marker 排在此前 canonical 之后，并在同一 Host data WebSocket 发送：
 

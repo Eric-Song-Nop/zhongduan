@@ -233,6 +233,7 @@ describe("cloud relay runtime", () => {
       session.writerCapability,
       first.clientId ?? undefined,
     );
+    expect(second.deliveryGeneration).toBe("2");
     const secondControl = await upgrade(session.sessionId, "control", second.controlTicket);
     expect(secondControl.response.status).toBe(101);
 
@@ -244,6 +245,96 @@ describe("cloud relay runtime", () => {
 
     secondControl.socket?.close(1000, "test complete");
     currentData.socket?.close(1000, "test complete");
+  });
+
+  it("freezes one activation across each reserved browser connection set", async () => {
+    const session = await createSession();
+    const first = await createConnectionSet(session.sessionId, session.writerCapability);
+    expect(first.deliveryGeneration).toBe("1");
+
+    const replacedPending = await createConnectionSet(
+      session.sessionId,
+      session.writerCapability,
+      first.clientId ?? undefined,
+    );
+    expect(replacedPending.deliveryGeneration).toBe("1");
+    expect((await upgrade(session.sessionId, "control", first.controlTicket)).response.status).toBe(
+      401,
+    );
+
+    const firstControl = await upgrade(session.sessionId, "control", replacedPending.controlTicket);
+    const firstData = await upgrade(session.sessionId, "data", replacedPending.dataTicket);
+    expect(firstControl.response.status).toBe(101);
+    expect(firstData.response.status).toBe(101);
+
+    const staleReplacement = await createConnectionSet(
+      session.sessionId,
+      session.writerCapability,
+      first.clientId ?? undefined,
+    );
+    const currentReplacement = await createConnectionSet(
+      session.sessionId,
+      session.writerCapability,
+      first.clientId ?? undefined,
+    );
+    expect(staleReplacement.deliveryGeneration).toBe("2");
+    expect(currentReplacement.deliveryGeneration).toBe("2");
+
+    const ticketGenerations = await runInDurableObject(
+      env.TERMINAL_SESSIONS.get(env.TERMINAL_SESSIONS.idFromName(`v1:${session.sessionId}`)),
+      (_instance, state) =>
+        state.storage.sql
+          .exec(
+            `SELECT channel, delivery_generation
+             FROM connection_ticket
+             WHERE connection_set_id = ?
+             ORDER BY channel`,
+            currentReplacement.connectionSetId,
+          )
+          .toArray() as unknown as Array<{ channel: string; delivery_generation: string }>,
+    );
+    expect(ticketGenerations).toEqual([
+      { channel: "control", delivery_generation: "2" },
+      { channel: "data", delivery_generation: "2" },
+    ]);
+
+    expect(
+      (await upgrade(session.sessionId, "control", staleReplacement.controlTicket)).response.status,
+    ).toBe(401);
+    expect(
+      (await upgrade(session.sessionId, "data", staleReplacement.dataTicket)).response.status,
+    ).toBe(401);
+    expect(
+      (await upgrade(session.sessionId, "data", currentReplacement.dataTicket)).response.status,
+    ).toBe(409);
+
+    const replacementControl = await upgrade(
+      session.sessionId,
+      "control",
+      currentReplacement.controlTicket,
+    );
+    const replacementData = await upgrade(session.sessionId, "data", currentReplacement.dataTicket);
+    expect(replacementControl.response.status).toBe(101);
+    expect(replacementData.response.status).toBe(101);
+    await drainSession(session.sessionId);
+    expect(firstControl.socket?.readyState).not.toBe(WebSocket.OPEN);
+    expect(firstData.socket?.readyState).not.toBe(WebSocket.OPEN);
+
+    const activated = await runInDurableObject(
+      env.TERMINAL_SESSIONS.get(env.TERMINAL_SESSIONS.idFromName(`v1:${session.sessionId}`)),
+      (_instance, state) =>
+        state.storage.sql
+          .exec(
+            "SELECT delivery_generation, registered_at FROM client_delivery WHERE client_id = ?",
+            first.clientId,
+          )
+          .one(),
+    );
+    expect(activated).toMatchObject({ delivery_generation: "2" });
+    expect(activated.registered_at).not.toBeNull();
+
+    replacementControl.socket?.close(1000, "test complete");
+    replacementData.socket?.close(1000, "test complete");
   });
 
   it("shares one atomic quota between pending reservations and registered clients", async () => {

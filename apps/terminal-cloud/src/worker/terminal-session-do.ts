@@ -1,8 +1,10 @@
 import {
   ClientControlFrameSchema,
+  ConnectionSetResponseSchema,
   DATA_HEADER_BYTES,
   DataFrameKind,
   HostControlFrameSchema,
+  HostCapabilityReclaimRequestSchema,
   MAX_U64,
   PositiveDecimalU64Schema,
   RelayToHostControlFrameSchema,
@@ -57,6 +59,10 @@ const InitializeSessionSchema = z.strictObject({
   sessionId: identifier,
   sessionEpoch: PositiveDecimalU64Schema,
   engineId,
+});
+
+const VerifySessionIdentitySchema = HostCapabilityReclaimRequestSchema.extend({
+  sessionId: identifier,
 });
 
 const CreateConnectionSetSchema = z.strictObject({
@@ -191,6 +197,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/internal/initialize") {
       return this.initializeSession(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/session-identity/verify") {
+      return this.verifySessionIdentity(request);
     }
     if (request.method === "POST" && url.pathname === "/internal/connection-sets") {
       return this.createConnectionSet(request);
@@ -437,6 +446,22 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     return json({ created: true }, 201);
   }
 
+  private async verifySessionIdentity(request: Request): Promise<Response> {
+    const parsed = VerifySessionIdentitySchema.safeParse(await parseJson(request));
+    if (!parsed.success) return json({ error: "invalid-session-identity" }, 400);
+    const session = this.session();
+    if (session === undefined || session.session_id !== parsed.data.sessionId) {
+      return json({ error: "session-not-found" }, 404);
+    }
+    if (
+      session.engine_id !== parsed.data.engineId ||
+      session.session_epoch !== parsed.data.sessionEpoch
+    ) {
+      return json({ error: "session-identity-mismatch" }, 409);
+    }
+    return json({ matches: true });
+  }
+
   private async finalizeSnapshot(request: Request): Promise<Response> {
     const parsed = FinalizedSnapshotSchema.safeParse(await parseJson(request));
     if (!parsed.success) return json({ error: "invalid-snapshot" }, 400);
@@ -504,16 +529,18 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
     const client = reservation.client;
 
-    return json({
-      connectionSetId,
-      connectionId,
-      clientId: requestedClientId,
-      streamId: client?.stream_id ?? 0,
-      deliveryGeneration: client?.delivery_generation ?? "0",
-      expiresAt,
-      controlTicket,
-      dataTicket,
-    });
+    return json(
+      ConnectionSetResponseSchema.parse({
+        connectionSetId,
+        connectionId,
+        clientId: requestedClientId,
+        streamId: client?.stream_id ?? 0,
+        deliveryGeneration: reservation.deliveryGeneration,
+        expiresAt,
+        controlTicket,
+        dataTicket,
+      }),
+    );
   }
 
   private async acceptSocket(request: Request, channel: Channel): Promise<Response> {

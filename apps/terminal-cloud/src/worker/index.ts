@@ -1,14 +1,7 @@
-import { PositiveDecimalU64Schema } from "@zhongduan/protocol";
+import { ConnectionSetRequestSchema, PositiveDecimalU64Schema } from "@zhongduan/protocol";
 import { z } from "zod";
-import {
-  AuthError,
-  issueCapability,
-  randomId,
-  secretsEqual,
-  verifyBearerCapability,
-  type CapabilityClaims,
-  type CapabilityRole,
-} from "./auth";
+import { AuthError, randomId, secretsEqual, verifyBearerCapability } from "./auth";
+import { handleCapabilityRequest, issueSessionCapability } from "./capability-http";
 import type { CloudEnv } from "./env";
 import { handleSnapshotRequest } from "./snapshot-http";
 
@@ -27,21 +20,20 @@ const SnapshotRoute = new RegExp(
   `^/api/v1/sessions/(${sessionIdPattern})/snapshots/(${sessionIdPattern})$`,
   "u",
 );
+const CapabilityRoute = new RegExp(`^/api/v1/sessions/(${sessionIdPattern})/capabilities$`, "u");
+const CapabilityRefreshRoute = new RegExp(
+  `^/api/v1/sessions/(${sessionIdPattern})/capabilities/refresh$`,
+  "u",
+);
+const HostCapabilityReclaimRoute = new RegExp(
+  `^/api/v1/sessions/(${sessionIdPattern})/capabilities/host/reclaim$`,
+  "u",
+);
 
 const CreateSessionSchema = z.strictObject({
   engineId: z.string().min(1).max(512),
   sessionEpoch: PositiveDecimalU64Schema,
 });
-
-const ConnectionSetRequestSchema = z.strictObject({
-  clientId: z
-    .string()
-    .regex(/^[A-Za-z0-9_-]{16,128}$/)
-    .optional(),
-});
-
-const HOST_CAPABILITY_SECONDS = 24 * 60 * 60;
-const BROWSER_CAPABILITY_SECONDS = 8 * 60 * 60;
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, {
@@ -65,25 +57,6 @@ function bearerToken(request: Request): string | undefined {
 
 function sessionStub(env: CloudEnv, sessionId: string) {
   return env.TERMINAL_SESSIONS.get(env.TERMINAL_SESSIONS.idFromName(`v1:${sessionId}`));
-}
-
-async function capabilityFor(
-  env: CloudEnv,
-  sessionId: string,
-  role: CapabilityRole,
-  lifetimeSeconds: number,
-): Promise<string> {
-  const issuedAt = Math.floor(Date.now() / 1000);
-  const claims: CapabilityClaims = {
-    version: 1,
-    sessionId,
-    subject: randomId(),
-    role,
-    issuedAt,
-    expiresAt: issuedAt + lifetimeSeconds,
-    tokenId: randomId(),
-  };
-  return issueCapability(claims, env.CAPABILITY_SIGNING_KEY);
 }
 
 async function createSession(request: Request, env: CloudEnv): Promise<Response> {
@@ -110,18 +83,18 @@ async function createSession(request: Request, env: CloudEnv): Promise<Response>
   }
 
   const [hostCapability, writerCapability, observerCapability] = await Promise.all([
-    capabilityFor(env, sessionId, "host", HOST_CAPABILITY_SECONDS),
-    capabilityFor(env, sessionId, "writer", BROWSER_CAPABILITY_SECONDS),
-    capabilityFor(env, sessionId, "observer", BROWSER_CAPABILITY_SECONDS),
+    issueSessionCapability(env.CAPABILITY_SIGNING_KEY, sessionId, "host"),
+    issueSessionCapability(env.CAPABILITY_SIGNING_KEY, sessionId, "writer"),
+    issueSessionCapability(env.CAPABILITY_SIGNING_KEY, sessionId, "observer"),
   ]);
   return json(
     {
       sessionId,
       engineId: input.data.engineId,
       sessionEpoch: input.data.sessionEpoch,
-      hostCapability,
-      writerCapability,
-      observerCapability,
+      hostCapability: hostCapability.capability,
+      writerCapability: writerCapability.capability,
+      observerCapability: observerCapability.capability,
     },
     201,
   );
@@ -188,6 +161,21 @@ async function fetch(request: Request, env: CloudEnv): Promise<Response> {
   const connectionSetMatch = ConnectionSetRoute.exec(url.pathname);
   if (request.method === "POST" && connectionSetMatch !== null) {
     return createConnectionSet(request, env, connectionSetMatch[1]!);
+  }
+
+  const capabilityMatch = CapabilityRoute.exec(url.pathname);
+  if (request.method === "POST" && capabilityMatch !== null) {
+    return handleCapabilityRequest(request, env, capabilityMatch[1]!, "mint");
+  }
+
+  const capabilityRefreshMatch = CapabilityRefreshRoute.exec(url.pathname);
+  if (request.method === "POST" && capabilityRefreshMatch !== null) {
+    return handleCapabilityRequest(request, env, capabilityRefreshMatch[1]!, "refresh");
+  }
+
+  const hostCapabilityReclaimMatch = HostCapabilityReclaimRoute.exec(url.pathname);
+  if (request.method === "POST" && hostCapabilityReclaimMatch !== null) {
+    return handleCapabilityRequest(request, env, hostCapabilityReclaimMatch[1]!, "reclaim-host");
   }
 
   const snapshotMatch = SnapshotRoute.exec(url.pathname);

@@ -1,10 +1,6 @@
-import { DataFrameKind, type DataFrame } from "@zhongduan/protocol";
+import { DataFrameKind, MAX_DELIVERY_OUTSTANDING_BYTES, type DataFrame } from "@zhongduan/protocol";
 import { describe, expect, it } from "vitest";
-import {
-  MAX_UNACKED_BYTES,
-  advanceDeliveryCursor,
-  type DeliveryCursorState,
-} from "../src/worker/relay-delivery";
+import { advanceDeliveryCursor, type DeliveryCursorState } from "../src/worker/relay-delivery";
 
 const baseline: DeliveryCursorState = {
   dataState: "catching-up",
@@ -75,6 +71,6 @@ describe("delivery cursor validation", () => {
       frame({ eventSeq: 32n, ptyOffset: BigInt(31 * payload.byteLength), payload }),
     );
     expect(result).toEqual({ kind: "credit-exceeded" });
-    expect(MAX_UNACKED_BYTES).toBe(512 * 1024);
+    expect(MAX_DELIVERY_OUTSTANDING_BYTES).toBe(512 * 1024);
   });
 });
