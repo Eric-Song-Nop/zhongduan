@@ -57,7 +57,7 @@ class ManualPty implements PtyProcess {
 }
 
 describe("TerminalSession", () => {
-  it("bounds the development authority history used by the local CLI", () => {
+  it("bounds the fake authority history used by injected tests", () => {
     const authority = new FakeTerminalAuthority({ maxOperationBytes: 2 });
 
     authority.applyOutput(Uint8Array.of(0x41));

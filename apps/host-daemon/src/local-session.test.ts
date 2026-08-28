@@ -1,4 +1,5 @@
 import { DataFrameKind, decodeDataFrame } from "@zhongduan/protocol";
+import { GHOSTTY_ENGINE_ID, GHOSTTY_TERMINAL_PROFILE } from "@wterm/ghostty";
 import { describe, expect, it } from "vitest";
 
 import { createSessionEpoch, startLocalSession } from "./local-session";
@@ -14,7 +15,7 @@ describe("local terminal session", () => {
   });
 
   it("drives a real shell through semantic input", async () => {
-    const session = startLocalSession({
+    const session = await startLocalSession({
       args: [],
       cols: 80,
       command: "/bin/sh",
@@ -26,27 +27,44 @@ describe("local terminal session", () => {
       if (frame.kind === DataFrameKind.PtyOutput) output.push(frame.payload.slice());
     });
 
-    session.writePaste("printf '__ZHONGDUAN_HOST_OK__\\n'; exit");
-    session.writeKey({
-      action: "press",
-      altGraph: false,
-      code: "Enter",
-      composing: false,
-      consumedModifiers: 0,
-      key: "Enter",
-      modifiers: 0,
-    });
-    const exit = await Promise.race([
-      session.waitForExit(),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("shell did not exit")), 5_000),
-      ),
-    ]);
-    session.dispose();
+    try {
+      expect(session.engineId).toBe(GHOSTTY_ENGINE_ID);
+      await expect(session.captureSnapshot()).resolves.toMatchObject({
+        engineId: GHOSTTY_ENGINE_ID,
+      });
 
-    expect(exit).toMatchObject({ status: "exited", exitCode: 0 });
-    expect(Buffer.concat(output.map((chunk) => Buffer.from(chunk))).toString()).toContain(
-      "__ZHONGDUAN_HOST_OK__",
-    );
+      session.writePaste("printf '__ZHONGDUAN_HOST_OK__:%s__\\n' \"$TERM\"; exit");
+      session.writeKey({
+        action: "press",
+        altGraph: false,
+        code: "Enter",
+        composing: false,
+        consumedModifiers: 0,
+        key: "Enter",
+        modifiers: 0,
+      });
+      const exit = await withTimeout(session.waitForExit(), 5_000);
+
+      expect(exit).toMatchObject({ status: "exited", exitCode: 0 });
+      expect(Buffer.concat(output.map((chunk) => Buffer.from(chunk))).toString()).toContain(
+        `__ZHONGDUAN_HOST_OK__:${GHOSTTY_TERMINAL_PROFILE.term}__`,
+      );
+    } finally {
+      session.dispose();
+    }
   });
 });
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("shell did not exit")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
