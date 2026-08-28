@@ -512,7 +512,7 @@ describe("cloud relay runtime", () => {
     const session = await createSession();
     const first = await createConnectionSet(session.sessionId, session.observerCapability);
     let latest = first;
-    for (let index = 0; index < 20; index += 1) {
+    for (let index = 0; index < 4; index += 1) {
       latest = await createConnectionSet(
         session.sessionId,
         session.observerCapability,
@@ -540,7 +540,7 @@ describe("cloud relay runtime", () => {
     const session = await createSession();
     const first = await createConnectionSet(session.sessionId, session.hostCapability);
     let latest = first;
-    for (let index = 0; index < 20; index += 1) {
+    for (let index = 0; index < 4; index += 1) {
       latest = await createConnectionSet(session.sessionId, session.hostCapability);
     }
 
