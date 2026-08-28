@@ -30,6 +30,7 @@ class FakeWebSocket extends EventTarget {
   static readonly CLOSED = 3;
 
   readonly sent: Array<string | ArrayBufferLike | Blob | ArrayBufferView> = [];
+  onSend: ((data: string | ArrayBufferLike | Blob | ArrayBufferView) => void) | undefined;
   binaryType: BinaryType = "arraybuffer";
   bufferedAmount = 0;
   readyState = FakeWebSocket.OPEN;
@@ -42,6 +43,7 @@ class FakeWebSocket extends EventTarget {
 
   send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
     this.sent.push(data);
+    this.onSend?.(data);
   }
 
   message(data: string): void {
@@ -403,6 +405,48 @@ describe("HostRelayConnection", () => {
       ]),
     );
     expect(JSON.stringify(events)).not.toContain("must-not-enter-telemetry");
+    harness.relay.close();
+    harness.session.dispose();
+  });
+
+  it("keeps ACK send cost out of the Host input decision duration", async () => {
+    let now = 0;
+    const events: TerminalTelemetryEvent[] = [];
+    const harness = createHarness({
+      monotonicNow: () => now,
+      telemetry: (event) => events.push(event),
+    });
+    await acknowledgeReady(harness);
+    await settle();
+    events.length = 0;
+    harness.control.onSend = (encoded) => {
+      if (typeof encoded !== "string" || encoded === "ping") return;
+      const frame = decodeControlFrame(encoded, HostControlFrameSchema);
+      if (frame.type === "input-ack") now += 50;
+    };
+
+    harness.control.message(
+      JSON.stringify({
+        type: "text",
+        connectionId: "connection_browser_A",
+        clientId: "client_AAAAAAAAA",
+        writerLease: "writer-lease",
+        inputEpoch: "input-epoch",
+        clientInputSeq: "1",
+        writerFence: "1",
+        data: "latency-boundary",
+      }),
+    );
+    await settle();
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        name: "host.input.apply",
+        hostIngressToAckDecisionMs: 0,
+        ackSendOutcome: "send-returned",
+        ackSendMs: 50,
+      }),
+    );
     harness.relay.close();
     harness.session.dispose();
   });

@@ -391,7 +391,9 @@ export class HostRelayConnection {
   async #handleInput(frame: ForwardedInput, context: ControlQueueContext): Promise<void> {
     const fence = this.#pairFence;
     const result = await dispatchForwardedInput(this.#session, frame);
+    const ackDecisionAt = this.#monotonicNow();
     let ackSendOutcome: "send-returned" | "not-attempted" | "uncertain" = "not-attempted";
+    let ackSendMs = 0;
     try {
       if (
         !this.#closed &&
@@ -399,14 +401,19 @@ export class HostRelayConnection {
         fence === this.#pairFence &&
         this.#pair.control.readyState === WebSocket.OPEN
       ) {
-        this.#sendControl(result.ack);
-        ackSendOutcome = "send-returned";
+        const ackSendStartedAt = this.#monotonicNow();
+        try {
+          this.#sendControl(result.ack);
+          ackSendOutcome = "send-returned";
+        } finally {
+          ackSendMs = elapsedMs(ackSendStartedAt, this.#monotonicNow());
+        }
       }
     } catch (error) {
       ackSendOutcome = "uncertain";
       throw error;
     } finally {
-      this.#recordInputApply(result, context, ackSendOutcome);
+      this.#recordInputApply(result, context, ackDecisionAt, ackSendOutcome, ackSendMs);
     }
   }
 
@@ -485,7 +492,9 @@ export class HostRelayConnection {
   #recordInputApply(
     result: Awaited<ReturnType<typeof dispatchForwardedInput>>,
     context: ControlQueueContext,
+    ackDecisionAt: number,
     ackSendOutcome: "send-returned" | "not-attempted" | "uncertain",
+    ackSendMs: number,
   ): void {
     try {
       const finishedAt = this.#monotonicNow();
@@ -496,12 +505,13 @@ export class HostRelayConnection {
         outcome: result.ack.status,
         effectStage: result.timing.effectStage,
         ackSendOutcome,
+        ackSendMs,
         controlAdmissionMs: elapsedMs(context.ingressAt, context.queuedAt),
         controlQueueWaitMs: elapsedMs(context.queuedAt, context.handlingStartedAt),
         controlQueueDepth: context.queuedCount,
         actorQueueWaitMs: result.timing.actorQueueWaitMs,
         actorProcessingMs: result.timing.actorProcessingMs,
-        hostIngressToAckDecisionMs: elapsedMs(context.ingressAt, finishedAt),
+        hostIngressToAckDecisionMs: elapsedMs(context.ingressAt, ackDecisionAt),
       } as const;
       if (result.timing.inputKind === "resize") {
         this.#enqueueTelemetry({

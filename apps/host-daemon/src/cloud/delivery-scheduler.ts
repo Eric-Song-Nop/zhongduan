@@ -12,9 +12,9 @@ import {
 import {
   createBufferedTelemetrySink,
   elapsedMs,
-  emitTelemetry,
   type BufferedTelemetrySink,
   type TelemetrySink,
+  type TerminalTelemetryEvent,
 } from "@zhongduan/telemetry";
 
 import type {
@@ -583,7 +583,7 @@ export class HostDeliveryScheduler {
     ]);
     try {
       const snapshot = await raceAbort(this.#session.captureSnapshot(), signal);
-      emitTelemetry(this.#telemetry, {
+      this.#enqueueTelemetry({
         schemaVersion: 1,
         monotonicAtMs: this.#monotonicNow(),
         name: "host.snapshot.capture",
@@ -594,7 +594,7 @@ export class HostDeliveryScheduler {
       return snapshot;
     } catch (error) {
       const finishedAt = this.#monotonicNow();
-      emitTelemetry(this.#telemetry, {
+      this.#enqueueTelemetry({
         schemaVersion: 1,
         monotonicAtMs: finishedAt,
         name: "host.snapshot.capture",
@@ -869,8 +869,7 @@ export class HostDeliveryScheduler {
 
   #emitRange(mode: "warm" | "snapshot", measurement: ReplayRangeMeasurement): void {
     const monotonicAtMs = this.#monotonicNow();
-    emitTelemetry(
-      this.#telemetry,
+    this.#enqueueTelemetry(
       measurement.status === "exact"
         ? {
             schemaVersion: 1,
@@ -901,8 +900,7 @@ export class HostDeliveryScheduler {
     snapshotBytes?: number,
   ): void {
     const finishedAt = this.#monotonicNow();
-    emitTelemetry(
-      this.#telemetry,
+    this.#enqueueTelemetry(
       source === "fresh"
         ? {
             schemaVersion: 1,
@@ -922,6 +920,14 @@ export class HostDeliveryScheduler {
             totalDurationMs: elapsedMs(startedAt, finishedAt),
           },
     );
+  }
+
+  #enqueueTelemetry(event: TerminalTelemetryEvent): void {
+    try {
+      this.#telemetry?.(event);
+    } catch {
+      // The bounded diagnostics queue is observational and must not affect recovery.
+    }
   }
 
   #publishOutcome(

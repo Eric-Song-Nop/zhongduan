@@ -7,6 +7,7 @@ import {
   emitTelemetry,
   telemetryByteSizeBucket,
   type TelemetrySink,
+  type TerminalTelemetryEvent,
 } from "./index";
 
 describe("terminal telemetry", () => {
@@ -48,6 +49,7 @@ describe("terminal telemetry", () => {
       effectStage: "completed" as const,
       encodeKind: "ghostty" as const,
       ackSendOutcome: "send-returned" as const,
+      ackSendMs: 0.25,
       controlAdmissionMs: 1,
       controlQueueWaitMs: 2,
       controlQueueDepth: 1,
@@ -67,6 +69,7 @@ describe("terminal telemetry", () => {
       outcome: "written" as const,
       effectStage: "completed" as const,
       ackSendOutcome: "send-returned" as const,
+      ackSendMs: 0.25,
       controlAdmissionMs: 1,
       controlQueueWaitMs: 2,
       controlQueueDepth: 1,
@@ -135,6 +138,7 @@ describe("terminal telemetry", () => {
           effectStage: "completed",
           encodeKind: "utf8",
           ackSendOutcome: "send-returned",
+          ackSendMs: 0.25,
           controlAdmissionMs: 1,
           controlQueueWaitMs: 2,
           controlQueueDepth: 1,
@@ -219,6 +223,31 @@ describe("terminal telemetry", () => {
     await flushed;
     expect(target).toHaveBeenCalledTimes(2);
     expect(buffered.pendingEvents).toBe(0);
+  });
+
+  it("validates only from the deferred drain and drops malformed diagnostics", async () => {
+    const scheduled: Array<() => void> = [];
+    const target = vi.fn<TelemetrySink>();
+    const buffered = createBufferedTelemetrySink(target, {
+      schedule: (task) => scheduled.push(task),
+    });
+
+    expect(() =>
+      buffered.sink({
+        schemaVersion: 1,
+        monotonicAtMs: 1,
+        name: "host.snapshot.capture",
+        outcome: "not-a-real-outcome",
+        totalDurationMs: 1,
+      } as unknown as TerminalTelemetryEvent),
+    ).not.toThrow();
+    expect(buffered.pendingEvents).toBe(1);
+    expect(target).not.toHaveBeenCalled();
+
+    scheduled.shift()!();
+    await buffered.flush();
+    expect(buffered.pendingEvents).toBe(0);
+    expect(target).not.toHaveBeenCalled();
   });
 
   it("contains synchronous and asynchronous deferred collector failures", async () => {

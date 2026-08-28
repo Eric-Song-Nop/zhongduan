@@ -92,6 +92,7 @@ const hostInputApplyBase = {
   outcome: z.enum(["written", "duplicate", "rejected", "uncertain"]),
   effectStage: z.enum(["not-attempted", "completed", "threw"]),
   ackSendOutcome: z.enum(["send-returned", "not-attempted", "uncertain"]),
+  ackSendMs: durationMs,
   controlAdmissionMs: durationMs,
   controlQueueWaitMs: durationMs,
   controlQueueDepth: frameCount,
@@ -240,10 +241,11 @@ export function createBufferedTelemetrySink(
         const event = queue.shift();
         if (event !== undefined) {
           try {
-            const result = (target as (sample: TerminalTelemetryEvent) => unknown)(event);
+            const parsed = TerminalTelemetryEventSchema.parse(event);
+            const result = (target as (sample: TerminalTelemetryEvent) => unknown)(parsed);
             if (isPromiseLike(result)) void Promise.resolve(result).catch(() => undefined);
           } catch {
-            // A collector failure only drops this diagnostic event.
+            // A schema or collector failure only drops this diagnostic event.
           }
         }
         if (queue.length > 0) scheduleNext();

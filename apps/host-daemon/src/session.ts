@@ -690,11 +690,10 @@ export class TerminalSession {
 
   #commitSubmittedResize(dimensions: ResizePayload, probe: SubmittedInputProbe): void {
     probe.encodeKind = "resize";
+    const payload = encodeResizePayload(dimensions);
     const authorityStartedAt = this.#monotonicNow();
-    let payload: Uint8Array;
     let replies: readonly Uint8Array[];
     try {
-      payload = encodeResizePayload(dimensions);
       replies = this.#authority.resize(dimensions);
     } finally {
       probe.inputEncodeMs += elapsedMs(authorityStartedAt, this.#monotonicNow());
