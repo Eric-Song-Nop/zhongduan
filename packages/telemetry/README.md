@@ -28,20 +28,65 @@ when the encoding was non-empty, the synchronous PTY call returned. It does not 
 read the bytes, produced output, or painted a result. `host.relay.rtt` includes local event-loop/socket
 queue time plus the Host-to-Cloud auto-response round trip; it is not pure network RTT.
 
-The Cloud Phase 0b slice adds content-free events for the current single relay queue, Browser semantic
-input lease/Host-send decisions, delivery barriers, attach, and delivery reset. Successful high-rate
-queue/input events use a randomized per-DO phase with systematic producer sampling and carry
-`sampleWeight`; failures, capacity decisions, and recovery transitions are retained best-effort. If
-secure phase selection fails, that sampled series is dropped rather than assigned a biased weight.
-Cloud durations use `clockKind=workers-io`: production
-Workers clocks advance only at I/O boundaries, so these values are local lower bounds and may report
-zero for synchronous CPU work. A local `WebSocket.send()` return is not peer receipt or application.
+Cloud schema v2 retains the Phase 0b content-free events for the current single relay queue, Browser
+semantic-input lease/Host-send decisions, delivery barriers, attach, and delivery reset. Phase 0c adds
+three facts at the existing authoritative `TerminalSessionDO` paths:
 
-The production Cloud sink is enabled only by the exact versioned mode `workers-logs-v1`, buffers at
-most 64 events per DO instance, and may lose pending diagnostics on hibernation. Automatic invocation
-logs and tracing remain explicitly disabled because request URLs contain terminal session metadata and
-one-time WebSocket tickets. The strict event payload contains no raw identifiers or content; the
-Cloudflare log envelope can still add platform identifiers and must be handled as sensitive metadata.
+- `cloud.input.ack-forward` observes a Host input ACK from relay-queue ingress through the Browser
+  control target/send decision. Its outcomes are `send-returned`, `target-missing`, and `send-failed`;
+  the ACK status remains the bounded `written`, `duplicate`, `rejected`, or `uncertain` enum.
+- `cloud.data.fanout` emits one aggregate per Host data frame, not one event per Browser target. It
+  distinguishes canonical and directed paths, classifies the local result as completed, degraded,
+  not-targeted, stale, or host-failed, and accounts for every selected target as send-returned, stale,
+  sequence-error, credit-reset, or send-uncertain-reset. Credit utilization is bucketed. Reset counts
+  describe a local reset decision/request; the existing reset transition records issuance and Host
+  notification decisions, and neither event proves reset completion or peer receipt.
+- `cloud.writer.lease` observes writer acquire during attach and verify-renew during heartbeat. Its
+  bounded outcomes distinguish acquired/renewed, unavailable/inactive, stale-context, released-stale,
+  and uncertain paths without exporting the lease or its identity.
+
+Every Cloud event carries `sampleWeight`; the existing successful high-rate queue/input facts remain
+sampled. ACK forwarding is systematically sampled at weight 16. A canonical Host data frame is
+selected before its Browser loop at weight 64, so the other 63 frames install no per-Browser observer;
+the same weight applies whether the sampled outcome is completed or exceptional. Heartbeat
+`renewed-current`/`inactive-current` use weight 64. Directed fanout, attach acquire, other heartbeat
+outcomes, capacity decisions, and recovery transitions use weight 1. Sampling has a randomized
+per-DO/key starting phase; if secure
+phase selection fails, that series is dropped rather than assigned a biased weight. Weight 1 is still
+best-effort, not a delivery guarantee, so aggregation must use `sampleWeight` and must not treat raw
+event counts as complete traffic counts.
+
+Cloud durations use `clockKind=workers-io`: production Workers clocks advance only at I/O boundaries,
+so ingress-to-decision, queue, fanout, and lease values are local lower bounds and may report zero for
+synchronous CPU work. A local `WebSocket.send()` return is not proof that the frame left the socket
+queue, reached a peer, affected the child application, or painted.
+
+The production Cloud sink is enabled only by the exact versioned mode `workers-logs-v2` and buffers at
+most 64 events per DO instance. Pending events, drop state, and sampling phases/counters are in-memory
+only: capacity pressure, collector/runtime failure, version rollout, eviction, or hibernation may drop
+or reset them. They are not stored in SQLite or a WebSocket attachment and are never backfilled or
+replayed. This loss cannot affect relay authority, recovery, or socket lifetime.
+
+Queries and dashboards must accept both historical/in-flight `schemaVersion=1` records and
+`schemaVersion=2` records throughout rollout and rollback, and interpret each version independently.
+`CloudTelemetryWriteEventSchema` is the strict v2 producer boundary;
+`CloudTelemetryReadEventSchema` retains the four v1 Phase 0b shapes alongside all v2 shapes for
+ingestion during that compatibility window. It validates the event payload after ingestion has
+projected and checked the `type=zhongduan.telemetry` / `runtime=cloud-do` log wrapper; a strict
+record-level read schema and wrapped-log integration fixture remain a query-layer follow-up. New
+Phase 0c event names are never accepted with v1.
+The runtime gate itself accepts only the mode paired with its code. Separately deploying or rolling
+back code and `CLOUD_TELEMETRY_MODE` can therefore disable custom logging and create an irrecoverable
+telemetry blind window; code and binding should ship as one version, and v1 queries should remain until
+v2 arrival is verified.
+
+Automatic invocation logs and tracing remain explicitly disabled because request URLs contain terminal
+session metadata and one-time WebSocket tickets. Strict custom event payloads must not contain terminal,
+input, or frame payloads; text, paste, command, cell, or key material; tickets, capabilities, or writer
+leases; session, client, connection, stream, generation, epoch, or sequence identifiers; journal or
+snapshot identifiers/cursors; URLs; error/exception strings; or hashes/digests of those sensitive
+values. Sizes are bucketed. The Cloudflare log envelope can still add platform identifiers and must be
+handled as sensitive metadata.
 
 The Browser fact slice uses `clockKind=browser-performance` and records only same-page monotonic
 durations for control/data relay probes, semantic-input acknowledgement, attach-start terminal outcomes, snapshot load,
@@ -58,6 +103,11 @@ the sink never writes console, storage, or network output. Production aggregatio
 operator-controlled export remain a separate layer.
 
 The Host stderr adapter stops writing while the stream reports backpressure and drops diagnostics
-until `drain`, so telemetry cannot grow an unbounded application-owned output queue. Cloud Host-ACK/data
-fanout, independent lease acquisition/heartbeat facts, Browser paint and end-to-end facts, production
-aggregation/query, and a unified dashboard remain part of the open Phase 0 gate.
+until `drain`, so telemetry cannot grow an unbounded application-owned output queue. Phase 0c is only a
+Cloud fact layer: per-input SHA-256 plus SQLite lease renewal and the larger Phase A correctness/hot-path
+work remain unchanged. Browser paint/end-to-end facts, production aggregation/query/dashboard, and the
+enabled-instrumentation input-latency/canonical-throughput canary proving at most 5% regression remain
+open Phase 0 gates. Ordinary directed recovery fanout currently remains weight 1 as a deliberate
+P1 follow-up: measure its volume first, then give successful/stale/not-targeted outcomes an unbiased
+producer sample without hiding bounded recovery failures. URL query-string redaction is also tracked
+as platform-envelope hardening in addition to keeping automatic invocation logs and traces disabled.

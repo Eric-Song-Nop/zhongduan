@@ -718,6 +718,22 @@ socket close 等路径调用的 `resetBrowserDelivery()` 操作入口起算。�
 renewal，也不修改 wire、fence、dedup、journal、snapshot、replay 或 WebSocket attachment，所以同样不代表
 Phase A 已完成。
 
+`observability/cloud-delivery-facts` 这个 Cloud Phase 0c 切片只补齐上述缺失的 Cloud owner 事实，并把 Cloud event
+升级为 `workers-logs-v2`：
+
+- `cloud.input.ack-forward` 从 Host ACK 进入 relay queue 量到 Browser control target missing、`send()` returned
+  或 send failed，同时保留 ACK status；这不是 Browser receipt、canonical paint 或 app-effect ACK。
+- `cloud.data.fanout` 由 `TerminalSessionDO` 为每个 Host canonical/directed data frame 产生一条聚合事实，而不是
+  每个 Browser 一条。它用闭集 outcome/reason 和计数覆盖 selected、send-returned、stale、sequence-error、
+  credit-reset、send-uncertain-reset targets，并只记录最大 credit utilization bucket。Reset 计数是本地 decision/
+  request；既有 reset transition 另记 issuance/Host notify decision，两者都不是完成证明。
+- `cloud.writer.lease` 记录 writer attach acquire 与 heartbeat verify-renew，并区分 acquired/renewed、unavailable/
+  inactive、current/stale 和 uncertain outcome；它观察现有 lease authority，不移动或替换它。
+
+这个切片仍不拆 lane，不改变 input sequence/fence/dedup/wire/recovery，也没有移除每次 semantic input 上的 writer
+token SHA-256 与 SQLite lease renewal。Phase A 的 connection-scoped lease 和 input correctness/hot-path 工作仍未
+完成。
+
 `observability/browser-recovery-latency` 继续补 Browser 本机事实，但仍不修改 input correctness。它用独立于
 票据 wall clock 的 monotonic clock 记录 control/data socket RTT、成功送入 control socket 到 input ACK 的时间、
 attach matching/timeout/cancelled 终点，以及 snapshot load/restore/buffer apply/adopt 与最终 recovery outcome。内部 pairing 可以使用
@@ -809,17 +825,29 @@ Recovery v3、FrozenTerminalCut 和 rolling checkpoint 是并行工作流，phas
 Host input result，不证明 child read、应用 effect、canonical output 或 Browser paint。Host relay RTT 也只是该
 socket 到 Cloud auto-responder 的本机观测 RTT，不是 Browser↔Host 或纯网络 RTT。
 
-Cloud 自定义 event payload 同样不得包含 input/frame、ticket/capability/lease、原始 session/client/connection
-标识或异常文本。Cloudflare 自动 invocation logs 和 tracing 必须保持显式关闭，因为 WebSocket ticket 位于 query、
-session ID 位于 path；这个 payload 保证不延伸为“平台 envelope 匿名”，Workers Logs 仍可能附加平台 request、
-invocation 或 Durable Object 标识。Cloud queue wait 只从 `webSocketMessage` callback/local queue admission 起算；
-Browser input→Host send decision 与 barrier result send 只量到本地 decision/`send()` 返回。Workers runtime clock
-只在 I/O 边界推进，同步 CPU 工作可能不可见，所以这些字段全部是 Cloud local lower-bound，不能标成网络传输、
-对端接收、端到端 latency 或 CPU time。有界 best-effort producer sampling 的聚合必须使用 `sampleWeight`，原始
-event count 不是完整流量计数。Browser 本机切片已经补齐 input send-return→ACK、socket RTT 与 snapshot
-load/restore/buffer apply/adopt，但还没有 keydown、canonical match 或真实 paint 信号。Host ACK 转发、Host data
-fanout、独立 lease acquire/heartbeat、Browser paint、跨节点聚合/dashboard 和端到端 SLO 仍是开放的 Phase 0
-gate。
+Cloud 自定义 event payload 同样不得包含 terminal/input/frame payload、text/paste/command/cell/key、ticket/
+capability/writer lease，原始 session/client/connection/stream/generation/epoch/sequence、journal/snapshot ID 或
+cursor、URL、异常或 error string，以及上述敏感值的 hash/digest；input/control/frame 大小只允许 bucket。
+Cloudflare 自动 invocation logs 和 tracing 必须保持显式关闭，因为 WebSocket ticket 位于 query、session ID 位于
+path；这个 payload 保证不延伸为“平台 envelope 匿名”，Workers Logs 仍可能附加平台 request、invocation 或
+Durable Object 标识。
+
+Cloud queue wait 只从 `webSocketMessage` callback/local queue admission 起算；Browser input→Host send、Host
+ACK→Browser control、每 Host data frame fanout 和 barrier result send 只量到本地 decision/`send()` 返回。
+Workers runtime clock 只在 I/O 边界推进，同步 CPU 工作可能不可见，所以这些字段全部是 Cloud local lower-bound，
+不能标成网络传输、对端接收、端到端 latency 或 CPU time。每个 v2 event 都有 `sampleWeight`；ACK 与常见
+heartbeat outcome 会采样；canonical frame 在 Browser loop 前以 weight 64 固定选择，未选中时不安装
+per-Browser observer，选中的正常或异常 outcome 使用同一权重。Weight 1 也仍是 best-effort；原始 event count
+不是完整流量计数，聚合必须使用 `sampleWeight`。
+
+Cloud pending event、drop 状态和 sampling phase/counter 只驻每个 DO instance 的有界内存，不进入 SQLite 或
+WebSocket attachment；capacity、collector/runtime failure、版本切换、eviction/hibernation 可以丢弃或重置它们，
+没有 backfill/replay。生产 query 在 rollout/rollback 期间必须同时接受 schema v1/v2；代码和精确 mode 分步发布或
+回滚不匹配会形成不可恢复的 telemetry blind window，因此必须成对发布并验证 v2 到达后再退休 v1 query。
+
+Browser 本机切片已经补齐 input send-return→ACK、socket RTT 与 snapshot load/restore/buffer apply/adopt，但还没有
+keydown、canonical match 或真实 paint 信号。Cloud Phase 0c 只补事实层；生产 query/aggregation/dashboard、
+Browser paint、跨节点 E2E/SLO，以及启用插桩后 input latency/canonical throughput `<=5%` 回归 gate 仍开放。
 
 ### 初始发布门槛
 

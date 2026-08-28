@@ -9,7 +9,7 @@ import {
 
 function inputForwardEvent(monotonicAtMs = 1): CloudTelemetryEvent {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     monotonicAtMs,
     clockKind: "workers-io",
     sampleWeight: 8,
@@ -108,6 +108,26 @@ describe("Cloud telemetry", () => {
     } as unknown as CloudTelemetryEvent;
 
     expect(() => telemetry.record(hostDiagnostic)).not.toThrow();
+    expect(telemetry.pendingEvents).toBe(1);
+    scheduled.shift()!();
+
+    expect(collector).not.toHaveBeenCalled();
+    expect(telemetry.pendingEvents).toBe(0);
+  });
+
+  it("drops legacy Cloud v1 diagnostics at the versioned sink boundary", () => {
+    const scheduled: Array<() => void> = [];
+    const collector = vi.fn();
+    const telemetry = createCloudTelemetry({
+      collector,
+      schedule: (task) => scheduled.push(task),
+    });
+    const legacy = {
+      ...inputForwardEvent(),
+      schemaVersion: 1,
+    } as unknown as CloudTelemetryEvent;
+
+    expect(() => telemetry.record(legacy)).not.toThrow();
     expect(telemetry.pendingEvents).toBe(1);
     scheduled.shift()!();
 

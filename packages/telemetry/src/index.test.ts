@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   BrowserTelemetryEventSchema,
+  CloudTelemetryReadEventSchema,
+  CloudTelemetryWriteEventSchema,
   TerminalTelemetryEventSchema,
   createBufferedTelemetrySink,
   elapsedMs,
@@ -11,6 +13,65 @@ import {
   type TelemetrySink,
   type TerminalTelemetryEvent,
 } from "./index";
+
+const cloudInputAckForwardEvent = {
+  schemaVersion: 2 as const,
+  monotonicAtMs: 36,
+  clockKind: "workers-io" as const,
+  sampleWeight: 16,
+  name: "cloud.input.ack-forward" as const,
+  status: "written" as const,
+  outcome: "send-returned" as const,
+  observedQueueWaitMs: 2,
+  observedIngressToSendDecisionMs: 4,
+  frameBytesBucket: "65-1024" as const,
+};
+
+const cloudDataFanoutEvent = {
+  schemaVersion: 2 as const,
+  monotonicAtMs: 37,
+  clockKind: "workers-io" as const,
+  sampleWeight: 64,
+  name: "cloud.data.fanout" as const,
+  path: "canonical" as const,
+  frameKind: "pty-output" as const,
+  outcome: "completed" as const,
+  reason: "none" as const,
+  observedQueueWaitMs: 3,
+  observedIngressToFanoutDecisionMs: 5,
+  frameBytesBucket: "1025-65536" as const,
+  selectedTargets: 2,
+  sendReturnedTargets: 2,
+  staleTargets: 0,
+  sequenceErrorTargets: 0,
+  creditResetTargets: 0,
+  sendUncertainResetTargets: 0,
+  maxCreditUtilization: "51-75%" as const,
+};
+
+const cloudWriterLeaseAcquireEvent = {
+  schemaVersion: 2 as const,
+  monotonicAtMs: 38,
+  clockKind: "workers-io" as const,
+  sampleWeight: 1,
+  name: "cloud.writer.lease" as const,
+  operation: "acquire" as const,
+  trigger: "attach" as const,
+  outcome: "acquired-current" as const,
+  observedLeaseOutcomeMs: 2,
+};
+
+const cloudWriterLeaseRenewEvent = {
+  schemaVersion: 2 as const,
+  monotonicAtMs: 39,
+  clockKind: "workers-io" as const,
+  sampleWeight: 64,
+  name: "cloud.writer.lease" as const,
+  operation: "verify-renew" as const,
+  trigger: "heartbeat" as const,
+  outcome: "renewed-current" as const,
+  observedLeaseOutcomeMs: 1,
+};
 
 describe("terminal telemetry", () => {
   it("accepts the privacy-safe recovery event shapes", () => {
@@ -109,7 +170,7 @@ describe("terminal telemetry", () => {
 
   it.each([
     {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       monotonicAtMs: 30,
       clockKind: "workers-io" as const,
       sampleWeight: 64,
@@ -128,7 +189,7 @@ describe("terminal telemetry", () => {
       socketQueuedCount: 4,
     },
     {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       monotonicAtMs: 31,
       clockKind: "workers-io" as const,
       sampleWeight: 1,
@@ -147,7 +208,7 @@ describe("terminal telemetry", () => {
       socketQueuedCount: 8,
     },
     {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       monotonicAtMs: 32,
       clockKind: "workers-io" as const,
       sampleWeight: 8,
@@ -163,7 +224,7 @@ describe("terminal telemetry", () => {
       socketQueuedCount: 1,
     },
     {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       monotonicAtMs: 33,
       clockKind: "workers-io" as const,
       sampleWeight: 1,
@@ -175,7 +236,7 @@ describe("terminal telemetry", () => {
       observedDurationMs: 1,
     },
     {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       monotonicAtMs: 34,
       clockKind: "workers-io" as const,
       sampleWeight: 1,
@@ -187,7 +248,7 @@ describe("terminal telemetry", () => {
       observedDurationMs: 2,
     },
     {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       monotonicAtMs: 35,
       clockKind: "workers-io" as const,
       sampleWeight: 1,
@@ -198,6 +259,10 @@ describe("terminal telemetry", () => {
       hostNotifyOutcome: "not-requested" as const,
       observedDurationMs: 3,
     },
+    cloudInputAckForwardEvent,
+    cloudDataFanoutEvent,
+    cloudWriterLeaseAcquireEvent,
+    cloudWriterLeaseRenewEvent,
   ])("accepts the content-free Cloud event $name", (event) => {
     expect(TerminalTelemetryEventSchema.parse(event)).toEqual(event);
   });
@@ -394,7 +459,7 @@ describe("terminal telemetry", () => {
 
   it("enforces the current queue lane/profile and capacity shape", () => {
     const baseEvent = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       monotonicAtMs: 30,
       clockKind: "workers-io",
       sampleWeight: 1,
@@ -423,6 +488,157 @@ describe("terminal telemetry", () => {
     ).toThrow();
   });
 
+  it("rejects Cloud v1 fixtures and impossible input ACK classifications", () => {
+    for (const event of [
+      { ...cloudInputAckForwardEvent, schemaVersion: 1 },
+      { ...cloudInputAckForwardEvent, status: "delivered" },
+      { ...cloudInputAckForwardEvent, outcome: "send-uncertain" },
+    ]) {
+      expect(() => TerminalTelemetryEventSchema.parse(event)).toThrow();
+    }
+  });
+
+  it("reads legacy Cloud v1 facts without accepting them at the v2 write boundary", () => {
+    const legacyInputForward = {
+      schemaVersion: 1,
+      monotonicAtMs: 32,
+      clockKind: "workers-io",
+      sampleWeight: 8,
+      name: "cloud.input.forward",
+      inputKind: "key",
+      leaseOutcome: "active",
+      outcome: "send-returned",
+      observedQueueWaitMs: 3,
+      observedIngressToLeaseDecisionMs: 4,
+      observedIngressToSendDecisionMs: 5,
+      frameBytesBucket: "65-1024",
+      globalQueuedCount: 2,
+      socketQueuedCount: 1,
+    };
+    expect(CloudTelemetryReadEventSchema.parse(legacyInputForward)).toEqual(legacyInputForward);
+    expect(() => CloudTelemetryWriteEventSchema.parse(legacyInputForward)).toThrow();
+    expect(CloudTelemetryReadEventSchema.parse(cloudInputAckForwardEvent)).toEqual(
+      cloudInputAckForwardEvent,
+    );
+    expect(() =>
+      CloudTelemetryReadEventSchema.parse({
+        ...cloudInputAckForwardEvent,
+        schemaVersion: 1,
+      }),
+    ).toThrow();
+  });
+
+  it("rejects impossible data fanout outcome and reason combinations", () => {
+    for (const event of [
+      { ...cloudDataFanoutEvent, outcome: "completed", reason: "credit-exceeded" },
+      { ...cloudDataFanoutEvent, outcome: "not-targeted", reason: "none" },
+      { ...cloudDataFanoutEvent, outcome: "stale", reason: "client-gone" },
+      { ...cloudDataFanoutEvent, outcome: "host-failed", reason: "data-send-uncertain" },
+      { ...cloudDataFanoutEvent, selectedTargets: 3 },
+      {
+        ...cloudDataFanoutEvent,
+        selectedTargets: 0,
+        sendReturnedTargets: 0,
+        maxCreditUtilization: "not-evaluated",
+      },
+      {
+        ...cloudDataFanoutEvent,
+        outcome: "not-targeted",
+        reason: "client-gone",
+        selectedTargets: 1,
+        sendReturnedTargets: 1,
+      },
+      {
+        ...cloudDataFanoutEvent,
+        outcome: "degraded",
+        reason: "credit-exceeded",
+        sendReturnedTargets: 1,
+        creditResetTargets: 1,
+        maxCreditUtilization: "76-100%",
+      },
+    ]) {
+      expect(() => TerminalTelemetryEventSchema.parse(event)).toThrow();
+    }
+  });
+
+  it("keeps writer lease acquire and heartbeat renew as disjoint strict shapes", () => {
+    for (const event of [
+      { ...cloudWriterLeaseAcquireEvent, trigger: "heartbeat" },
+      { ...cloudWriterLeaseAcquireEvent, outcome: "renewed-current" },
+      { ...cloudWriterLeaseRenewEvent, trigger: "attach" },
+      { ...cloudWriterLeaseRenewEvent, outcome: "acquired-current" },
+    ]) {
+      expect(() => TerminalTelemetryEventSchema.parse(event)).toThrow();
+    }
+  });
+
+  it.each([
+    [
+      "cloud.input.ack-forward",
+      cloudInputAckForwardEvent,
+      [
+        "sessionId",
+        "clientId",
+        "connectionId",
+        "inputEpoch",
+        "clientInputSeq",
+        "writerLease",
+        "writerFence",
+        "error",
+      ],
+    ],
+    [
+      "cloud.data.fanout",
+      cloudDataFanoutEvent,
+      [
+        "sessionId",
+        "streamId",
+        "deliveryGeneration",
+        "eventSeq",
+        "ptyOffset",
+        "snapshotId",
+        "payload",
+        "text",
+        "error",
+      ],
+    ],
+    [
+      "cloud.writer.lease",
+      cloudWriterLeaseAcquireEvent,
+      [
+        "clientId",
+        "writerLease",
+        "leaseDigest",
+        "lease_digest",
+        "writerFence",
+        "expiresAt",
+        "error",
+      ],
+    ],
+    [
+      "cloud.writer.lease heartbeat",
+      cloudWriterLeaseRenewEvent,
+      [
+        "clientId",
+        "writerLease",
+        "leaseDigest",
+        "lease_digest",
+        "writerFence",
+        "expiresAt",
+        "error",
+      ],
+    ],
+  ] as const)("rejects extra private fields from %s", (_name, event, fields) => {
+    for (const field of fields) {
+      expect(() =>
+        TerminalTelemetryEventSchema.parse({
+          ...event,
+          [field]: "must-not-leave-the-runtime",
+        }),
+      ).toThrow();
+    }
+  });
+
   it.each([
     "sessionId",
     "clientId",
@@ -439,7 +655,7 @@ describe("terminal telemetry", () => {
   ])("rejects the Cloud diagnostic identity/content field %s", (field) => {
     expect(() =>
       TerminalTelemetryEventSchema.parse({
-        schemaVersion: 1,
+        schemaVersion: 2,
         monotonicAtMs: 32,
         clockKind: "workers-io",
         sampleWeight: 8,

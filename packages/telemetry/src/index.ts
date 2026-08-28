@@ -300,6 +300,7 @@ export const BrowserTelemetryEventSchema = z.union([
 
 const cloudBase = {
   ...base,
+  schemaVersion: z.literal(2),
   clockKind: z.literal("workers-io"),
   sampleWeight,
 } as const;
@@ -377,6 +378,146 @@ const CloudInputForwardEventSchema = z.strictObject({
   globalQueuedCount: frameCount,
   socketQueuedCount: frameCount,
 });
+
+const CloudInputAckForwardEventSchema = z.strictObject({
+  ...cloudBase,
+  name: z.literal("cloud.input.ack-forward"),
+  status: z.enum(["written", "duplicate", "rejected", "uncertain"]),
+  outcome: z.enum(["send-returned", "target-missing", "send-failed"]),
+  observedQueueWaitMs: durationMs,
+  observedIngressToSendDecisionMs: durationMs,
+  frameBytesBucket: byteSizeBucket,
+});
+
+const CloudDataFanoutEventSchema = z
+  .strictObject({
+    ...cloudBase,
+    name: z.literal("cloud.data.fanout"),
+    path: z.enum(["canonical", "directed"]),
+    frameKind: z.enum(["pty-output", "resize-applied", "replay-commit", "reset", "other"]),
+    outcome: z.enum(["completed", "degraded", "not-targeted", "stale", "host-failed"]),
+    reason: z.enum([
+      "none",
+      "no-eligible-browser",
+      "generation-fenced",
+      "client-gone",
+      "credit-exceeded",
+      "data-send-uncertain",
+      "sequence-error",
+      "canonical-rejected",
+      "directed-reset",
+      "pinned-commit-exceeded",
+      "mixed",
+    ]),
+    observedQueueWaitMs: durationMs,
+    observedIngressToFanoutDecisionMs: durationMs,
+    frameBytesBucket: byteSizeBucket,
+    selectedTargets: frameCount,
+    sendReturnedTargets: frameCount,
+    staleTargets: frameCount,
+    sequenceErrorTargets: frameCount,
+    creditResetTargets: frameCount,
+    sendUncertainResetTargets: frameCount,
+    maxCreditUtilization: z.enum([
+      "not-evaluated",
+      "0",
+      "1-25%",
+      "26-50%",
+      "51-75%",
+      "76-100%",
+      ">100%",
+    ]),
+  })
+  .superRefine((event, context) => {
+    const accountedTargets =
+      event.sendReturnedTargets +
+      event.staleTargets +
+      event.sequenceErrorTargets +
+      event.creditResetTargets +
+      event.sendUncertainResetTargets;
+    if (accountedTargets !== event.selectedTargets) {
+      context.addIssue({
+        code: "custom",
+        message: "fanout target outcomes must account for every selected target",
+        path: ["selectedTargets"],
+      });
+    }
+    const expectedReasons: Record<typeof event.outcome, ReadonlySet<typeof event.reason>> = {
+      completed: new Set(["none"]),
+      degraded: new Set(["credit-exceeded", "data-send-uncertain", "sequence-error", "mixed"]),
+      "not-targeted": new Set(["no-eligible-browser", "client-gone"]),
+      stale: new Set(["generation-fenced"]),
+      "host-failed": new Set([
+        "sequence-error",
+        "canonical-rejected",
+        "directed-reset",
+        "pinned-commit-exceeded",
+      ]),
+    };
+    if (!expectedReasons[event.outcome].has(event.reason)) {
+      context.addIssue({
+        code: "custom",
+        message: "fanout reason is incompatible with outcome",
+        path: ["reason"],
+      });
+    }
+    if (event.outcome === "completed" && event.selectedTargets === 0) {
+      context.addIssue({
+        code: "custom",
+        message: "completed fanout requires at least one selected target",
+        path: ["selectedTargets"],
+      });
+    }
+    if (event.outcome === "not-targeted" && event.selectedTargets !== 0) {
+      context.addIssue({
+        code: "custom",
+        message: "not-targeted fanout cannot select a target",
+        path: ["selectedTargets"],
+      });
+    }
+    if (event.creditResetTargets > 0 && event.maxCreditUtilization !== ">100%") {
+      context.addIssue({
+        code: "custom",
+        message: "credit reset requires over-limit utilization",
+        path: ["maxCreditUtilization"],
+      });
+    }
+  });
+
+const CloudWriterLeaseAcquireEventSchema = z.strictObject({
+  ...cloudBase,
+  name: z.literal("cloud.writer.lease"),
+  operation: z.literal("acquire"),
+  trigger: z.literal("attach"),
+  outcome: z.enum([
+    "acquired-current",
+    "acquired-released-stale",
+    "unavailable-current",
+    "unavailable-stale",
+    "uncertain",
+  ]),
+  observedLeaseOutcomeMs: durationMs,
+});
+
+const CloudWriterLeaseRenewEventSchema = z.strictObject({
+  ...cloudBase,
+  name: z.literal("cloud.writer.lease"),
+  operation: z.literal("verify-renew"),
+  trigger: z.literal("heartbeat"),
+  outcome: z.enum([
+    "renewed-current",
+    "renewed-stale",
+    "inactive-current",
+    "inactive-stale",
+    "uncertain",
+  ]),
+  observedLeaseOutcomeMs: durationMs,
+});
+
+const CloudWriterLeaseEventSchema = z.union([
+  CloudWriterLeaseAcquireEventSchema,
+  CloudWriterLeaseRenewEventSchema,
+]);
 
 const CloudRecoveryBarrierEventSchema = z.strictObject({
   ...cloudBase,
@@ -479,8 +620,60 @@ const CloudRecoveryTransitionEventSchema = z.union([
 export const CloudTelemetryEventSchema = z.union([
   CloudRelayQueueEventSchema,
   CloudInputForwardEventSchema,
+  CloudInputAckForwardEventSchema,
+  CloudDataFanoutEventSchema,
+  CloudWriterLeaseEventSchema,
   CloudRecoveryBarrierEventSchema,
   CloudRecoveryTransitionEventSchema,
+]);
+export const CloudTelemetryWriteEventSchema = CloudTelemetryEventSchema;
+
+const LegacyCloudRelayQueueProcessedEventSchema = CloudRelayQueueProcessedEventSchema.omit({
+  schemaVersion: true,
+}).extend({ schemaVersion: z.literal(1) });
+const LegacyCloudRelayQueueCapacityEventSchema = CloudRelayQueueCapacityEventSchema.omit({
+  schemaVersion: true,
+}).extend({ schemaVersion: z.literal(1) });
+const LegacyCloudRelayQueueEventSchema = z
+  .union([LegacyCloudRelayQueueProcessedEventSchema, LegacyCloudRelayQueueCapacityEventSchema])
+  .superRefine((event, context) => {
+    if (event.lane !== event.queueProfile) {
+      context.addIssue({
+        code: "custom",
+        message: "queueProfile must match the current relay lane",
+        path: ["queueProfile"],
+      });
+    }
+  });
+const LegacyCloudInputForwardEventSchema = CloudInputForwardEventSchema.omit({
+  schemaVersion: true,
+}).extend({ schemaVersion: z.literal(1) });
+const LegacyCloudRecoveryBarrierEventSchema = CloudRecoveryBarrierEventSchema.omit({
+  schemaVersion: true,
+}).extend({ schemaVersion: z.literal(1) });
+const LegacyCloudRecoveryAttachTransitionEventSchema =
+  CloudRecoveryAttachTransitionEventSchema.omit({ schemaVersion: true }).extend({
+    schemaVersion: z.literal(1),
+  });
+const LegacyCloudRecoveryResetTransitionEventSchema = CloudRecoveryResetTransitionEventSchema.omit({
+  schemaVersion: true,
+}).extend({
+  schemaVersion: z.literal(1),
+});
+const LegacyCloudRecoveryTransitionEventSchema = z.union([
+  LegacyCloudRecoveryAttachTransitionEventSchema,
+  LegacyCloudRecoveryResetTransitionEventSchema,
+]);
+const LegacyCloudTelemetryEventSchema = z.union([
+  LegacyCloudRelayQueueEventSchema,
+  LegacyCloudInputForwardEventSchema,
+  LegacyCloudRecoveryBarrierEventSchema,
+  LegacyCloudRecoveryTransitionEventSchema,
+]);
+
+export const CloudTelemetryReadEventSchema = z.union([
+  LegacyCloudTelemetryEventSchema,
+  CloudTelemetryWriteEventSchema,
 ]);
 
 export const TerminalTelemetryEventSchema = z.union([
@@ -500,6 +693,7 @@ export const TerminalTelemetryEventSchema = z.union([
 export type TerminalTelemetryEvent = z.output<typeof TerminalTelemetryEventSchema>;
 export type CloudTelemetryEvent = z.output<typeof CloudTelemetryEventSchema>;
 export type BrowserTelemetryEvent = z.output<typeof BrowserTelemetryEventSchema>;
+export type CloudTelemetryReadEvent = z.output<typeof CloudTelemetryReadEventSchema>;
 export type TelemetrySink = (event: TerminalTelemetryEvent) => void;
 export type BrowserTelemetrySink = (event: BrowserTelemetryEvent) => void;
 export type MonotonicClock = () => number;

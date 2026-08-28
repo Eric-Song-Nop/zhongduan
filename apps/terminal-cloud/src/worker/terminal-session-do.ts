@@ -5,6 +5,7 @@ import {
   DataFrameKind,
   HostControlFrameSchema,
   HostCapabilityReclaimRequestSchema,
+  MAX_DELIVERY_OUTSTANDING_BYTES,
   MAX_U64,
   PositiveDecimalU64Schema,
   RELAY_CAPABILITIES_HEADER,
@@ -93,12 +94,44 @@ type TelemetryCompletion = Readonly<{ at: number | undefined }>;
 
 type CloudRelayQueueEvent = Extract<CloudTelemetryEvent, { name: "cloud.relay.queue" }>;
 type CloudInputForwardEvent = Extract<CloudTelemetryEvent, { name: "cloud.input.forward" }>;
+type CloudInputAckForwardEvent = Extract<CloudTelemetryEvent, { name: "cloud.input.ack-forward" }>;
+type CloudDataFanoutEvent = Extract<CloudTelemetryEvent, { name: "cloud.data.fanout" }>;
+type CloudWriterLeaseEvent = Extract<CloudTelemetryEvent, { name: "cloud.writer.lease" }>;
 type CloudRecoveryBarrierEvent = Extract<CloudTelemetryEvent, { name: "cloud.recovery.barrier" }>;
 type CloudRecoveryTransitionEvent = Extract<
   CloudTelemetryEvent,
   { name: "cloud.recovery.transition" }
 >;
 type CloudRecoveryResetEvent = Extract<CloudRecoveryTransitionEvent, { transition: "reset" }>;
+type WriterLeaseFacts =
+  | Pick<
+      Extract<CloudWriterLeaseEvent, { operation: "acquire" }>,
+      "operation" | "trigger" | "outcome"
+    >
+  | Pick<
+      Extract<CloudWriterLeaseEvent, { operation: "verify-renew" }>,
+      "operation" | "trigger" | "outcome"
+    >;
+
+type BrowserDeliveryObservation = Readonly<{
+  decision:
+    | "send-returned"
+    | "stale"
+    | "sequence-error"
+    | "reset-slow-client"
+    | "reset-send-failed";
+  creditUtilization: CloudDataFanoutEvent["maxCreditUtilization"];
+}>;
+
+interface BrowserFanoutFacts {
+  selectedTargets: number;
+  sendReturnedTargets: number;
+  staleTargets: number;
+  sequenceErrorTargets: number;
+  creditResetTargets: number;
+  sendUncertainResetTargets: number;
+  maxCreditUtilization: CloudDataFanoutEvent["maxCreditUtilization"];
+}
 
 type DeliveryBarrierOutcome =
   | { status: "ready" }
@@ -146,10 +179,13 @@ const MAX_CONTROL_MESSAGE_CHARS = 6 * 1024 * 1024 + 4_096;
 const MAX_HOST_DATA_BYTES = DATA_HEADER_BYTES + 16 * 1024;
 const SOCKET_REPLACED = 4001;
 const SLOW_CLIENT = 4008;
-const CLOUD_TELEMETRY_MODE = "workers-logs-v1";
+const CLOUD_TELEMETRY_MODE = "workers-logs-v2";
 const CLOUD_QUEUE_CONTROL_SAMPLE_WEIGHT = 16;
 const CLOUD_QUEUE_DATA_SAMPLE_WEIGHT = 64;
 const CLOUD_INPUT_SUCCESS_SAMPLE_WEIGHT = 16;
+const CLOUD_ACK_SAMPLE_WEIGHT = 16;
+const CLOUD_CANONICAL_FANOUT_SAMPLE_WEIGHT = 64;
+const CLOUD_HEARTBEAT_LEASE_SAMPLE_WEIGHT = 64;
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, {
@@ -384,7 +420,13 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         return;
       }
       if (attachment.peer === "host") {
-        await this.handleHostControl(webSocket, attachment, message);
+        await this.handleHostControl(
+          webSocket,
+          attachment,
+          message,
+          queueContext,
+          telemetryIngressAt,
+        );
       } else {
         await this.handleBrowserControl(
           webSocket,
@@ -780,6 +822,8 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     webSocket: WebSocket,
     attachment: SocketAttachment,
     message: string,
+    queueContext: Readonly<RelayQueueTaskContext>,
+    telemetryIngressAt: number | undefined,
   ): Promise<void> {
     if (!this.isCurrentHost(attachment)) return;
 
@@ -852,10 +896,48 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
 
     if (frame.type === "input-ack") {
+      const telemetrySampleWeight = this.shouldSampleTelemetry(
+        "forward:input-ack",
+        CLOUD_ACK_SAMPLE_WEIGHT,
+      )
+        ? CLOUD_ACK_SAMPLE_WEIGHT
+        : undefined;
       const browser = this.browserControlByConnection(frame.connectionId);
-      if (browser === undefined) return;
+      if (browser === undefined) {
+        if (telemetrySampleWeight !== undefined) {
+          this.recordInputAckForward(
+            queueContext,
+            telemetryIngressAt,
+            frame.status,
+            "target-missing",
+            this.readTelemetryClock(),
+            telemetrySampleWeight,
+          );
+        }
+        return;
+      }
       const { connectionId: _connectionId, ...browserFrame } = frame;
-      this.sendBrowserControl(browser, browserFrame, "input acknowledgement delivery failed");
+      let sendDecisionAt: number | undefined;
+      const sent = this.sendBrowserControl(
+        browser,
+        browserFrame,
+        "input acknowledgement delivery failed",
+        telemetrySampleWeight === undefined
+          ? undefined
+          : () => {
+              sendDecisionAt = this.readTelemetryClock();
+            },
+      );
+      if (telemetrySampleWeight !== undefined) {
+        this.recordInputAckForward(
+          queueContext,
+          telemetryIngressAt,
+          frame.status,
+          sent ? "send-returned" : "send-failed",
+          sendDecisionAt,
+          telemetrySampleWeight,
+        );
+      }
       return;
     }
 
@@ -1179,22 +1261,47 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       return;
     }
     if (frame.type === "writer-lease-renew") {
-      const expiresAt =
-        attachment.controlState === "active" && attachment.role === "writer"
+      const leaseAttempted = attachment.controlState === "active" && attachment.role === "writer";
+      const leaseStartedAt = leaseAttempted ? this.readTelemetryClock() : undefined;
+      let expiresAt: number | undefined;
+      try {
+        expiresAt = leaseAttempted
           ? await this.renewWriterLease(
               attachment.clientId,
               attachment.leaseFence,
               frame.writerLease,
             )
           : undefined;
+      } catch (error) {
+        this.recordWriterLease(leaseStartedAt, {
+          operation: "verify-renew",
+          trigger: "heartbeat",
+          outcome: "uncertain",
+        });
+        throw error;
+      }
       const latestAttachment = readAttachment(webSocket);
-      const active =
-        expiresAt !== undefined &&
+      const contextCurrent =
         webSocket.readyState === WebSocket.OPEN &&
         latestAttachment?.controlState === "active" &&
         latestAttachment.clientId === attachment.clientId &&
         latestAttachment.leaseFence === attachment.leaseFence &&
         this.activeBrowserControl(attachment.clientId) === webSocket;
+      const active = expiresAt !== undefined && contextCurrent;
+      if (leaseAttempted) {
+        this.recordWriterLease(leaseStartedAt, {
+          operation: "verify-renew",
+          trigger: "heartbeat",
+          outcome:
+            expiresAt === undefined
+              ? contextCurrent
+                ? "inactive-current"
+                : "inactive-stale"
+              : contextCurrent
+                ? "renewed-current"
+                : "renewed-stale",
+        });
+      }
       this.sendBrowserControl(
         webSocket,
         {
@@ -1261,16 +1368,16 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
     const leaseDecisionAt = this.readTelemetryClock();
     const latestAttachment = readAttachment(webSocket);
-    if (
-      !validLease ||
-      webSocket.readyState !== WebSocket.OPEN ||
-      latestAttachment === undefined ||
-      latestAttachment.clientId !== attachment.clientId ||
-      latestAttachment.controlState !== "active" ||
-      latestAttachment.leaseFence === null ||
-      latestAttachment.leaseFence !== attachment.leaseFence ||
-      this.activeBrowserControl(attachment.clientId) !== webSocket
-    ) {
+    const leaseUsable =
+      validLease &&
+      webSocket.readyState === WebSocket.OPEN &&
+      latestAttachment !== undefined &&
+      latestAttachment.clientId === attachment.clientId &&
+      latestAttachment.controlState === "active" &&
+      latestAttachment.leaseFence !== null &&
+      latestAttachment.leaseFence === attachment.leaseFence &&
+      this.activeBrowserControl(attachment.clientId) === webSocket;
+    if (!leaseUsable || latestAttachment === undefined || latestAttachment.leaseFence === null) {
       const decisionAt = this.readTelemetryClock();
       this.rejectInput(webSocket, frame.inputEpoch, frame.clientInputSeq);
       this.recordInputForward(
@@ -1383,19 +1490,32 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
     const initial = initialResult.value;
     const initialActivation = initial.controlAttachment.controlState === "awaiting-attach";
+    const leaseAttempted = initialActivation && attachment.role === "writer";
+    const leaseStartedAt = leaseAttempted ? this.readTelemetryClock() : undefined;
     let lease: AcquiredLease | undefined;
     try {
-      lease =
-        initialActivation && attachment.role === "writer"
-          ? await this.acquireWriterLease(attachment.clientId!, Date.now())
-          : undefined;
+      lease = leaseAttempted
+        ? await this.acquireWriterLease(attachment.clientId!, Date.now())
+        : undefined;
     } catch (error) {
+      this.recordWriterLease(leaseStartedAt, {
+        operation: "acquire",
+        trigger: "attach",
+        outcome: "uncertain",
+      });
       recordAttach("failed", "unexpected");
       throw error;
     }
     const currentResult = this.resolveBrowserAttachContext(webSocket, attachment, frame);
     if (!currentResult.ok) {
       if (lease !== undefined) this.releaseWriterLease(attachment.clientId!, lease.fence);
+      if (leaseAttempted) {
+        this.recordWriterLease(leaseStartedAt, {
+          operation: "acquire",
+          trigger: "attach",
+          outcome: lease === undefined ? "unavailable-stale" : "acquired-released-stale",
+        });
+      }
       recordAttach(
         currentResult.reason === "stale-control" || currentResult.reason === "stale-delivery"
           ? "stale"
@@ -1403,6 +1523,13 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         currentResult.reason,
       );
       return;
+    }
+    if (leaseAttempted) {
+      this.recordWriterLease(leaseStartedAt, {
+        operation: "acquire",
+        trigger: "attach",
+        outcome: lease === undefined ? "unavailable-current" : "acquired-current",
+      });
     }
     const current = currentResult.value;
 
@@ -1702,19 +1829,41 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
 
     if (frame.streamId === 0) {
+      const fanoutSampleWeight = this.sampleDataFanout("canonical");
       if (
         frame.deliveryGeneration !== 0n ||
         this.hasPinnedDeliveryInProgress() ||
         !this.commitCanonicalFrame(session, frame)
       ) {
+        this.recordDataFanout(
+          queueContext,
+          telemetryIngressAt,
+          frame,
+          "canonical",
+          "host-failed",
+          "canonical-rejected",
+          fanoutSampleWeight === undefined ? undefined : this.emptyBrowserFanoutFacts(),
+          fanoutSampleWeight,
+        );
         this.failCurrentHost(attachment, "canonical data sequence gap");
         return;
       }
       const pendingResets: Promise<void>[] = [];
+      const fanoutFacts =
+        fanoutSampleWeight === undefined ? undefined : this.emptyBrowserFanoutFacts();
       for (const browserData of this.browserDataSockets()) {
         const browserAttachment = readAttachment(browserData);
         if (browserAttachment?.dataState === "synced") {
-          const result = this.deliverToBrowser(browserData, browserAttachment, encoded, frame);
+          if (fanoutFacts !== undefined) fanoutFacts.selectedTargets += 1;
+          const result = this.deliverToBrowser(
+            browserData,
+            browserAttachment,
+            encoded,
+            frame,
+            fanoutFacts === undefined
+              ? undefined
+              : (observation) => this.accumulateBrowserFanout(fanoutFacts, observation),
+          );
           if (result === "sequence-error") {
             if (browserAttachment.clientId !== null) {
               pendingResets.push(
@@ -1726,12 +1875,36 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
           }
         }
       }
+      if (fanoutFacts !== undefined) {
+        const canonicalResult = this.classifyBrowserFanout(fanoutFacts);
+        this.recordDataFanout(
+          queueContext,
+          telemetryIngressAt,
+          frame,
+          "canonical",
+          canonicalResult.outcome,
+          canonicalResult.reason,
+          fanoutFacts,
+          fanoutSampleWeight,
+        );
+      }
       await Promise.all(pendingResets);
       return;
     }
 
+    const fanoutSampleWeight = this.sampleDataFanout("directed");
     const client = this.clientByStream(frame.streamId);
     if (client === undefined || frame.deliveryGeneration !== BigInt(client.delivery_generation)) {
+      this.recordDataFanout(
+        queueContext,
+        telemetryIngressAt,
+        frame,
+        "directed",
+        "stale",
+        "generation-fenced",
+        fanoutSampleWeight === undefined ? undefined : this.emptyBrowserFanoutFacts(),
+        fanoutSampleWeight,
+      );
       return;
     }
     const browserData = this.browserDataByClient(client.client_id);
@@ -1741,6 +1914,16 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       browserAttachment !== undefined &&
       frame.kind === DataFrameKind.Reset
     ) {
+      this.recordDataFanout(
+        queueContext,
+        telemetryIngressAt,
+        frame,
+        "directed",
+        "host-failed",
+        "directed-reset",
+        fanoutSampleWeight === undefined ? undefined : this.emptyBrowserFanoutFacts(),
+        fanoutSampleWeight,
+      );
       this.failCurrentHost(attachment, "directed reset is not supported");
       return;
     }
@@ -1750,16 +1933,74 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       browserAttachment.deliveryGeneration !== client.delivery_generation ||
       browserAttachment.dataState === "synced"
     ) {
+      this.recordDataFanout(
+        queueContext,
+        telemetryIngressAt,
+        frame,
+        "directed",
+        browserData === undefined || browserAttachment === undefined ? "not-targeted" : "stale",
+        browserData === undefined || browserAttachment === undefined
+          ? "client-gone"
+          : "generation-fenced",
+        fanoutSampleWeight === undefined ? undefined : this.emptyBrowserFanoutFacts(),
+        fanoutSampleWeight,
+      );
       return;
     }
     if (!this.isDirectedFrameWithinPinnedCommit(browserAttachment, frame)) {
+      this.recordDataFanout(
+        queueContext,
+        telemetryIngressAt,
+        frame,
+        "directed",
+        "host-failed",
+        "pinned-commit-exceeded",
+        fanoutSampleWeight === undefined ? undefined : this.emptyBrowserFanoutFacts(),
+        fanoutSampleWeight,
+      );
       this.failCurrentHost(attachment, "directed replay exceeds pinned commit");
       return;
     }
-    const result = this.deliverToBrowser(browserData, browserAttachment, encoded, frame);
+    const fanoutFacts =
+      fanoutSampleWeight === undefined ? undefined : this.emptyBrowserFanoutFacts();
+    if (fanoutFacts !== undefined) fanoutFacts.selectedTargets = 1;
+    const result = this.deliverToBrowser(
+      browserData,
+      browserAttachment,
+      encoded,
+      frame,
+      fanoutFacts === undefined
+        ? undefined
+        : (observation) => this.accumulateBrowserFanout(fanoutFacts, observation),
+    );
     if (result === "sequence-error") {
+      if (fanoutFacts !== undefined) {
+        this.recordDataFanout(
+          queueContext,
+          telemetryIngressAt,
+          frame,
+          "directed",
+          "host-failed",
+          "sequence-error",
+          fanoutFacts,
+          fanoutSampleWeight,
+        );
+      }
       this.failCurrentHost(attachment, "directed replay sequence gap");
     } else {
+      if (fanoutFacts !== undefined) {
+        const directedResult = this.classifyBrowserFanout(fanoutFacts);
+        this.recordDataFanout(
+          queueContext,
+          telemetryIngressAt,
+          frame,
+          "directed",
+          directedResult.outcome,
+          directedResult.reason,
+          fanoutFacts,
+          fanoutSampleWeight,
+        );
+      }
       await result;
     }
   }
@@ -1835,19 +2076,41 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     attachment: SocketAttachment,
     encoded: Uint8Array,
     frame: DataFrame,
+    onDecision?: (observation: BrowserDeliveryObservation) => void,
   ): Promise<void> | "sequence-error" | undefined {
-    if (attachment.clientId === null || webSocket.readyState !== WebSocket.OPEN) return;
+    const decide =
+      onDecision === undefined
+        ? undefined
+        : (
+            decision: BrowserDeliveryObservation["decision"],
+            creditUtilization: BrowserDeliveryObservation["creditUtilization"] = "not-evaluated",
+          ): void => {
+            try {
+              onDecision({ decision, creditUtilization });
+            } catch {
+              // Fanout observers are diagnostic only and cannot alter delivery or reset ownership.
+            }
+          };
+    if (attachment.clientId === null || webSocket.readyState !== WebSocket.OPEN) {
+      decide?.("stale");
+      return;
+    }
     const client = this.clientById(attachment.clientId);
     if (
       client === undefined ||
       client.stream_id !== attachment.streamId ||
       client.delivery_generation !== attachment.deliveryGeneration
     ) {
+      decide?.("stale");
       return;
     }
     const cursor = advanceDeliveryCursor(attachment, frame);
-    if (cursor.kind === "sequence-error") return "sequence-error";
+    if (cursor.kind === "sequence-error") {
+      decide?.("sequence-error");
+      return "sequence-error";
+    }
     if (cursor.kind === "credit-exceeded") {
+      decide?.("reset-slow-client", ">100%");
       return this.resetBrowserDelivery(attachment.clientId, "slow-client", true);
     }
 
@@ -1859,12 +2122,16 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     try {
       webSocket.send(rewritten);
     } catch {
+      decide?.("reset-send-failed");
       return this.resetBrowserAfterDataSendFailure(webSocket, attachment);
     }
     writeAttachment(webSocket, {
       ...attachment,
       ...cursor.nextState,
     });
+    if (decide !== undefined) {
+      decide("send-returned", this.deliveryCreditUtilization(cursor.outstandingBytes));
+    }
   }
 
   private resetBrowserAfterDataSendFailure(
@@ -2241,7 +2508,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     try {
       const capacity = observation.outcome === "capacity";
       const common = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         monotonicAtMs: capacity ? observation.admittedAt : observation.finishedAt,
         clockKind: "workers-io",
         sampleWeight,
@@ -2329,7 +2596,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (!this.shouldSampleTelemetry("input", sampleWeight)) return;
     try {
       telemetry.record({
-        schemaVersion: 1,
+        schemaVersion: 2,
         monotonicAtMs: sendDecisionAt,
         clockKind: "workers-io",
         sampleWeight,
@@ -2349,6 +2616,230 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
   }
 
+  private recordInputAckForward(
+    queueContext: Readonly<RelayQueueTaskContext>,
+    telemetryIngressAt: number | undefined,
+    status: CloudInputAckForwardEvent["status"],
+    outcome: CloudInputAckForwardEvent["outcome"],
+    decisionAt: number | undefined,
+    sampleWeight: number,
+  ): void {
+    const telemetry = this.telemetry;
+    if (
+      telemetry === undefined ||
+      telemetryIngressAt === undefined ||
+      queueContext.observedQueueWaitMs === undefined ||
+      decisionAt === undefined
+    ) {
+      return;
+    }
+    try {
+      telemetry.record({
+        schemaVersion: 2,
+        monotonicAtMs: decisionAt,
+        clockKind: "workers-io",
+        sampleWeight,
+        name: "cloud.input.ack-forward",
+        status,
+        outcome,
+        observedQueueWaitMs: queueContext.observedQueueWaitMs,
+        observedIngressToSendDecisionMs: Math.max(0, decisionAt - telemetryIngressAt),
+        frameBytesBucket: telemetryByteSizeBucket(queueContext.reservationBytes),
+      });
+    } catch {
+      // ACK diagnostics cannot alter Host acknowledgement forwarding.
+    }
+  }
+
+  private recordWriterLease(startedAt: number | undefined, facts: WriterLeaseFacts): void {
+    const telemetry = this.telemetry;
+    if (telemetry === undefined || startedAt === undefined) return;
+    const finishedAt = this.readTelemetryClock();
+    if (finishedAt === undefined) return;
+    const sampleWeight =
+      facts.operation === "verify-renew" &&
+      (facts.outcome === "renewed-current" || facts.outcome === "inactive-current")
+        ? CLOUD_HEARTBEAT_LEASE_SAMPLE_WEIGHT
+        : 1;
+    if (!this.shouldSampleTelemetry(`lease:${facts.operation}:${facts.outcome}`, sampleWeight)) {
+      return;
+    }
+    try {
+      const common = {
+        schemaVersion: 2,
+        monotonicAtMs: finishedAt,
+        clockKind: "workers-io",
+        sampleWeight,
+        name: "cloud.writer.lease",
+        observedLeaseOutcomeMs: Math.max(0, finishedAt - startedAt),
+      } as const;
+      const event: CloudWriterLeaseEvent =
+        facts.operation === "acquire"
+          ? {
+              ...common,
+              operation: facts.operation,
+              trigger: facts.trigger,
+              outcome: facts.outcome,
+            }
+          : {
+              ...common,
+              operation: facts.operation,
+              trigger: facts.trigger,
+              outcome: facts.outcome,
+            };
+      telemetry.record(event);
+    } catch {
+      // Lease diagnostics cannot alter acquisition, renewal, cleanup, or status delivery.
+    }
+  }
+
+  private emptyBrowserFanoutFacts(): BrowserFanoutFacts {
+    return {
+      selectedTargets: 0,
+      sendReturnedTargets: 0,
+      staleTargets: 0,
+      sequenceErrorTargets: 0,
+      creditResetTargets: 0,
+      sendUncertainResetTargets: 0,
+      maxCreditUtilization: "not-evaluated",
+    };
+  }
+
+  private accumulateBrowserFanout(
+    facts: BrowserFanoutFacts,
+    observation: BrowserDeliveryObservation,
+  ): void {
+    switch (observation.decision) {
+      case "send-returned":
+        facts.sendReturnedTargets += 1;
+        break;
+      case "stale":
+        facts.staleTargets += 1;
+        break;
+      case "sequence-error":
+        facts.sequenceErrorTargets += 1;
+        break;
+      case "reset-slow-client":
+        facts.creditResetTargets += 1;
+        break;
+      case "reset-send-failed":
+        facts.sendUncertainResetTargets += 1;
+        break;
+    }
+    if (
+      this.deliveryCreditUtilizationRank(observation.creditUtilization) >
+      this.deliveryCreditUtilizationRank(facts.maxCreditUtilization)
+    ) {
+      facts.maxCreditUtilization = observation.creditUtilization;
+    }
+  }
+
+  private classifyBrowserFanout(
+    facts: BrowserFanoutFacts,
+  ): Pick<CloudDataFanoutEvent, "outcome" | "reason"> {
+    if (facts.selectedTargets === 0) {
+      return { outcome: "not-targeted", reason: "no-eligible-browser" };
+    }
+    const reasons: CloudDataFanoutEvent["reason"][] = [];
+    if (facts.staleTargets > 0) reasons.push("generation-fenced");
+    if (facts.sequenceErrorTargets > 0) reasons.push("sequence-error");
+    if (facts.creditResetTargets > 0) reasons.push("credit-exceeded");
+    if (facts.sendUncertainResetTargets > 0) reasons.push("data-send-uncertain");
+    if (reasons.length === 0 && facts.sendReturnedTargets === facts.selectedTargets) {
+      return { outcome: "completed", reason: "none" };
+    }
+    if (reasons.length === 1 && reasons[0] === "generation-fenced") {
+      return { outcome: "stale", reason: "generation-fenced" };
+    }
+    return {
+      outcome: "degraded",
+      reason: reasons.length === 1 ? reasons[0]! : "mixed",
+    };
+  }
+
+  private recordDataFanout(
+    queueContext: Readonly<RelayQueueTaskContext>,
+    telemetryIngressAt: number | undefined,
+    frame: DataFrame,
+    path: CloudDataFanoutEvent["path"],
+    outcome: CloudDataFanoutEvent["outcome"],
+    reason: CloudDataFanoutEvent["reason"],
+    facts: BrowserFanoutFacts | undefined,
+    sampleWeight: number | undefined,
+  ): void {
+    const telemetry = this.telemetry;
+    if (
+      telemetry === undefined ||
+      telemetryIngressAt === undefined ||
+      queueContext.observedQueueWaitMs === undefined ||
+      facts === undefined ||
+      sampleWeight === undefined
+    ) {
+      return;
+    }
+    const decisionAt = this.readTelemetryClock();
+    if (decisionAt === undefined) return;
+    try {
+      telemetry.record({
+        schemaVersion: 2,
+        monotonicAtMs: decisionAt,
+        clockKind: "workers-io",
+        sampleWeight,
+        name: "cloud.data.fanout",
+        path,
+        frameKind: this.telemetryDataFrameKind(frame.kind),
+        outcome,
+        reason,
+        observedQueueWaitMs: queueContext.observedQueueWaitMs,
+        observedIngressToFanoutDecisionMs: Math.max(0, decisionAt - telemetryIngressAt),
+        frameBytesBucket: telemetryByteSizeBucket(queueContext.reservationBytes),
+        ...facts,
+      });
+    } catch {
+      // Data diagnostics cannot alter cursor commits, Browser resets, or Host fail-close behavior.
+    }
+  }
+
+  private sampleDataFanout(path: CloudDataFanoutEvent["path"]): number | undefined {
+    const sampleWeight = path === "canonical" ? CLOUD_CANONICAL_FANOUT_SAMPLE_WEIGHT : 1;
+    return this.shouldSampleTelemetry(`data:${path}`, sampleWeight) ? sampleWeight : undefined;
+  }
+
+  private telemetryDataFrameKind(kind: DataFrameKind): CloudDataFanoutEvent["frameKind"] {
+    switch (kind) {
+      case DataFrameKind.PtyOutput:
+        return "pty-output";
+      case DataFrameKind.ResizeApplied:
+        return "resize-applied";
+      case DataFrameKind.ReplayCommit:
+        return "replay-commit";
+      case DataFrameKind.Reset:
+        return "reset";
+      default:
+        return "other";
+    }
+  }
+
+  private deliveryCreditUtilization(
+    outstandingBytes: bigint,
+  ): CloudDataFanoutEvent["maxCreditUtilization"] {
+    if (outstandingBytes === 0n) return "0";
+    const limit = BigInt(MAX_DELIVERY_OUTSTANDING_BYTES);
+    if (outstandingBytes * 4n <= limit) return "1-25%";
+    if (outstandingBytes * 2n <= limit) return "26-50%";
+    if (outstandingBytes * 4n <= limit * 3n) return "51-75%";
+    if (outstandingBytes <= limit) return "76-100%";
+    return ">100%";
+  }
+
+  private deliveryCreditUtilizationRank(
+    utilization: CloudDataFanoutEvent["maxCreditUtilization"],
+  ): number {
+    return ["not-evaluated", "0", "1-25%", "26-50%", "51-75%", "76-100%", ">100%"].indexOf(
+      utilization,
+    );
+  }
+
   private recordRecoveryAttach(
     startedAt: number | undefined,
     replica: Extract<CloudRecoveryTransitionEvent, { transition: "attach" }>["replica"],
@@ -2361,7 +2852,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (telemetry === undefined || startedAt === undefined || finishedAt === undefined) return;
     try {
       telemetry.record({
-        schemaVersion: 1,
+        schemaVersion: 2,
         monotonicAtMs: finishedAt,
         clockKind: "workers-io",
         sampleWeight: 1,
@@ -2390,7 +2881,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (telemetry === undefined || startedAt === undefined || finishedAt === undefined) return;
     try {
       telemetry.record({
-        schemaVersion: 1,
+        schemaVersion: 2,
         monotonicAtMs: finishedAt,
         clockKind: "workers-io",
         sampleWeight: 1,
@@ -2418,7 +2909,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (telemetry === undefined || startedAt === undefined || finishedAt === undefined) return;
     try {
       telemetry.record({
-        schemaVersion: 1,
+        schemaVersion: 2,
         monotonicAtMs: finishedAt,
         clockKind: "workers-io",
         sampleWeight: 1,
@@ -2484,8 +2975,23 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     webSocket: WebSocket,
     frame: z.input<typeof ServerControlFrameSchema>,
     failureReason: string,
+    onDecision?: (sent: boolean) => void,
   ): boolean {
-    if (trySendServerControl(webSocket, frame)) return true;
+    const decide =
+      onDecision === undefined
+        ? undefined
+        : (sent: boolean): void => {
+            try {
+              onDecision(sent);
+            } catch {
+              // Observers are diagnostic only and cannot alter Browser control delivery.
+            }
+          };
+    if (trySendServerControl(webSocket, frame)) {
+      decide?.(true);
+      return true;
+    }
+    decide?.(false);
     const attachment = readAttachment(webSocket);
     if (attachment?.peer === "browser") {
       this.isolateBrowserConnection(webSocket, attachment, failureReason);

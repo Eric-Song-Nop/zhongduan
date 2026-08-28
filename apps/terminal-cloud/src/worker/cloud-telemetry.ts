@@ -1,5 +1,5 @@
 import {
-  CloudTelemetryEventSchema,
+  CloudTelemetryWriteEventSchema,
   createBufferedTelemetrySink,
   type CloudTelemetryEvent,
 } from "@zhongduan/telemetry";
@@ -33,7 +33,7 @@ export function createCloudTelemetry(options: CloudTelemetryOptions = {}): Cloud
     options.collector ?? ((record) => console.info(record));
   const buffered = createBufferedTelemetrySink(
     (event) => {
-      const cloudEvent = CloudTelemetryEventSchema.parse(event);
+      const cloudEvent = CloudTelemetryWriteEventSchema.parse(event);
       const record: CloudTelemetryLogRecord = {
         type: CLOUD_TELEMETRY_RECORD_TYPE,
         runtime: CLOUD_TELEMETRY_RUNTIME,

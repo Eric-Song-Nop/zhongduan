@@ -20,6 +20,6 @@ describe("production observability configuration", () => {
 
     expect(config.observability?.logs?.invocation_logs).toBe(false);
     expect(config.observability?.traces?.enabled).toBe(false);
-    expect(config.vars?.CLOUD_TELEMETRY_MODE).toBe("workers-logs-v1");
+    expect(config.vars?.CLOUD_TELEMETRY_MODE).toBe("workers-logs-v2");
   });
 });

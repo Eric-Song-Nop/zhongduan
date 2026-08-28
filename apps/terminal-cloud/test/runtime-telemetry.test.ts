@@ -1,4 +1,9 @@
-import { DataFrameKind, encodeDataFrame, encodeDeliveryBarrierPayload } from "@zhongduan/protocol";
+import {
+  DataFrameKind,
+  decodeDataFrame,
+  encodeDataFrame,
+  encodeDeliveryBarrierPayload,
+} from "@zhongduan/protocol";
 import { env, exports as workerExports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -60,6 +65,15 @@ class SocketInbox {
     if (typeof message !== "string") throw new Error("expected a text WebSocket message");
     return JSON.parse(message) as Record<string, unknown>;
   }
+}
+
+async function bytesFromMessage(message: unknown): Promise<Uint8Array> {
+  if (message instanceof ArrayBuffer) return new Uint8Array(message);
+  if (ArrayBuffer.isView(message)) {
+    return new Uint8Array(message.buffer, message.byteOffset, message.byteLength).slice();
+  }
+  if (message instanceof Blob) return new Uint8Array(await message.arrayBuffer());
+  throw new Error("expected a binary WebSocket message");
 }
 
 function sessionStub(sessionId: string) {
@@ -190,6 +204,32 @@ function warmDeliveryBarrier(connection: ConnectionSet): Uint8Array {
   });
 }
 
+function warmReplayCommit(connection: ConnectionSet): Uint8Array {
+  return encodeDataFrame({
+    kind: DataFrameKind.ReplayCommit,
+    flags: 0,
+    sessionEpoch: 7n,
+    deliveryGeneration: BigInt(connection.deliveryGeneration),
+    eventSeq: 0n,
+    ptyOffset: 0n,
+    streamId: connection.streamId,
+    payload: new Uint8Array(),
+  });
+}
+
+function canonicalOutput(eventSeq: bigint, ptyOffset: bigint, payload: Uint8Array): Uint8Array {
+  return encodeDataFrame({
+    kind: DataFrameKind.PtyOutput,
+    flags: 0,
+    sessionEpoch: 7n,
+    deliveryGeneration: 0n,
+    eventSeq,
+    ptyOffset,
+    streamId: 0,
+    payload,
+  });
+}
+
 afterEach(async () => {
   for (const socket of testSockets) {
     if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
@@ -260,6 +300,22 @@ describe("live Durable Object telemetry", () => {
       const writerLease = String(welcome.writerLease);
       expect(writerLease).not.toBe("undefined");
 
+      let renewedLeaseStatus: Record<string, unknown> | undefined;
+      let inactiveLeaseStatus: Record<string, unknown> | undefined;
+      for (let heartbeat = 0; heartbeat < 64; heartbeat += 1) {
+        browser.control.socket.send(JSON.stringify({ type: "writer-lease-renew", writerLease }));
+        renewedLeaseStatus = await browser.control.inbox.nextJson();
+        expect(renewedLeaseStatus).toMatchObject({ type: "writer-lease-status", active: true });
+      }
+      const invalidWriterLease = "private-invalid-writer-lease";
+      for (let heartbeat = 0; heartbeat < 64; heartbeat += 1) {
+        browser.control.socket.send(
+          JSON.stringify({ type: "writer-lease-renew", writerLease: invalidWriterLease }),
+        );
+        inactiveLeaseStatus = await browser.control.inbox.nextJson();
+        expect(inactiveLeaseStatus).toEqual({ type: "writer-lease-status", active: false });
+      }
+
       const forwardedInputs: Record<string, unknown>[] = [];
       const acknowledgements: Record<string, unknown>[] = [];
       for (let clientInputSeq = 1; clientInputSeq <= 16; clientInputSeq += 1) {
@@ -313,6 +369,35 @@ describe("live Durable Object telemetry", () => {
         commitPtyOffset: "0",
       });
 
+      host.data.socket.send(warmReplayCommit(browser.connection));
+      const deliveredCommitMessage = await browser.data.inbox.nextMessage();
+      const deliveredCommit = decodeDataFrame(await bytesFromMessage(deliveredCommitMessage));
+      expect(deliveredCommit).toMatchObject({
+        kind: DataFrameKind.ReplayCommit,
+        deliveryGeneration: BigInt(browser.connection.deliveryGeneration),
+        eventSeq: 0n,
+        ptyOffset: 0n,
+        streamId: browser.connection.streamId,
+      });
+
+      const canonicalPayloadMarker = "private-canonical-payload";
+      const canonicalPayload = new TextEncoder().encode(canonicalPayloadMarker);
+      let canonicalPtyOffset = 0n;
+      for (let eventSeq = 1n; eventSeq <= 64n; eventSeq += 1n) {
+        host.data.socket.send(canonicalOutput(eventSeq, canonicalPtyOffset, canonicalPayload));
+        const delivered = decodeDataFrame(
+          await bytesFromMessage(await browser.data.inbox.nextMessage()),
+        );
+        expect(delivered).toMatchObject({
+          kind: DataFrameKind.PtyOutput,
+          deliveryGeneration: BigInt(browser.connection.deliveryGeneration),
+          eventSeq,
+          ptyOffset: canonicalPtyOffset,
+          streamId: browser.connection.streamId,
+        });
+        canonicalPtyOffset += BigInt(canonicalPayload.byteLength);
+      }
+
       browser.data.socket.close(1000, "exercise telemetry delivery reset");
       const deliveryReset = await browser.control.inbox.nextJson();
       expect(deliveryReset).toMatchObject({
@@ -340,6 +425,9 @@ describe("live Durable Object telemetry", () => {
             ?.deserializeAttachment() as
             | { controlState?: string; deliveryGeneration?: string; leaseFence?: string | null }
             | undefined;
+          const sessionState = state.storage.sql
+            .exec("SELECT head_event_seq, next_pty_offset FROM session_state WHERE singleton = 1")
+            .one();
           return {
             controlState: control?.controlState,
             deliveryGeneration: control?.deliveryGeneration,
@@ -347,6 +435,8 @@ describe("live Durable Object telemetry", () => {
             leaseFence: lease.fence,
             leaseMatchesClient: lease.client_id === browserClientId,
             socketLeaseFence: control?.leaseFence,
+            sessionHeadEventSeq: sessionState.head_event_seq,
+            sessionNextPtyOffset: sessionState.next_pty_offset,
           };
         },
       );
@@ -362,6 +452,8 @@ describe("live Durable Object telemetry", () => {
           "telemetry_equivalence",
           "KeyE",
           "€",
+          invalidWriterLease,
+          canonicalPayloadMarker,
         ],
         records,
         summary: {
@@ -400,6 +492,19 @@ describe("live Durable Object telemetry", () => {
               forwarded.clientId === browserClientId,
           },
           acknowledgement,
+          renewedLeaseStatus: {
+            type: renewedLeaseStatus?.type,
+            active: renewedLeaseStatus?.active,
+            hasExpiry: typeof renewedLeaseStatus?.expiresAt === "number",
+          },
+          inactiveLeaseStatus,
+          deliveredCommit: {
+            kind: deliveredCommit.kind,
+            deliveryGeneration: deliveredCommit.deliveryGeneration.toString(),
+            eventSeq: deliveredCommit.eventSeq.toString(),
+            ptyOffset: deliveredCommit.ptyOffset.toString(),
+            streamId: deliveredCommit.streamId,
+          },
           replayStart,
           barrierResult: {
             type: barrierResult.type,
@@ -429,8 +534,8 @@ describe("live Durable Object telemetry", () => {
 
     try {
       const disabled = await runScenario("off", false);
-      const enabled = await runScenario("workers-logs-v1", false);
-      const throwing = await runScenario("workers-logs-v1", true);
+      const enabled = await runScenario("workers-logs-v2", false);
+      const throwing = await runScenario("workers-logs-v2", true);
       collectorThrows = false;
 
       expect(enabled.summary).toEqual(disabled.summary);
@@ -444,6 +549,58 @@ describe("live Durable Object telemetry", () => {
               name: "cloud.input.forward",
               leaseOutcome: "active",
               outcome: "send-returned",
+            }),
+            expect.objectContaining({
+              schemaVersion: 2,
+              name: "cloud.input.ack-forward",
+              status: "written",
+              outcome: "send-returned",
+            }),
+            expect.objectContaining({
+              schemaVersion: 2,
+              name: "cloud.writer.lease",
+              operation: "acquire",
+              trigger: "attach",
+              outcome: "acquired-current",
+              sampleWeight: 1,
+            }),
+            expect.objectContaining({
+              schemaVersion: 2,
+              name: "cloud.writer.lease",
+              operation: "verify-renew",
+              trigger: "heartbeat",
+              outcome: "renewed-current",
+              sampleWeight: 64,
+            }),
+            expect.objectContaining({
+              schemaVersion: 2,
+              name: "cloud.writer.lease",
+              operation: "verify-renew",
+              trigger: "heartbeat",
+              outcome: "inactive-current",
+              sampleWeight: 64,
+            }),
+            expect.objectContaining({
+              schemaVersion: 2,
+              name: "cloud.data.fanout",
+              path: "directed",
+              frameKind: "replay-commit",
+              outcome: "completed",
+              reason: "none",
+              selectedTargets: 1,
+              sendReturnedTargets: 1,
+              sampleWeight: 1,
+            }),
+            expect.objectContaining({
+              schemaVersion: 2,
+              name: "cloud.data.fanout",
+              path: "canonical",
+              frameKind: "pty-output",
+              outcome: "completed",
+              reason: "none",
+              selectedTargets: 1,
+              sendReturnedTargets: 1,
+              sampleWeight: 64,
             }),
             expect.objectContaining({
               name: "cloud.recovery.transition",
@@ -466,6 +623,14 @@ describe("live Durable Object telemetry", () => {
             }),
           ]),
         );
+        expect(
+          result.records.filter(
+            (record) =>
+              record.name === "cloud.data.fanout" &&
+              record.path === "canonical" &&
+              record.outcome === "completed",
+          ),
+        ).toHaveLength(1);
         const serialized = JSON.stringify(result.records);
         for (const privateValue of result.privateValues) {
           expect(serialized).not.toContain(privateValue);
@@ -475,5 +640,5 @@ describe("live Durable Object telemetry", () => {
       collectorThrows = false;
       Object.defineProperty(env, "CLOUD_TELEMETRY_MODE", originalMode);
     }
-  }, 15_000);
+  }, 30_000);
 });
