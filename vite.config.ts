@@ -1,4 +1,5 @@
 import { defineConfig } from "vite-plus";
+import { configDefaults } from "vite-plus/test/config";
 
 export default defineConfig({
   fmt: {
@@ -11,10 +12,13 @@ export default defineConfig({
       typeCheck: true,
     },
   },
+  test: {
+    exclude: [...configDefaults.exclude, "apps/terminal-cloud/test/runtime.test.ts"],
+  },
   run: {
     tasks: {
       verify: {
-        command: ["vp check", "vp test --run"],
+        command: ["vp check", "vp test --run", "vp run @zhongduan/terminal-cloud#test"],
         cache: false,
       },
     },
