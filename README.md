@@ -96,8 +96,10 @@ URL fragment 不会发送给 HTTP 服务器，页面加载后也会立即从地�
 
 - [部署指南](docs/deployment.md)
 - [MVP 架构](docs/mvp-architecture.md)
+- [高性能远程终端 Snapshot 恢复实施计划](docs/high-performance-snapshot-recovery-plan.md)
+- [输入稳定性与高 RTT 交互实施计划](docs/input-stability-plan.md)
 - [Wire protocol](docs/wire-protocol.md)
-- [详细资源与恢复约束](resource.md)
+- [设计记录与资源约束](resource.md)
 
 ## License
 
