@@ -148,6 +148,156 @@ const HostRelayRttEventSchema = z.union([
   HostRelayRttTimeoutEventSchema,
 ]);
 
+const browserBase = {
+  ...base,
+  clockKind: z.literal("browser-performance"),
+} as const;
+
+const BrowserRelayRttSuccessEventSchema = z.strictObject({
+  ...browserBase,
+  name: z.literal("browser.relay.rtt"),
+  channel: z.enum(["control", "data"]),
+  outcome: z.literal("success"),
+  durationMs,
+  outstandingPings: frameCount,
+});
+
+const BrowserRelayRttTimeoutEventSchema = z.strictObject({
+  ...browserBase,
+  name: z.literal("browser.relay.rtt"),
+  channel: z.enum(["control", "data"]),
+  outcome: z.literal("timeout"),
+  silenceMs: durationMs,
+  outstandingPings: frameCount,
+});
+
+const BrowserRelayRttEventSchema = z.union([
+  BrowserRelayRttSuccessEventSchema,
+  BrowserRelayRttTimeoutEventSchema,
+]);
+
+const BrowserRecoveryAttachStartReadyEventSchema = z.strictObject({
+  ...browserBase,
+  name: z.literal("browser.recovery.attach-start"),
+  outcome: z.literal("matching-start-received"),
+  startingReplica: z.enum(["live", "empty"]),
+  mode: z.enum(["warm", "snapshot"]),
+  durationMs,
+});
+
+const BrowserRecoveryAttachStartTimeoutEventSchema = z.strictObject({
+  ...browserBase,
+  name: z.literal("browser.recovery.attach-start"),
+  outcome: z.literal("timeout"),
+  startingReplica: z.enum(["live", "empty"]),
+  durationMs,
+});
+
+const BrowserRecoveryAttachStartCancelledEventSchema = z.strictObject({
+  ...browserBase,
+  name: z.literal("browser.recovery.attach-start"),
+  outcome: z.literal("cancelled"),
+  reason: z.enum(["generation-replaced", "connection-invalidated", "session-closed"]),
+  startingReplica: z.enum(["live", "empty"]),
+  durationMs,
+});
+
+const BrowserRecoveryAttachStartEventSchema = z.union([
+  BrowserRecoveryAttachStartReadyEventSchema,
+  BrowserRecoveryAttachStartTimeoutEventSchema,
+  BrowserRecoveryAttachStartCancelledEventSchema,
+]);
+
+const BrowserInputAckEventSchema = z.strictObject({
+  ...browserBase,
+  name: z.literal("browser.input.ack"),
+  inputKind: z.enum(["key", "text", "paste", "focus", "mouse", "resize"]),
+  status: z.enum(["written", "duplicate", "rejected", "uncertain"]),
+  sendToAckMs: durationMs,
+  outstandingInputs: frameCount,
+});
+
+const browserSnapshotEventBase = {
+  ...browserBase,
+  outcome: z.enum(["ready", "timeout", "cancelled", "failed"]),
+  durationMs,
+  snapshotBytesBucket: byteSizeBucket,
+} as const;
+
+const BrowserSnapshotLoadTotalEventSchema = z.strictObject({
+  ...browserSnapshotEventBase,
+  name: z.literal("browser.snapshot.load-total"),
+});
+
+const BrowserSnapshotRestoreEventSchema = z.strictObject({
+  ...browserSnapshotEventBase,
+  name: z.literal("browser.snapshot.restore"),
+});
+
+const BrowserSnapshotBufferFlushEventSchema = z.strictObject({
+  ...browserBase,
+  name: z.literal("browser.snapshot.buffer-flush"),
+  outcome: z.enum(["applied", "failed"]),
+  durationMs,
+  bufferedFrames: frameCount,
+  bufferedBytesBucket: byteSizeBucket,
+});
+
+const BrowserSnapshotAdoptEventSchema = z.strictObject({
+  ...browserBase,
+  name: z.literal("browser.snapshot.adopt"),
+  outcome: z.enum(["call-returned", "threw"]),
+  durationMs,
+});
+
+const browserRecoveryOutcomeBase = {
+  ...browserBase,
+  name: z.literal("browser.recovery.outcome"),
+  mode: z.enum(["warm", "snapshot"]),
+  startingReplica: z.enum(["empty", "live"]),
+  totalDurationMs: durationMs,
+} as const;
+
+const BrowserRecoveryOutcomeEventSchema = z.union([
+  z.strictObject({
+    ...browserRecoveryOutcomeBase,
+    outcome: z.literal("live"),
+    reason: z.literal("none"),
+  }),
+  z.strictObject({
+    ...browserRecoveryOutcomeBase,
+    outcome: z.literal("resync"),
+    reason: z.enum([
+      "journal-gap",
+      "slow-client",
+      "engine-mismatch",
+      "epoch-changed",
+      "restore-failed",
+    ]),
+  }),
+  z.strictObject({
+    ...browserRecoveryOutcomeBase,
+    outcome: z.literal("superseded"),
+    reason: z.literal("generation-fenced"),
+  }),
+  z.strictObject({
+    ...browserRecoveryOutcomeBase,
+    outcome: z.literal("closed"),
+    reason: z.literal("session-closed"),
+  }),
+]);
+
+export const BrowserTelemetryEventSchema = z.union([
+  BrowserRelayRttEventSchema,
+  BrowserRecoveryAttachStartEventSchema,
+  BrowserInputAckEventSchema,
+  BrowserSnapshotLoadTotalEventSchema,
+  BrowserSnapshotRestoreEventSchema,
+  BrowserSnapshotBufferFlushEventSchema,
+  BrowserSnapshotAdoptEventSchema,
+  BrowserRecoveryOutcomeEventSchema,
+]);
+
 const cloudBase = {
   ...base,
   clockKind: z.literal("workers-io"),
@@ -343,12 +493,15 @@ export const TerminalTelemetryEventSchema = z.union([
   HostControlQueueEventSchema,
   HostInputApplyEventSchema,
   HostRelayRttEventSchema,
+  BrowserTelemetryEventSchema,
   CloudTelemetryEventSchema,
 ]);
 
 export type TerminalTelemetryEvent = z.output<typeof TerminalTelemetryEventSchema>;
 export type CloudTelemetryEvent = z.output<typeof CloudTelemetryEventSchema>;
+export type BrowserTelemetryEvent = z.output<typeof BrowserTelemetryEventSchema>;
 export type TelemetrySink = (event: TerminalTelemetryEvent) => void;
+export type BrowserTelemetrySink = (event: BrowserTelemetryEvent) => void;
 export type MonotonicClock = () => number;
 
 export interface BufferedTelemetrySink {

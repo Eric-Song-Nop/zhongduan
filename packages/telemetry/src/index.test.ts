@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  BrowserTelemetryEventSchema,
   TerminalTelemetryEventSchema,
   createBufferedTelemetrySink,
   elapsedMs,
   emitTelemetry,
   telemetryByteSizeBucket,
+  type BrowserTelemetryEvent,
   type TelemetrySink,
   type TerminalTelemetryEvent,
 } from "./index";
@@ -198,6 +200,196 @@ describe("terminal telemetry", () => {
     },
   ])("accepts the content-free Cloud event $name", (event) => {
     expect(TerminalTelemetryEventSchema.parse(event)).toEqual(event);
+  });
+
+  it.each([
+    {
+      schemaVersion: 1,
+      monotonicAtMs: 40,
+      clockKind: "browser-performance",
+      name: "browser.relay.rtt",
+      channel: "control",
+      outcome: "success",
+      durationMs: 18,
+      outstandingPings: 0,
+    },
+    {
+      schemaVersion: 1,
+      monotonicAtMs: 41,
+      clockKind: "browser-performance",
+      name: "browser.relay.rtt",
+      channel: "data",
+      outcome: "timeout",
+      silenceMs: 45_000,
+      outstandingPings: 2,
+    },
+    {
+      schemaVersion: 1,
+      monotonicAtMs: 42,
+      clockKind: "browser-performance",
+      name: "browser.recovery.attach-start",
+      outcome: "matching-start-received",
+      startingReplica: "live",
+      mode: "warm",
+      durationMs: 12,
+    },
+    {
+      schemaVersion: 1,
+      monotonicAtMs: 43,
+      clockKind: "browser-performance",
+      name: "browser.recovery.attach-start",
+      outcome: "timeout",
+      startingReplica: "empty",
+      durationMs: 205_000,
+    },
+    {
+      schemaVersion: 1,
+      monotonicAtMs: 44,
+      clockKind: "browser-performance",
+      name: "browser.recovery.attach-start",
+      outcome: "cancelled",
+      reason: "generation-replaced",
+      startingReplica: "live",
+      durationMs: 7,
+    },
+    {
+      schemaVersion: 1,
+      monotonicAtMs: 45,
+      clockKind: "browser-performance",
+      name: "browser.input.ack",
+      inputKind: "key",
+      status: "written",
+      sendToAckMs: 22,
+      outstandingInputs: 3,
+    },
+    {
+      schemaVersion: 1,
+      monotonicAtMs: 46,
+      clockKind: "browser-performance",
+      name: "browser.snapshot.load-total",
+      outcome: "ready",
+      durationMs: 35,
+      snapshotBytesBucket: "1025-65536",
+    },
+    {
+      schemaVersion: 1,
+      monotonicAtMs: 47,
+      clockKind: "browser-performance",
+      name: "browser.snapshot.restore",
+      outcome: "cancelled",
+      durationMs: 8,
+      snapshotBytesBucket: "65537+",
+    },
+    {
+      schemaVersion: 1,
+      monotonicAtMs: 48,
+      clockKind: "browser-performance",
+      name: "browser.snapshot.buffer-flush",
+      outcome: "applied",
+      durationMs: 4,
+      bufferedFrames: 6,
+      bufferedBytesBucket: "1025-65536",
+    },
+    {
+      schemaVersion: 1,
+      monotonicAtMs: 49,
+      clockKind: "browser-performance",
+      name: "browser.snapshot.adopt",
+      outcome: "call-returned",
+      durationMs: 1,
+    },
+    {
+      schemaVersion: 1,
+      monotonicAtMs: 50,
+      clockKind: "browser-performance",
+      name: "browser.recovery.outcome",
+      mode: "snapshot",
+      startingReplica: "empty",
+      outcome: "resync",
+      reason: "journal-gap",
+      totalDurationMs: 61,
+    },
+  ] satisfies BrowserTelemetryEvent[])("accepts strict Browser event $name", (event) => {
+    expect(BrowserTelemetryEventSchema.parse(event)).toEqual(event);
+    expect(TerminalTelemetryEventSchema.parse(event)).toEqual(event);
+  });
+
+  it("keeps attach-start outcomes as disjoint strict shapes", () => {
+    const common = {
+      schemaVersion: 1,
+      monotonicAtMs: 42,
+      clockKind: "browser-performance",
+      name: "browser.recovery.attach-start",
+      startingReplica: "empty",
+      durationMs: 10,
+    };
+    expect(() =>
+      BrowserTelemetryEventSchema.parse({
+        ...common,
+        outcome: "matching-start-received",
+      }),
+    ).toThrow();
+    expect(() =>
+      BrowserTelemetryEventSchema.parse({
+        ...common,
+        outcome: "timeout",
+        mode: "snapshot",
+      }),
+    ).toThrow();
+    expect(() =>
+      BrowserTelemetryEventSchema.parse({
+        ...common,
+        outcome: "cancelled",
+      }),
+    ).toThrow();
+  });
+
+  it("rejects impossible recovery outcome and reason combinations", () => {
+    const common = {
+      schemaVersion: 1,
+      monotonicAtMs: 50,
+      clockKind: "browser-performance",
+      name: "browser.recovery.outcome",
+      mode: "snapshot",
+      startingReplica: "empty",
+      totalDurationMs: 10,
+    };
+    for (const event of [
+      { ...common, outcome: "live", reason: "journal-gap" },
+      { ...common, outcome: "closed", reason: "none" },
+      { ...common, outcome: "superseded", reason: "restore-failed" },
+    ]) {
+      expect(() => BrowserTelemetryEventSchema.parse(event)).toThrow();
+    }
+  });
+
+  it.each([
+    "sessionId",
+    "clientId",
+    "connectionId",
+    "streamId",
+    "deliveryGeneration",
+    "inputEpoch",
+    "clientInputSeq",
+    "writerLease",
+    "snapshotId",
+    "text",
+    "key",
+    "error",
+  ])("rejects the Browser diagnostic identity/content field %s", (field) => {
+    expect(() =>
+      BrowserTelemetryEventSchema.parse({
+        schemaVersion: 1,
+        monotonicAtMs: 44,
+        clockKind: "browser-performance",
+        name: "browser.input.ack",
+        inputKind: "text",
+        status: "written",
+        sendToAckMs: 22,
+        outstandingInputs: 3,
+        [field]: "must-stay-local",
+      }),
+    ).toThrow();
   });
 
   it("enforces the current queue lane/profile and capacity shape", () => {

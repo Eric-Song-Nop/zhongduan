@@ -43,7 +43,21 @@ logs and tracing remain explicitly disabled because request URLs contain termina
 one-time WebSocket tickets. The strict event payload contains no raw identifiers or content; the
 Cloudflare log envelope can still add platform identifiers and must be handled as sensitive metadata.
 
+The Browser fact slice uses `clockKind=browser-performance` and records only same-page monotonic
+durations for control/data relay probes, semantic-input acknowledgement, attach-start terminal outcomes, snapshot load,
+passive restore, buffered-tail application, synchronous replica `adopt()` return, and the terminal recovery
+outcome. An adopt event is not proof that pixels were painted, and an input acknowledgement is not an
+application-effect acknowledgement. Input sequence, delivery generation, session/client identifiers,
+snapshot identifiers, credentials, URLs, terminal content, and error strings are not event fields.
+
+`createBrowserDiagnostics()` is an in-memory-only sink. Admission is deferred behind a bounded queue;
+strict validation happens during its drain into a fixed-size circular ring. The pending queue and ring
+are each hard-bounded at 256 events (and may be configured smaller). A full pending queue, invalid event, scheduler failure, or overwritten ring
+entry increments the drop count without affecting terminal behavior. Snapshots are chronological copies;
+the sink never writes console, storage, or network output. Production aggregation/query and any
+operator-controlled export remain a separate layer.
+
 The Host stderr adapter stops writing while the stream reports backpressure and drops diagnostics
 until `drain`, so telemetry cannot grow an unbounded application-owned output queue. Cloud Host-ACK/data
-fanout, Browser restore/adopt, Browser RTT, production aggregation/query, and a unified dashboard remain
-part of the open Phase 0 gate.
+fanout, independent lease acquisition/heartbeat facts, Browser paint and end-to-end facts, production
+aggregation/query, and a unified dashboard remain part of the open Phase 0 gate.

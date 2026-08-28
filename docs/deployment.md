@@ -148,7 +148,7 @@ edge/唤醒/调度；`send()` 返回不证明帧已离开 socket queue 或被 Br
 事件是有界、best-effort 的；高频成功事件采用每个 DO/key 随机起始相位的系统采样，聚合估算必须使用
 `sampleWeight`，原始 event count 不是完整流量计数。安全随机相位无法取得时直接丢弃该采样序列，不使用有偏的固定
 首样本。这一层只提供部分 Phase 0 Cloud 本地事实。Host ACK 转发、Host data fanout、独立 lease
-acquire/heartbeat、Browser paint/restore/adopt、跨节点关联、聚合/dashboard 和端到端 SLO 仍未完成；诊断不得
+acquire/heartbeat、跨节点关联、聚合/dashboard 和端到端 SLO 仍未完成；诊断不得
 写入 terminal wire、journal、snapshot、replay、SQLite schema 或 WebSocket attachment。
 
 ## 5. 构建和启动 Host
@@ -209,6 +209,18 @@ fragment，并把凭据放进当前站点的 `sessionStorage`。完整链接和 
 
 浏览器 capability 初始有效期为 8 小时，在线客户端会在半寿命附近自动刷新。Host
 capability 初始有效期为 24 小时，并由 daemon 自动刷新或使用 bootstrap token 回收。
+
+Browser session 维护一个最多 256 条的本机诊断 ring，记录 control/data socket RTT、input send-return 到
+ACK、attach matching/timeout/cancelled 终点，以及 snapshot load-total、restore、buffer apply、adopt call 和最终
+recovery outcome。
+ring 只驻内存，不进入 console、`sessionStorage`/`localStorage`、terminal snapshot 或网络；容量满时覆盖最旧事件并
+累计 drop count。`TerminalSession.diagnostics` 返回按时间顺序复制的只读快照，主要供本机排障和测试使用。
+
+这些 duration 使用 `performance.now()` 一类本机 monotonic clock；票据 `expiresAt` 仍只能与 wall clock 比较。
+`load-total` 包含 HTTP、完整性校验、解压和 worker transfer，不能称为纯下载；`adopt call-returned` 不证明浏览器
+已经 paint；socket RTT 包含 Browser event loop/socket queue 与 Cloud auto-response，也不是纯网络 RTT；input ACK
+仍不证明 child/app effect。事件不包含 session/client/connection、epoch/seq/generation、snapshot ID、URL、输入内容
+或异常文本。Browser 当前没有生产上传出口，跨节点聚合与 dashboard 属于后续显式 opt-in 的独立阶段。
 
 ## 7. 本地联调
 

@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@zhongduan/protocol": "workspace:*",
+    "@zhongduan/telemetry": "workspace:*",
     "fzstd": "0.1.1"
   }
 }

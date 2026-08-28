@@ -7,6 +7,13 @@ import {
   type DataFrame,
   type ReplicaCursor,
 } from "@zhongduan/protocol";
+import {
+  elapsedMs,
+  telemetryByteSizeBucket,
+  type BrowserTelemetrySink,
+  type MonotonicClock,
+  type TelemetryByteSizeBucket,
+} from "@zhongduan/telemetry";
 
 import type {
   DeliveryState,
@@ -23,6 +30,40 @@ const DEFAULT_MAX_BUFFERED_TAIL_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_BUFFERED_TAIL_FRAMES = 1_024;
 const DEFAULT_RESTORE_DEADLINE_MS = 5_000;
 const MAX_U64 = 0xffff_ffff_ffff_ffffn;
+
+type BrowserTelemetryEvent = Parameters<BrowserTelemetrySink>[0];
+type RecoveryMode = "warm" | "snapshot";
+type RecoveryTerminal =
+  | { outcome: "live"; reason: "none" }
+  | { outcome: "resync"; reason: ResyncReason }
+  | { outcome: "superseded"; reason: "generation-fenced" }
+  | { outcome: "closed"; reason: "session-closed" };
+type SnapshotStageOutcome = "ready" | "timeout" | "cancelled" | "failed";
+
+type SnapshotStage =
+  | {
+      name: "load-total" | "restore";
+      startedAt: number | undefined;
+      snapshotBytesBucket: TelemetryByteSizeBucket | undefined;
+    }
+  | {
+      name: "buffer-flush";
+      startedAt: number | undefined;
+      bufferedFrames: number;
+      bufferedBytesBucket: TelemetryByteSizeBucket | undefined;
+    }
+  | { name: "adopt"; startedAt: number | undefined };
+
+interface RecoveryAttempt {
+  readonly token: number;
+  readonly mode: RecoveryMode;
+  readonly startingReplica: "empty" | "live";
+  readonly startedAt: number | undefined;
+  readonly snapshotBytesBucket: TelemetryByteSizeBucket | undefined;
+  readonly telemetry: BrowserTelemetryEvent[];
+  openStage: SnapshotStage | null;
+  terminal: boolean;
+}
 
 interface Delivery {
   start: DeliveryStart;
@@ -128,6 +169,12 @@ function deliveryStartGeneration(start: DeliveryStart): bigint {
     : BigInt(start.manifest.deliveryGeneration);
 }
 
+function isTimeoutError(error: unknown): boolean {
+  return (
+    typeof error === "object" && error !== null && "name" in error && error.name === "TimeoutError"
+  );
+}
+
 function applyFrame(replica: ReplicaSink, cursor: ReplicaCursor, frame: DataFrame): ReplicaCursor {
   const applied = applyMutationCursor(cursor, frame);
   if (frame.kind === DataFrameKind.PtyOutput) {
@@ -149,6 +196,8 @@ export class SessionCoordinator {
   readonly #restoreDeadlineMs: number;
   readonly #setTimer: NonNullable<SessionCoordinatorOptions["setTimer"]>;
   readonly #clearTimer: NonNullable<SessionCoordinatorOptions["clearTimer"]>;
+  readonly #telemetry: BrowserTelemetrySink | undefined;
+  readonly #monotonicNow: MonotonicClock;
 
   #state: DeliveryState = "idle";
   #delivery: Delivery | null = null;
@@ -160,6 +209,8 @@ export class SessionCoordinator {
   #restoreAbort: AbortController | null = null;
   #restoreTimer: ReturnType<typeof setTimeout> | null = null;
   #restoreAttempt = 0;
+  #recoveryToken = 0;
+  #recovery: RecoveryAttempt | null = null;
 
   constructor(options: SessionCoordinatorOptions) {
     this.#host = options.host;
@@ -179,6 +230,8 @@ export class SessionCoordinator {
     this.#setTimer =
       options.setTimer ?? ((callback, delayMs) => globalThis.setTimeout(callback, delayMs));
     this.#clearTimer = options.clearTimer ?? ((timer) => globalThis.clearTimeout(timer));
+    this.#telemetry = options.telemetry;
+    this.#monotonicNow = options.monotonicNow ?? (() => globalThis.performance.now());
   }
 
   get state(): DeliveryState {
@@ -210,6 +263,8 @@ export class SessionCoordinator {
     };
     if (!this.#acceptDeliveryStart(identity)) return;
     this.#advanceGenerationFence(cursor.deliveryGeneration);
+    this.#discardPendingDelivery("superseded");
+    this.#beginRecovery("warm");
     if (!this.#liveReplica || this.#liveReplica.engineId !== this.#host.engineId) {
       this.#requestResync("engine-mismatch");
       return;
@@ -223,7 +278,6 @@ export class SessionCoordinator {
       this.#requestResync("journal-gap");
       return;
     }
-    this.#discardPendingDelivery();
     this.#delivery = {
       start: identity,
       streamId: start.streamId,
@@ -250,12 +304,13 @@ export class SessionCoordinator {
     };
     if (!this.#acceptDeliveryStart(identity)) return;
     this.#advanceGenerationFence(generation);
+    this.#discardPendingDelivery("superseded");
+    const recovery = this.#beginRecovery("snapshot", manifest);
     if (manifest.engineId !== this.#host.engineId) {
       this.#requestResync("engine-mismatch");
       return;
     }
 
-    this.#discardPendingDelivery();
     const attempt = ++this.#restoreAttempt;
     const cursor = manifestCursor(manifest);
     const expectedCommit = {
@@ -291,18 +346,22 @@ export class SessionCoordinator {
     this.#restoreAbort = abort;
     this.#restoreTimer = this.#setTimer(() => {
       if (this.#restoreAttempt === attempt && this.#state === "restoring") {
-        this.#requestResync("slow-client");
+        this.#requestResync("slow-client", "timeout");
       }
     }, this.#restoreDeadlineMs);
 
     try {
+      this.#beginSnapshotStage(recovery, "load-total");
       const snapshot = await this.#snapshots.load(manifest, abort.signal);
       if (attempt !== this.#restoreAttempt || abort.signal.aborted) return;
+      this.#finishSnapshotStage(recovery, "ready");
+      this.#beginSnapshotStage(recovery, "restore");
       const candidate = await this.#host.restore(snapshot, manifest, abort.signal);
       if (attempt !== this.#restoreAttempt || abort.signal.aborted) {
         candidate.dispose();
         return;
       }
+      this.#finishSnapshotStage(recovery, "ready");
       if (candidate.engineId !== this.#host.engineId) {
         candidate.dispose();
         this.#requestResync("engine-mismatch");
@@ -315,11 +374,16 @@ export class SessionCoordinator {
         return;
       }
       delivery.candidate = candidate;
+      this.#beginBufferFlushStage(recovery, delivery);
       this.#flushBuffered(delivery);
+      this.#finishSnapshotStage(recovery, "ready");
       this.#tryCommit(delivery);
     } catch (error) {
       if (attempt !== this.#restoreAttempt || abort.signal.aborted) return;
-      this.#requestResync(error instanceof ProtocolError ? "journal-gap" : "restore-failed");
+      this.#requestResync(
+        error instanceof ProtocolError ? "journal-gap" : "restore-failed",
+        isTimeoutError(error) ? "timeout" : "failed",
+      );
     }
   }
 
@@ -340,12 +404,17 @@ export class SessionCoordinator {
 
   close(): void {
     if (this.#state === "closed") return;
+    const telemetry = this.#finishRecovery(
+      { outcome: "closed", reason: "session-closed" },
+      "cancelled",
+    );
     this.#cancelRestore();
     const candidate = this.#delivery?.candidate;
     if (candidate && candidate !== this.#liveReplica) candidate.dispose();
     this.#delivery = null;
     this.#clearPendingFrames();
     this.#state = "closed";
+    this.#emitTelemetry(telemetry);
   }
 
   #acceptFrame(frame: DataFrame, ownsPayload: boolean): void {
@@ -471,7 +540,7 @@ export class SessionCoordinator {
       this.#delivery !== null &&
       this.#delivery.received.deliveryGeneration < this.#generationFence
     ) {
-      this.#discardPendingDelivery();
+      this.#discardPendingDelivery("generation-fenced");
     }
     this.#discardPendingFramesBefore(generation);
     if (this.#state !== "closed" && (this.#state !== "resyncing" || resumeFromResync)) {
@@ -533,7 +602,10 @@ export class SessionCoordinator {
     }
 
     if (this.#state === "restoring") {
+      const recovery = this.#recovery;
+      if (recovery !== null) this.#beginSnapshotStage(recovery, "adopt");
       this.#host.adopt(delivery.candidate, delivery.applied);
+      if (recovery !== null) this.#finishSnapshotStage(recovery, "ready");
       this.#liveReplica = delivery.candidate;
       this.#activeCursor = { ...delivery.applied };
       this.#reportReplicaProgress(delivery.applied);
@@ -541,17 +613,23 @@ export class SessionCoordinator {
     }
     this.#finishRestoreTimer();
     this.#state = "live";
+    this.#emitTelemetry(this.#finishRecovery({ outcome: "live", reason: "none" }, "ready"));
   }
 
-  #requestResync(reason: ResyncReason): void {
+  #requestResync(reason: ResyncReason, stageOutcome: SnapshotStageOutcome = "cancelled"): void {
     if (this.#state === "closed" || this.#state === "resyncing") return;
+    const telemetry = this.#finishRecovery({ outcome: "resync", reason }, stageOutcome);
     this.#state = "resyncing";
     this.#cancelRestore();
     const candidate = this.#delivery?.candidate;
     if (candidate && candidate !== this.#liveReplica) candidate.dispose();
     this.#delivery = null;
     this.#clearPendingFrames();
-    this.#onResync(reason);
+    try {
+      this.#onResync(reason);
+    } finally {
+      this.#emitTelemetry(telemetry);
+    }
   }
 
   #cancelRestore(): void {
@@ -561,11 +639,185 @@ export class SessionCoordinator {
     this.#finishRestoreTimer();
   }
 
-  #discardPendingDelivery(): void {
+  #discardPendingDelivery(_reason: "generation-fenced" | "superseded"): void {
+    const telemetry = this.#finishRecovery(
+      { outcome: "superseded", reason: "generation-fenced" },
+      "cancelled",
+    );
     this.#cancelRestore();
     const candidate = this.#delivery?.candidate;
     if (candidate && candidate !== this.#liveReplica) candidate.dispose();
     this.#delivery = null;
+    this.#emitTelemetry(telemetry);
+  }
+
+  #beginRecovery(mode: "warm"): RecoveryAttempt;
+  #beginRecovery(mode: "snapshot", manifest: SnapshotManifest): RecoveryAttempt;
+  #beginRecovery(mode: RecoveryMode, manifest?: SnapshotManifest): RecoveryAttempt {
+    const attempt: RecoveryAttempt = {
+      token: ++this.#recoveryToken,
+      mode,
+      startingReplica: this.#activeCursor === null ? "empty" : "live",
+      startedAt: this.#readTelemetryClock(),
+      snapshotBytesBucket:
+        mode === "snapshot" && manifest !== undefined
+          ? this.#snapshotBytesBucket(manifest)
+          : undefined,
+      telemetry: [],
+      openStage: null,
+      terminal: false,
+    };
+    this.#recovery = attempt;
+    return attempt;
+  }
+
+  #beginSnapshotStage(attempt: RecoveryAttempt, name: "load-total" | "restore" | "adopt"): void {
+    if (
+      this.#recovery !== attempt ||
+      attempt.terminal ||
+      attempt.mode !== "snapshot" ||
+      attempt.openStage !== null
+    ) {
+      return;
+    }
+    attempt.openStage =
+      name === "adopt"
+        ? { name, startedAt: this.#readTelemetryClock() }
+        : {
+            name,
+            startedAt: this.#readTelemetryClock(),
+            snapshotBytesBucket: attempt.snapshotBytesBucket,
+          };
+  }
+
+  #beginBufferFlushStage(attempt: RecoveryAttempt, delivery: Delivery): void {
+    if (
+      this.#recovery !== attempt ||
+      attempt.terminal ||
+      attempt.mode !== "snapshot" ||
+      attempt.openStage !== null
+    ) {
+      return;
+    }
+    attempt.openStage = {
+      name: "buffer-flush",
+      startedAt: this.#readTelemetryClock(),
+      bufferedFrames: delivery.buffered.length,
+      bufferedBytesBucket: this.#telemetryBytesBucket(delivery.bufferedBytes),
+    };
+  }
+
+  #finishSnapshotStage(attempt: RecoveryAttempt, outcome: SnapshotStageOutcome): void {
+    if (this.#recovery !== attempt || attempt.terminal) return;
+    const stage = attempt.openStage;
+    if (stage === null) return;
+    attempt.openStage = null;
+    if (stage.startedAt === undefined) return;
+    const finishedAt = this.#readTelemetryClock();
+    if (finishedAt === undefined) return;
+    const timing = {
+      schemaVersion: 1 as const,
+      monotonicAtMs: finishedAt,
+      clockKind: "browser-performance" as const,
+      durationMs: elapsedMs(stage.startedAt, finishedAt),
+    };
+    if (stage.name === "load-total" || stage.name === "restore") {
+      if (stage.snapshotBytesBucket === undefined) return;
+      this.#queueAttemptTelemetry(attempt, {
+        ...timing,
+        name: `browser.snapshot.${stage.name}`,
+        outcome,
+        snapshotBytesBucket: stage.snapshotBytesBucket,
+      });
+      return;
+    }
+    if (stage.name === "buffer-flush") {
+      if (stage.bufferedBytesBucket === undefined) return;
+      this.#queueAttemptTelemetry(attempt, {
+        ...timing,
+        name: "browser.snapshot.buffer-flush",
+        outcome: outcome === "ready" ? "applied" : "failed",
+        bufferedFrames: stage.bufferedFrames,
+        bufferedBytesBucket: stage.bufferedBytesBucket,
+      });
+      return;
+    }
+    this.#queueAttemptTelemetry(attempt, {
+      ...timing,
+      name: "browser.snapshot.adopt",
+      outcome: outcome === "ready" ? "call-returned" : "threw",
+    });
+  }
+
+  #finishRecovery(
+    terminal: RecoveryTerminal,
+    stageOutcome: SnapshotStageOutcome,
+  ): BrowserTelemetryEvent[] {
+    const attempt = this.#recovery;
+    if (attempt === null || attempt.terminal) return [];
+    this.#finishSnapshotStage(attempt, stageOutcome);
+    attempt.terminal = true;
+    if (this.#recovery === attempt) this.#recovery = null;
+    if (attempt.startedAt !== undefined) {
+      const finishedAt = this.#readTelemetryClock();
+      if (finishedAt !== undefined) {
+        this.#queueAttemptTelemetry(attempt, {
+          schemaVersion: 1,
+          monotonicAtMs: finishedAt,
+          clockKind: "browser-performance",
+          name: "browser.recovery.outcome",
+          mode: attempt.mode,
+          startingReplica: attempt.startingReplica,
+          ...terminal,
+          totalDurationMs: elapsedMs(attempt.startedAt, finishedAt),
+        });
+      }
+    }
+    return attempt.telemetry.splice(0);
+  }
+
+  #queueAttemptTelemetry(attempt: RecoveryAttempt, event: BrowserTelemetryEvent): void {
+    if (attempt.telemetry.length < 5) attempt.telemetry.push(event);
+  }
+
+  #snapshotBytesBucket(manifest: SnapshotManifest): TelemetryByteSizeBucket | undefined {
+    if (this.#telemetry === undefined) return undefined;
+    try {
+      const bytes = Number(BigInt(manifest.uncompressedLength));
+      return this.#telemetryBytesBucket(bytes);
+    } catch {
+      return undefined;
+    }
+  }
+
+  #telemetryBytesBucket(bytes: number): TelemetryByteSizeBucket | undefined {
+    if (this.#telemetry === undefined) return undefined;
+    try {
+      return telemetryByteSizeBucket(bytes);
+    } catch {
+      return undefined;
+    }
+  }
+
+  #readTelemetryClock(): number | undefined {
+    if (this.#telemetry === undefined) return undefined;
+    try {
+      const value = this.#monotonicNow();
+      return Number.isFinite(value) && value >= 0 ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  #emitTelemetry(events: BrowserTelemetryEvent[]): void {
+    if (this.#telemetry === undefined) return;
+    for (const event of events) {
+      try {
+        this.#telemetry(event);
+      } catch {
+        // Browser diagnostics are observational and cannot alter replica recovery.
+      }
+    }
   }
 
   #finishRestoreTimer(): void {

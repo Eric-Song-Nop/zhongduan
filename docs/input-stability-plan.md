@@ -718,6 +718,12 @@ socket close 等路径调用的 `resetBrowserDelivery()` 操作入口起算。�
 renewal，也不修改 wire、fence、dedup、journal、snapshot、replay 或 WebSocket attachment，所以同样不代表
 Phase A 已完成。
 
+`observability/browser-recovery-latency` 继续补 Browser 本机事实，但仍不修改 input correctness。它用独立于
+票据 wall clock 的 monotonic clock 记录 control/data socket RTT、成功送入 control socket 到 input ACK 的时间、
+attach matching/timeout/cancelled 终点，以及 snapshot load/restore/buffer apply/adopt 与最终 recovery outcome。内部 pairing 可以使用
+input epoch/seq，但事件不得带出这些标识或 key/text/paste；所有记录只进入 256 条有界内存 ring，不写 console、
+storage 或网络。这里的 ACK 仍不是 child read/app effect，socket RTT 也不是纯网络 RTT。
+
 - Browser 完整 validate/admit 后才分配 seq；
 - Host 使用 strict `nextExpectedSeq`；确定性 reject 消费 seq，`uncertain` 终止 epoch；
 - 建立单一 per-writer sequencer，明确 urgent cancellation 与 resize ordering；
@@ -810,8 +816,10 @@ invocation 或 Durable Object 标识。Cloud queue wait 只从 `webSocketMessage
 Browser input→Host send decision 与 barrier result send 只量到本地 decision/`send()` 返回。Workers runtime clock
 只在 I/O 边界推进，同步 CPU 工作可能不可见，所以这些字段全部是 Cloud local lower-bound，不能标成网络传输、
 对端接收、端到端 latency 或 CPU time。有界 best-effort producer sampling 的聚合必须使用 `sampleWeight`，原始
-event count 不是完整流量计数。Host ACK 转发、Host data fanout、独立 lease acquire/heartbeat、Browser
-paint/restore/adopt、跨节点聚合/dashboard 和端到端 SLO 仍是开放的 Phase 0 gate。
+event count 不是完整流量计数。Browser 本机切片已经补齐 input send-return→ACK、socket RTT 与 snapshot
+load/restore/buffer apply/adopt，但还没有 keydown、canonical match 或真实 paint 信号。Host ACK 转发、Host data
+fanout、独立 lease acquire/heartbeat、Browser paint、跨节点聚合/dashboard 和端到端 SLO 仍是开放的 Phase 0
+gate。
 
 ### 初始发布门槛
 

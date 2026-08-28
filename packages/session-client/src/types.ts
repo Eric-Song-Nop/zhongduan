@@ -1,4 +1,5 @@
 import type { ReplicaCursor, ResizePayload, ServerControlFrame } from "@zhongduan/protocol";
+import type { BrowserTelemetrySink, MonotonicClock } from "@zhongduan/telemetry";
 
 export type SnapshotManifest = Extract<ServerControlFrame, { type: "snapshot-manifest" }>;
 export type WarmReplayStart = Extract<ServerControlFrame, { type: "replay-start" }>;
@@ -54,4 +55,6 @@ export interface SessionCoordinatorOptions {
   restoreDeadlineMs?: number;
   setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  telemetry?: BrowserTelemetrySink;
+  monotonicNow?: MonotonicClock;
 }

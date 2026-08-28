@@ -12,9 +12,11 @@ import type {
   SnapshotManifest,
   SnapshotTransport,
 } from "@zhongduan/session-client";
+import type { BrowserTelemetryEvent } from "@zhongduan/telemetry";
 import { describe, expect, it, vi } from "vitest";
 
 import { CapabilityManager } from "./capability";
+import { createBrowserDiagnostics, type BrowserDiagnostics } from "./diagnostics-ring";
 import { InputDispatcher } from "./input-dispatcher";
 import { ATTACH_START_TIMEOUT_MS, TerminalSession } from "./terminal-session";
 
@@ -219,6 +221,133 @@ class ManualTimers {
     const next = [...this.#scheduled.values()].sort((left, right) => left.at - right.at)[0];
     return next === undefined ? undefined : next.at - this.now;
   }
+}
+
+interface DiagnosticHarness {
+  control: FakeSocket;
+  data: FakeSocket;
+  diagnostics: BrowserDiagnostics;
+  input: InputDispatcher;
+  response: {
+    connectionId: string;
+    deliveryGeneration: string;
+    streamId: number;
+  };
+  session: TerminalSession;
+  sockets: FakeSocket[];
+}
+
+interface DiagnosticHarnessOptions {
+  diagnostics?: BrowserDiagnostics;
+  liveReplica?: boolean;
+  monotonicNow?: () => number;
+  now?: () => number;
+  timers?: ManualTimers;
+}
+
+async function createDiagnosticHarness(
+  options: DiagnosticHarnessOptions = {},
+): Promise<DiagnosticHarness> {
+  const timers = options.timers;
+  const liveReplica = options.liveReplica ?? true;
+  const visible = liveReplica ? new VisibleSink() : null;
+  const response = {
+    connectionSetId: "connection_set_diagnostics",
+    connectionId: "connection_id_diagnostics",
+    clientId: "browser_client_diagnostics",
+    streamId: 7,
+    deliveryGeneration: liveReplica ? "2" : "1",
+    expiresAt: 2_000_000_030_000,
+    controlTicket: "control_ticket_diagnostics",
+    dataTicket: "data_ticket_diagnostics",
+  };
+  const fetch = vi.fn(
+    async () =>
+      new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+  );
+  const capabilities = new CapabilityManager({
+    bootstrap: {
+      capability: "opaque",
+      expiresAt: 2_000_000_100,
+      issuedAt: 2_000_000_000,
+      role: "writer",
+      sessionId: SESSION_ID,
+    },
+    fetch,
+    setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+    clearTimer: vi.fn(),
+  });
+  const input = new InputDispatcher({
+    getObservedEventSeq: () => 0n,
+    inputEpoch: "input_epoch_diagnostics",
+  });
+  const diagnostics = options.diagnostics ?? createBrowserDiagnostics();
+  const sockets: FakeSocket[] = [];
+  const session = new TerminalSession({
+    capabilities,
+    engineId: ENGINE_ID,
+    host: {
+      engineId: ENGINE_ID,
+      active: visible,
+      restore: vi.fn(async () => new VisibleSink()),
+      adopt: vi.fn(),
+    },
+    input,
+    ...(liveReplica
+      ? {
+          initialCursor: {
+            sessionEpoch: 1n,
+            deliveryGeneration: 1n,
+            lastEventSeq: 0n,
+            nextPtyOffset: 0n,
+          },
+        }
+      : {}),
+    sessionId: SESSION_ID,
+    snapshots: { load: vi.fn(async () => Uint8Array.of(1)) },
+    fetch,
+    createWebSocket: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    },
+    diagnostics,
+    makeWebSocketUrl: (path) => path,
+    ...(options.monotonicNow === undefined ? {} : { monotonicNow: options.monotonicNow }),
+    ...(options.now === undefined ? {} : { now: options.now }),
+    ...(timers === undefined ? {} : { setTimer: timers.setTimer, clearTimer: timers.clearTimer }),
+  });
+
+  session.start();
+  await waitForSockets(sockets, 1);
+  const control = sockets[0]!;
+  control.open();
+  await waitForSockets(sockets, 2);
+  const data = sockets[1]!;
+  data.open();
+  await vi.waitFor(() => {
+    expect(controlFrames(control).some((frame) => frame.type === "attach")).toBe(true);
+  });
+  return { control, data, diagnostics, input, response, session, sockets };
+}
+
+function welcomeDiagnosticWriter(harness: DiagnosticHarness, writerLease = "writer_lease_diag01") {
+  harness.control.message(
+    JSON.stringify({
+      type: "welcome",
+      connectionId: harness.response.connectionId,
+      streamId: harness.response.streamId,
+      writerLease,
+      engineId: ENGINE_ID,
+      sessionEpoch: "1",
+      deliveryGeneration: harness.response.deliveryGeneration,
+      headEventSeq: "0",
+      nextPtyOffset: "0",
+    }),
+  );
 }
 
 describe("TerminalSession delivery activation", () => {
@@ -1705,4 +1834,697 @@ describe("TerminalSession delivery activation", () => {
     expect(session.snapshot.phase).toBe("live");
     session.close();
   });
+
+  it("separates wall expiry from monotonic RTT and does not read the clock for binary data", async () => {
+    const timers = new ManualTimers();
+    let wallNow = 2_000_000_000_000;
+    let monotonicReads = 0;
+    const harness = await createDiagnosticHarness({
+      timers,
+      now: () => wallNow,
+      monotonicNow: () => {
+        monotonicReads += 1;
+        return timers.now;
+      },
+    });
+    harness.control.autoPong = false;
+    harness.data.autoPong = false;
+
+    const readsBeforeData = monotonicReads;
+    harness.data.message(dataFrame(2n, 1n, 0n, [65]));
+    expect(monotonicReads).toBe(readsBeforeData);
+
+    await timers.advanceBy(15_000);
+    wallNow += 1_000_000_000;
+    await timers.advanceBy(25);
+    harness.control.message("pong");
+    await harness.diagnostics.flush();
+    expect(
+      harness.session.diagnostics.events.filter(
+        (event) => event.name === "browser.relay.rtt" && event.outcome === "success",
+      ),
+    ).toContainEqual(
+      expect.objectContaining({ channel: "control", durationMs: 25, outstandingPings: 0 }),
+    );
+
+    harness.control.message(
+      JSON.stringify({
+        type: "resync-required",
+        deliveryGeneration: "3",
+        reason: "data-disconnected",
+        dataTicket: "expired_replacement_ticket",
+        expiresAt: wallNow - 1,
+      }),
+    );
+    expect(harness.control.readyState).toBe(3);
+    expect(harness.session.snapshot.lastError).toBe("protocol");
+    harness.session.close();
+  });
+
+  it("pairs overlapping control and data heartbeat probes independently in FIFO order", async () => {
+    const timers = new ManualTimers();
+    const harness = await createDiagnosticHarness({ timers, monotonicNow: () => timers.now });
+    harness.control.autoPong = false;
+    harness.data.autoPong = false;
+
+    await timers.advanceBy(15_000);
+    await timers.advanceBy(15_000);
+    await timers.advanceBy(2_000);
+    harness.control.message("pong");
+    await timers.advanceBy(1_000);
+    harness.data.message("pong");
+    await timers.advanceBy(2_000);
+    harness.control.message("pong");
+    await timers.advanceBy(1_000);
+    harness.data.message("pong");
+    await harness.diagnostics.flush();
+
+    expect(
+      harness.session.diagnostics.events
+        .filter((event) => event.name === "browser.relay.rtt" && event.outcome === "success")
+        .map((event) => ({
+          channel: event.channel,
+          durationMs: event.durationMs,
+          outstandingPings: event.outstandingPings,
+        })),
+    ).toEqual([
+      { channel: "control", durationMs: 17_000, outstandingPings: 1 },
+      { channel: "data", durationMs: 18_000, outstandingPings: 1 },
+      { channel: "control", durationMs: 5_000, outstandingPings: 0 },
+      { channel: "data", durationMs: 6_000, outstandingPings: 0 },
+    ]);
+    harness.session.close();
+  });
+
+  it("records heartbeat timeout before reconnect and resets probe pairing on new sockets", async () => {
+    const timers = new ManualTimers();
+    const harness = await createDiagnosticHarness({ timers, monotonicNow: () => timers.now });
+    harness.data.autoPong = false;
+
+    await timers.advanceBy(45_000);
+    await harness.diagnostics.flush();
+    expect(harness.session.diagnostics.events).toContainEqual(
+      expect.objectContaining({
+        name: "browser.relay.rtt",
+        channel: "data",
+        outcome: "timeout",
+        silenceMs: 45_000,
+        outstandingPings: 2,
+      }),
+    );
+    expect(harness.control.readyState).toBe(3);
+    expect(harness.data.readyState).toBe(3);
+    harness.diagnostics.clear();
+
+    await timers.runUntil(() => harness.sockets.length >= 3);
+    const replacementControl = harness.sockets[2]!;
+    replacementControl.autoPong = false;
+    replacementControl.open();
+    await waitForSockets(harness.sockets, 4);
+    const replacementData = harness.sockets[3]!;
+    replacementData.autoPong = false;
+    replacementData.open();
+    await vi.waitFor(() => expect(harness.session.snapshot.dataConnected).toBe(true));
+    await timers.advanceBy(15_000);
+    await timers.advanceBy(20);
+    replacementControl.message("pong");
+    replacementData.message("pong");
+    await harness.diagnostics.flush();
+
+    expect(
+      harness.session.diagnostics.events.filter(
+        (event) => event.name === "browser.relay.rtt" && event.outcome === "success",
+      ),
+    ).toEqual([
+      expect.objectContaining({ channel: "control", durationMs: 20, outstandingPings: 0 }),
+      expect.objectContaining({ channel: "data", durationMs: 20, outstandingPings: 0 }),
+    ]);
+    harness.session.close();
+  });
+
+  it("keeps heartbeat liveness and FIFO pairing correct when the diagnostic clock fails", async () => {
+    const timers = new ManualTimers();
+    let clockAvailable = true;
+    const harness = await createDiagnosticHarness({
+      timers,
+      monotonicNow: () => {
+        if (!clockAvailable) throw new Error("diagnostic clock unavailable");
+        return timers.now;
+      },
+    });
+    harness.control.autoPong = false;
+    harness.data.autoPong = false;
+
+    await timers.advanceBy(15_000);
+    clockAvailable = false;
+    harness.control.message("pong");
+    harness.data.message("pong");
+    clockAvailable = true;
+    await timers.advanceBy(15_000);
+    await timers.advanceBy(25);
+    harness.control.message("pong");
+    harness.data.message("pong");
+    await harness.diagnostics.flush();
+
+    expect(
+      harness.session.diagnostics.events
+        .filter((event) => event.name === "browser.relay.rtt" && event.outcome === "success")
+        .map((event) => ({ channel: event.channel, durationMs: event.durationMs })),
+    ).toEqual([
+      { channel: "control", durationMs: 25 },
+      { channel: "data", durationMs: 25 },
+    ]);
+
+    clockAvailable = false;
+    await timers.advanceBy(45_000);
+    expect(harness.control.readyState).toBe(3);
+    expect(harness.data.readyState).toBe(3);
+    harness.session.close();
+  });
+
+  it("preserves control RTT identity across a data-only socket replacement", async () => {
+    const timers = new ManualTimers();
+    const harness = await createDiagnosticHarness({
+      timers,
+      now: () => 2_000_000_000_000,
+      monotonicNow: () => timers.now,
+    });
+    harness.control.autoPong = false;
+    harness.data.autoPong = false;
+
+    await timers.advanceBy(15_000);
+    harness.control.message(
+      JSON.stringify({
+        type: "resync-required",
+        deliveryGeneration: "3",
+        reason: "data-disconnected",
+        dataTicket: "replacement_ticket_heartbeat",
+        expiresAt: 2_000_000_030_000,
+      }),
+    );
+    await waitForSockets(harness.sockets, 3);
+    const replacementData = harness.sockets[2]!;
+    replacementData.autoPong = false;
+    replacementData.open();
+    await vi.waitFor(() => expect(harness.session.snapshot.dataConnected).toBe(true));
+
+    await timers.advanceBy(15_000);
+    await timers.advanceBy(1);
+    harness.control.message("pong");
+    await timers.advanceBy(1);
+    harness.control.message("pong");
+    await harness.diagnostics.flush();
+
+    expect(
+      harness.session.diagnostics.events.flatMap((event) =>
+        event.name === "browser.relay.rtt" &&
+        event.outcome === "success" &&
+        event.channel === "control"
+          ? [
+              {
+                durationMs: event.durationMs,
+                outstandingPings: event.outstandingPings,
+              },
+            ]
+          : [],
+      ),
+    ).toEqual([
+      { durationMs: 15_001, outstandingPings: 1 },
+      { durationMs: 2, outstandingPings: 0 },
+    ]);
+    harness.session.close();
+  });
+
+  it("does not extend a silent control socket deadline across repeated data replacements", async () => {
+    const timers = new ManualTimers();
+    const harness = await createDiagnosticHarness({
+      timers,
+      now: () => 2_000_000_000_000,
+      monotonicNow: () => timers.now,
+    });
+    harness.control.autoPong = false;
+    harness.data.autoPong = false;
+
+    for (const [generation, at] of [
+      [3, 10_000],
+      [4, 20_000],
+    ] as const) {
+      await timers.advanceBy(at - timers.now);
+      harness.control.message(
+        JSON.stringify({
+          type: "resync-required",
+          deliveryGeneration: generation.toString(),
+          reason: "data-disconnected",
+          dataTicket: `replacement_ticket_deadline_${generation}`,
+          expiresAt: 2_000_000_030_000,
+        }),
+      );
+      await waitForSockets(harness.sockets, generation);
+      const replacementData = harness.sockets[generation - 1]!;
+      replacementData.autoPong = false;
+      replacementData.open();
+      await vi.waitFor(() => expect(harness.session.snapshot.dataConnected).toBe(true));
+    }
+
+    await timers.advanceBy(25_000);
+    expect(timers.now).toBe(45_000);
+    expect(harness.control.readyState).toBe(3);
+    expect(harness.session.snapshot.phase).toBe("reconnecting");
+    harness.session.close();
+  });
+
+  it.each([
+    { liveReplica: true, mode: "warm" as const, startingReplica: "live" as const },
+    { liveReplica: false, mode: "snapshot" as const, startingReplica: "empty" as const },
+  ])(
+    "records $mode attach send to the matching accepted start",
+    async ({ liveReplica, mode, startingReplica }) => {
+      const timers = new ManualTimers();
+      const harness = await createDiagnosticHarness({
+        liveReplica,
+        timers,
+        monotonicNow: () => timers.now,
+      });
+      await timers.advanceBy(123);
+      if (mode === "warm") {
+        harness.control.message(
+          JSON.stringify({
+            type: "replay-start",
+            sessionEpoch: "1",
+            streamId: 7,
+            deliveryGeneration: "2",
+            baseEventSeq: "0",
+            basePtyOffset: "0",
+            commitEventSeq: "0",
+            commitPtyOffset: "0",
+          }),
+        );
+      } else {
+        harness.control.message(JSON.stringify(snapshotManifest(1n)));
+      }
+      await harness.diagnostics.flush();
+
+      expect(harness.session.diagnostics.events).toContainEqual(
+        expect.objectContaining({
+          name: "browser.recovery.attach-start",
+          outcome: "matching-start-received",
+          mode,
+          startingReplica,
+          durationMs: 123,
+        }),
+      );
+      harness.session.close();
+    },
+  );
+
+  it("records only a live attach watchdog timeout and never invents an accepted mode", async () => {
+    const timers = new ManualTimers();
+    const harness = await createDiagnosticHarness({ timers, monotonicNow: () => timers.now });
+
+    await timers.advanceBy(ATTACH_START_TIMEOUT_MS);
+    await harness.diagnostics.flush();
+    const attachEvents = harness.session.diagnostics.events.filter(
+      (event) => event.name === "browser.recovery.attach-start",
+    );
+    expect(attachEvents).toEqual([
+      expect.objectContaining({
+        outcome: "timeout",
+        startingReplica: "live",
+        durationMs: ATTACH_START_TIMEOUT_MS,
+      }),
+    ]);
+    expect(attachEvents[0]).not.toHaveProperty("mode");
+    expect(harness.session.snapshot.phase).toBe("reconnecting");
+    harness.session.close();
+  });
+
+  it("records generation replacement and session close as terminal attach outcomes", async () => {
+    const timers = new ManualTimers();
+    const harness = await createDiagnosticHarness({
+      timers,
+      now: () => 2_000_000_000_000,
+      monotonicNow: () => timers.now,
+    });
+
+    await timers.advanceBy(25);
+    harness.control.message(
+      JSON.stringify({
+        type: "resync-required",
+        deliveryGeneration: "3",
+        reason: "data-disconnected",
+        dataTicket: "replacement_ticket_attach",
+        expiresAt: 2_000_000_030_000,
+      }),
+    );
+    await harness.diagnostics.flush();
+    expect(
+      harness.session.diagnostics.events.filter(
+        (event) => event.name === "browser.recovery.attach-start",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        outcome: "cancelled",
+        reason: "generation-replaced",
+        durationMs: 25,
+      }),
+    ]);
+
+    const closing = await createDiagnosticHarness({ timers, monotonicNow: () => timers.now });
+    await timers.advanceBy(10);
+    closing.session.close();
+    await closing.diagnostics.flush();
+    expect(
+      closing.session.diagnostics.events.filter(
+        (event) => event.name === "browser.recovery.attach-start",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        outcome: "cancelled",
+        reason: "session-closed",
+        durationMs: 10,
+      }),
+    ]);
+
+    const invalidated = await createDiagnosticHarness({
+      timers,
+      monotonicNow: () => timers.now,
+    });
+    await timers.advanceBy(5);
+    invalidated.control.message(
+      JSON.stringify({
+        type: "resync-required",
+        deliveryGeneration: "2",
+        reason: "epoch-changed",
+      }),
+    );
+    await invalidated.diagnostics.flush();
+    expect(
+      invalidated.session.diagnostics.events.filter(
+        (event) => event.name === "browser.recovery.attach-start",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        outcome: "cancelled",
+        reason: "connection-invalidated",
+        durationMs: 5,
+      }),
+    ]);
+    invalidated.session.close();
+    harness.session.close();
+  });
+
+  it("pairs all semantic input kinds and ACK statuses without retaining input identity or content", async () => {
+    const timers = new ManualTimers();
+    const harness = await createDiagnosticHarness({ timers, monotonicNow: () => timers.now });
+    welcomeDiagnosticWriter(harness);
+    const before = controlFrames(harness.control).length;
+    harness.input.send(interruptKey());
+    harness.input.send({ type: "text", text: "secret-text", source: "input" });
+    harness.input.send({ type: "paste", text: "secret-paste" });
+    harness.input.send({ type: "focus", focused: true });
+    harness.input.send(RESIZE);
+    await vi.waitFor(() => expect(controlFrames(harness.control).length).toBe(before + 5));
+    harness.input.setReplicaCurrent(true);
+    harness.input.confirmAuthoritativeResize(RESIZE);
+    harness.input.send(mousePress());
+    await vi.waitFor(() => expect(controlFrames(harness.control).length).toBe(before + 6));
+    const inputs = controlFrames(harness.control).slice(before) as Array<{
+      type: string;
+      inputEpoch: string;
+      clientInputSeq: string;
+    }>;
+    const statuses = [
+      "written",
+      "duplicate",
+      "rejected",
+      "uncertain",
+      "written",
+      "duplicate",
+    ] as const;
+    await timers.advanceBy(40);
+    inputs.forEach((frame, index) => {
+      harness.control.message(
+        JSON.stringify({
+          type: "input-ack",
+          inputEpoch: frame.inputEpoch,
+          clientInputSeq: frame.clientInputSeq,
+          status: statuses[index],
+          authorityEventSeq: "0",
+        }),
+      );
+    });
+    harness.control.message(
+      JSON.stringify({
+        type: "input-ack",
+        inputEpoch: "stale_input_epoch",
+        clientInputSeq: "1",
+        status: "written",
+        authorityEventSeq: "0",
+      }),
+    );
+    harness.control.message(
+      JSON.stringify({
+        type: "input-ack",
+        inputEpoch: inputs[0]!.inputEpoch,
+        clientInputSeq: inputs[0]!.clientInputSeq,
+        status: "duplicate",
+        authorityEventSeq: "0",
+      }),
+    );
+    await harness.diagnostics.flush();
+
+    const inputEvents = harness.session.diagnostics.events.filter(
+      (event) => event.name === "browser.input.ack",
+    );
+    expect(
+      inputEvents.map((event) => ({
+        inputKind: event.inputKind,
+        status: event.status,
+        sendToAckMs: event.sendToAckMs,
+      })),
+    ).toEqual([
+      { inputKind: "key", status: "written", sendToAckMs: 40 },
+      { inputKind: "text", status: "duplicate", sendToAckMs: 40 },
+      { inputKind: "paste", status: "rejected", sendToAckMs: 40 },
+      { inputKind: "focus", status: "uncertain", sendToAckMs: 40 },
+      { inputKind: "resize", status: "written", sendToAckMs: 40 },
+      { inputKind: "mouse", status: "duplicate", sendToAckMs: 40 },
+    ]);
+    const encodedDiagnostics = JSON.stringify(inputEvents);
+    expect(encodedDiagnostics).not.toContain("secret-text");
+    expect(encodedDiagnostics).not.toContain("secret-paste");
+    expect(encodedDiagnostics).not.toContain("input_epoch_diagnostics");
+    expect(encodedDiagnostics).not.toContain("KeyC");
+    harness.session.close();
+  });
+
+  it("consumes an input probe even when the ACK diagnostic timestamp is unavailable", async () => {
+    const timers = new ManualTimers();
+    let clockAvailable = true;
+    const harness = await createDiagnosticHarness({
+      timers,
+      monotonicNow: () => {
+        if (!clockAvailable) throw new Error("diagnostic clock unavailable");
+        return timers.now;
+      },
+    });
+    welcomeDiagnosticWriter(harness);
+    harness.input.send(interruptKey());
+    await vi.waitFor(() => {
+      expect(controlFrames(harness.control).filter((frame) => frame.type === "key")).toHaveLength(
+        1,
+      );
+    });
+    const frame = controlFrames(harness.control).find((candidate) => candidate.type === "key")!;
+    const acknowledgement = JSON.stringify({
+      type: "input-ack",
+      inputEpoch: frame.inputEpoch,
+      clientInputSeq: frame.clientInputSeq,
+      status: "written",
+      authorityEventSeq: "0",
+    });
+
+    clockAvailable = false;
+    harness.control.message(acknowledgement);
+    clockAvailable = true;
+    await timers.advanceBy(10);
+    harness.control.message(acknowledgement);
+    await harness.diagnostics.flush();
+
+    expect(
+      harness.session.diagnostics.events.filter((event) => event.name === "browser.input.ack"),
+    ).toEqual([]);
+    expect(harness.input.status).toMatchObject({ lastStatus: "written", pending: 0 });
+    harness.session.close();
+  });
+
+  it("preserves input probes across data-only replacement but clears them on lease transport replacement", async () => {
+    const timers = new ManualTimers();
+    let wallNow = 2_000_000_000_000;
+    const harness = await createDiagnosticHarness({
+      timers,
+      now: () => wallNow,
+      monotonicNow: () => timers.now,
+    });
+    welcomeDiagnosticWriter(harness);
+
+    harness.input.send(interruptKey());
+    await vi.waitFor(() => {
+      expect(controlFrames(harness.control).filter((frame) => frame.type === "key")).toHaveLength(
+        1,
+      );
+    });
+    const first = controlFrames(harness.control).find((frame) => frame.type === "key")!;
+    harness.control.message(
+      JSON.stringify({
+        type: "resync-required",
+        deliveryGeneration: "3",
+        reason: "data-disconnected",
+        dataTicket: "replacement_ticket_diagnostics",
+        expiresAt: wallNow + 30_000,
+      }),
+    );
+    await timers.advanceBy(25);
+    harness.control.message(
+      JSON.stringify({
+        type: "input-ack",
+        inputEpoch: first.inputEpoch,
+        clientInputSeq: first.clientInputSeq,
+        status: "written",
+        authorityEventSeq: "0",
+      }),
+    );
+
+    harness.input.send(interruptKey());
+    await vi.waitFor(() => {
+      expect(controlFrames(harness.control).filter((frame) => frame.type === "key")).toHaveLength(
+        2,
+      );
+    });
+    const second = controlFrames(harness.control)
+      .filter((frame) => frame.type === "key")
+      .at(-1)!;
+    welcomeDiagnosticWriter(
+      {
+        ...harness,
+        response: { ...harness.response, deliveryGeneration: "3" },
+      },
+      "writer_lease_diag02",
+    );
+    harness.control.message(
+      JSON.stringify({
+        type: "input-ack",
+        inputEpoch: second.inputEpoch,
+        clientInputSeq: second.clientInputSeq,
+        status: "written",
+        authorityEventSeq: "0",
+      }),
+    );
+    await harness.diagnostics.flush();
+
+    expect(
+      harness.session.diagnostics.events.filter((event) => event.name === "browser.input.ack"),
+    ).toEqual([expect.objectContaining({ status: "written", sendToAckMs: 25 })]);
+    wallNow += 1;
+    harness.session.close();
+  });
+
+  it("bounds input RTT probes to the dispatcher ACK window", async () => {
+    const timers = new ManualTimers();
+    const harness = await createDiagnosticHarness({ timers, monotonicNow: () => timers.now });
+    welcomeDiagnosticWriter(harness);
+
+    for (let index = 0; index < 1_025; index += 1) harness.input.send(interruptKey());
+    await vi.waitFor(() => {
+      expect(controlFrames(harness.control).filter((frame) => frame.type === "key")).toHaveLength(
+        1_025,
+      );
+    });
+    const keys = controlFrames(harness.control).filter((frame) => frame.type === "key");
+    await timers.advanceBy(10);
+    for (const frame of [keys[0]!, keys.at(-1)!]) {
+      harness.control.message(
+        JSON.stringify({
+          type: "input-ack",
+          inputEpoch: frame.inputEpoch,
+          clientInputSeq: frame.clientInputSeq,
+          status: "written",
+          authorityEventSeq: "0",
+        }),
+      );
+    }
+    await harness.diagnostics.flush();
+
+    expect(
+      harness.session.diagnostics.events.filter((event) => event.name === "browser.input.ack"),
+    ).toEqual([
+      expect.objectContaining({
+        inputKind: "key",
+        status: "written",
+        outstandingInputs: 1_023,
+      }),
+    ]);
+    harness.session.close();
+  });
+
+  it.each(["throw", "full"] as const)(
+    "keeps wire and input state live when diagnostics %s",
+    async (mode) => {
+      const diagnostics: BrowserDiagnostics =
+        mode === "throw"
+          ? {
+              get droppedEvents() {
+                return 0;
+              },
+              get pendingEvents() {
+                return 0;
+              },
+              get retainedEvents() {
+                return 0;
+              },
+              record(_event: BrowserTelemetryEvent) {
+                throw new Error("diagnostic sink failed");
+              },
+              snapshot: () => ({ events: [], droppedEvents: 0, pendingEvents: 0 }),
+              flush: () => Promise.resolve(),
+              clear: () => undefined,
+            }
+          : createBrowserDiagnostics({
+              capacity: 1,
+              maxPendingEvents: 1,
+              schedule: () => undefined,
+            });
+      const timers = new ManualTimers();
+      const harness = await createDiagnosticHarness({
+        diagnostics,
+        timers,
+        monotonicNow: () => timers.now,
+      });
+      welcomeDiagnosticWriter(harness);
+      harness.input.send(interruptKey());
+      await vi.waitFor(() => {
+        expect(controlFrames(harness.control).filter((frame) => frame.type === "key")).toHaveLength(
+          1,
+        );
+      });
+      const frame = controlFrames(harness.control).find((candidate) => candidate.type === "key")!;
+      harness.control.message(
+        JSON.stringify({
+          type: "input-ack",
+          inputEpoch: frame.inputEpoch,
+          clientInputSeq: frame.clientInputSeq,
+          status: "written",
+          authorityEventSeq: "0",
+        }),
+      );
+
+      expect(harness.input.status).toMatchObject({ lastStatus: "written", pending: 0 });
+      expect(harness.control.readyState).toBe(1);
+      expect(harness.data.readyState).toBe(1);
+      expect(
+        controlFrames(harness.control).filter((candidate) => candidate.type === "key"),
+      ).toEqual([frame]);
+      harness.session.close();
+    },
+  );
 });

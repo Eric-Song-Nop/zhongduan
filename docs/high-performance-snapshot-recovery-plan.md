@@ -493,8 +493,11 @@ generation，避免跨 attempt 拼接。
 - `observability/cloud-relay-latency` 是 Cloud Phase 0b：记录现有全局 relay queue、Browser input 的当前 lease
   verify/renew 与 Host send decision、barrier、attach 和 delivery reset；它只产生 Workers I/O-clock 可见的本地
   lower-bound，不改 wire、SQLite、socket attachment 或恢复状态机；
-- Phase 0 gate 仍未关闭：Host ACK/data 的 Cloud fanout、独立 lease acquire/heartbeat、Browser
-  link/restore/adopt、生产聚合与可查询 dashboard 必须由后续 stacked layer 补齐。Host relay RTT 包含本地
+- `observability/browser-recovery-latency` 是 Browser 本机事实切片：用独立 monotonic clock 记录 control/data
+  socket RTT、input send-return 到 ACK、attach matching/timeout/cancelled 终点，以及 snapshot load-total、restore、
+  buffer apply、adopt call 与最终 recovery outcome。事件只进入 256 条有界内存 ring，不写 console、storage 或网络；
+- Phase 0 gate 仍未关闭：Host ACK/data 的 Cloud fanout、独立 lease acquire/heartbeat、Browser paint/E2E、
+  生产聚合与可查询 dashboard 必须由后续 stacked layer 补齐。Host/Browser relay RTT 都包含各自本地
   event-loop/socket queue 与 Cloud auto-response，不能冒充纯网络 RTT；`written` 也不是 child/app effect ACK。
 
 - 保留 v2 pause/barrier/pinned commit correctness invariant；
@@ -604,9 +607,14 @@ Cloud 自定义 event payload 不记录 terminal/input/frame、ticket/capability
 标识或异常文本；自动 invocation logs 和 tracing 保持关闭，避免 query 中的 WebSocket ticket 和 path 中的
 session ID 被自动 URL telemetry 留存。该保证只覆盖 Zhongduan payload，Cloudflare 平台 envelope 仍可能带
 request/invocation/Durable Object 等平台标识。有界 best-effort producer sampling 的聚合必须使用 `sampleWeight`，
-原始 event count 不是完整流量计数。Host ACK 转发、Host data fanout、独立 lease acquire/heartbeat、Browser
-restore/adopt/paint、跨节点聚合/dashboard 和端到端 SLO 仍是开放的 Phase 0 gate；本层也不改 wire、journal、
-snapshot、replay、SQLite schema 或 WebSocket attachment。
+原始 event count 不是完整流量计数。Browser 本机事实使用 `performance.now()`，其中 snapshot `load-total`
+包含 HTTP、完整性校验、解压和 worker transfer，`adopt call-returned` 也只表示本地调用返回；socket RTT 不等于
+纯网络 RTT，input ACK 不等于应用 effect，任何事件都不包含配对所用的 seq/epoch/generation 或输入内容。
+Browser ring 只驻内存且有硬上限，不进入 terminal snapshot、storage、console 或网络。
+
+Host ACK 转发、Host data fanout、独立 lease acquire/heartbeat、Browser paint、跨节点聚合/dashboard 和端到端
+SLO 仍是开放的 Phase 0 gate；这些观测切片也不改 wire、journal、snapshot、replay、SQLite schema 或
+WebSocket attachment。
 
 初始 gate：
 
