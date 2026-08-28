@@ -1,4 +1,4 @@
-import { DecimalU64Schema } from "@zhongduan/protocol";
+import { DecimalU64Schema, RelayCapabilitySchema } from "@zhongduan/protocol";
 import { z } from "zod";
 
 const identifier = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/);
@@ -28,6 +28,7 @@ export const SocketAttachmentSchema = z.strictObject({
   snapshotId: identifier.nullable().default(null),
   replayCommitEventSeq: DecimalU64Schema.nullable().default(null),
   replayCommitPtyOffset: DecimalU64Schema.nullable().default(null),
+  relayCapabilities: z.array(RelayCapabilitySchema).max(16).default([]),
 });
 
 export type SocketAttachment = z.infer<typeof SocketAttachmentSchema>;

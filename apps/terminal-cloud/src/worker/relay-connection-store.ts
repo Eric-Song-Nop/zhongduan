@@ -12,6 +12,7 @@ export interface ConnectionSetReservation {
   now: number;
   peer: "host" | "browser";
   principalIdHash: string | undefined;
+  relayCapabilitiesJson: string;
   role: CapabilityRole;
   subject: string;
 }
@@ -110,8 +111,9 @@ export class RelayConnectionStore {
         this.sql.exec(
           `INSERT INTO connection_ticket
             (ticket_digest, connection_set_id, connection_id, peer, channel,
-             client_id, subject, role, stream_id, delivery_generation, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             client_id, subject, role, stream_id, delivery_generation, expires_at,
+             relay_capabilities_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           ticketDigest,
           input.connectionSetId,
           input.connectionId,
@@ -123,6 +125,7 @@ export class RelayConnectionStore {
           streamId,
           deliveryGeneration,
           input.expiresAt,
+          input.relayCapabilitiesJson,
         );
       }
       result = { client, deliveryGeneration, ok: true };

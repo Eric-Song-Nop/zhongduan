@@ -2,6 +2,8 @@ import {
   CapabilityResponseSchema,
   ConnectionSetResponseSchema,
   CreateSessionResponseSchema,
+  RELAY_CAPABILITIES_HEADER,
+  RelayCapability,
   SNAPSHOT_MEDIA_TYPE,
   SnapshotHeader,
   SnapshotMetadataSchema,
@@ -100,6 +102,9 @@ export class CloudApiClient {
       request,
       ConnectionSetResponseSchema,
       signal,
+      {
+        [RELAY_CAPABILITIES_HEADER]: RelayCapability.deliveryBarrierOutcomeV1,
+      },
     );
   }
 
@@ -195,6 +200,7 @@ export class CloudApiClient {
     body: object,
     schema: Schema<T>,
     signal?: AbortSignal,
+    extraHeaders: Record<string, string> = {},
   ): Promise<T> {
     const response = await this.#request(this.#url(pathname), {
       method: "POST",
@@ -203,6 +209,7 @@ export class CloudApiClient {
         authorization: `Bearer ${bearer}`,
         "cache-control": "no-store",
         "content-type": "application/json",
+        ...extraHeaders,
       },
       body: JSON.stringify(body),
       ...(signal === undefined ? {} : { signal }),

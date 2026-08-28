@@ -340,23 +340,70 @@ const hostReadyAck = z.strictObject({
 });
 const deliveryBarrierResultBase = {
   type: z.literal("delivery-barrier-result"),
-  status: z.enum(["ready", "stale", "rejected"]),
   connectionId: id,
   streamId: z.number().int().min(1).max(0xffff_ffff),
   deliveryGeneration: u64,
   commitEventSeq: u64,
   commitPtyOffset: u64,
 };
-const deliveryBarrierResult = z.discriminatedUnion("mode", [
-  z.strictObject({
-    ...deliveryBarrierResultBase,
-    mode: z.literal("warm"),
-  }),
-  z.strictObject({
-    ...deliveryBarrierResultBase,
-    mode: z.literal("snapshot"),
-    snapshotId: SnapshotResourceIdSchema,
-  }),
+const deliveryBarrierWarm = { ...deliveryBarrierResultBase, mode: z.literal("warm") };
+const deliveryBarrierSnapshot = {
+  ...deliveryBarrierResultBase,
+  mode: z.literal("snapshot"),
+  snapshotId: SnapshotResourceIdSchema,
+};
+const staleDeliveryBarrierStatus = {
+  status: z.literal("stale"),
+  reason: z.enum(["generation-fenced", "client-gone"]),
+};
+const rejectedDeliveryBarrierStatus = {
+  status: z.literal("rejected"),
+  reason: z.enum([
+    "missing-live-seed",
+    "snapshot-missing",
+    "snapshot-metadata-mismatch",
+    "browser-control-send-failed",
+    "cloud-head-behind-cut",
+  ]),
+  retryScope: z.enum(["same-generation", "refresh-checkpoint", "reset-generation", "drop-client"]),
+};
+const deliveryBarrierRetryScopeByReason = {
+  "missing-live-seed": "same-generation",
+  "snapshot-missing": "refresh-checkpoint",
+  "snapshot-metadata-mismatch": "refresh-checkpoint",
+  "browser-control-send-failed": "drop-client",
+  "cloud-head-behind-cut": "same-generation",
+} as const;
+const deliveryBarrierLegacyStatus = { status: z.enum(["ready", "stale", "rejected"]) };
+const rejectedDeliveryBarrierWarm = z
+  .strictObject({ ...deliveryBarrierWarm, ...rejectedDeliveryBarrierStatus })
+  .superRefine((value, context) => {
+    if (deliveryBarrierRetryScopeByReason[value.reason] !== value.retryScope) {
+      context.addIssue({
+        code: "custom",
+        message: "delivery barrier reason does not match its retry scope",
+        path: ["retryScope"],
+      });
+    }
+  });
+const rejectedDeliveryBarrierSnapshot = z
+  .strictObject({ ...deliveryBarrierSnapshot, ...rejectedDeliveryBarrierStatus })
+  .superRefine((value, context) => {
+    if (deliveryBarrierRetryScopeByReason[value.reason] !== value.retryScope) {
+      context.addIssue({
+        code: "custom",
+        message: "delivery barrier reason does not match its retry scope",
+        path: ["retryScope"],
+      });
+    }
+  });
+const deliveryBarrierResult = z.union([
+  z.strictObject({ ...deliveryBarrierWarm, ...deliveryBarrierLegacyStatus }),
+  z.strictObject({ ...deliveryBarrierSnapshot, ...deliveryBarrierLegacyStatus }),
+  z.strictObject({ ...deliveryBarrierWarm, ...staleDeliveryBarrierStatus }),
+  z.strictObject({ ...deliveryBarrierSnapshot, ...staleDeliveryBarrierStatus }),
+  rejectedDeliveryBarrierWarm,
+  rejectedDeliveryBarrierSnapshot,
 ]);
 
 export const RelayToHostControlFrameSchema = z.union([

@@ -270,6 +270,9 @@ export class HostDeliveryScheduler {
   #isRunnableRecovery(request: AttachRequest): boolean {
     const key = recoveryKey(request);
     if (!this.#recoveryQueue.isCold(request)) return true;
+    if (this.#recoveryQueue.readyAt(request, this.#lastCanonicalAt) > this.#monotonicNow()) {
+      return false;
+    }
     const preparation = this.#coldPreparations.get(key);
     if (preparation?.status === "ready") return true;
     if (this.#snapshotCheckpointCache.current() !== undefined) return true;
@@ -282,7 +285,15 @@ export class HostDeliveryScheduler {
     let earliest = Number.POSITIVE_INFINITY;
     this.#recoveryQueue.forEach((request) => {
       const key = recoveryKey(request);
-      if (!this.#recoveryQueue.isCold(request)) earliest = 0;
+      if (!this.#recoveryQueue.isCold(request)) {
+        earliest = 0;
+        return;
+      }
+      const retryReadyAt = this.#recoveryQueue.readyAt(request, this.#lastCanonicalAt);
+      if (retryReadyAt > this.#monotonicNow()) {
+        earliest = Math.min(earliest, retryReadyAt);
+        return;
+      }
       const preparation = this.#coldPreparations.get(key);
       if (preparation?.status === "ready") earliest = 0;
       if (this.#snapshotCheckpointCache.current() !== undefined) earliest = 0;
@@ -330,8 +341,18 @@ export class HostDeliveryScheduler {
           WARM_REPLAY_MAX_OUTSTANDING_BYTES <= MAX_DELIVERY_OUTSTANDING_BYTES
         ) {
           active.mode = "warm";
-          await this.#deliverWarm(request, base, commit, replay.frames, active);
-          this.#recoveryQueue.complete(request);
+          const result = await this.#deliverWarm(request, base, commit, replay.frames, active);
+          if (result.status === "ready" || result.status === "stale") {
+            this.#recoveryQueue.complete(request);
+            return;
+          }
+          const retryScope = deliveryBarrierRetryScope(result);
+          if (retryScope === "drop-client" || retryScope === "reset-generation") {
+            this.#recoveryQueue.complete(request);
+            return;
+          }
+          this.#recoveryQueue.markCold(request);
+          this.#recoveryQueue.requeue(request);
           return;
         }
         this.#resumeCanonical();
@@ -361,9 +382,26 @@ export class HostDeliveryScheduler {
         return;
       }
       if (preparation.status !== "ready") return;
-      await this.#deliverPreparedCold(request, preparation, active);
-      this.#recoveryQueue.complete(request);
-      this.#discardColdPreparation(request);
+      const result = await this.#deliverPreparedCold(request, preparation, active);
+      if (result.status === "ready" || result.status === "stale") {
+        this.#recoveryQueue.complete(request);
+        this.#discardColdPreparation(request);
+        return;
+      }
+      const retryScope = deliveryBarrierRetryScope(result);
+      if (retryScope === "drop-client" || retryScope === "reset-generation") {
+        this.#recoveryQueue.complete(request);
+        this.#discardColdPreparation(request);
+        return;
+      }
+      if (retryScope === "refresh-checkpoint") {
+        if (preparation.checkpoint !== undefined) {
+          this.#invalidateCheckpoint(preparation.checkpoint);
+        }
+        this.#discardColdPreparation(request);
+      }
+      this.#recoveryQueue.requeue(request);
+      this.#recoveryQueue.defer(request, SNAPSHOT_RECOVERY_QUIET_MS);
     } catch (error) {
       if (active.phase === "marker-uncertain" || active.phase === "pinned") {
         this.#failPair("delivery marker outcome is uncertain");
@@ -526,7 +564,7 @@ export class HostDeliveryScheduler {
     commit: ReplayCursor,
     replay: Uint8Array[],
     active: ActiveRecovery,
-  ): Promise<void> {
+  ): Promise<DeliveryBarrierResult> {
     await this.#flushCanonicalThrough(commit);
     active.controller.signal.throwIfAborted();
     const identity: BarrierIdentity = {
@@ -557,20 +595,21 @@ export class HostDeliveryScheduler {
     if (result.status !== "ready") {
       active.phase = "pre-marker";
       this.#resumeCanonical();
-      return;
+      return result;
     }
     active.phase = "pinned";
     await this.#sendDirectedReplay(request, base, commit, replay, active);
     this.#sendReplayCommit(request, commit);
     active.phase = "committed";
     this.#resumeCanonical();
+    return result;
   }
 
   async #deliverPreparedCold(
     request: AttachRequest,
     preparation: ColdPreparation,
     active: ActiveRecovery,
-  ): Promise<void> {
+  ): Promise<DeliveryBarrierResult> {
     const checkpoint = preparation.checkpoint;
     if (checkpoint === undefined) {
       throw new Error("prepared snapshot is incomplete");
@@ -582,7 +621,9 @@ export class HostDeliveryScheduler {
       throw new Error("published checkpoint does not match the terminal authority");
     }
     await this.#pauseCanonical();
-    if (this.#failed) return;
+    if (this.#failed) {
+      throw this.#connectionAbort.signal.reason ?? new Error("delivery scheduler stopped");
+    }
     active.controller.signal.throwIfAborted();
     const base = checkpoint.base;
     const commit = this.#session.cursor;
@@ -629,13 +670,14 @@ export class HostDeliveryScheduler {
     if (result.status !== "ready") {
       active.phase = "pre-marker";
       this.#resumeCanonical();
-      return;
+      return result;
     }
     active.phase = "pinned";
     await this.#sendDirectedReplay(request, base, commit, replay.frames, active);
     this.#sendReplayCommit(request, commit);
     active.phase = "committed";
     this.#resumeCanonical();
+    return result;
   }
 
   async #sendDirectedReplay(
@@ -742,6 +784,16 @@ export class HostDeliveryScheduler {
     this.dispose(reason);
     this.#closePair(reason);
   }
+}
+
+function deliveryBarrierRetryScope(
+  result: DeliveryBarrierResult,
+): "same-generation" | "refresh-checkpoint" | "reset-generation" | "drop-client" {
+  if (result.status !== "rejected") {
+    throw new Error("delivery barrier retry scope requires a rejected result");
+  }
+  if ("retryScope" in result) return result.retryScope;
+  return result.mode === "warm" ? "same-generation" : "refresh-checkpoint";
 }
 
 function cursorAfter(frame: ReturnType<typeof decodeDataFrame>): ReplayCursor {

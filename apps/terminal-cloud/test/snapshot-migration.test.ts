@@ -167,7 +167,7 @@ describe("snapshot retention migration", () => {
       backlog: 1,
       currentUploads: 0,
       snapshots: LEGACY_SNAPSHOT_ROWS,
-      version: 4,
+      version: 5,
     });
     expect(migrated.alarm).not.toBeNull();
     expect(migrated.indexes).toEqual([

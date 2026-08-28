@@ -1,4 +1,10 @@
-import { SNAPSHOT_MEDIA_TYPE, SnapshotHeader, type SnapshotMetadata } from "@zhongduan/protocol";
+import {
+  RELAY_CAPABILITIES_HEADER,
+  SNAPSHOT_MEDIA_TYPE,
+  SnapshotHeader,
+  RelayCapability,
+  type SnapshotMetadata,
+} from "@zhongduan/protocol";
 import { describe, expect, it, vi } from "vitest";
 
 import { CloudApiClient, CloudApiError, CloudTransportError } from "./cloud-api";
@@ -60,6 +66,35 @@ describe("CloudApiClient", () => {
       engineId: "ghostty/test",
       sessionEpoch: "7",
     });
+  });
+
+  it("advertises relay capabilities without changing the strict request body", async () => {
+    const response = {
+      connectionSetId: "connection_set_host01",
+      connectionId: "connection_id_host001",
+      clientId: null,
+      streamId: 0,
+      deliveryGeneration: "0",
+      expiresAt: 2_000,
+      controlTicket: "control_ticket_host01",
+      dataTicket: "data_ticket_host0001",
+      selectedCapabilities: [RelayCapability.deliveryBarrierOutcomeV1],
+    };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      jsonResponse(response),
+    );
+    const api = new CloudApiClient("https://cloud.example", {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(api.createConnectionSet("session_AAAAAAAAA", "host-cap")).resolves.toEqual(
+      response,
+    );
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(JSON.parse(init?.body as string)).toEqual({});
+    expect(new Headers(init?.headers).get(RELAY_CAPABILITIES_HEADER)).toBe(
+      RelayCapability.deliveryBarrierOutcomeV1,
+    );
   });
 
   it("uploads the immutable snapshot body with the complete metadata contract", async () => {

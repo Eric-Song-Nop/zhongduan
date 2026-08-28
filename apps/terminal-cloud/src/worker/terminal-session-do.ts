@@ -7,6 +7,8 @@ import {
   HostCapabilityReclaimRequestSchema,
   MAX_U64,
   PositiveDecimalU64Schema,
+  RelayCapability,
+  RelayCapabilitySchema,
   RelayToHostControlFrameSchema,
   ServerControlFrameSchema,
   decodeControlFrame,
@@ -70,7 +72,9 @@ const CreateConnectionSetSchema = z.strictObject({
   subject: identifier,
   role: z.enum(["host", "writer", "observer"]),
   clientId: identifier.optional(),
+  selectedCapabilities: z.array(RelayCapabilitySchema).max(16).optional(),
 });
+const RelayCapabilitiesSchema = z.array(RelayCapabilitySchema).max(16);
 
 interface AcquiredLease {
   fence: string;
@@ -519,6 +523,8 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const controlTicket = randomId(32);
     const dataTicket = randomId(32);
     const requestedClientId = peer === "browser" ? (parsed.data.clientId ?? randomId()) : null;
+    const selectedCapabilities =
+      parsed.data.role === "host" ? (parsed.data.selectedCapabilities ?? []) : [];
     const [controlDigest, dataDigest, principalIdHash] = await Promise.all([
       sha256Hex(controlTicket),
       sha256Hex(dataTicket),
@@ -536,6 +542,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       now,
       peer,
       principalIdHash,
+      relayCapabilitiesJson: JSON.stringify(selectedCapabilities),
       role: parsed.data.role,
       subject: parsed.data.subject,
     });
@@ -557,6 +564,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         expiresAt,
         controlTicket,
         dataTicket,
+        ...(selectedCapabilities.length === 0 ? {} : { selectedCapabilities }),
       }),
     );
   }
@@ -575,6 +583,14 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       if (ticket?.expires_at !== undefined && ticket.expires_at <= Date.now()) {
         this.connections.expireTicket(ticketDigest, Date.now());
       }
+      return json({ error: "invalid-ticket" }, 401);
+    }
+    let relayCapabilities: z.output<typeof RelayCapabilitiesSchema>;
+    try {
+      relayCapabilities = RelayCapabilitiesSchema.parse(
+        JSON.parse(ticket.relay_capabilities_json) as unknown,
+      );
+    } catch {
       return json({ error: "invalid-ticket" }, 401);
     }
 
@@ -667,6 +683,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       snapshotId: null,
       replayCommitEventSeq: null,
       replayCommitPtyOffset: null,
+      relayCapabilities,
     });
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -811,7 +828,10 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
 
     const client = this.clientByStream(frame.streamId);
     if (client === undefined || frame.deliveryGeneration !== BigInt(client.delivery_generation)) {
-      this.sendDeliveryBarrierResult(hostControl, frame, payload, "stale");
+      this.sendDeliveryBarrierResult(hostControl, frame, payload, {
+        status: "stale",
+        reason: "generation-fenced",
+      });
       return;
     }
     const browserControl = this.activeBrowserControl(client.client_id);
@@ -835,7 +855,10 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       dataAttachment.streamId !== client.stream_id ||
       dataAttachment.deliveryGeneration !== client.delivery_generation
     ) {
-      this.sendDeliveryBarrierResult(hostControl, frame, payload, "stale");
+      this.sendDeliveryBarrierResult(hostControl, frame, payload, {
+        status: "stale",
+        reason: "client-gone",
+      });
       return;
     }
     if (
@@ -866,7 +889,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     let browserFrame: z.input<typeof ServerControlFrameSchema>;
     if (payload.mode === "warm") {
       if (dataAttachment.firstEventSeq === null || dataAttachment.firstPtyOffset === null) {
-        this.sendDeliveryBarrierResult(hostControl, frame, payload, "rejected");
+        this.sendDeliveryBarrierResult(hostControl, frame, payload, {
+          status: "rejected",
+          reason: "missing-live-seed",
+          retryScope: "same-generation",
+        });
         return;
       }
       nextAttachment = {
@@ -888,15 +915,26 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       };
     } else {
       const snapshot = this.snapshots.published(payload.snapshotId);
+      if (snapshot === undefined) {
+        this.sendDeliveryBarrierResult(hostControl, frame, payload, {
+          status: "rejected",
+          reason: "snapshot-missing",
+          retryScope: "refresh-checkpoint",
+        });
+        return;
+      }
       if (
-        snapshot === undefined ||
         snapshot.sessionId !== session.session_id ||
         snapshot.sessionEpoch !== session.session_epoch ||
         snapshot.engineId !== session.engine_id ||
         BigInt(snapshot.cutEventSeq) > frame.eventSeq ||
         BigInt(snapshot.nextPtyOffset) > frame.ptyOffset
       ) {
-        this.sendDeliveryBarrierResult(hostControl, frame, payload, "rejected");
+        this.sendDeliveryBarrierResult(hostControl, frame, payload, {
+          status: "rejected",
+          reason: "snapshot-metadata-mismatch",
+          retryScope: "refresh-checkpoint",
+        });
         return;
       }
       if (
@@ -945,21 +983,40 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       if (nextAttachment.snapshotId !== null) this.snapshotUploads.scheduleMaintenance();
     }
     if (!this.sendBrowserControl(browserControl, browserFrame, "delivery start failed")) {
-      this.sendDeliveryBarrierResult(hostControl, frame, payload, "rejected");
+      this.sendDeliveryBarrierResult(hostControl, frame, payload, {
+        status: "rejected",
+        reason: "browser-control-send-failed",
+        retryScope: "drop-client",
+      });
       return;
     }
-    this.sendDeliveryBarrierResult(hostControl, frame, payload, "ready");
+    this.sendDeliveryBarrierResult(hostControl, frame, payload, { status: "ready" });
   }
 
   private sendDeliveryBarrierResult(
     webSocket: WebSocket,
     frame: DataFrame,
     payload: DeliveryBarrierPayload,
-    status: "ready" | "stale" | "rejected",
+    outcome:
+      | { status: "ready" }
+      | { status: "stale"; reason: "generation-fenced" | "client-gone" }
+      | {
+          status: "rejected";
+          reason:
+            | "missing-live-seed"
+            | "snapshot-missing"
+            | "snapshot-metadata-mismatch"
+            | "browser-control-send-failed"
+            | "cloud-head-behind-cut";
+          retryScope: "same-generation" | "refresh-checkpoint" | "reset-generation" | "drop-client";
+        },
   ): void {
+    const supportsOutcomeDetails = readAttachment(webSocket)?.relayCapabilities.includes(
+      RelayCapability.deliveryBarrierOutcomeV1,
+    );
     const common = {
       type: "delivery-barrier-result" as const,
-      status,
+      ...(supportsOutcomeDetails ? outcome : { status: outcome.status }),
       connectionId: payload.connectionId,
       streamId: frame.streamId,
       deliveryGeneration: frame.deliveryGeneration.toString(),

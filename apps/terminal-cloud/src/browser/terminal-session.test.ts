@@ -16,7 +16,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { CapabilityManager } from "./capability";
 import { InputDispatcher } from "./input-dispatcher";
-import { TerminalSession } from "./terminal-session";
+import { ATTACH_START_TIMEOUT_MS, TerminalSession } from "./terminal-session";
 
 const SESSION_ID = "session_123456789";
 const ENGINE_ID = "ghostty:test-engine";
@@ -628,7 +628,7 @@ describe("TerminalSession delivery activation", () => {
           inputEpoch: `input_epoch_${silentChannel}`,
         }),
         sessionId: SESSION_ID,
-        snapshots: { load: vi.fn() },
+        snapshots: { load: vi.fn(() => new Promise<Uint8Array>(() => undefined)) },
         fetch,
         createWebSocket: () => {
           const socket = new FakeSocket();
@@ -652,6 +652,7 @@ describe("TerminalSession delivery activation", () => {
       await vi.waitFor(() => {
         expect(controlFrames(control).some((frame) => frame.type === "attach")).toBe(true);
       });
+      control.message(JSON.stringify(snapshotManifest(1n)));
       (silentChannel === "control" ? control : data).autoPong = false;
 
       await timers.advanceBy(44_999);
@@ -665,6 +666,89 @@ describe("TerminalSession delivery activation", () => {
       session.close();
     },
   );
+
+  it("fences a healthy socket pair when attach never receives a delivery start", async () => {
+    const timers = new ManualTimers();
+    timers.now = 2_000_000_000_000;
+    const response = {
+      connectionSetId: "connection_set_attach_timeout",
+      connectionId: "connection_attach_timeout",
+      clientId: "browser_attach_timeout",
+      streamId: 7,
+      deliveryGeneration: "1",
+      expiresAt: timers.now + 30_000,
+      controlTicket: "control_ticket_attach_timeout",
+      dataTicket: "data_ticket_attach_timeout",
+    };
+    const fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify(response), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    const capabilities = new CapabilityManager({
+      bootstrap: {
+        capability: "opaque",
+        expiresAt: Math.floor(timers.now / 1_000) + 1_000,
+        issuedAt: Math.floor(timers.now / 1_000),
+        role: "observer",
+        sessionId: SESSION_ID,
+      },
+      fetch,
+      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: vi.fn(),
+    });
+    const sockets: FakeSocket[] = [];
+    const session = new TerminalSession({
+      capabilities,
+      engineId: ENGINE_ID,
+      host: {
+        engineId: ENGINE_ID,
+        active: new VisibleSink(),
+        restore: vi.fn<ReplicaHost["restore"]>(),
+        adopt: vi.fn(),
+      },
+      input: new InputDispatcher({
+        getObservedEventSeq: () => null,
+        inputEpoch: "input_epoch_attach_timeout",
+      }),
+      sessionId: SESSION_ID,
+      snapshots: { load: vi.fn() },
+      fetch,
+      createWebSocket: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+      makeWebSocketUrl: (path) => path,
+      now: () => timers.now,
+      random: () => 0,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    });
+
+    session.start();
+    await waitForSockets(sockets, 1);
+    const control = sockets[0]!;
+    control.open();
+    await waitForSockets(sockets, 2);
+    const data = sockets[1]!;
+    data.open();
+    await vi.waitFor(() => {
+      expect(controlFrames(control).some((frame) => frame.type === "attach")).toBe(true);
+    });
+
+    await timers.advanceBy(ATTACH_START_TIMEOUT_MS - 1);
+    expect(control.readyState).toBe(1);
+    expect(data.readyState).toBe(1);
+    await timers.advanceBy(1);
+
+    expect(control.readyState).toBe(3);
+    expect(data.readyState).toBe(3);
+    expect(session.snapshot).toMatchObject({ lastError: "connection", phase: "reconnecting" });
+    session.close();
+  });
 
   it("bounds a connection-set request even when fetch ignores abort", async () => {
     const timers = new ManualTimers();

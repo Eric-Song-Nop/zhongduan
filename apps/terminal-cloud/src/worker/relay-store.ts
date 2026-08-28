@@ -9,6 +9,7 @@ export interface TicketRow {
   delivery_generation: string;
   expires_at: number;
   host_fence: string | null;
+  relay_capabilities_json: string;
   peer: "host" | "browser";
   role: CapabilityRole;
   stream_id: number;
@@ -227,6 +228,22 @@ export function migrateRelayStore(state: DurableObjectState, sql: SqlStorage): v
         ON snapshot_upload(state, expires_at)
       `);
       state.storage.kv.put("schema-version", 4);
+    });
+    version = 4;
+  }
+
+  if (version < 5) {
+    state.storage.transactionSync(() => {
+      const hasRelayCapabilities = sql
+        .exec("PRAGMA table_info(connection_ticket)")
+        .toArray()
+        .some((column) => column.name === "relay_capabilities_json");
+      if (!hasRelayCapabilities) {
+        sql.exec(
+          "ALTER TABLE connection_ticket ADD COLUMN relay_capabilities_json TEXT NOT NULL DEFAULT '[]'",
+        );
+      }
+      state.storage.kv.put("schema-version", 5);
     });
   }
 }
