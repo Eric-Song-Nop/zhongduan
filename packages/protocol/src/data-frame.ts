@@ -2,7 +2,7 @@ import { ProtocolError } from "./errors";
 import { MAX_U64 } from "./scalars";
 
 export const DATA_MAGIC = 0x5a54524d;
-export const DATA_PROTOCOL_VERSION = 1;
+export const DATA_PROTOCOL_VERSION = 2;
 export const DATA_HEADER_BYTES = 48;
 export const MAX_DATA_PAYLOAD_BYTES = 16 * 1024 * 1024;
 
@@ -11,14 +11,13 @@ export const DataFrameKind = {
   ResizeApplied: 2,
   ReplayCommit: 3,
   Reset: 4,
+  DeliveryBarrier: 5,
 } as const;
 
 export type DataFrameKind = (typeof DataFrameKind)[keyof typeof DataFrameKind];
 
 export const DataFrameFlag = {
   None: 0,
-  Compressed: 1 << 0,
-  Final: 1 << 1,
 } as const;
 
 export interface DataFrameHeader {
@@ -64,6 +63,9 @@ function assertKind(kind: number): asserts kind is DataFrameKind {
 export function encodeDataFrame(frame: DataFrame): Uint8Array {
   assertKind(frame.kind);
   assertU16(frame.flags, "flags");
+  if (frame.flags !== DataFrameFlag.None) {
+    throw new ProtocolError("BAD_FLAGS", "data frame flags must be zero");
+  }
   assertU64(frame.sessionEpoch, "sessionEpoch");
   assertU64(frame.deliveryGeneration, "deliveryGeneration");
   assertU64(frame.eventSeq, "eventSeq");
@@ -109,6 +111,10 @@ export function decodeDataFrame(encoded: ArrayBuffer | Uint8Array): DataFrame {
 
   const kind = view.getUint8(5);
   assertKind(kind);
+  const flags = view.getUint16(6, true);
+  if (flags !== DataFrameFlag.None) {
+    throw new ProtocolError("BAD_FLAGS", "data frame flags must be zero");
+  }
   const payloadLength = view.getUint32(44, true);
   if (
     payloadLength > MAX_DATA_PAYLOAD_BYTES ||
@@ -119,7 +125,7 @@ export function decodeDataFrame(encoded: ArrayBuffer | Uint8Array): DataFrame {
 
   return {
     kind,
-    flags: view.getUint16(6, true),
+    flags,
     sessionEpoch: view.getBigUint64(8, true),
     deliveryGeneration: view.getBigUint64(16, true),
     eventSeq: view.getBigUint64(24, true),

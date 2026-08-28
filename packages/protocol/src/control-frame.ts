@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { DecimalU64Schema } from "./scalars";
+import { SnapshotContentMetadataSchema, SnapshotResourceIdSchema } from "./snapshot";
 
 const u64 = DecimalU64Schema;
 const id = z.string().min(1).max(128);
@@ -166,29 +167,46 @@ const resyncRequired = z
     message: "dataTicket and expiresAt must be provided together",
   });
 
-const snapshotManifest = z.strictObject({
+const snapshotManifest = SnapshotContentMetadataSchema.safeExtend({
   type: z.literal("snapshot-manifest"),
-  snapshotId: id,
-  engineId,
-  sessionEpoch: u64,
+  snapshotId: SnapshotResourceIdSchema,
+  streamId: z.number().int().min(1).max(0xffff_ffff),
   deliveryGeneration: u64,
-  cutEventSeq: u64,
-  nextPtyOffset: u64,
   commitEventSeq: u64,
   commitPtyOffset: u64,
-  compression: z.enum(["none", "zstd"]),
-  compressedLength: u64,
-  uncompressedLength: u64,
-  sha256: z.string().regex(/^[a-f0-9]{64}$/),
   downloadPath: z.string().startsWith("/api/v1/sessions/"),
   restoreThrough: z.enum(["ready", "finish"]),
-});
+}).refine(
+  (frame) =>
+    BigInt(frame.commitEventSeq) >= BigInt(frame.cutEventSeq) &&
+    BigInt(frame.commitPtyOffset) >= BigInt(frame.nextPtyOffset),
+  { message: "snapshot commit must not precede its cut" },
+);
+
+const replayStart = z
+  .strictObject({
+    type: z.literal("replay-start"),
+    sessionEpoch: u64,
+    streamId: z.number().int().min(1).max(0xffff_ffff),
+    deliveryGeneration: u64,
+    baseEventSeq: u64,
+    basePtyOffset: u64,
+    commitEventSeq: u64,
+    commitPtyOffset: u64,
+  })
+  .refine(
+    (frame) =>
+      BigInt(frame.commitEventSeq) >= BigInt(frame.baseEventSeq) &&
+      BigInt(frame.commitPtyOffset) >= BigInt(frame.basePtyOffset),
+    { message: "replay commit must not precede its baseline" },
+  );
 
 export const ServerControlFrameSchema = z.discriminatedUnion("type", [
   welcome,
   inputAck.omit({ connectionId: true }),
   hostOffline,
   resyncRequired,
+  replayStart,
   snapshotManifest,
 ]);
 
@@ -232,9 +250,30 @@ const hostReadyAck = z.strictObject({
   headEventSeq: u64,
   nextPtyOffset: u64,
 });
+const deliveryBarrierResultBase = {
+  type: z.literal("delivery-barrier-result"),
+  status: z.enum(["ready", "stale", "rejected"]),
+  connectionId: id,
+  streamId: z.number().int().min(1).max(0xffff_ffff),
+  deliveryGeneration: u64,
+  commitEventSeq: u64,
+  commitPtyOffset: u64,
+};
+const deliveryBarrierResult = z.discriminatedUnion("mode", [
+  z.strictObject({
+    ...deliveryBarrierResultBase,
+    mode: z.literal("warm"),
+  }),
+  z.strictObject({
+    ...deliveryBarrierResultBase,
+    mode: z.literal("snapshot"),
+    snapshotId: SnapshotResourceIdSchema,
+  }),
+]);
 
 export const RelayToHostControlFrameSchema = z.union([
   hostReadyAck,
+  deliveryBarrierResult,
   attachRequest,
   forwardedKey,
   forwardedPaste,

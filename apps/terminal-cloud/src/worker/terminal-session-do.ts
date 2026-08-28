@@ -9,9 +9,11 @@ import {
   ServerControlFrameSchema,
   decodeControlFrame,
   decodeDataFrame,
+  decodeDeliveryBarrierPayload,
   encodeControlFrame,
   rewriteDelivery,
   type DataFrame,
+  type DeliveryBarrierPayload,
 } from "@zhongduan/protocol";
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
@@ -45,6 +47,8 @@ import {
   type TicketRow,
   type WriterLeaseRow,
 } from "./relay-store";
+import { FinalizedSnapshotSchema } from "./snapshot-contract";
+import { SnapshotStore } from "./snapshot-store";
 
 const identifier = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/);
 const engineId = z.string().min(1).max(512);
@@ -81,6 +85,7 @@ type BrowserAttachContextResult =
       ok: false;
       client?: ClientRow;
       reason:
+        | "already-attached"
         | "cursor-ahead"
         | "data-missing"
         | "engine-mismatch"
@@ -113,12 +118,18 @@ async function parseJson(request: Request): Promise<unknown> {
   }
 }
 
-function sendServerControl(
+function trySendServerControl(
   webSocket: WebSocket,
   frame: z.input<typeof ServerControlFrameSchema>,
-): void {
-  if (webSocket.readyState !== WebSocket.OPEN) return;
-  webSocket.send(encodeControlFrame(ServerControlFrameSchema.parse(frame)));
+): boolean {
+  if (webSocket.readyState !== WebSocket.OPEN) return false;
+  const encoded = encodeControlFrame(ServerControlFrameSchema.parse(frame));
+  try {
+    webSocket.send(encoded);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function sendRelayControl(
@@ -135,10 +146,29 @@ function closeProtocol(webSocket: WebSocket, reason: string): void {
   }
 }
 
+function hasUnadvancedDeliveryCursor(attachment: SocketAttachment): boolean {
+  const eventCursorUnchanged =
+    (attachment.firstEventSeq === null &&
+      attachment.ackedEventSeq === null &&
+      attachment.sentEventSeq === null) ||
+    (attachment.firstEventSeq !== null &&
+      attachment.firstEventSeq === attachment.ackedEventSeq &&
+      attachment.firstEventSeq === attachment.sentEventSeq);
+  const ptyCursorUnchanged =
+    (attachment.firstPtyOffset === null &&
+      attachment.ackedPtyOffset === null &&
+      attachment.sentPtyOffset === null) ||
+    (attachment.firstPtyOffset !== null &&
+      attachment.firstPtyOffset === attachment.ackedPtyOffset &&
+      attachment.firstPtyOffset === attachment.sentPtyOffset);
+  return eventCursorUnchanged && ptyCursorUnchanged;
+}
+
 export class TerminalSessionDO extends DurableObject<CloudEnv> {
   private readonly sql: SqlStorage;
   private readonly store: RelayStore;
   private readonly connections: RelayConnectionStore;
+  private readonly snapshots: SnapshotStore;
   private readonly messageQueue = new BoundedSerialQueue<WebSocket>();
 
   constructor(ctx: DurableObjectState, env: CloudEnv) {
@@ -153,6 +183,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       MAX_BROWSER_CONNECTIONS,
       MAX_PENDING_CONNECTION_SETS,
     );
+    this.snapshots = new SnapshotStore(ctx, this.sql, this.store);
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
@@ -163,6 +194,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
     if (request.method === "POST" && url.pathname === "/internal/connection-sets") {
       return this.createConnectionSet(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/snapshots/finalize") {
+      return this.finalizeSnapshot(request);
+    }
+    if (request.method === "GET" && url.pathname.startsWith("/internal/snapshots/")) {
+      return this.getPublishedSnapshot(url.pathname.slice("/internal/snapshots/".length));
     }
     if (request.method === "GET" && url.pathname.startsWith("/internal/ws/")) {
       const channel = url.pathname.slice("/internal/ws/".length);
@@ -400,6 +437,25 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     return json({ created: true }, 201);
   }
 
+  private async finalizeSnapshot(request: Request): Promise<Response> {
+    const parsed = FinalizedSnapshotSchema.safeParse(await parseJson(request));
+    if (!parsed.success) return json({ error: "invalid-snapshot" }, 400);
+    const finalized = this.snapshots.finalize(parsed.data);
+    if (!finalized.ok) {
+      return json({ error: finalized.reason }, 409);
+    }
+    return json(
+      { created: finalized.created, snapshot: finalized.snapshot },
+      finalized.created ? 201 : 200,
+    );
+  }
+
+  private getPublishedSnapshot(snapshotId: string): Response {
+    if (!identifier.safeParse(snapshotId).success) return json({ error: "not-found" }, 404);
+    const snapshot = this.snapshots.published(snapshotId);
+    return snapshot === undefined ? json({ error: "snapshot-not-found" }, 404) : json(snapshot);
+  }
+
   private async createConnectionSet(request: Request): Promise<Response> {
     const parsed = CreateConnectionSetSchema.safeParse(await parseJson(request));
     if (!parsed.success) {
@@ -562,6 +618,10 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       firstPtyOffset: null,
       ackedPtyOffset: null,
       sentPtyOffset: null,
+      replayMode: null,
+      snapshotId: null,
+      replayCommitEventSeq: null,
+      replayCommitPtyOffset: null,
     });
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -653,7 +713,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       const browser = this.browserControlByConnection(frame.connectionId);
       if (browser === undefined) return;
       const { connectionId: _connectionId, ...browserFrame } = frame;
-      sendServerControl(browser, browserFrame);
+      this.sendBrowserControl(browser, browserFrame, "input acknowledgement delivery failed");
       return;
     }
 
@@ -662,6 +722,204 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (browserAttachment?.clientId !== null && browserAttachment?.clientId !== undefined) {
       await this.resetBrowserDelivery(browserAttachment.clientId, frame.reason, false);
     }
+  }
+
+  private handleDeliveryBarrier(
+    hostData: WebSocket,
+    hostAttachment: SocketAttachment,
+    session: SessionRow,
+    frame: DataFrame,
+  ): void {
+    const hostControl = matchingSocket(this.ctx, hostAttachment, "control");
+    const hostControlAttachment =
+      hostControl === undefined ? undefined : readAttachment(hostControl);
+    if (
+      hostData !== this.currentHostData() ||
+      hostControl === undefined ||
+      hostControl !== this.currentHostControl() ||
+      hostControlAttachment === undefined ||
+      hostControlAttachment.hostFence !== hostAttachment.hostFence ||
+      !sameConnection(hostControlAttachment, hostAttachment)
+    ) {
+      this.failCurrentHost(hostAttachment, "delivery barrier host channels are not current");
+      return;
+    }
+    let payload: DeliveryBarrierPayload;
+    try {
+      payload = decodeDeliveryBarrierPayload(frame.payload);
+    } catch {
+      this.failCurrentHost(hostAttachment, "invalid delivery barrier payload");
+      return;
+    }
+    if (
+      frame.streamId === 0 ||
+      frame.eventSeq !== BigInt(session.head_event_seq) ||
+      frame.ptyOffset !== BigInt(session.next_pty_offset)
+    ) {
+      this.failCurrentHost(hostAttachment, "delivery barrier does not match canonical head");
+      return;
+    }
+
+    const client = this.clientByStream(frame.streamId);
+    if (client === undefined || frame.deliveryGeneration !== BigInt(client.delivery_generation)) {
+      this.sendDeliveryBarrierResult(hostControl, frame, payload, "stale");
+      return;
+    }
+    const browserControl = this.activeBrowserControl(client.client_id);
+    const controlAttachment =
+      browserControl === undefined ? undefined : readAttachment(browserControl);
+    const browserData = this.browserDataByClient(client.client_id);
+    const dataAttachment = browserData === undefined ? undefined : readAttachment(browserData);
+    if (
+      browserControl === undefined ||
+      controlAttachment === undefined ||
+      browserData === undefined ||
+      dataAttachment === undefined ||
+      controlAttachment.controlState !== "active" ||
+      controlAttachment.clientId !== client.client_id ||
+      controlAttachment.connectionId !== payload.connectionId ||
+      controlAttachment.streamId !== client.stream_id ||
+      controlAttachment.deliveryGeneration !== client.delivery_generation ||
+      dataAttachment.clientId !== client.client_id ||
+      dataAttachment.connectionSetId !== controlAttachment.connectionSetId ||
+      dataAttachment.connectionId !== controlAttachment.connectionId ||
+      dataAttachment.streamId !== client.stream_id ||
+      dataAttachment.deliveryGeneration !== client.delivery_generation
+    ) {
+      this.sendDeliveryBarrierResult(hostControl, frame, payload, "stale");
+      return;
+    }
+    if (
+      dataAttachment.dataState !== "catching-up" ||
+      !hasUnadvancedDeliveryCursor(dataAttachment)
+    ) {
+      this.failCurrentHost(hostAttachment, "delivery barrier conflicts with active delivery");
+      return;
+    }
+
+    const expectedSnapshotId = payload.mode === "snapshot" ? payload.snapshotId : null;
+    const hasNoPin =
+      dataAttachment.replayMode === null &&
+      dataAttachment.snapshotId === null &&
+      dataAttachment.replayCommitEventSeq === null &&
+      dataAttachment.replayCommitPtyOffset === null;
+    const hasExactPin =
+      dataAttachment.replayMode === payload.mode &&
+      dataAttachment.snapshotId === expectedSnapshotId &&
+      dataAttachment.replayCommitEventSeq === frame.eventSeq.toString() &&
+      dataAttachment.replayCommitPtyOffset === frame.ptyOffset.toString();
+    if (!hasNoPin && !hasExactPin) {
+      this.failCurrentHost(hostAttachment, "delivery barrier conflicts with pinned delivery");
+      return;
+    }
+
+    let nextAttachment = dataAttachment;
+    let browserFrame: z.input<typeof ServerControlFrameSchema>;
+    if (payload.mode === "warm") {
+      if (dataAttachment.firstEventSeq === null || dataAttachment.firstPtyOffset === null) {
+        this.sendDeliveryBarrierResult(hostControl, frame, payload, "rejected");
+        return;
+      }
+      nextAttachment = {
+        ...dataAttachment,
+        replayMode: "warm",
+        snapshotId: null,
+        replayCommitEventSeq: frame.eventSeq.toString(),
+        replayCommitPtyOffset: frame.ptyOffset.toString(),
+      };
+      browserFrame = {
+        type: "replay-start",
+        sessionEpoch: session.session_epoch,
+        streamId: client.stream_id,
+        deliveryGeneration: client.delivery_generation,
+        baseEventSeq: dataAttachment.firstEventSeq,
+        basePtyOffset: dataAttachment.firstPtyOffset,
+        commitEventSeq: frame.eventSeq.toString(),
+        commitPtyOffset: frame.ptyOffset.toString(),
+      };
+    } else {
+      const snapshot = this.snapshots.published(payload.snapshotId);
+      if (
+        snapshot === undefined ||
+        snapshot.sessionId !== session.session_id ||
+        snapshot.sessionEpoch !== session.session_epoch ||
+        snapshot.engineId !== session.engine_id ||
+        BigInt(snapshot.cutEventSeq) > frame.eventSeq ||
+        BigInt(snapshot.nextPtyOffset) > frame.ptyOffset
+      ) {
+        this.sendDeliveryBarrierResult(hostControl, frame, payload, "rejected");
+        return;
+      }
+      if (
+        hasExactPin &&
+        (dataAttachment.firstEventSeq !== snapshot.cutEventSeq ||
+          dataAttachment.firstPtyOffset !== snapshot.nextPtyOffset)
+      ) {
+        this.failCurrentHost(hostAttachment, "snapshot barrier conflicts with pinned seed");
+        return;
+      }
+      nextAttachment = {
+        ...dataAttachment,
+        firstEventSeq: snapshot.cutEventSeq,
+        ackedEventSeq: snapshot.cutEventSeq,
+        sentEventSeq: snapshot.cutEventSeq,
+        firstPtyOffset: snapshot.nextPtyOffset,
+        ackedPtyOffset: snapshot.nextPtyOffset,
+        sentPtyOffset: snapshot.nextPtyOffset,
+        replayMode: "snapshot",
+        snapshotId: payload.snapshotId,
+        replayCommitEventSeq: frame.eventSeq.toString(),
+        replayCommitPtyOffset: frame.ptyOffset.toString(),
+      };
+      browserFrame = {
+        type: "snapshot-manifest",
+        snapshotId: snapshot.snapshotId,
+        engineId: snapshot.engineId,
+        sessionEpoch: snapshot.sessionEpoch,
+        streamId: client.stream_id,
+        deliveryGeneration: client.delivery_generation,
+        cutEventSeq: snapshot.cutEventSeq,
+        nextPtyOffset: snapshot.nextPtyOffset,
+        commitEventSeq: frame.eventSeq.toString(),
+        commitPtyOffset: frame.ptyOffset.toString(),
+        compression: snapshot.compression,
+        compressedLength: snapshot.compressedLength,
+        uncompressedLength: snapshot.uncompressedLength,
+        sha256: snapshot.sha256,
+        downloadPath: `/api/v1/sessions/${session.session_id}/snapshots/${snapshot.snapshotId}`,
+        restoreThrough: "finish",
+      };
+    }
+
+    if (hasNoPin) writeAttachment(browserData, nextAttachment);
+    if (!this.sendBrowserControl(browserControl, browserFrame, "delivery start failed")) {
+      this.sendDeliveryBarrierResult(hostControl, frame, payload, "rejected");
+      return;
+    }
+    this.sendDeliveryBarrierResult(hostControl, frame, payload, "ready");
+  }
+
+  private sendDeliveryBarrierResult(
+    webSocket: WebSocket,
+    frame: DataFrame,
+    payload: DeliveryBarrierPayload,
+    status: "ready" | "stale" | "rejected",
+  ): void {
+    const common = {
+      type: "delivery-barrier-result" as const,
+      status,
+      connectionId: payload.connectionId,
+      streamId: frame.streamId,
+      deliveryGeneration: frame.deliveryGeneration.toString(),
+      commitEventSeq: frame.eventSeq.toString(),
+      commitPtyOffset: frame.ptyOffset.toString(),
+    };
+    sendRelayControl(
+      webSocket,
+      payload.mode === "warm"
+        ? { ...common, mode: "warm" }
+        : { ...common, mode: "snapshot", snapshotId: payload.snapshotId },
+    );
   }
 
   private async handleBrowserControl(
@@ -726,7 +984,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
 
     const host = this.currentHostControl();
     if (host === undefined) {
-      sendServerControl(webSocket, { type: "host-offline" });
+      if (
+        !this.sendBrowserControl(webSocket, { type: "host-offline" }, "host status delivery failed")
+      ) {
+        return;
+      }
       this.rejectInput(webSocket, frame.inputEpoch, frame.clientInputSeq);
       return;
     }
@@ -788,22 +1050,34 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       firstPtyOffset: baselinePtyOffset,
       ackedPtyOffset: baselinePtyOffset,
       sentPtyOffset: baselinePtyOffset,
+      replayMode: null,
+      snapshotId: null,
+      replayCommitEventSeq: null,
+      replayCommitPtyOffset: null,
     });
-    sendServerControl(webSocket, {
-      type: "welcome",
-      connectionId: current.controlAttachment.connectionId,
-      streamId: current.client.stream_id,
-      ...(lease === undefined ? {} : { writerLease: lease.token }),
-      engineId: current.session.engine_id,
-      sessionEpoch: current.session.session_epoch,
-      deliveryGeneration: current.client.delivery_generation,
-      headEventSeq: current.session.head_event_seq,
-      nextPtyOffset: current.session.next_pty_offset,
-    });
+    if (
+      !this.sendBrowserControl(
+        webSocket,
+        {
+          type: "welcome",
+          connectionId: current.controlAttachment.connectionId,
+          streamId: current.client.stream_id,
+          ...(lease === undefined ? {} : { writerLease: lease.token }),
+          engineId: current.session.engine_id,
+          sessionEpoch: current.session.session_epoch,
+          deliveryGeneration: current.client.delivery_generation,
+          headEventSeq: current.session.head_event_seq,
+          nextPtyOffset: current.session.next_pty_offset,
+        },
+        "welcome delivery failed",
+      )
+    ) {
+      return;
+    }
 
     const host = this.currentHostControl();
     if (host === undefined) {
-      sendServerControl(webSocket, { type: "host-offline" });
+      this.sendBrowserControl(webSocket, { type: "host-offline" }, "host status delivery failed");
       return;
     }
     sendRelayControl(host, {
@@ -835,6 +1109,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.activeBrowserControl(attachment.clientId) !== webSocket
     ) {
       return { ok: false, client, reason: "stale-control" };
+    }
+    if (controlAttachment.controlState !== "awaiting-attach") {
+      return { ok: false, client, reason: "already-attached" };
     }
     if (frame.engineId !== session.engine_id) {
       return { ok: false, client, reason: "engine-mismatch" };
@@ -870,15 +1147,25 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     result: Extract<BrowserAttachContextResult, { ok: false }>,
   ): void {
     if (result.reason === "stale-control") return;
+    if (result.reason === "already-attached") {
+      const attachment = readAttachment(webSocket);
+      if (attachment === undefined) closeProtocol(webSocket, "delivery is already attached");
+      else this.isolateBrowserConnection(webSocket, attachment, "delivery is already attached");
+      return;
+    }
     if (
       result.client !== undefined &&
       (result.reason === "engine-mismatch" || result.reason === "epoch-changed")
     ) {
-      sendServerControl(webSocket, {
-        type: "resync-required",
-        deliveryGeneration: result.client.delivery_generation,
-        reason: result.reason,
-      });
+      this.sendBrowserControl(
+        webSocket,
+        {
+          type: "resync-required",
+          deliveryGeneration: result.client.delivery_generation,
+          reason: result.reason,
+        },
+        "resync notification failed",
+      );
       return;
     }
     closeProtocol(
@@ -900,11 +1187,15 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (session === undefined || client === undefined) return;
     if (frame.deliveryGeneration !== client.delivery_generation) return;
     if (frame.sessionEpoch !== session.session_epoch) {
-      sendServerControl(webSocket, {
-        type: "resync-required",
-        deliveryGeneration: client.delivery_generation,
-        reason: "epoch-changed",
-      });
+      this.sendBrowserControl(
+        webSocket,
+        {
+          type: "resync-required",
+          deliveryGeneration: client.delivery_generation,
+          reason: "epoch-changed",
+        },
+        "resync notification failed",
+      );
       return;
     }
 
@@ -980,8 +1271,17 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       return;
     }
 
+    if (frame.kind === DataFrameKind.DeliveryBarrier) {
+      this.handleDeliveryBarrier(webSocket, attachment, session, frame);
+      return;
+    }
+
     if (frame.streamId === 0) {
-      if (frame.deliveryGeneration !== 0n || !this.commitCanonicalFrame(session, frame)) {
+      if (
+        frame.deliveryGeneration !== 0n ||
+        this.hasPinnedDeliveryInProgress() ||
+        !this.commitCanonicalFrame(session, frame)
+      ) {
         this.failCurrentHost(attachment, "canonical data sequence gap");
         return;
       }
@@ -1009,18 +1309,26 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (client === undefined || frame.deliveryGeneration !== BigInt(client.delivery_generation)) {
       return;
     }
-    if (!this.isDirectedFrameWithinCanonicalHead(session, frame)) {
-      this.failCurrentHost(attachment, "directed replay exceeds canonical head");
-      return;
-    }
     const browserData = this.browserDataByClient(client.client_id);
     const browserAttachment = browserData === undefined ? undefined : readAttachment(browserData);
+    if (
+      browserData !== undefined &&
+      browserAttachment !== undefined &&
+      frame.kind === DataFrameKind.Reset
+    ) {
+      this.failCurrentHost(attachment, "directed reset is not supported");
+      return;
+    }
     if (
       browserData === undefined ||
       browserAttachment === undefined ||
       browserAttachment.deliveryGeneration !== client.delivery_generation ||
       browserAttachment.dataState === "synced"
     ) {
+      return;
+    }
+    if (!this.isDirectedFrameWithinPinnedCommit(browserAttachment, frame)) {
+      this.failCurrentHost(attachment, "directed replay exceeds pinned commit");
       return;
     }
     const result = this.deliverToBrowser(browserData, browserAttachment, encoded, frame);
@@ -1031,20 +1339,41 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
   }
 
-  private isDirectedFrameWithinCanonicalHead(session: SessionRow, frame: DataFrame): boolean {
-    const headEventSeq = BigInt(session.head_event_seq);
-    const headPtyOffset = BigInt(session.next_pty_offset);
+  private isDirectedFrameWithinPinnedCommit(
+    attachment: SocketAttachment,
+    frame: DataFrame,
+  ): boolean {
+    if (
+      attachment.replayMode === null ||
+      attachment.replayCommitEventSeq === null ||
+      attachment.replayCommitPtyOffset === null
+    ) {
+      return false;
+    }
+    const commitEventSeq = BigInt(attachment.replayCommitEventSeq);
+    const commitPtyOffset = BigInt(attachment.replayCommitPtyOffset);
     if (frame.kind === DataFrameKind.Reset) return false;
     if (frame.kind === DataFrameKind.ReplayCommit) {
-      return frame.eventSeq === headEventSeq && frame.ptyOffset === headPtyOffset;
+      return frame.eventSeq === commitEventSeq && frame.ptyOffset === commitPtyOffset;
     }
-    if (frame.eventSeq > headEventSeq || frame.ptyOffset > headPtyOffset) return false;
+    if (frame.eventSeq > commitEventSeq || frame.ptyOffset > commitPtyOffset) return false;
     if (frame.kind === DataFrameKind.ResizeApplied) return true;
     return (
       frame.kind === DataFrameKind.PtyOutput &&
       frame.ptyOffset <= MAX_U64 - BigInt(frame.payload.byteLength) &&
-      frame.ptyOffset + BigInt(frame.payload.byteLength) <= headPtyOffset
+      frame.ptyOffset + BigInt(frame.payload.byteLength) <= commitPtyOffset
     );
+  }
+
+  private hasPinnedDeliveryInProgress(): boolean {
+    return this.browserDataSockets().some((socket) => {
+      const attachment = readAttachment(socket);
+      return (
+        attachment?.dataState === "catching-up" &&
+        attachment.replayCommitEventSeq !== null &&
+        attachment.replayCommitPtyOffset !== null
+      );
+    });
   }
 
   private commitCanonicalFrame(session: SessionRow, frame: DataFrame): boolean {
@@ -1102,21 +1431,39 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       BigInt(client.delivery_generation),
       client.stream_id,
     );
-    webSocket.send(rewritten);
+    try {
+      webSocket.send(rewritten);
+    } catch {
+      return this.resetBrowserAfterDataSendFailure(webSocket, attachment);
+    }
     writeAttachment(webSocket, {
       ...attachment,
       ...cursor.nextState,
     });
   }
 
-  private rejectInput(webSocket: WebSocket, inputEpoch: string, clientInputSeq: string): void {
-    sendServerControl(webSocket, {
-      type: "input-ack",
-      inputEpoch,
-      clientInputSeq,
-      status: "rejected",
-      authorityEventSeq: this.session()?.head_event_seq ?? "0",
+  private resetBrowserAfterDataSendFailure(
+    webSocket: WebSocket,
+    attachment: SocketAttachment,
+  ): Promise<void> | undefined {
+    if (attachment.clientId === null) return;
+    return this.resetBrowserDelivery(attachment.clientId, "data-disconnected", false).catch(() => {
+      this.isolateBrowserConnection(webSocket, attachment, "browser data delivery failed");
     });
+  }
+
+  private rejectInput(webSocket: WebSocket, inputEpoch: string, clientInputSeq: string): void {
+    this.sendBrowserControl(
+      webSocket,
+      {
+        type: "input-ack",
+        inputEpoch,
+        clientInputSeq,
+        status: "rejected",
+        authorityEventSeq: this.session()?.head_event_seq ?? "0",
+      },
+      "input rejection delivery failed",
+    );
   }
 
   private async resetBrowserDelivery(
@@ -1198,13 +1545,21 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       controlState: "awaiting-attach",
     });
     writeAttachment(issuingControl, resetAttachment);
-    sendServerControl(issuingControl, {
-      type: "resync-required",
-      deliveryGeneration: nextGeneration,
-      reason,
-      dataTicket,
-      expiresAt,
-    });
+    if (
+      !this.sendBrowserControl(
+        issuingControl,
+        {
+          type: "resync-required",
+          deliveryGeneration: nextGeneration,
+          reason,
+          dataTicket,
+          expiresAt,
+        },
+        "browser delivery reset failed",
+      )
+    ) {
+      return;
+    }
 
     if (!notifyHost || reason !== "slow-client") return;
     const host = this.currentHostControl();
@@ -1383,8 +1738,25 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
   }
 
+  private sendBrowserControl(
+    webSocket: WebSocket,
+    frame: z.input<typeof ServerControlFrameSchema>,
+    failureReason: string,
+  ): boolean {
+    if (trySendServerControl(webSocket, frame)) return true;
+    const attachment = readAttachment(webSocket);
+    if (attachment?.peer === "browser") {
+      this.isolateBrowserConnection(webSocket, attachment, failureReason);
+    } else {
+      closeProtocol(webSocket, failureReason);
+    }
+    return false;
+  }
+
   private broadcastBrowserControl(frame: z.input<typeof ServerControlFrameSchema>): void {
-    for (const socket of this.browserControlSockets()) sendServerControl(socket, frame);
+    for (const socket of this.browserControlSockets()) {
+      this.sendBrowserControl(socket, frame, "browser control broadcast failed");
+    }
   }
 
   private failCurrentHost(attachment: SocketAttachment, reason: string): void {
@@ -1408,6 +1780,31 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.broadcastBrowserControl({ type: "host-offline" });
       this.markBrowserDataCatchingUp();
     }
+  }
+
+  private isolateBrowserConnection(
+    webSocket: WebSocket,
+    attachment: SocketAttachment,
+    reason: string,
+  ): void {
+    if (attachment.clientId === null) {
+      closeProtocol(webSocket, reason);
+      return;
+    }
+    this.releaseWriterLease(attachment.clientId, attachment.leaseFence);
+    this.connections.closeConnectionSet(attachment.connectionSetId);
+    this.closeSockets(
+      (candidate) => {
+        return (
+          candidate.peer === "browser" &&
+          candidate.clientId === attachment.clientId &&
+          sameConnection(candidate, attachment)
+        );
+      },
+      undefined,
+      4400,
+      reason,
+    );
   }
 
   private closeSockets(

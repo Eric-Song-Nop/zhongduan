@@ -2,6 +2,7 @@ export type ProtocolErrorCode =
   | "BAD_MAGIC"
   | "BAD_VERSION"
   | "BAD_KIND"
+  | "BAD_FLAGS"
   | "BAD_LENGTH"
   | "BAD_PAYLOAD"
   | "BAD_EPOCH"

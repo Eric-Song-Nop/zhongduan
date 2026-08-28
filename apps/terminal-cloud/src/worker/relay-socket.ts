@@ -24,6 +24,10 @@ export const SocketAttachmentSchema = z.strictObject({
   firstPtyOffset: DecimalU64Schema.nullable(),
   ackedPtyOffset: DecimalU64Schema.nullable(),
   sentPtyOffset: DecimalU64Schema.nullable(),
+  replayMode: z.enum(["warm", "snapshot"]).nullable().default(null),
+  snapshotId: identifier.nullable().default(null),
+  replayCommitEventSeq: DecimalU64Schema.nullable().default(null),
+  replayCommitPtyOffset: DecimalU64Schema.nullable().default(null),
 });
 
 export type SocketAttachment = z.infer<typeof SocketAttachmentSchema>;

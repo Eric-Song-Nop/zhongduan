@@ -1,7 +1,10 @@
 import {
   DATA_HEADER_BYTES,
   DataFrameKind,
+  SNAPSHOT_MEDIA_TYPE,
+  SnapshotHeader,
   decodeDataFrame,
+  encodeDeliveryBarrierPayload,
   encodeDataFrame,
   type DataFrame,
 } from "@zhongduan/protocol";
@@ -116,6 +119,28 @@ async function drainSession(sessionId: string): Promise<void> {
   await runInDurableObject(sessionStub(sessionId), () => undefined);
 }
 
+async function injectServerSendFailure(
+  session: CreatedSession,
+  browser: BrowserEndpoint,
+  channel: "control" | "data",
+): Promise<void> {
+  await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+    const socket = state
+      .getWebSockets(`client:${browser.connection.clientId}`)
+      .find((candidate) => {
+        return (candidate.deserializeAttachment() as { channel?: string }).channel === channel;
+      });
+    if (socket === undefined) throw new Error(`browser ${channel} socket missing`);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    Object.defineProperty(socket, "send", {
+      configurable: true,
+      value() {
+        throw new Error(`injected browser ${channel} send failure`);
+      },
+    });
+  });
+}
+
 async function createSession(): Promise<CreatedSession> {
   const response = await workerExports.default.fetch(
     new Request(`${origin}/api/v1/sessions`, {
@@ -129,6 +154,140 @@ async function createSession(): Promise<CreatedSession> {
   );
   expect(response.status).toBe(201);
   return response.json<CreatedSession>();
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes).buffer),
+  );
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function publishSnapshot(
+  session: CreatedSession,
+  snapshotId: string,
+  cutEventSeq = "0",
+  nextPtyOffset = "0",
+): Promise<void> {
+  const body = textEncoder.encode(`snapshot:${snapshotId}`);
+  const length = body.byteLength.toString();
+  const response = await workerExports.default.fetch(
+    new Request(`${origin}/api/v1/sessions/${session.sessionId}/snapshots/${snapshotId}`, {
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${session.hostCapability}`,
+        "content-type": SNAPSHOT_MEDIA_TYPE,
+        [SnapshotHeader.compression]: "none",
+        [SnapshotHeader.compressedLength]: length,
+        [SnapshotHeader.cutEventSeq]: cutEventSeq,
+        [SnapshotHeader.engineId]: engineId,
+        [SnapshotHeader.nextPtyOffset]: nextPtyOffset,
+        [SnapshotHeader.sessionEpoch]: "7",
+        [SnapshotHeader.sha256]: await sha256Hex(body),
+        [SnapshotHeader.uncompressedLength]: length,
+      },
+      body: body.buffer,
+    }),
+  );
+  expect(response.status).toBe(201);
+  await response.body?.cancel();
+}
+
+function deliveryBarrier(
+  browser: BrowserEndpoint,
+  mode: "warm" | "snapshot",
+  commitEventSeq: bigint,
+  commitPtyOffset: bigint,
+  snapshotId?: string,
+): Uint8Array {
+  return encodeDataFrame({
+    kind: DataFrameKind.DeliveryBarrier,
+    flags: 0,
+    sessionEpoch: 7n,
+    deliveryGeneration: BigInt(browser.connection.deliveryGeneration),
+    eventSeq: commitEventSeq,
+    ptyOffset: commitPtyOffset,
+    streamId: browser.connection.streamId,
+    payload: encodeDeliveryBarrierPayload(
+      mode === "warm"
+        ? { mode, connectionId: browser.connection.connectionId }
+        : {
+            mode,
+            connectionId: browser.connection.connectionId,
+            snapshotId: snapshotId!,
+          },
+    ),
+  });
+}
+
+async function beginWarmDelivery(
+  session: CreatedSession,
+  host: HostEndpoint,
+  browser: BrowserEndpoint,
+  commitEventSeq: bigint,
+  commitPtyOffset: bigint,
+): Promise<void> {
+  host.data.socket.send(deliveryBarrier(browser, "warm", commitEventSeq, commitPtyOffset));
+  await drainSession(session.sessionId);
+  expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+  expect(browser.control.socket.readyState).toBe(WebSocket.OPEN);
+  const [start, result] = await Promise.all([
+    browser.control.inbox.nextJson<Record<string, unknown>>(),
+    host.control.inbox.nextJson<Record<string, unknown>>(),
+  ]);
+  expect(start).toMatchObject({
+    type: "replay-start",
+    streamId: browser.connection.streamId,
+    deliveryGeneration: browser.connection.deliveryGeneration,
+    commitEventSeq: commitEventSeq.toString(),
+    commitPtyOffset: commitPtyOffset.toString(),
+  });
+  expect(result).toMatchObject({
+    type: "delivery-barrier-result",
+    status: "ready",
+    mode: "warm",
+    connectionId: browser.connection.connectionId,
+    streamId: browser.connection.streamId,
+    deliveryGeneration: browser.connection.deliveryGeneration,
+  });
+  expect(host.data.inbox.pendingMessageCount).toBe(0);
+}
+
+async function beginSnapshotDelivery(
+  session: CreatedSession,
+  host: HostEndpoint,
+  browser: BrowserEndpoint,
+  snapshotId: string,
+  commitEventSeq: bigint,
+  commitPtyOffset: bigint,
+): Promise<Record<string, unknown>> {
+  host.data.socket.send(
+    deliveryBarrier(browser, "snapshot", commitEventSeq, commitPtyOffset, snapshotId),
+  );
+  await drainSession(session.sessionId);
+  expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+  expect(browser.control.socket.readyState).toBe(WebSocket.OPEN);
+  const [manifest, result] = await Promise.all([
+    browser.control.inbox.nextJson<Record<string, unknown>>(),
+    host.control.inbox.nextJson<Record<string, unknown>>(),
+  ]);
+  expect(manifest).toMatchObject({
+    type: "snapshot-manifest",
+    snapshotId,
+    streamId: browser.connection.streamId,
+    deliveryGeneration: browser.connection.deliveryGeneration,
+    commitEventSeq: commitEventSeq.toString(),
+    commitPtyOffset: commitPtyOffset.toString(),
+  });
+  expect(result).toMatchObject({
+    type: "delivery-barrier-result",
+    status: "ready",
+    mode: "snapshot",
+    connectionId: browser.connection.connectionId,
+    snapshotId,
+  });
+  expect(host.data.inbox.pendingMessageCount).toBe(0);
+  return manifest;
 }
 
 async function createConnectionSet(
@@ -345,6 +504,75 @@ describe("live Durable Object relay", () => {
     expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
   });
 
+  it("isolates an input acknowledgement control sink failure without failing the Host", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const failing = await openBrowser(session, session.observerCapability);
+    const healthy = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, failing);
+    await attachBrowser(session, host, healthy);
+    await injectServerSendFailure(session, failing, "control");
+
+    host.control.socket.send(
+      JSON.stringify({
+        type: "input-ack",
+        connectionId: failing.connection.connectionId,
+        inputEpoch: "input_ack_failure",
+        clientInputSeq: "1",
+        status: "written",
+        authorityEventSeq: "0",
+      }),
+    );
+    const [controlClose, dataClose] = await Promise.all([
+      failing.control.inbox.nextClose(),
+      failing.data.inbox.nextClose(),
+    ]);
+    expect(controlClose.code).toBe(4400);
+    expect(dataClose.code).toBe(4400);
+    await drainSession(session.sessionId);
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+    expect(healthy.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(healthy.data.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("continues host-offline broadcast after one browser control sink fails", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const failing = await openBrowser(session, session.observerCapability);
+    const healthy = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, failing);
+    await attachBrowser(session, host, healthy);
+    await injectServerSendFailure(session, failing, "control");
+
+    host.data.socket.send(ptyFrame(2n, 0n, textEncoder.encode("gap")));
+    expect((await host.control.inbox.nextClose()).code).toBe(4400);
+    expect((await host.data.inbox.nextClose()).code).toBe(4400);
+    const [controlClose, dataClose] = await Promise.all([
+      failing.control.inbox.nextClose(),
+      failing.data.inbox.nextClose(),
+    ]);
+    expect(controlClose.code).toBe(4400);
+    expect(dataClose.code).toBe(4400);
+    expect(await healthy.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "host-offline",
+    });
+    expect(healthy.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(healthy.data.socket.readyState).toBe(WebSocket.OPEN);
+    const healthyData = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const socket = state
+          .getWebSockets(`client:${healthy.connection.clientId}`)
+          .find((candidate) => {
+            return (candidate.deserializeAttachment() as { channel?: string }).channel === "data";
+          });
+        return socket?.deserializeAttachment() as { dataState: string };
+      },
+    );
+    expect(healthyData.dataState).toBe("catching-up");
+  });
+
   it("rejects host-ready until the same fenced connection has an open data channel", async () => {
     const session = await createSession();
     const connection = await createConnectionSet(session.sessionId, session.hostCapability);
@@ -420,6 +648,7 @@ describe("live Durable Object relay", () => {
     const first = textEncoder.encode("one");
     host.data.socket.send(ptyFrame(1n, 0n, first));
     await drainSession(session.sessionId);
+    await beginWarmDelivery(session, host, browser, 1n, 3n);
     host.data.socket.send(
       ptyFrame(
         1n,
@@ -602,6 +831,7 @@ describe("live Durable Object relay", () => {
       eventSeq: "90",
       nextPtyOffset: "90",
     });
+    await beginWarmDelivery(session, host, replacement, 100n, 100n);
     host.data.socket.send(
       ptyFrame(
         91n,
@@ -645,6 +875,7 @@ describe("live Durable Object relay", () => {
     const host = await openHost(session, "100", "100");
     const first = await openBrowser(session, session.observerCapability);
     await attachBrowser(session, host, first);
+    await beginWarmDelivery(session, host, first, 100n, 100n);
     host.data.socket.send(ptyFrame(1n, 0n, textEncoder.encode("a"), 1n, first.connection.streamId));
     expect((await first.data.inbox.nextDataFrame()).eventSeq).toBe(1n);
 
@@ -669,6 +900,7 @@ describe("live Durable Object relay", () => {
     });
     expect(attached.welcome).toMatchObject({ deliveryGeneration: "2" });
     expect(connection.deliveryGeneration).toBe("2");
+    await beginWarmDelivery(session, host, replacement, 100n, 100n);
 
     host.data.socket.send(ptyFrame(50n, 50n, textEncoder.encode("stale"), 1n, connection.streamId));
     await drainSession(session.sessionId);
@@ -771,11 +1003,12 @@ describe("live Durable Object relay", () => {
     await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
       state.storage.sql.exec("UPDATE writer_lease SET expires_at = 0 WHERE singleton = 1");
     });
-    second.control.socket.send(JSON.stringify({ type: "attach", engineId, hasLiveReplica: false }));
-    const [secondWelcome] = await Promise.all([
-      second.control.inbox.nextJson<Record<string, unknown>>(),
-      host.control.inbox.nextJson<Record<string, unknown>>(),
-    ]);
+    const secondReplacement = await openBrowser(
+      session,
+      session.writerCapability,
+      second.connection.clientId ?? undefined,
+    );
+    const { welcome: secondWelcome } = await attachBrowser(session, host, secondReplacement);
     const secondLease = secondWelcome.writerLease;
     expect(typeof secondLease).toBe("string");
 
@@ -792,7 +1025,9 @@ describe("live Durable Object relay", () => {
     expect(lease).toMatchObject({ client_id: second.connection.clientId, fence: "2" });
     expect(Number(lease.expires_at)).toBeGreaterThan(Date.now());
 
-    second.control.socket.send(JSON.stringify(keyFrame(String(secondLease), "input_second", "2")));
+    secondReplacement.control.socket.send(
+      JSON.stringify(keyFrame(String(secondLease), "input_second", "2")),
+    );
     expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
       type: "key",
       clientId: second.connection.clientId,
@@ -800,13 +1035,40 @@ describe("live Durable Object relay", () => {
       clientInputSeq: "2",
     });
 
-    second.control.socket.send(
+    secondReplacement.control.socket.send(
       JSON.stringify({
         ...keyFrame(String(secondLease), "input_second", "3"),
         clientId: first.connection.clientId,
       }),
     );
-    expect((await second.control.inbox.nextClose()).code).toBe(4400);
+    expect((await secondReplacement.control.inbox.nextClose()).code).toBe(4400);
+  });
+
+  it("isolates a repeated attach without replacing the generation baseline", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser);
+
+    browser.control.socket.send(
+      JSON.stringify({
+        type: "attach",
+        engineId,
+        hasLiveReplica: true,
+        lastSessionEpoch: "7",
+        lastEventSeq: "0",
+        nextPtyOffset: "0",
+      }),
+    );
+    const [controlClose, dataClose] = await Promise.all([
+      browser.control.inbox.nextClose(),
+      browser.data.inbox.nextClose(),
+    ]);
+    expect(controlClose.code).toBe(4400);
+    expect(dataClose.code).toBe(4400);
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.control.inbox.pendingMessageCount).toBe(0);
   });
 
   it("does not acquire a writer lease for a stale replica epoch", async () => {
@@ -834,6 +1096,483 @@ describe("live Durable Object relay", () => {
       state.storage.sql.exec("SELECT fence FROM writer_lease").toArray(),
     );
     expect(leases).toHaveLength(0);
+  });
+
+  it("seeds a cold replica before manifest acknowledgement and relays the directed tail", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const snapshotId = "snapshot_relay_seed_0001";
+    await publishSnapshot(session, snapshotId);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser, null);
+
+    host.data.socket.send(ptyFrame(1n, 0n, textEncoder.encode("a")));
+    host.data.socket.send(ptyFrame(2n, 1n, textEncoder.encode("b")));
+    await drainSession(session.sessionId);
+    expect(browser.data.inbox.pendingMessageCount).toBe(0);
+
+    host.data.socket.send(deliveryBarrier(browser, "snapshot", 2n, 2n, snapshotId));
+    const acknowledgement = await host.control.inbox.nextJson<Record<string, unknown>>();
+    expect(acknowledgement).toMatchObject({
+      type: "delivery-barrier-result",
+      status: "ready",
+      mode: "snapshot",
+      snapshotId,
+      connectionId: browser.connection.connectionId,
+      streamId: browser.connection.streamId,
+      deliveryGeneration: browser.connection.deliveryGeneration,
+      commitEventSeq: "2",
+      commitPtyOffset: "2",
+    });
+    expect(browser.control.inbox.pendingMessageCount).toBe(1);
+
+    const seeded = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      const dataSocket = state
+        .getWebSockets(`client:${browser.connection.clientId}`)
+        .find((socket) => {
+          return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+        });
+      return dataSocket?.deserializeAttachment() as {
+        ackedEventSeq: string;
+        ackedPtyOffset: string;
+        sentEventSeq: string;
+        sentPtyOffset: string;
+        replayCommitEventSeq: string;
+        replayCommitPtyOffset: string;
+        replayMode: string;
+        snapshotId: string;
+      };
+    });
+    expect(seeded).toMatchObject({
+      ackedEventSeq: "0",
+      ackedPtyOffset: "0",
+      sentEventSeq: "0",
+      sentPtyOffset: "0",
+      replayCommitEventSeq: "2",
+      replayCommitPtyOffset: "2",
+      replayMode: "snapshot",
+      snapshotId,
+    });
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "snapshot-manifest",
+      snapshotId,
+      engineId,
+      sessionEpoch: "7",
+      streamId: browser.connection.streamId,
+      deliveryGeneration: browser.connection.deliveryGeneration,
+      cutEventSeq: "0",
+      nextPtyOffset: "0",
+      commitEventSeq: "2",
+      commitPtyOffset: "2",
+      compression: "none",
+      downloadPath: `/api/v1/sessions/${session.sessionId}/snapshots/${snapshotId}`,
+      restoreThrough: "finish",
+    });
+
+    const generation = BigInt(browser.connection.deliveryGeneration);
+    host.data.socket.send(
+      ptyFrame(1n, 0n, textEncoder.encode("a"), generation, browser.connection.streamId),
+    );
+    host.data.socket.send(
+      ptyFrame(2n, 1n, textEncoder.encode("b"), generation, browser.connection.streamId),
+    );
+    host.data.socket.send(replayCommit(2n, 2n, generation, browser.connection.streamId));
+    expect(await browser.data.inbox.nextDataFrame()).toMatchObject({
+      kind: DataFrameKind.PtyOutput,
+      eventSeq: 1n,
+      ptyOffset: 0n,
+    });
+    expect(await browser.data.inbox.nextDataFrame()).toMatchObject({
+      kind: DataFrameKind.PtyOutput,
+      eventSeq: 2n,
+      ptyOffset: 1n,
+    });
+    expect(await browser.data.inbox.nextDataFrame()).toMatchObject({
+      kind: DataFrameKind.ReplayCommit,
+      eventSeq: 2n,
+      ptyOffset: 2n,
+    });
+    host.data.socket.send(ptyFrame(3n, 2n, textEncoder.encode("c")));
+    expect(await browser.data.inbox.nextDataFrame()).toMatchObject({
+      kind: DataFrameKind.PtyOutput,
+      eventSeq: 3n,
+      ptyOffset: 2n,
+    });
+  });
+
+  it("allows an unstarted live attach to fall back to a snapshot seed", async () => {
+    const session = await createSession();
+    const host = await openHost(session, "2", "2");
+    const snapshotId = "snapshot_warm_fallback_01";
+    await publishSnapshot(session, snapshotId, "0", "0");
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser, {
+      sessionEpoch: "7",
+      eventSeq: "1",
+      nextPtyOffset: "1",
+    });
+    expect(browser.control.inbox.pendingMessageCount).toBe(0);
+
+    await beginSnapshotDelivery(session, host, browser, snapshotId, 2n, 2n);
+    const seeded = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      const dataSocket = state
+        .getWebSockets(`client:${browser.connection.clientId}`)
+        .find((socket) => {
+          return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+        });
+      return dataSocket?.deserializeAttachment() as {
+        firstEventSeq: string;
+        firstPtyOffset: string;
+        replayMode: string;
+      };
+    });
+    expect(seeded).toMatchObject({
+      firstEventSeq: "0",
+      firstPtyOffset: "0",
+      replayMode: "snapshot",
+    });
+  });
+
+  it("isolates a browser manifest send failure without acknowledging or failing the Host", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const snapshotId = "snapshot_manifest_failure1";
+    await publishSnapshot(session, snapshotId);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser, null);
+
+    await injectServerSendFailure(session, browser, "control");
+
+    host.data.socket.send(deliveryBarrier(browser, "snapshot", 0n, 0n, snapshotId));
+    const [controlClose, dataClose, result] = await Promise.all([
+      browser.control.inbox.nextClose(),
+      browser.data.inbox.nextClose(),
+      host.control.inbox.nextJson<Record<string, unknown>>(),
+    ]);
+    expect(controlClose.code).toBe(4400);
+    expect(dataClose.code).toBe(4400);
+    expect(result).toMatchObject({
+      type: "delivery-barrier-result",
+      status: "rejected",
+      snapshotId,
+    });
+    await drainSession(session.sessionId);
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("resets only the target when a directed browser data send fails", async () => {
+    const session = await createSession();
+    const host = await openHost(session, "1", "1");
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser);
+    await beginWarmDelivery(session, host, browser, 1n, 1n);
+    await injectServerSendFailure(session, browser, "data");
+
+    host.data.socket.send(
+      ptyFrame(
+        1n,
+        0n,
+        textEncoder.encode("x"),
+        BigInt(browser.connection.deliveryGeneration),
+        browser.connection.streamId,
+      ),
+    );
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "resync-required",
+      reason: "data-disconnected",
+      deliveryGeneration: "2",
+    });
+    expect((await browser.data.inbox.nextClose()).code).toBe(4001);
+    host.data.socket.send(ptyFrame(2n, 1n, textEncoder.encode("y")));
+    await drainSession(session.sessionId);
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("continues canonical broadcast when one browser data send fails", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const failing = await openBrowser(session, session.observerCapability);
+    const healthy = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, failing);
+    await attachBrowser(session, host, healthy);
+    await beginWarmDelivery(session, host, failing, 0n, 0n);
+    host.data.socket.send(
+      replayCommit(
+        0n,
+        0n,
+        BigInt(failing.connection.deliveryGeneration),
+        failing.connection.streamId,
+      ),
+    );
+    expect((await failing.data.inbox.nextDataFrame()).kind).toBe(DataFrameKind.ReplayCommit);
+    await beginWarmDelivery(session, host, healthy, 0n, 0n);
+    host.data.socket.send(
+      replayCommit(
+        0n,
+        0n,
+        BigInt(healthy.connection.deliveryGeneration),
+        healthy.connection.streamId,
+      ),
+    );
+    expect((await healthy.data.inbox.nextDataFrame()).kind).toBe(DataFrameKind.ReplayCommit);
+    await injectServerSendFailure(session, failing, "data");
+
+    host.data.socket.send(ptyFrame(1n, 0n, textEncoder.encode("x")));
+    expect(await healthy.data.inbox.nextDataFrame()).toMatchObject({
+      kind: DataFrameKind.PtyOutput,
+      eventSeq: 1n,
+    });
+    expect(await failing.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "resync-required",
+      deliveryGeneration: "2",
+    });
+    await drainSession(session.sessionId);
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+    const head = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) =>
+      state.storage.sql.exec("SELECT head_event_seq FROM session_state").one(),
+    );
+    expect(head).toMatchObject({ head_event_seq: "1" });
+  });
+
+  it("replays an exact snapshot barrier only while its seed has not advanced", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const snapshotId = "snapshot_offer_retry_0001";
+    await publishSnapshot(session, snapshotId);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser, null);
+    host.data.socket.send(ptyFrame(1n, 0n, textEncoder.encode("x")));
+    await drainSession(session.sessionId);
+
+    const barrier = deliveryBarrier(browser, "snapshot", 1n, 1n, snapshotId);
+    host.data.socket.send(barrier);
+    await Promise.all([
+      host.control.inbox.nextJson<Record<string, unknown>>(),
+      browser.control.inbox.nextJson<Record<string, unknown>>(),
+    ]);
+    host.data.socket.send(barrier);
+    const [retryAck, retryManifest] = await Promise.all([
+      host.control.inbox.nextJson<Record<string, unknown>>(),
+      browser.control.inbox.nextJson<Record<string, unknown>>(),
+    ]);
+    expect(retryAck).toMatchObject({
+      type: "delivery-barrier-result",
+      status: "ready",
+      snapshotId,
+    });
+    expect(retryManifest).toMatchObject({ type: "snapshot-manifest", snapshotId });
+
+    host.data.socket.send(
+      ptyFrame(
+        1n,
+        0n,
+        textEncoder.encode("x"),
+        BigInt(browser.connection.deliveryGeneration),
+        browser.connection.streamId,
+      ),
+    );
+    expect(await browser.data.inbox.nextDataFrame()).toMatchObject({ eventSeq: 1n });
+
+    host.data.socket.send(barrier);
+    expect((await host.control.inbox.nextClose()).code).toBe(4400);
+    expect((await host.data.inbox.nextClose()).code).toBe(4400);
+    const delivery = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const dataSocket = state
+          .getWebSockets(`client:${browser.connection.clientId}`)
+          .find((socket) => {
+            return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+          });
+        return dataSocket?.deserializeAttachment() as {
+          sentEventSeq: string;
+          sentPtyOffset: string;
+        };
+      },
+    );
+    expect(delivery).toMatchObject({ sentEventSeq: "1", sentPtyOffset: "1" });
+  });
+
+  it("fails the Host when directed snapshot tail arrives before the ready acknowledgement", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const snapshotId = "snapshot_early_tail_00001";
+    await publishSnapshot(session, snapshotId);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser, null);
+    host.data.socket.send(ptyFrame(1n, 0n, textEncoder.encode("x")));
+    await drainSession(session.sessionId);
+
+    host.data.socket.send(
+      ptyFrame(
+        1n,
+        0n,
+        textEncoder.encode("x"),
+        BigInt(browser.connection.deliveryGeneration),
+        browser.connection.streamId,
+      ),
+    );
+    expect((await host.control.inbox.nextClose()).code).toBe(4400);
+    expect((await host.data.inbox.nextClose()).code).toBe(4400);
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "host-offline",
+    });
+  });
+
+  it("fails the Host when a delivery barrier does not equal the canonical head", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const snapshotId = "snapshot_bad_barrier_0001";
+    await publishSnapshot(session, snapshotId);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser, null);
+    host.data.socket.send(ptyFrame(1n, 0n, textEncoder.encode("x")));
+    await drainSession(session.sessionId);
+
+    host.data.socket.send(deliveryBarrier(browser, "snapshot", 0n, 0n, snapshotId));
+    expect((await host.control.inbox.nextClose()).code).toBe(4400);
+    expect((await host.data.inbox.nextClose()).code).toBe(4400);
+  });
+
+  it("rejects mismatched finalized snapshot metadata without failing the Host", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const snapshotId = "snapshot_bad_metadata_001";
+    await publishSnapshot(session, snapshotId);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser, null);
+    await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE snapshot SET engine_id = 'ghostty:other' WHERE snapshot_id = ?",
+        snapshotId,
+      );
+    });
+
+    host.data.socket.send(deliveryBarrier(browser, "snapshot", 0n, 0n, snapshotId));
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "delivery-barrier-result",
+      status: "rejected",
+      snapshotId,
+    });
+    expect(browser.control.inbox.pendingMessageCount).toBe(0);
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("returns stale when a barrier target closed its control connection", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser);
+    const barrier = deliveryBarrier(browser, "warm", 0n, 0n);
+
+    browser.control.socket.close(1000, "browser left");
+    await drainSession(session.sessionId);
+    host.data.socket.send(barrier);
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "delivery-barrier-result",
+      status: "stale",
+      connectionId: browser.connection.connectionId,
+    });
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("returns stale when a browser data reset fenced the barrier generation", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser);
+    const barrier = deliveryBarrier(browser, "warm", 0n, 0n);
+
+    browser.data.socket.close(1000, "data disconnected");
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "resync-required",
+      deliveryGeneration: "2",
+    });
+    host.data.socket.send(barrier);
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "delivery-barrier-result",
+      status: "stale",
+      deliveryGeneration: "1",
+    });
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("returns stale after a full browser connection replacement", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.observerCapability);
+    const other = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser);
+    await attachBrowser(session, host, other);
+    const barrier = deliveryBarrier(browser, "warm", 0n, 0n);
+
+    const replacement = await openBrowser(
+      session,
+      session.observerCapability,
+      browser.connection.clientId ?? undefined,
+    );
+    expect(replacement.control.socket.readyState).toBe(WebSocket.OPEN);
+    host.data.socket.send(barrier);
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "delivery-barrier-result",
+      status: "stale",
+      deliveryGeneration: "1",
+    });
+    expect(other.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(other.data.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("restores finalized snapshot metadata and delivery seeding after hibernation", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const snapshotId = "snapshot_offer_hibernate1";
+    await publishSnapshot(session, snapshotId);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser, null);
+
+    await evictDurableObject(sessionStub(session.sessionId), { webSockets: "hibernate" });
+    host.data.socket.send(deliveryBarrier(browser, "snapshot", 0n, 0n, snapshotId));
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "delivery-barrier-result",
+      status: "ready",
+      snapshotId,
+    });
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "snapshot-manifest",
+      snapshotId,
+      cutEventSeq: "0",
+      nextPtyOffset: "0",
+    });
+
+    const restored = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const snapshot = state.storage.sql
+          .exec("SELECT state, object_key FROM snapshot WHERE snapshot_id = ?", snapshotId)
+          .one();
+        const data = state
+          .getWebSockets(`client:${browser.connection.clientId}`)
+          .find((socket) => {
+            return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+          })
+          ?.deserializeAttachment();
+        return { snapshot, data };
+      },
+    );
+    expect(restored.snapshot).toMatchObject({ state: "servable" });
+    expect(restored.data).toMatchObject({
+      snapshotId,
+      firstEventSeq: "0",
+      firstPtyOffset: "0",
+    });
   });
 
   it("refuses a directed commit until an explicit live-replica baseline exists", async () => {
@@ -866,6 +1605,7 @@ describe("live Durable Object relay", () => {
 
     host.data.socket.send(ptyFrame(1n, 0n, textEncoder.encode("one")));
     await drainSession(session.sessionId);
+    await beginWarmDelivery(session, host, browser, 1n, 3n);
     host.data.socket.send(
       replayCommit(
         0n,
@@ -881,11 +1621,30 @@ describe("live Durable Object relay", () => {
     expect(browser.data.inbox.pendingMessageCount).toBe(0);
   });
 
+  it("fails the Host when canonical output overtakes a pinned replay commit", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser);
+    host.data.socket.send(ptyFrame(1n, 0n, textEncoder.encode("a")));
+    await drainSession(session.sessionId);
+    await beginWarmDelivery(session, host, browser, 1n, 1n);
+
+    host.data.socket.send(ptyFrame(2n, 1n, textEncoder.encode("b")));
+    expect((await host.control.inbox.nextClose()).code).toBe(4400);
+    expect((await host.data.inbox.nextClose()).code).toBe(4400);
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "host-offline",
+    });
+    expect(browser.data.inbox.pendingMessageCount).toBe(0);
+  });
+
   it("rejects directed Reset instead of silently desynchronizing a synced client", async () => {
     const session = await createSession();
     const host = await openHost(session);
     const browser = await openBrowser(session, session.observerCapability);
     await attachBrowser(session, host, browser);
+    await beginWarmDelivery(session, host, browser, 0n, 0n);
     host.data.socket.send(
       replayCommit(
         0n,
@@ -942,6 +1701,7 @@ describe("live Durable Object relay", () => {
       type: "welcome",
       deliveryGeneration: "2",
     });
+    browser.connection.deliveryGeneration = "2";
     expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
       type: "attach-request",
       deliveryGeneration: "2",
@@ -1112,6 +1872,7 @@ describe("live Durable Object relay", () => {
     const browser = await openBrowser(session, session.observerCapability);
     await attachBrowser(session, host, browser);
 
+    await beginWarmDelivery(session, host, browser, 0n, 0n);
     host.data.socket.send(
       replayCommit(
         0n,
@@ -1205,10 +1966,12 @@ describe("live Durable Object relay", () => {
       type: "welcome",
       deliveryGeneration: "2",
     });
+    browser.connection.deliveryGeneration = "2";
     expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
       type: "attach-request",
       deliveryGeneration: "2",
     });
+    await beginWarmDelivery(session, host, browser, 32n, BigInt(32 * chunk.byteLength));
 
     const oldGeneration = ptyFrame(
       32n,

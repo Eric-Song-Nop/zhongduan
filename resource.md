@@ -58,8 +58,17 @@ type ServerFrame =
       nextPtyOffset: U64;
     })
   | (Common & {
-      type: "snapshot-begin";
+      type: "replay-start";
+      streamId: number;
+      baseEventSeq: U64;
+      basePtyOffset: U64;
+      commitEventSeq: U64;
+      commitPtyOffset: U64;
+    })
+  | (Common & {
+      type: "snapshot-manifest";
       snapshotId: string;
+      streamId: number;
       engineId: string;
 
       // Snapshot 包含所有 eventSeq <= cutEventSeq 的状态。
@@ -68,18 +77,16 @@ type ServerFrame =
       // Snapshot 已经消费了 [0, nextPtyOffset) 的 PTY 输出。
       nextPtyOffset: U64;
 
+      // Host 在收到 ready barrier result 后，从 cut 补到这个 pinned head。
+      commitEventSeq: U64;
+      commitPtyOffset: U64;
+
+      compressedLength: U64;
       uncompressedLength: U64;
       compression: "none" | "zstd";
-    })
-  | (Common & {
-      type: "snapshot-chunk";
-      snapshotId: string;
-      chunkIndex: number;
-      data: Uint8Array;
-    })
-  | (Common & {
-      type: "snapshot-end";
-      snapshotId: string;
+      sha256: string;
+      downloadPath: string;
+      restoreThrough: "finish";
     })
   | (Common & {
       type: "pty-output";
@@ -173,6 +180,8 @@ type ClientFrame =
     };
 ```
 
+Binary data frame 当前固定为 protocol v2。MVP 的 `flags` 必须为 `0`；任何非零 flags 都是未实现语义，Relay 必须 fail 当前 Host，不能把声明 compressed/final 的 payload 当 raw bytes 转发。v2 data kind 为 `PtyOutput`、`ResizeApplied`、`ReplayCommit`、`Reset` 和 Host-only `DeliveryBarrier`；`Reset` 不接受 Host 入站。
+
 `modifiers` 和 `consumedModifiers` 固定采用 Ghostty 位布局：
 
 ```text
@@ -184,9 +193,11 @@ Shift=1, Control=2, Alt=4, Super=8, CapsLock=16, NumLock=32
 
 `ack` 只表示该 delivery generation 的 frame 已可靠到达，用于 512 KiB credit 计算，不代表 libghostty 已应用。ACK cursor 只保存在当前 data WebSocket 的 hibernation attachment 中，不写入 SQL，也不作为下一 connection set 的单调下界；full reconnect 必须以新 `attach` 的 live replica cursor 重新建立 credit baseline。Host 重连或浏览器 data 断线时，DO 会 bump generation、关闭旧 data、签发同一 connection set 的 30 秒单次 data ticket，并发送一个 `resync-required`。浏览器建立新 data 后，必须从当前 active replica 读取 cursor 并重新 `attach`；DO 不缓存 cursor 来自动 replay，从而消除“frame 已 apply、progress 尚未上报”的重复应用窗口。
 
-`hasLiveReplica: false` 不提供 delivery baseline。在 snapshot manifest 用明确 cut cursor seed 之前，DO 不接受 directed mutation 或 `ReplayCommit`；`hasLiveReplica: true` 则以完整三元 cursor 初始化严格的 event/PTY delivery 校验。
+每个 delivery generation 只允许一次 `attach`，且只允许 `awaiting-attach -> active`。重复 attach 不得重写 baseline 或 snapshot pin，只隔离该 browser connection set；writer lease 的重新获取不能借重复 attach 偷渡。`welcome` 只确认身份、generation 和 session head，本身不启动 directed delivery。
 
-directed replay 还必须受 DO canonical head 约束：mutation 的 event/PTY 端点不能超过当时已处理的 canonical head，`ReplayCommit` 必须精确等于该 head。MVP 不接受 Host 发来的 directed `Reset`；合法 reset 只能走 DO 的 generation bump、关闭旧 data、签发 replacement ticket、control `resync-required` 这一条显式路径。
+`hasLiveReplica: false` 不提供 delivery baseline；`hasLiveReplica: true` 只采样完整三元 cursor。两者在 DO 接受同 Host data WebSocket 上的 `DeliveryBarrier` 前都不允许 directed mutation 或 `ReplayCommit`。warm barrier 以 attach cursor 为 base 并向 browser control 发送 `replay-start {streamId, generation, base, pinnedCommit}`；snapshot barrier 可以在尚未 pin/尚未发送 start 时覆盖 live attach baseline，以 finalize 后的 snapshot cut seed attachment 并发送 manifest。
+
+barrier 接受后，directed mutation 的上界和 `ReplayCommit` 的精确终点都使用 attachment 中不可变的 pinned commit，不再读取会继续变化的 session head。barrier 到 commit 之间出现 canonical frame、commit 不等于 pin、或当前 generation 的 delivery 被另一 barrier 冲突覆盖，都是 Host data 顺序违约并 fail closed。MVP 不接受 Host 发来的 directed `Reset`；合法 reset 只能走 DO 的 generation bump、关闭旧 data、签发 replacement ticket、control `resync-required` 这一条显式路径。
 
 connection set 遵循 `reserved -> control-open/data-open -> paired -> ready -> replaced/closed`。每次转换都同时校验 `{peer, connectionSetId, connectionId, hostFence | (clientId, deliveryGeneration)}`。未消费 reservation 与已注册 browser identity 共用 16-client 原子 quota；同一 browser identity 或 Host subject 最多保留一个 pending set，新签会撤销旧票。quota 满时只按 LRU 回收同时满足“无 open/hibernating socket、无 pending ticket、无有效 writer lease”的断连 identity。这样“只签票不连 WS”和“批量签完再消费”都不能绕过限额，也不会把 16 变成 session 终身 clientId 上限。
 
@@ -195,6 +206,98 @@ Hibernation socket 的 Error 事件直接执行同一套 fenced close lifecycle�
 Host 的 control/data 是两条独立 WebSocket，不存在跨通道顺序保证。Host 发送 `host-ready` 后必须等待 relay 在同一 control socket 返回 `host-ready-ack { sessionEpoch, headEventSeq, nextPtyOffset }`，再放行 data；DO 只在校验并提交 session head、将当前 fenced pair 切到 ready、完成现有 browser delivery reset 后返回 ACK。当前 fenced Host 在 barrier 前发送 data 会 fail closed，不能静默丢弃或在 DO 内隐式缓存。
 
 入站消息在进入串行处理队列前完成 channel/type/size 校验。队列全局限制为 2048 条/32 MiB；Host data 单 socket 为 1024 条/16 MiB，browser control 为 8 条/16 MiB。Host 超限会 fail 当前 fenced pair，browser 超限只隔离对应客户端。
+
+## Snapshot blob 使用私有 R2 HTTP，不进入 WebSocket 或 DO
+
+snapshot 二进制采用统一公开契约：
+
+```text
+Content-Type: application/vnd.ghostty.snapshot
+最大压缩长度:   32 MiB
+最大解压后长度: 128 MiB
+
+x-zhongduan-compression: none | zstd
+x-zhongduan-compressed-length: canonical decimal u64
+x-zhongduan-uncompressed-length: canonical decimal u64
+x-zhongduan-sha256: lowercase hex SHA-256
+x-zhongduan-engine-id
+x-zhongduan-session-epoch
+x-zhongduan-cut-event-seq
+x-zhongduan-next-pty-offset
+```
+
+Host 用 Host capability 上传：
+
+```http
+PUT /api/v1/sessions/:sessionId/snapshots/:snapshotId
+```
+
+请求必须带规范的 `Content-Length`，且精确等于 `x-zhongduan-compressed-length`；不接受 chunked/缺失长度上传。Worker 将 request body 的 `ReadableStream` 直接传给 R2，并把 Host 声明的 SHA-256 交给 R2 校验，不在 Worker 或 Durable Object 中聚合 blob。R2 object key 是 immutable 的，写入使用 `etagDoesNotMatch: "*"`。流程固定为：
+
+```text
+R2 conditional put 成功
+  -> 校验 size/checksum/httpMetadata/customMetadata
+  -> DO SQLite transaction 幂等 finalize metadata
+  -> 更新 latest_snapshot_id
+```
+
+finalize 失败时 object 只是私有 orphan，没有 DO serving pointer，因此浏览器不可见。乱序 finalize 不允许 latest pointer 回退；比较顺序是 `cutEventSeq`、`nextPtyOffset`、`createdAt`、`snapshotId`，前两个必须用 `BigInt`，不能依赖 SQLite TEXT 字典序。
+
+Host、writer、observer 使用各自 capability 下载：
+
+```http
+GET /api/v1/sessions/:sessionId/snapshots/:snapshotId
+```
+
+Worker 先从 DO 读取已发布 pointer，再从 R2 读取 object。version、etag、size、checksum、HTTP metadata 或 custom metadata 任一不匹配时，先 cancel R2 body，再返回 503；绝不能返回部分对象。成功响应把 R2 `ReadableStream` 直接返回，并固定 `Cache-Control: private, no-store` 与 `X-Content-Type-Options: nosniff`。
+
+Warm replay 与 snapshot recovery 共用同一个 data-plane barrier。Host 暂停新的 canonical frame，把 marker 排在此前 canonical 之后，并在同一 Host data WebSocket 发送：
+
+```ts
+type DeliveryBarrierPayload =
+  | { mode: "warm"; connectionId: string }
+  | { mode: "snapshot"; connectionId: string; snapshotId: string };
+
+type DeliveryBarrier = {
+  kind: "DeliveryBarrier";
+  sessionEpoch: U64;
+  streamId: number;
+  deliveryGeneration: U64;
+  commitEventSeq: U64;
+  commitPtyOffset: U64;
+  payload: DeliveryBarrierPayload;
+};
+
+type DeliveryBarrierResult = {
+  type: "delivery-barrier-result";
+  status: "ready" | "stale" | "rejected";
+  mode: "warm" | "snapshot";
+  connectionId: string;
+  snapshotId?: string;
+  streamId: number;
+  deliveryGeneration: U64;
+  commitEventSeq: U64;
+  commitPtyOffset: U64;
+};
+```
+
+marker header 的 commit cursor 必须精确等于 DO 处理该 data frame 时的 canonical head。这样 ACK 虽然返回 Host control WebSocket，入站顺序仍由同一个 data WebSocket 的 marker 保证。snapshot payload 不携带 engine、长度、checksum 等可重复伪造的元数据；DO 只从已 finalize 的 SQLite row 构造 manifest，并校验 snapshot epoch/engine 与 `cut <= pinned commit`。成功路径固定为：
+
+```text
+1. 在 browser data attachment 原子 pin commit；snapshot mode 同时以 cut seed cursor
+2. 向 browser control 发送 replay-start 或 snapshot-manifest
+3. 消息成功入队后，向 matching/current Host control 发送 status=ready 的 result
+4. Host 收到 ready 后，在同一 data WebSocket 严格发送 tail -> ReplayCommit(pin)
+5. ReplayCommit 之后才恢复 queued canonical frame
+```
+
+目标 browser 已关闭、data generation 已 bump 或 full connection 已替换时，旧 marker 是合法陈旧工作：DO 返回 `status=stale`，不 seed、不发送 start，也不伤 Host/其他 browser。snapshot 不可服务或该 delivery 无合适 baseline 时返回 `status=rejected`。browser control send 失败也只隔离该 browser 并返回 rejected。Host 对 stale/rejected 必须丢弃对应 tail 并恢复 queued canonical。
+
+同一个 marker 只有在 attachment 仍精确停在该 seed、没有发送任何 tail 时才可幂等重发 start/result；cursor 一旦推进，重复 marker 是当前 delivery 的顺序冲突，必须 fail 当前 Host，不能把 delivery 倒退到 base/cut。pin 之前收到 directed mutation/commit 同样 fail Host。
+
+Browser 的 control/data WebSocket 也没有跨通道顺序保证。即使 DO 先发 start/manifest 再向 Host 返回 ready，directed data 仍可能先于 browser control message 到达。SessionClient 必须按 connection/stream/generation 暂存 pre-control binary frame，队列严格限制为 2 MiB 或 1024 帧，先到任一上限就关闭当前 data 并请求 resync；收到匹配的 `replay-start`/`snapshot-manifest` 后才按 base/cut 应用，`welcome` 不能释放 queued data，旧 generation 直接丢弃。
+
+connection-set 响应给出新 generation 后，SessionClient 必须先 fence 并停止旧 data handler，再从当时的 active libghostty replica 采样完整 attach cursor、发送 `attach`，最后才允许新 generation 的 queued frame 进入 apply 路径。不能等待“首个新 generation frame”再切 fence 或采样 cursor，否则旧 handler 与新 frame 的竞态会把重复/遗漏固化为新的 baseline。
 
 ## 为什么既要 `eventSeq`，又要 `ptyOffset`
 
@@ -813,15 +916,14 @@ function enqueueOutput(
 新的恢复数据：
 
 ```text
-SNAPSHOT_BEGIN
+SNAPSHOT_MANIFEST (control)
   deliveryGeneration = 9
   cutEventSeq         = 100000
   nextPtyOffset       = 80 MiB
 
-SNAPSHOT_CHUNK...
-SNAPSHOT_END
+HTTP GET snapshot blob from private R2
 
-PTY_OUTPUT
+DIRECTED PTY_OUTPUT (data)
   deliveryGeneration = 9
   eventSeq            = 100001
   startOffset         = 80 MiB
@@ -858,8 +960,12 @@ control WebSocket
 
 data WebSocket
   PTY output
-  snapshot
-  history
+  directed tail
+  DeliveryBarrier
+  ReplayCommit
+
+private HTTP + R2
+  snapshot blob
 ```
 
 慢客户端时：
@@ -869,13 +975,13 @@ data WebSocket
 control WebSocket 保持
 ```
 
-重新建立 data WebSocket 后直接发最新 snapshot。
+重新建立 data WebSocket 后，control 发送最新 snapshot manifest；浏览器通过私有 HTTP GET 流式恢复 R2 blob，再应用新 generation 的 directed tail。
 
 使用 WebTransport/QUIC 时更自然：
 
 ```text
 reset old output stream
-open a new snapshot/live stream
+open a new live stream
 ```
 
 这才是真正能“跳过中间状态”。
@@ -898,17 +1004,17 @@ headEventSeq   = 2050
 nextPtyOffset  = 410000
 ```
 
-客户端可能先后收到：
+客户端可能交错收到：
 
 ```text
-snapshot chunks
+snapshot HTTP body chunks
 tail event 2001
 tail event 2002
 ...
 tail event 2050
 ```
 
-客户端在 snapshot 到 `READY` 前不能应用 tail。
+客户端在 snapshot 到 `READY` 前不能应用 tail；如果 tail 甚至早于 control manifest 到达，则先进入上一节的 pre-control 有界队列。
 
 ```ts
 interface PendingRestore {
@@ -1751,37 +1857,30 @@ while (
 # 十九、一次完整断线恢复时序
 
 ```text
-Client                         Durable Object                 Host Agent
-  │                                  │                            │
-  │── ATTACH ───────────────────────▶│                            │
-  │   last epoch=7                   │── resume request ─────────▶│
-  │   last event=8000                │                            │
-  │                                  │                            │
-  │                                  │◀─ journal starts at 8500 ─│
-  │                                  │   gap: 8001..8499 missing  │
-  │                                  │                            │
-  │◀─ RESYNC_REQUIRED ───────────────│                            │
-  │                                  │                            │
-  │                                  │── request snapshot ──────▶│
-  │                                  │                            │
-  │                                  │◀─ snapshot@9000 ─────────│
-  │                                  │   next offset=2 MiB        │
-  │                                  │                            │
-  │◀─ SNAPSHOT_BEGIN ────────────────│                            │
-  │◀─ SNAPSHOT_CHUNK... ─────────────│                            │
-  │                                  │◀─ event 9001 ─────────────│
-  │◀─ tail event 9001（先缓存）──────│                            │
-  │                                  │◀─ event 9002 ─────────────│
-  │◀─ tail event 9002（先缓存）──────│                            │
-  │◀─ SNAPSHOT_END ──────────────────│                            │
-  │                                  │                            │
-  │ decode to READY                  │                            │
-  │ install terminal@9000            │                            │
-  │ apply 9001                       │                            │
-  │ apply 9002                       │                            │
-  │                                  │                            │
-  │── ACK event=9002 ───────────────▶│── ACK state ─────────────▶│
-  │                                  │                            │
+Client                    Worker / Durable Object              Host Agent / R2
+  │                                  │                                  │
+  │── ATTACH live@8000 ─────────────▶│── attach-request ───────────────▶│
+  │                                  │                                  │
+  │                                  │◀─ replay-unavailable ───────────│
+  │◀─ RESYNC_REQUIRED ───────────────│   gap: 8001..8499 missing        │
+  │                                  │                                  │
+  │                                  │◀─ PUT snapshot@9000 to R2 ─────│
+  │                                  │   blob-first + finalize pointer  │
+  │                                  │                                  │
+  │                                  │◀─ SNAPSHOT_OFFER commit@9002 ──│
+  │                                  │   seed browser cursor@9000       │
+  │◀─ SNAPSHOT_MANIFEST ─────────────│                                  │
+  │                                  │── SNAPSHOT_READY_ACK ──────────▶│
+  │                                  │                                  │
+  │── authenticated HTTP GET ───────▶│── R2 GET stream ───────────────▶│
+  │◀─ snapshot body stream ──────────│◀────────────────────────────────│
+  │◀─ directed event 9001（先缓存）──│◀─ after ACK: tail 9001 ─────────│
+  │◀─ directed event 9002（先缓存）──│◀─ tail 9002 + ReplayCommit ─────│
+  │                                  │                                  │
+  │ decode to READY                  │                                  │
+  │ install terminal@9000            │                                  │
+  │ apply 9001, 9002                 │                                  │
+  │── ACK event=9002 ───────────────▶│                                  │
 ```
 
 ---
