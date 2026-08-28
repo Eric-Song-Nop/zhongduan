@@ -2,8 +2,9 @@
 
 > 历史文档：这里记录 MVP 最初的 stacked PR 规划。相关实现已于 2026-08-28 合并到
 > `main`，不再用本页判断当前功能或部署状态。当前入口见[项目 README](../README.md)和
-> [部署指南](deployment.md)；恢复架构的后续工作见
-> [高性能远程终端 Snapshot 恢复实施计划](high-performance-snapshot-recovery-plan.md)。
+> [部署指南](deployment.md)。当前演进的最高级协议不变量见[终端协议架构](terminal-protocol-architecture.md)，
+> 具体工作分别见[高性能远程终端 Snapshot 恢复实施计划](high-performance-snapshot-recovery-plan.md)与
+> [输入稳定性与高 RTT 交互实施计划](input-stability-plan.md)。
 
 每层 PR 都基于前一层分支，并提供一个可运行或可验证的纵向能力。后续 PR 只在其直接依赖合并后改 base，不压平历史。
 

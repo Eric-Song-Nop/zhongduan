@@ -13,6 +13,19 @@ PTY + Host daemon  <->  Worker + SQLite Durable Object + R2  <->  wterm replica
 等 TUI 的场景。正常连接传输有序 PTY mutation；恢复时优先重放短 journal，必要时恢复
 Ghostty snapshot 再接续 tail。
 
+## 核心协议不变量
+
+> 客户端采用的 execution terminal state，始终等于一个 immutable checkpoint 加同一
+> authority mutation log 的连续前缀；所有 prediction 仅是其上的 disposable
+> presentation branch。
+
+Host 是唯一 authority，`eventSeq` 只排序重建该 authority 所需的 mutation。Snapshot 可以吸收
+旧 mutation，但 snapshot cut 之后的 mutation 不能被任意跳过；预测也绝不能进入 PTY、权威
+Ghostty core、journal、snapshot 或 replay。当前 protocol v2 依靠 recovery 期间的 global pause
+和 pinned commit 守住这个边界；目标 protocol 只有在完整的 concurrent gap-fill 交接可用后才会
+取消 pause。规范边界、三个逻辑平面和 CURRENT/TARGET 区分见
+[终端协议架构与不变量](docs/terminal-protocol-architecture.md)。
+
 ## 当前状态
 
 这是可部署、可验证的 MVP，不是已经打包发布的通用远程运维产品。
@@ -96,6 +109,7 @@ URL fragment 不会发送给 HTTP 服务器，页面加载后也会立即从地�
 
 - [部署指南](docs/deployment.md)
 - [MVP 架构](docs/mvp-architecture.md)
+- [终端协议架构与不变量](docs/terminal-protocol-architecture.md)
 - [高性能远程终端 Snapshot 恢复实施计划](docs/high-performance-snapshot-recovery-plan.md)
 - [输入稳定性与高 RTT 交互实施计划](docs/input-stability-plan.md)
 - [Wire protocol](docs/wire-protocol.md)
