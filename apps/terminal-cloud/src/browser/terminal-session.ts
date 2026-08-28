@@ -26,6 +26,8 @@ const SOCKET_OPEN_TIMEOUT_MS = 10_000;
 const DATA_REPLACEMENT_GRACE_MS = 350;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 45_000;
+const WRITER_LEASE_RENEW_INTERVAL_MS = 10_000;
+const HTTP_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_RECONNECT_DELAY_MS = 10_000;
 const SNAPSHOT_RETRY_BASE_MS = 2_000;
 const SNAPSHOT_RETRY_MAX_MS = 30_000;
@@ -141,6 +143,7 @@ export class TerminalSession {
   #streamId = 0;
   #connectionId: string | null = null;
   #writerLease: string | null = null;
+  #writerIdentityConnectionId: string | null = null;
   #clientId: string | undefined;
   #connectPromise: Promise<void> | null = null;
   #connectAbort: AbortController | null = null;
@@ -149,9 +152,11 @@ export class TerminalSession {
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   #dataFailureTimer: ReturnType<typeof setTimeout> | null = null;
   #heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  #writerLeaseTimer: ReturnType<typeof setTimeout> | null = null;
   #snapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
   #snapshotFailureCount = 0;
-  #lastPongAt = 0;
+  #lastControlPongAt = 0;
+  #lastDataPongAt = 0;
   #automaticReconnectBlocked = false;
   #closed = false;
 
@@ -160,13 +165,14 @@ export class TerminalSession {
     this.#engineId = options.engineId;
     this.#capabilities = options.capabilities;
     this.#input = options.input;
-    this.#fetch = options.fetch ?? fetch;
+    this.#fetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.#createWebSocket = options.createWebSocket ?? ((url) => new WebSocket(url));
     this.#makeWebSocketUrl = options.makeWebSocketUrl ?? defaultWebSocketUrl;
     this.#now = options.now ?? Date.now;
     this.#random = options.random ?? Math.random;
-    this.#setTimer = options.setTimer ?? setTimeout;
-    this.#clearTimer = options.clearTimer ?? clearTimeout;
+    this.#setTimer =
+      options.setTimer ?? ((callback, delayMs) => globalThis.setTimeout(callback, delayMs));
+    this.#clearTimer = options.clearTimer ?? ((timer) => globalThis.clearTimeout(timer));
     this.#storage = options.storage;
     this.#clientId = readClientId(this.#storage, this.#sessionId);
     this.#snapshot = {
@@ -268,6 +274,7 @@ export class TerminalSession {
     this.#input.detachTransport();
     this.#writerLease = null;
     this.#stopHeartbeat();
+    this.#stopWriterLeaseRenewal();
     this.#cancelDataFailureTimer();
 
     const response = await this.#createConnectionSet(signal);
@@ -292,8 +299,7 @@ export class TerminalSession {
       return;
     }
     this.#control = control;
-    this.#lastPongAt = this.#now();
-    this.#startHeartbeat(connectionEpoch);
+    this.#lastControlPongAt = this.#now();
     this.#update({ controlConnected: true });
 
     const dataEpoch = this.#dataEpoch;
@@ -310,6 +316,8 @@ export class TerminalSession {
       return;
     }
     this.#data = data;
+    this.#lastDataPongAt = this.#now();
+    this.#startHeartbeat(connectionEpoch, dataEpoch, generation);
     this.#update({ dataConnected: true, phase: "attaching" });
     this.#sendAttach();
   }
@@ -318,33 +326,37 @@ export class TerminalSession {
     const request = ConnectionSetRequestSchema.parse(
       this.#clientId === undefined ? {} : { clientId: this.#clientId },
     );
-    const response = await this.#fetch(
-      `/api/v1/sessions/${encodeURIComponent(this.#sessionId)}/connection-sets`,
-      {
-        method: "POST",
-        credentials: "same-origin",
-        redirect: "error",
-        headers: {
-          ...this.#capabilities.authorizationHeaders(),
-          "Content-Type": "application/json",
+    return this.#withRequestDeadline(signal, async (requestSignal) => {
+      const response = await this.#fetch(
+        `/api/v1/sessions/${encodeURIComponent(this.#sessionId)}/connection-sets`,
+        {
+          method: "POST",
+          credentials: "same-origin",
+          redirect: "error",
+          headers: {
+            ...this.#capabilities.authorizationHeaders(),
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(request),
+          signal: requestSignal,
         },
-        body: JSON.stringify(request),
-        signal,
-      },
-    );
-    if (response.status === 401 || response.status === 403) throw new AuthenticationError();
-    if (!response.ok) throw new Error("connection set request failed");
-    const connectionSet = ConnectionSetResponseSchema.parse(await response.json());
-    if (connectionSet.clientId === null || connectionSet.streamId === 0) {
-      throw new Error("browser connection set has no delivery identity");
-    }
-    this.#clientId = connectionSet.clientId;
-    try {
-      this.#storage?.setItem(clientStorageKey(this.#sessionId), connectionSet.clientId);
-    } catch {
-      // The in-memory identity remains valid when storage is unavailable.
-    }
-    return connectionSet;
+      );
+      this.#throwIfAborted(requestSignal);
+      if (response.status === 401 || response.status === 403) throw new AuthenticationError();
+      if (!response.ok) throw new Error("connection set request failed");
+      const connectionSet = ConnectionSetResponseSchema.parse(await response.json());
+      this.#throwIfAborted(requestSignal);
+      if (connectionSet.clientId === null || connectionSet.streamId === 0) {
+        throw new Error("browser connection set has no delivery identity");
+      }
+      this.#clientId = connectionSet.clientId;
+      try {
+        this.#storage?.setItem(clientStorageKey(this.#sessionId), connectionSet.clientId);
+      } catch {
+        // The in-memory identity remains valid when storage is unavailable.
+      }
+      return connectionSet;
+    });
   }
 
   async #openControl(
@@ -389,6 +401,10 @@ export class TerminalSession {
       if (!this.#isCurrentData(connectionEpoch, dataEpoch, generation) || socket !== this.#data) {
         return;
       }
+      if (event.data === "pong") {
+        this.#lastDataPongAt = this.#now();
+        return;
+      }
       if (!(event.data instanceof ArrayBuffer)) {
         this.#protocolFailure();
         return;
@@ -413,6 +429,7 @@ export class TerminalSession {
         return;
       }
       this.#data = null;
+      this.#stopHeartbeat();
       this.#input.setReplicaCurrent(false);
       this.#update({ dataConnected: false, phase: "reconnecting" });
       this.#cancelDataFailureTimer();
@@ -466,13 +483,24 @@ export class TerminalSession {
   }
 
   #sendAttach(): void {
+    const generation = this.#generation;
+    if (generation === null) {
+      this.#protocolFailure();
+      return;
+    }
     const cursor = this.coordinator.activeCursor;
     const frame =
       cursor === null
-        ? { type: "attach" as const, engineId: this.#engineId, hasLiveReplica: false as const }
+        ? {
+            type: "attach" as const,
+            engineId: this.#engineId,
+            deliveryGeneration: generation.toString(),
+            hasLiveReplica: false as const,
+          }
         : {
             type: "attach" as const,
             engineId: this.#engineId,
+            deliveryGeneration: generation.toString(),
             hasLiveReplica: true as const,
             lastSessionEpoch: cursor.sessionEpoch.toString(),
             lastEventSeq: cursor.lastEventSeq.toString(),
@@ -483,7 +511,7 @@ export class TerminalSession {
 
   #handleControlMessage(data: unknown): void {
     if (data === "pong") {
-      this.#lastPongAt = this.#now();
+      this.#lastControlPongAt = this.#now();
       return;
     }
     if (typeof data !== "string") {
@@ -503,6 +531,9 @@ export class TerminalSession {
         return;
       case "input-ack":
         this.#input.acceptAcknowledgement(frame);
+        return;
+      case "writer-lease-status":
+        this.#acceptWriterLeaseStatus(frame);
         return;
       case "host-offline":
         this.#update({ hostOnline: false, phase: "offline" });
@@ -541,13 +572,15 @@ export class TerminalSession {
     }
     const previousLease = this.#writerLease;
     this.#writerLease = frame.writerLease ?? null;
-    if (!this.#input.status.connected || previousLease !== this.#writerLease) {
-      this.#input.attachTransport((inputFrame) => {
-        const sent = this.#sendControl(inputFrame);
-        if (!sent) this.#failFullConnection();
-        return sent;
-      }, this.#writerLease ?? undefined);
+    if (this.#writerLease !== null && this.#writerIdentityConnectionId !== frame.connectionId) {
+      if (this.#writerIdentityConnectionId !== null) this.#input.startNewInputEpoch();
+      this.#writerIdentityConnectionId = frame.connectionId;
     }
+    if (!this.#input.status.connected || previousLease !== this.#writerLease) {
+      this.#attachInputTransport();
+    }
+    if (this.#writerLease === null) this.#stopWriterLeaseRenewal();
+    else this.#startWriterLeaseRenewal();
     this.#update({
       controlOwnership:
         this.#capabilities.role === "observer"
@@ -558,6 +591,16 @@ export class TerminalSession {
       hostOnline: true,
       phase: "attaching",
     });
+  }
+
+  #acceptWriterLeaseStatus(
+    frame: Extract<ServerControlFrame, { type: "writer-lease-status" }>,
+  ): void {
+    if (frame.active || this.#capabilities.role === "observer") return;
+    this.#writerLease = null;
+    this.#stopWriterLeaseRenewal();
+    this.#attachInputTransport();
+    this.#update({ controlOwnership: "waiting" });
   }
 
   #handleResyncRequired(frame: Extract<ServerControlFrame, { type: "resync-required" }>): void {
@@ -603,6 +646,7 @@ export class TerminalSession {
     this.#replacementAbort = abort;
     this.#generation = generation;
     this.#input.setReplicaCurrent(false);
+    this.#stopHeartbeat();
     this.#closeSocket(this.#data);
     this.#data = null;
     this.#update({ dataConnected: false, phase: "reconnecting" });
@@ -620,6 +664,8 @@ export class TerminalSession {
         return;
       }
       this.#data = data;
+      this.#lastDataPongAt = this.#now();
+      this.#startHeartbeat(connectionEpoch, dataEpoch, generation);
       this.#update({ dataConnected: true, phase: "attaching" });
       this.#sendAttach();
     } catch {
@@ -752,25 +798,31 @@ export class TerminalSession {
     }, delay);
   }
 
-  #startHeartbeat(connectionEpoch: number): void {
+  #startHeartbeat(connectionEpoch: number, dataEpoch: number, generation: bigint): void {
     this.#stopHeartbeat();
     const tick = () => {
       this.#heartbeatTimer = null;
-      if (!this.#isCurrentConnection(connectionEpoch)) return;
+      if (!this.#isCurrentData(connectionEpoch, dataEpoch, generation)) return;
       const control = this.#control;
-      if (control === null || control.readyState !== 1) {
+      const data = this.#data;
+      if (control === null || data === null || control.readyState !== 1 || data.readyState !== 1) {
         this.#invalidateFullConnection();
         this.#scheduleReconnect();
         return;
       }
-      if (this.#now() - this.#lastPongAt > HEARTBEAT_TIMEOUT_MS) {
-        this.#invalidateFullConnection();
-        this.#scheduleReconnect();
-        return;
-      }
+      const now = this.#now();
       if (
-        control.bufferedAmount + textEncoder.encode("ping").byteLength >
-        MAX_CONTROL_QUEUE_BYTES
+        now - this.#lastControlPongAt >= HEARTBEAT_TIMEOUT_MS ||
+        now - this.#lastDataPongAt >= HEARTBEAT_TIMEOUT_MS
+      ) {
+        this.#invalidateFullConnection();
+        this.#scheduleReconnect();
+        return;
+      }
+      const heartbeatBytes = textEncoder.encode("ping").byteLength;
+      if (
+        control.bufferedAmount + heartbeatBytes > MAX_CONTROL_QUEUE_BYTES ||
+        data.bufferedAmount + heartbeatBytes > MAX_CONTROL_QUEUE_BYTES
       ) {
         this.#invalidateFullConnection();
         this.#scheduleReconnect();
@@ -778,6 +830,13 @@ export class TerminalSession {
       }
       try {
         control.send("ping");
+        data.send("ping");
+        if (
+          control.bufferedAmount > MAX_CONTROL_QUEUE_BYTES ||
+          data.bufferedAmount > MAX_CONTROL_QUEUE_BYTES
+        ) {
+          throw new Error("heartbeat backpressure exceeded");
+        }
       } catch {
         this.#invalidateFullConnection();
         this.#scheduleReconnect();
@@ -786,6 +845,37 @@ export class TerminalSession {
       this.#heartbeatTimer = this.#setTimer(tick, HEARTBEAT_INTERVAL_MS);
     };
     this.#heartbeatTimer = this.#setTimer(tick, HEARTBEAT_INTERVAL_MS);
+  }
+
+  #startWriterLeaseRenewal(): void {
+    this.#stopWriterLeaseRenewal();
+    const connectionEpoch = this.#connectionEpoch;
+    const tick = () => {
+      this.#writerLeaseTimer = null;
+      if (!this.#isCurrentConnection(connectionEpoch)) return;
+      const writerLease = this.#writerLease;
+      if (writerLease === null) return;
+      const sent = this.#sendControl(
+        ClientControlFrameSchema.parse({ type: "writer-lease-renew", writerLease }),
+        true,
+      );
+      if (!sent || !this.#isCurrentConnection(connectionEpoch)) return;
+      this.#writerLeaseTimer = this.#setTimer(tick, WRITER_LEASE_RENEW_INTERVAL_MS);
+    };
+    this.#writerLeaseTimer = this.#setTimer(tick, WRITER_LEASE_RENEW_INTERVAL_MS);
+  }
+
+  #stopWriterLeaseRenewal(): void {
+    if (this.#writerLeaseTimer !== null) this.#clearTimer(this.#writerLeaseTimer);
+    this.#writerLeaseTimer = null;
+  }
+
+  #attachInputTransport(): void {
+    this.#input.attachTransport((inputFrame) => {
+      const sent = this.#sendControl(inputFrame);
+      if (!sent) this.#failFullConnection();
+      return sent;
+    }, this.#writerLease ?? undefined);
   }
 
   #stopHeartbeat(): void {
@@ -820,6 +910,7 @@ export class TerminalSession {
     this.#abortDataReplacement();
     this.#cancelDataFailureTimer();
     this.#stopHeartbeat();
+    this.#stopWriterLeaseRenewal();
     this.#input.detachTransport();
     this.#closeSocket(this.#control);
     this.#closeSocket(this.#data);
@@ -877,6 +968,41 @@ export class TerminalSession {
       dataEpoch === this.#dataEpoch &&
       generation === this.#generation
     );
+  }
+
+  async #withRequestDeadline<T>(
+    parentSignal: AbortSignal,
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const abort = new AbortController();
+    let rejectBoundary!: (reason?: unknown) => void;
+    const boundary = new Promise<never>((_resolve, reject) => {
+      rejectBoundary = reject;
+    });
+    const fail = (reason: unknown) => {
+      if (!abort.signal.aborted) abort.abort(reason);
+      rejectBoundary(reason);
+    };
+    const onAbort = () =>
+      fail(parentSignal.reason ?? new DOMException("connection attempt aborted", "AbortError"));
+    const timeout = this.#setTimer(
+      () => fail(new DOMException("connection set request timed out", "TimeoutError")),
+      HTTP_REQUEST_TIMEOUT_MS,
+    );
+    parentSignal.addEventListener("abort", onAbort, { once: true });
+    if (parentSignal.aborted) onAbort();
+    try {
+      return await Promise.race([operation(abort.signal), boundary]);
+    } finally {
+      this.#clearTimer(timeout);
+      parentSignal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  #throwIfAborted(signal: AbortSignal): void {
+    if (signal.aborted) {
+      throw signal.reason ?? new DOMException("request aborted", "AbortError");
+    }
   }
 
   #update(patch: Partial<TerminalSessionSnapshot>): void {

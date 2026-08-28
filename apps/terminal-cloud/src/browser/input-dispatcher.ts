@@ -10,7 +10,7 @@ const MAX_PENDING_ACKS = 1_024;
 const MAX_QUEUED_INPUTS = 256;
 
 type InputAck = Extract<ServerControlFrame, { type: "input-ack" }>;
-type InputFrame = Exclude<ClientControlFrame, { type: "ack" | "attach" }>;
+type InputFrame = Exclude<ClientControlFrame, { type: "ack" | "attach" | "writer-lease-renew" }>;
 
 export interface InputDispatcherStatus {
   connected: boolean;
@@ -24,6 +24,7 @@ export interface InputDispatcherStatus {
 export interface InputDispatcherOptions {
   getObservedEventSeq: () => bigint | null;
   inputEpoch?: string;
+  createInputEpoch?: () => string;
   queueMicrotask?: (callback: () => void) => void;
 }
 
@@ -58,11 +59,12 @@ function sameDimensions(
 
 /** Converts semantic WTerm input into authority-owned control frames. */
 export class InputDispatcher implements InputSink {
-  readonly #inputEpoch: string;
+  readonly #createInputEpoch: () => string;
   readonly #getObservedEventSeq: () => bigint | null;
   readonly #queueMicrotask: (callback: () => void) => void;
   readonly #listeners = new Set<() => void>();
   readonly #pending = new Map<bigint, InputFrame["type"]>();
+  #inputEpoch: string;
   #nextSequence = 1n;
   #sender: FrameSender | null = null;
   #writerLease: string | null = null;
@@ -83,8 +85,10 @@ export class InputDispatcher implements InputSink {
 
   constructor(options: InputDispatcherOptions) {
     this.#getObservedEventSeq = options.getObservedEventSeq;
-    this.#inputEpoch = options.inputEpoch ?? crypto.randomUUID();
-    this.#queueMicrotask = options.queueMicrotask ?? queueMicrotask;
+    this.#createInputEpoch = options.createInputEpoch ?? (() => crypto.randomUUID());
+    this.#inputEpoch = options.inputEpoch ?? this.#createInputEpoch();
+    this.#queueMicrotask =
+      options.queueMicrotask ?? ((callback) => globalThis.queueMicrotask(callback));
   }
 
   get inputEpoch(): string {
@@ -93,6 +97,14 @@ export class InputDispatcher implements InputSink {
 
   get status(): InputDispatcherStatus {
     return this.#statusSnapshot;
+  }
+
+  startNewInputEpoch(): void {
+    this.#markOutstandingUncertain();
+    this.#inputEpoch = this.#createInputEpoch();
+    this.#nextSequence = 1n;
+    this.#queue = [];
+    this.#emit();
   }
 
   subscribe(listener: () => void): () => void {
@@ -225,8 +237,7 @@ export class InputDispatcher implements InputSink {
     let frame: unknown;
     switch (event.type) {
       case "key": {
-        const observedEventSeq = this.#getObservedEventSeq();
-        if (observedEventSeq === null) return null;
+        const observedEventSeq = this.#getObservedEventSeq() ?? 0n;
         frame = {
           type: "key",
           ...identity,

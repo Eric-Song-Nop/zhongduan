@@ -176,8 +176,9 @@ export class SessionCoordinator {
     this.#maxBufferedTailBytes = options.maxBufferedTailBytes ?? DEFAULT_MAX_BUFFERED_TAIL_BYTES;
     this.#maxBufferedTailFrames = options.maxBufferedTailFrames ?? DEFAULT_MAX_BUFFERED_TAIL_FRAMES;
     this.#restoreDeadlineMs = options.restoreDeadlineMs ?? DEFAULT_RESTORE_DEADLINE_MS;
-    this.#setTimer = options.setTimer ?? setTimeout;
-    this.#clearTimer = options.clearTimer ?? clearTimeout;
+    this.#setTimer =
+      options.setTimer ?? ((callback, delayMs) => globalThis.setTimeout(callback, delayMs));
+    this.#clearTimer = options.clearTimer ?? ((timer) => globalThis.clearTimeout(timer));
   }
 
   get state(): DeliveryState {

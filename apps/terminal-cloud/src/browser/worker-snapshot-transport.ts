@@ -5,6 +5,7 @@ import {
 import type { SnapshotManifest, SnapshotTransport } from "@zhongduan/session-client";
 
 import {
+  SNAPSHOT_LOAD_TIMEOUT_MS,
   type SnapshotWorkerRequest,
   type SnapshotWorkerResponse,
 } from "./snapshot-worker-contract";
@@ -22,6 +23,8 @@ interface SnapshotWorker {
 export interface WorkerSnapshotTransportOptions {
   createWorker?: () => SnapshotWorker;
   getCapability: () => string;
+  setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+  clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 }
 
 function defaultWorker(): SnapshotWorker {
@@ -43,10 +46,15 @@ function assertProtocolLimit(manifest: SnapshotManifest): void {
 export class WorkerSnapshotTransport implements SnapshotTransport {
   readonly #createWorker: () => SnapshotWorker;
   readonly #getCapability: () => string;
+  readonly #setTimer: NonNullable<WorkerSnapshotTransportOptions["setTimer"]>;
+  readonly #clearTimer: NonNullable<WorkerSnapshotTransportOptions["clearTimer"]>;
 
   constructor(options: WorkerSnapshotTransportOptions) {
     this.#createWorker = options.createWorker ?? defaultWorker;
     this.#getCapability = options.getCapability;
+    this.#setTimer =
+      options.setTimer ?? ((callback, delayMs) => globalThis.setTimeout(callback, delayMs));
+    this.#clearTimer = options.clearTimer ?? ((timer) => globalThis.clearTimeout(timer));
   }
 
   load(manifest: SnapshotManifest, signal: AbortSignal): Promise<Uint8Array> {
@@ -55,9 +63,11 @@ export class WorkerSnapshotTransport implements SnapshotTransport {
     const worker = this.#createWorker();
     return new Promise((resolve, reject) => {
       let settled = false;
+      let deadline: ReturnType<typeof setTimeout> | null = null;
       const finish = (result: { bytes: Uint8Array } | { error: unknown }): void => {
         if (settled) return;
         settled = true;
+        if (deadline !== null) this.#clearTimer(deadline);
         signal.removeEventListener("abort", onAbort);
         worker.terminate();
         if ("bytes" in result) resolve(result.bytes);
@@ -77,6 +87,13 @@ export class WorkerSnapshotTransport implements SnapshotTransport {
         finish({ error: new Error("snapshot worker failed") });
       });
       signal.addEventListener("abort", onAbort, { once: true });
+      deadline = this.#setTimer(() => {
+        finish({ error: new DOMException("snapshot load timed out", "TimeoutError") });
+      }, SNAPSHOT_LOAD_TIMEOUT_MS);
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
       try {
         worker.postMessage({
           type: "load",

@@ -53,6 +53,10 @@ export default defineConfig({
         command: "node scripts/verify-clean-browser-build.mjs",
         cache: false,
       },
+      "verify-browser-e2e": {
+        command: "python scripts/verify-browser-e2e.py",
+        cache: false,
+      },
     },
   },
 });

@@ -208,4 +208,58 @@ describe("InputDispatcher", () => {
     expect(frames.every((frame) => frame.type === "key")).toBe(true);
     expect(dispatcher.status.lastStatus).toBe("idle");
   });
+
+  it("uses the empty replica cursor so Ctrl-C remains available during cold recovery", () => {
+    const microtasks: Array<() => void> = [];
+    const frames: ClientControlFrame[] = [];
+    const dispatcher = new InputDispatcher({
+      getObservedEventSeq: () => null,
+      inputEpoch: "epoch_cold_ctrl_c1",
+      queueMicrotask: (callback) => microtasks.push(callback),
+    });
+    dispatcher.attachTransport((frame) => (frames.push(frame), true), "lease_cold_ctrl_c1");
+
+    dispatcher.send({
+      type: "key",
+      action: "press",
+      altGraph: false,
+      code: "KeyC",
+      composing: false,
+      consumedModifiers: 2,
+      key: "c",
+      modifiers: 2,
+      repeat: false,
+      text: "\u0003",
+      unshiftedCodepoint: 99,
+    });
+    microtasks.splice(0).forEach((callback) => callback());
+
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toMatchObject({ type: "key", observedEventSeq: "0", text: "\u0003" });
+  });
+
+  it("starts a fresh identity at sequence one for each writer welcome", () => {
+    const microtasks: Array<() => void> = [];
+    const frames: ClientControlFrame[] = [];
+    const dispatcher = new InputDispatcher({
+      getObservedEventSeq: () => 9n,
+      inputEpoch: "epoch_writer_first1",
+      createInputEpoch: () => "epoch_writer_second",
+      queueMicrotask: (callback) => microtasks.push(callback),
+    });
+    dispatcher.attachTransport((frame) => (frames.push(frame), true), "lease_writer_first1");
+    dispatcher.send(key());
+    microtasks.splice(0).forEach((callback) => callback());
+
+    dispatcher.detachTransport();
+    dispatcher.startNewInputEpoch();
+    dispatcher.attachTransport((frame) => (frames.push(frame), true), "lease_writer_second");
+    dispatcher.send(key());
+    microtasks.splice(0).forEach((callback) => callback());
+
+    expect(frames).toMatchObject([
+      { type: "key", inputEpoch: "epoch_writer_first1", clientInputSeq: "1" },
+      { type: "key", inputEpoch: "epoch_writer_second", clientInputSeq: "1" },
+    ]);
+  });
 });

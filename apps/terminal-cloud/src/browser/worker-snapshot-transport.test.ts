@@ -6,6 +6,7 @@ import type { SnapshotManifest } from "@zhongduan/session-client";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  SNAPSHOT_LOAD_TIMEOUT_MS,
   transferableSnapshot,
   type SnapshotWorkerRequest,
   type SnapshotWorkerResponse,
@@ -58,7 +59,60 @@ class FakeWorker {
   }
 }
 
+class ManualTimers {
+  readonly pending = new Map<ReturnType<typeof setTimeout>, () => void>();
+  #nextId = 1;
+
+  readonly setTimer = (callback: () => void, _delayMs: number): ReturnType<typeof setTimeout> => {
+    const id = this.#nextId as unknown as ReturnType<typeof setTimeout>;
+    this.#nextId += 1;
+    this.pending.set(id, callback);
+    return id;
+  };
+
+  readonly clearTimer = (timer: ReturnType<typeof setTimeout>): void => {
+    this.pending.delete(timer);
+  };
+
+  runOnly(): void {
+    const entry = [...this.pending].at(0);
+    if (entry === undefined || this.pending.size !== 1) {
+      throw new Error("expected exactly one pending timer");
+    }
+    this.pending.delete(entry[0]);
+    entry[1]();
+  }
+}
+
 describe("WorkerSnapshotTransport", () => {
+  it("invokes default browser timers with the global receiver", async () => {
+    const setTimer = vi.fn(function (this: unknown): ReturnType<typeof setTimeout> {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    });
+    const clearTimer = vi.fn(function (this: unknown): void {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+    });
+    vi.stubGlobal("setTimeout", setTimer);
+    vi.stubGlobal("clearTimeout", clearTimer);
+    try {
+      const worker = new FakeWorker();
+      const transport = new WorkerSnapshotTransport({
+        createWorker: () => worker,
+        getCapability: () => "secret-capability",
+      });
+      const abort = new AbortController();
+      const loading = transport.load(MANIFEST, abort.signal);
+      abort.abort(new DOMException("cancelled", "AbortError"));
+
+      await expect(loading).rejects.toMatchObject({ name: "AbortError" });
+      expect(setTimer).toHaveBeenCalledOnce();
+      expect(clearTimer).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("receives the transferred snapshot and terminates the dedicated worker", async () => {
     const worker = new FakeWorker();
     const transport = new WorkerSnapshotTransport({
@@ -78,15 +132,19 @@ describe("WorkerSnapshotTransport", () => {
 
   it("terminates on abort and enforces the shared compressed and uncompressed limits", async () => {
     const worker = new FakeWorker();
+    const timers = new ManualTimers();
     const transport = new WorkerSnapshotTransport({
       createWorker: () => worker,
       getCapability: () => "secret-capability",
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
     });
     const abort = new AbortController();
     const loading = transport.load(MANIFEST, abort.signal);
     abort.abort(new DOMException("cancelled", "AbortError"));
     await expect(loading).rejects.toMatchObject({ name: "AbortError" });
     expect(worker.terminate).toHaveBeenCalledOnce();
+    expect(timers.pending.size).toBe(0);
 
     const legalLargeWorker = new FakeWorker();
     const legalLargeTransport = new WorkerSnapshotTransport({
@@ -140,6 +198,27 @@ describe("WorkerSnapshotTransport", () => {
 
     await expect(loading).rejects.toThrow("snapshot worker failed");
     expect(worker.terminate).toHaveBeenCalledOnce();
+  });
+
+  it("terminates a worker that exceeds the independent load deadline", async () => {
+    const worker = new FakeWorker();
+    const timers = new ManualTimers();
+    const setTimer = vi.fn(timers.setTimer);
+    const transport = new WorkerSnapshotTransport({
+      createWorker: () => worker,
+      getCapability: () => "secret-capability",
+      setTimer,
+      clearTimer: timers.clearTimer,
+    });
+    const loading = transport.load(MANIFEST, new AbortController().signal);
+
+    expect(setTimer).toHaveBeenCalledWith(expect.any(Function), SNAPSHOT_LOAD_TIMEOUT_MS);
+    timers.runOnly();
+    worker.loaded(Uint8Array.from([1, 2, 3]).buffer);
+
+    await expect(loading).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(worker.terminate).toHaveBeenCalledOnce();
+    expect(timers.pending.size).toBe(0);
   });
 
   it("copies a view before transfer so unrelated bytes never leave the worker", () => {

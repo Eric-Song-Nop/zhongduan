@@ -249,6 +249,8 @@ Data 缺失、等待 attach 或 cold snapshot 恢复期间，已激活 writer co
 
 Writer lease 是需要显式维持的 control-plane liveness，而不是 data progress。Browser 只在持有 token 且 control 已激活时每 10 秒发送一次 `writer-lease-renew`；DO 只允许相同 `{clientId, leaseFence, token digest}` 的 active writer control 把 30 秒 deadline 向后推进，并返回 `writer-lease-status {active: true, expiresAt}`。renew 不能获取 lease、改变 fence、转发 Host 或替代 semantic input；data reset/reattach 也不能隐式续租。token 已过期、被新 fence 取代、control 尚未激活或角色不是 writer 时返回 `{active: false}`，Browser 必须立即清除 token 并进入 waiting。control close 继续按 fence 释放 lease；WebSocket ping/pong 的运行时自动响应不构成续租，也不能依赖它唤醒 DO。
 
+Browser 的 session HTTP 边界不能依赖底层取消一定生效：connection-set 创建与 capability refresh 各自有 10 秒独立 deadline，并在外层结束等待；迟到响应在安装 client identity 或新 capability 前必须再次检查 abort/lifecycle。snapshot dedicated worker 的 HTTP 恢复上限为 30 秒，主线程再以 35 秒 watchdog 终止失去响应的 worker；这些 deadline 与 snapshot 失败的 2/4/8/16/30 秒重连退避相互独立。
+
 `writer_lease` singleton 同时是 session 内 writer fence 的持久 high-water。lease 过期或 client LRU 回收只能把 deadline 置为失效并删除 client row，不能删除 singleton；下一次成功获取必须在旧 fence 上加一，达到 `u64::MAX` 后 fail closed，绝不能回绕。Browser 每次收到携带新 `writerLease` 的 writer `welcome`，必须生成新的随机 `inputEpoch`，把 `clientInputSeq` 从 `1` 开始；data-only recovery 不发送第二个 welcome，继续使用原 fence、input epoch 和序列。
 
 DO 对所有 WebSocket 入站使用同一全局串行队列，因此 lease acquisition、fence 注入和向同一 Host control WebSocket 的 semantic input 发送保持同一顺序。Host 分开保存最高 `writerFence` 与该 fence 已绑定的 `{clientId, inputEpoch, highWater, bounded results}`：低 fence 一律 `rejected`；首次看到高 fence 时先原子推进 fence、清空旧 dedup 并保持 identity 未绑定，再校验输入。即使首帧的 seq、cursor 或纯 payload 校验失败，旧 fence 也已经永久失效，同时坏帧不会抢占新 fence；只有合法的 seq=1 可以完成 `{clientId, inputEpoch}` 绑定。绑定后，同 fence 改变 `clientId` 或 `inputEpoch` 一律 `rejected`。这使 Host 内存与 session 生命周期内累计 client/epoch 数量解耦，同时不会把被淘汰 client 的旧重传再次写入 PTY。
@@ -264,6 +266,8 @@ Hibernation socket 的 Error 事件直接执行同一套 fenced close lifecycle�
 Host 的 control/data 是两条独立 WebSocket，不存在跨通道顺序保证。Host 发送 `host-ready` 后必须等待 relay 在同一 control socket 返回 `host-ready-ack { sessionEpoch, headEventSeq, nextPtyOffset }`，再放行 data；DO 只在校验并提交 session head、将当前 fenced pair 切到 ready、完成现有 browser delivery reset 后返回 ACK。当前 fenced Host 在 barrier 前发送 data 会 fail closed，不能静默丢弃或在 DO 内隐式缓存。
 
 Host 在 control 和 data 两条连接上分别用原始文本 `ping`/`pong` 检测 silent half-open，不能为此新增 JSON control frame。DO 通过 `setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"))` 在 hibernation 下直接应答，不唤醒 handler；Host 为两条连接分别记录精确原始 `pong`，任一连接约 45 秒无响应就 fence 整个 pair 并重连。heartbeat 只替换网络 pair，不改变 PTY、authority 或 `sessionEpoch`。
+
+Browser 在 full connection set 激活后也分别维护 control/data 的 `pong` 时间戳，并每 15 秒向两条 socket 发送同一原始 `ping`；任一通道 45 秒无响应、不可写或超过发送队列上限都会 fence 整个 Browser pair。data-only replacement 期间 heartbeat 暂停并在 replacement data open 后按新 generation 重启，writer control 与 10 秒 lease renewal 保持独立可用。
 
 入站消息在进入串行处理队列前完成 channel/type/size 校验。队列全局限制为 2048 条/32 MiB；Host data 单 socket 为 1024 条/16 MiB，browser control 为 8 条/16 MiB。Host 超限会 fail 当前 fenced pair，browser 超限只隔离对应客户端。
 

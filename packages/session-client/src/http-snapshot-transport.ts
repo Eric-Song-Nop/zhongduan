@@ -105,7 +105,7 @@ export class HttpSnapshotTransport implements SnapshotTransport {
   readonly #getHeaders?: HttpSnapshotTransportOptions["getHeaders"];
 
   constructor(options: HttpSnapshotTransportOptions = {}) {
-    this.#fetch = options.fetch ?? fetch;
+    this.#fetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.#maxCompressedBytes = configuredMaximum(
       options.maxCompressedBytes,
       MAX_SNAPSHOT_COMPRESSED_BYTES,

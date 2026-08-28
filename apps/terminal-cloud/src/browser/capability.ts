@@ -10,6 +10,7 @@ const STORAGE_PREFIX = "zhongduan:browser-capability:";
 const MAX_CAPABILITY_CHARS = 4_096;
 const MAX_STORED_CAPABILITY_JSON_CHARS = 8_192;
 const MAX_CLOCK_SKEW_SECONDS = 60;
+const CAPABILITY_REFRESH_TIMEOUT_MS = 10_000;
 
 interface CapabilityClaimsView {
   sessionId: string;
@@ -156,6 +157,27 @@ function removeStoredCapability(storage: Pick<Storage, "removeItem">, sessionId:
   }
 }
 
+function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      reject(signal.reason ?? new DOMException("operation aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+    if (signal.aborted) onAbort();
+  });
+}
+
 export function sessionIdFromPath(pathname: string): string {
   const segment = pathname.split("/").filter(Boolean).at(-1);
   return CloudResourceIdSchema.parse(segment);
@@ -210,16 +232,18 @@ export class CapabilityManager {
   #timer: ReturnType<typeof setTimeout> | null = null;
   #stopped = false;
   #refreshing: Promise<void> | null = null;
+  #refreshAbort: AbortController | null = null;
 
   constructor(options: CapabilityManagerOptions) {
     this.#sessionId = options.bootstrap.sessionId;
     this.#capability = options.bootstrap.capability;
     this.#claims = options.bootstrap;
-    this.#fetch = options.fetch ?? fetch;
+    this.#fetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.#now = options.now ?? Date.now;
     this.#random = options.random ?? Math.random;
-    this.#setTimer = options.setTimer ?? setTimeout;
-    this.#clearTimer = options.clearTimer ?? clearTimeout;
+    this.#setTimer =
+      options.setTimer ?? ((callback, delayMs) => globalThis.setTimeout(callback, delayMs));
+    this.#clearTimer = options.clearTimer ?? ((timer) => globalThis.clearTimeout(timer));
     this.#storage = options.storage;
     this.#onRefreshError = options.onRefreshError;
   }
@@ -249,9 +273,13 @@ export class CapabilityManager {
     this.#stopped = true;
     if (this.#timer !== null) this.#clearTimer(this.#timer);
     this.#timer = null;
+    this.#refreshAbort?.abort(new DOMException("capability manager stopped", "AbortError"));
   }
 
   refreshNow(): Promise<void> {
+    if (this.#stopped) {
+      return Promise.reject(new DOMException("capability manager stopped", "AbortError"));
+    }
     if (this.#refreshing !== null) return this.#refreshing;
     this.#refreshing = this.#refresh().finally(() => {
       this.#refreshing = null;
@@ -275,22 +303,33 @@ export class CapabilityManager {
   }
 
   async #refresh(): Promise<void> {
+    const abort = new AbortController();
+    this.#refreshAbort = abort;
+    const deadline = this.#setTimer(() => {
+      abort.abort(new DOMException("capability refresh timed out", "TimeoutError"));
+    }, CAPABILITY_REFRESH_TIMEOUT_MS);
     try {
-      const response = await this.#fetch(
-        `/api/v1/sessions/${encodeURIComponent(this.#sessionId)}/capabilities/refresh`,
-        {
-          method: "POST",
-          credentials: "same-origin",
-          redirect: "error",
-          headers: {
-            ...this.authorizationHeaders(),
-            "Content-Type": "application/json",
+      const response = await awaitWithAbort(
+        this.#fetch(
+          `/api/v1/sessions/${encodeURIComponent(this.#sessionId)}/capabilities/refresh`,
+          {
+            method: "POST",
+            credentials: "same-origin",
+            redirect: "error",
+            signal: abort.signal,
+            headers: {
+              ...this.authorizationHeaders(),
+              "Content-Type": "application/json",
+            },
+            body: "{}",
           },
-          body: "{}",
-        },
+        ),
+        abort.signal,
       );
       if (!response.ok) throw new Error("capability refresh failed");
-      const refreshed = CapabilityResponseSchema.parse(await response.json());
+      const refreshed = CapabilityResponseSchema.parse(
+        await awaitWithAbort(response.json(), abort.signal),
+      );
       const claims = readCapabilityClaims(refreshed.capability);
       if (
         claims.sessionId !== this.#sessionId ||
@@ -299,6 +338,10 @@ export class CapabilityManager {
       ) {
         throw new Error("capability refresh changed identity");
       }
+      abort.signal.throwIfAborted();
+      if (this.#stopped) {
+        throw new DOMException("capability manager stopped", "AbortError");
+      }
       this.#capability = refreshed.capability;
       this.#claims = claims;
       if (this.#storage !== undefined) {
@@ -306,15 +349,19 @@ export class CapabilityManager {
       }
       this.#scheduleAtHalfLife();
     } catch (error) {
-      this.#onRefreshError?.();
+      if (!this.#stopped) this.#onRefreshError?.();
       if (!this.#stopped && this.#now() < this.#claims.expiresAt * 1_000) {
         const retryMs = 30_000 + Math.floor(this.#random() * 30_000);
+        if (this.#timer !== null) this.#clearTimer(this.#timer);
         this.#timer = this.#setTimer(() => {
           this.#timer = null;
           void this.refreshNow().catch(() => undefined);
         }, retryMs);
       }
       throw error;
+    } finally {
+      this.#clearTimer(deadline);
+      if (this.#refreshAbort === abort) this.#refreshAbort = null;
     }
   }
 }

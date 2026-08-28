@@ -21,6 +21,36 @@ class MemoryStorage {
   }
 }
 
+class ManualTimers {
+  readonly pending = new Map<
+    ReturnType<typeof setTimeout>,
+    { callback: () => void; delayMs: number }
+  >();
+  #nextId = 1;
+
+  readonly setTimer = (callback: () => void, delayMs: number): ReturnType<typeof setTimeout> => {
+    const id = this.#nextId as unknown as ReturnType<typeof setTimeout>;
+    this.#nextId += 1;
+    this.pending.set(id, { callback, delayMs });
+    return id;
+  };
+
+  readonly clearTimer = (timer: ReturnType<typeof setTimeout>): void => {
+    this.pending.delete(timer);
+  };
+
+  run(delayMs: number): void {
+    const entry = [...this.pending].find(([, timer]) => timer.delayMs === delayMs);
+    if (entry === undefined) throw new Error(`timer with delay ${delayMs} was not scheduled`);
+    this.pending.delete(entry[0]);
+    entry[1].callback();
+  }
+
+  delays(): number[] {
+    return [...this.pending.values()].map(({ delayMs }) => delayMs);
+  }
+}
+
 function capability(
   overrides: Partial<{ expiresAt: number; issuedAt: number; role: string; sessionId: string }> = {},
 ): string {
@@ -152,8 +182,41 @@ describe("browser capability bootstrap", () => {
 });
 
 describe("CapabilityManager", () => {
+  it("invokes default browser timers with the global receiver", async () => {
+    const setTimer = vi.fn(function (this: unknown): ReturnType<typeof setTimeout> {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    });
+    const clearTimer = vi.fn(function (this: unknown): void {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+    });
+    vi.stubGlobal("setTimeout", setTimer);
+    vi.stubGlobal("clearTimeout", clearTimer);
+    try {
+      const manager = new CapabilityManager({
+        bootstrap: {
+          capability: capability(),
+          expiresAt: NOW_SECONDS + 100,
+          issuedAt: NOW_SECONDS - 100,
+          role: "writer",
+          sessionId: SESSION_ID,
+        },
+        fetch: vi.fn(() => new Promise<Response>(() => undefined)),
+      });
+
+      const refreshing = manager.refreshNow();
+      manager.stop();
+
+      await expect(refreshing).rejects.toMatchObject({ name: "AbortError" });
+      expect(setTimer).toHaveBeenCalledOnce();
+      expect(clearTimer).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("handles scheduled refresh failure and retains rejection for manual refresh", async () => {
-    const timers: Array<() => void> = [];
+    const timers = new ManualTimers();
     const onRefreshError = vi.fn();
     const manager = new CapabilityManager({
       bootstrap: {
@@ -166,20 +229,148 @@ describe("CapabilityManager", () => {
       fetch: vi.fn().mockRejectedValue(new Error("offline")),
       now: () => NOW_SECONDS * 1_000,
       random: () => 0.5,
-      setTimer: (callback) => {
-        timers.push(callback);
-        return timers.length as unknown as ReturnType<typeof setTimeout>;
-      },
-      clearTimer: vi.fn(),
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
       onRefreshError,
     });
 
     manager.start();
-    expect(timers).toHaveLength(1);
-    timers.shift()!();
+    expect(timers.delays()).toEqual([0]);
+    timers.run(0);
     await vi.waitFor(() => expect(onRefreshError).toHaveBeenCalledOnce());
-    expect(timers).toHaveLength(1);
+    expect(timers.delays()).toEqual([45_000]);
     await expect(manager.refreshNow()).rejects.toThrow("offline");
     manager.stop();
+  });
+
+  it("aborts a refresh whose fetch exceeds the independent deadline", async () => {
+    const timers = new ManualTimers();
+    const onRefreshError = vi.fn();
+    let requestSignal: AbortSignal | undefined;
+    const fetchCapability = vi.fn<typeof fetch>((_input, init) => {
+      requestSignal = init?.signal ?? undefined;
+      return new Promise<Response>(() => undefined);
+    });
+    const manager = new CapabilityManager({
+      bootstrap: {
+        capability: capability(),
+        expiresAt: NOW_SECONDS + 100,
+        issuedAt: NOW_SECONDS - 100,
+        role: "writer",
+        sessionId: SESSION_ID,
+      },
+      fetch: fetchCapability,
+      now: () => NOW_SECONDS * 1_000,
+      random: () => 0.5,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+      onRefreshError,
+    });
+
+    const refreshing = manager.refreshNow();
+    expect(timers.delays()).toEqual([10_000]);
+    timers.run(10_000);
+
+    await expect(refreshing).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(requestSignal?.aborted).toBe(true);
+    expect(onRefreshError).toHaveBeenCalledOnce();
+    expect(timers.delays()).toEqual([45_000]);
+    manager.stop();
+  });
+
+  it("bounds response parsing and ignores a valid result that arrives after timeout", async () => {
+    const timers = new ManualTimers();
+    const originalCapability = capability();
+    const refreshedCapability = capability({
+      issuedAt: NOW_SECONDS,
+      expiresAt: NOW_SECONDS + 200,
+    });
+    let resolveJson: ((value: unknown) => void) | undefined;
+    const json = vi.fn(
+      () =>
+        new Promise<unknown>((resolve) => {
+          resolveJson = resolve;
+        }),
+    );
+    const manager = new CapabilityManager({
+      bootstrap: {
+        capability: originalCapability,
+        expiresAt: NOW_SECONDS + 100,
+        issuedAt: NOW_SECONDS - 100,
+        role: "writer",
+        sessionId: SESSION_ID,
+      },
+      fetch: vi.fn(async () => ({ json, ok: true }) as unknown as Response),
+      now: () => NOW_SECONDS * 1_000,
+      random: () => 0.5,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    });
+
+    const refreshing = manager.refreshNow();
+    await vi.waitFor(() => expect(json).toHaveBeenCalledOnce());
+    timers.run(10_000);
+    await expect(refreshing).rejects.toMatchObject({ name: "TimeoutError" });
+
+    resolveJson?.({
+      capability: refreshedCapability,
+      expiresAt: NOW_SECONDS + 200,
+      role: "writer",
+    });
+    await Promise.resolve();
+    expect(manager.capability).toBe(originalCapability);
+    manager.stop();
+  });
+
+  it("stop aborts an active refresh without installing a late response", async () => {
+    const timers = new ManualTimers();
+    const onRefreshError = vi.fn();
+    const originalCapability = capability();
+    const refreshedCapability = capability({
+      issuedAt: NOW_SECONDS,
+      expiresAt: NOW_SECONDS + 200,
+    });
+    let requestSignal: AbortSignal | undefined;
+    let resolveFetch: ((response: Response) => void) | undefined;
+    const manager = new CapabilityManager({
+      bootstrap: {
+        capability: originalCapability,
+        expiresAt: NOW_SECONDS + 100,
+        issuedAt: NOW_SECONDS - 100,
+        role: "writer",
+        sessionId: SESSION_ID,
+      },
+      fetch: vi.fn((_input, init) => {
+        requestSignal = init?.signal ?? undefined;
+        return new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        });
+      }),
+      now: () => NOW_SECONDS * 1_000,
+      random: () => 0.5,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+      onRefreshError,
+    });
+
+    const refreshing = manager.refreshNow();
+    manager.stop();
+    await expect(refreshing).rejects.toMatchObject({ name: "AbortError" });
+    expect(requestSignal?.aborted).toBe(true);
+    expect(onRefreshError).not.toHaveBeenCalled();
+    expect(timers.pending.size).toBe(0);
+
+    resolveFetch?.(
+      new Response(
+        JSON.stringify({
+          capability: refreshedCapability,
+          expiresAt: NOW_SECONDS + 200,
+          role: "writer",
+        }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+    await Promise.resolve();
+    expect(manager.capability).toBe(originalCapability);
   });
 });
