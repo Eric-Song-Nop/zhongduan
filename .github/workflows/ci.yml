@@ -32,3 +32,4 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec vp run verify
       - run: pnpm exec vp run verify-clean-host
+      - run: pnpm exec vp run verify-clean-browser

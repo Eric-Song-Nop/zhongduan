@@ -26,6 +26,10 @@ export default defineConfig({
         command: "vp run @zhongduan/host-daemon#build",
         cache: false,
       },
+      "build-browser": {
+        command: "vp run @zhongduan/terminal-cloud#build",
+        cache: false,
+      },
       verify: {
         command: [
           "node scripts/prepare-wterm.mjs",
@@ -33,6 +37,7 @@ export default defineConfig({
           "node scripts/verify-no-source-emit.mjs",
           "vp test --run",
           "vp run @zhongduan/terminal-cloud#test",
+          "vp run @zhongduan/terminal-cloud#test:browser",
         ],
         cache: false,
       },
@@ -42,6 +47,14 @@ export default defineConfig({
       },
       "verify-no-source-emit": {
         command: "node scripts/verify-no-source-emit.mjs",
+        cache: false,
+      },
+      "verify-clean-browser": {
+        command: "node scripts/verify-clean-browser-build.mjs",
+        cache: false,
+      },
+      "verify-browser-e2e": {
+        command: "python scripts/verify-browser-e2e.py",
         cache: false,
       },
     },

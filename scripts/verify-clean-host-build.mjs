@@ -9,6 +9,7 @@ const vp = fileURLToPath(new URL("../node_modules/vite-plus/bin/vp", import.meta
 const wtermDistDirectories = [
   new URL("../vendor/wterm/packages/@wterm/core/dist", import.meta.url),
   new URL("../vendor/wterm/packages/@wterm/ghostty/dist", import.meta.url),
+  new URL("../vendor/wterm/packages/@wterm/dom/dist", import.meta.url),
 ];
 const hostDist = new URL("../apps/host-daemon/dist/", import.meta.url);
 const packagedWasm = new URL("ghostty-vt.wasm", hostDist);

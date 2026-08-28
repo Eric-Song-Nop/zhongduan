@@ -14,11 +14,13 @@ import {
   snapshotObjectKey,
 } from "../src/worker/snapshot-contract";
 import {
+  bucketWithOverrides,
   createSession,
   encoder,
   engineId,
   getSnapshot,
   metadataFor,
+  overrideSnapshotBucket,
   origin,
   sessionStub,
   sha256Hex,
@@ -142,6 +144,46 @@ describe("private HTTP snapshots", () => {
     });
     expect(state.latest).toMatchObject({ latest_snapshot_id: snapshotId });
     expect(state.snapshot).toMatchObject({ r2_version: object?.version, state: "servable" });
+  });
+
+  it("revalidates the completed object through HEAD before publishing", async () => {
+    const session = await createSession();
+    const snapshotId = "snapshot_complete_head_01";
+    await overrideSnapshotBucket(session, (base) =>
+      bucketWithOverrides(base, {
+        async createMultipartUpload(
+          key: string,
+          options?: R2MultipartOptions,
+        ): Promise<R2MultipartUpload> {
+          const multipart = await base.createMultipartUpload(key, options);
+          return {
+            abort: multipart.abort.bind(multipart),
+            async complete(parts) {
+              const object = await multipart.complete(parts);
+              return new Proxy(object, {
+                get(target, property) {
+                  if (property === "customMetadata" || property === "httpMetadata") return {};
+                  const value = Reflect.get(target, property, target);
+                  return typeof value === "function" ? value.bind(target) : value;
+                },
+              });
+            },
+            key: multipart.key,
+            uploadId: multipart.uploadId,
+            uploadPart: multipart.uploadPart.bind(multipart),
+          };
+        },
+      }),
+    );
+
+    const response = await uploadSnapshot(session, snapshotId);
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({ created: true, snapshot: { snapshotId } });
+    const downloaded = await getSnapshot(session, snapshotId);
+    expect(downloaded.status).toBe(200);
+    expect(new Uint8Array(await downloaded.arrayBuffer())).toEqual(
+      encoder.encode("snapshot-state"),
+    );
   });
 
   it("serves legacy single-put rows whose R2 metadata predates uploadKind", async () => {

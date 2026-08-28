@@ -1,8 +1,9 @@
 :root {
-  color: #e8e8e8;
-  background: #111111;
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: #d8dee9;
+  background: #111315;
+  font-family: "IBM Plex Sans", "Noto Sans", sans-serif;
   font-synthesis: none;
+  letter-spacing: 0;
 }
 
 * {
@@ -11,15 +12,251 @@
 
 html,
 body,
-#root,
-.terminal-surface {
+#root {
   width: 100%;
-  min-width: 0;
   height: 100%;
-  min-height: 0;
   margin: 0;
+  overflow: hidden;
 }
 
-.terminal-surface {
-  background: #111111;
+button,
+input,
+textarea {
+  font: inherit;
+  letter-spacing: 0;
+}
+
+.terminal-app {
+  display: grid;
+  grid-template-rows: 36px minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  background: #111315;
+}
+
+.session-bar {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  height: 36px;
+  gap: 14px;
+  padding: 0 8px 0 10px;
+  color: #b7bec8;
+  background: #1a1d20;
+  border-bottom: 1px solid #30353a;
+  font-size: 12px;
+  line-height: 1;
+  user-select: none;
+}
+
+.product-mark,
+.connection-status,
+.session-actions {
+  display: flex;
+  align-items: center;
+}
+
+.product-mark {
+  flex: none;
+  gap: 7px;
+  color: #eef1f4;
+  font-weight: 600;
+}
+
+.product-glyph {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  color: #111315;
+  background: #72c7b4;
+  border-radius: 3px;
+  font-family: "IBM Plex Mono", "Noto Sans Mono", monospace;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.connection-status {
+  flex: none;
+  gap: 7px;
+  color: #c6ccd4;
+}
+
+.status-light {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: #7f8790;
+}
+
+.status-light[data-tone="ok"] {
+  background: #69c39e;
+}
+
+.status-light[data-tone="warning"] {
+  background: #d9a441;
+}
+
+.status-light[data-tone="error"] {
+  background: #e06c75;
+}
+
+.status-light[data-tone="busy"] {
+  background: #70a7d8;
+  animation: status-pulse 1.4s ease-in-out infinite;
+}
+
+.terminal-title {
+  min-width: 0;
+  overflow: hidden;
+  color: #858d96;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-actions {
+  min-width: 0;
+  margin-left: auto;
+  gap: 6px;
+}
+
+.input-state {
+  color: #d9a441;
+  font-variant-numeric: tabular-nums;
+}
+
+.ownership-button,
+.recovery-button {
+  height: 26px;
+  padding: 0 9px;
+  color: #d8dee9;
+  background: #252a2e;
+  border: 1px solid #3a4147;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.recovery-button {
+  display: grid;
+  width: 26px;
+  flex: none;
+  padding: 0;
+  place-items: center;
+}
+
+.ownership-button:hover:not(:disabled),
+.recovery-button:hover:not(:disabled) {
+  background: #30363b;
+  border-color: #56616a;
+}
+
+.ownership-button:focus-visible,
+.recovery-button:focus-visible {
+  outline: 2px solid #70a7d8;
+  outline-offset: 1px;
+}
+
+.ownership-button[data-owned="true"] {
+  color: #8fd5b7;
+  border-color: #3d6656;
+  background: #1d2b26;
+}
+
+.ownership-button:disabled,
+.recovery-button:disabled {
+  cursor: default;
+  opacity: 0.62;
+}
+
+.terminal-stage {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #111315;
+}
+
+.terminal-viewport.wterm {
+  --term-bg: #111315;
+  --term-fg: #d8dee9;
+  --term-cursor: #e6e9ed;
+  --term-color-0: #111315;
+  --term-color-1: #e06c75;
+  --term-color-2: #8fbc8f;
+  --term-color-3: #e5c07b;
+  --term-color-4: #70a7d8;
+  --term-color-5: #c678dd;
+  --term-color-6: #72c7b4;
+  --term-color-7: #d8dee9;
+  --term-color-8: #626a73;
+  --term-font-family: "IBM Plex Mono", "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  --term-font-size: 14px;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 10px 12px;
+  overflow: hidden;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.terminal-viewport.wterm.has-scrollback {
+  overflow-y: auto;
+}
+
+.engine-status {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #7f8790;
+  background: #111315;
+  font-family: "IBM Plex Mono", "Noto Sans Mono", monospace;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.engine-status.error {
+  color: #e06c75;
+}
+
+@keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 0.48;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 620px) {
+  .terminal-app {
+    grid-template-rows: 40px minmax(0, 1fr);
+  }
+
+  .session-bar {
+    height: 40px;
+    gap: 10px;
+  }
+
+  .product-name,
+  .terminal-title,
+  .input-state {
+    display: none;
+  }
+
+  .terminal-viewport.wterm {
+    --term-font-size: 13px;
+    padding: 8px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-light[data-tone="busy"] {
+    animation: none;
+  }
 }

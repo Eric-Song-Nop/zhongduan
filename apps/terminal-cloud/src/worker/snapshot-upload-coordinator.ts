@@ -576,8 +576,20 @@ export class SnapshotUploadCoordinator {
     if (completing.kind !== "fulfilled") {
       return json({ error: "snapshot-upload-failed" }, 503);
     }
-    const object = completing.value;
-    if (!matchesSnapshotObject(object, metadata, "multipart-verified")) {
+    const completedObject = completing.value;
+    const heading = await this.runR2WithinDeadline(() =>
+      this.snapshotBucket.head(upload.object_key),
+    );
+    if (heading.kind !== "fulfilled") {
+      return json({ error: "snapshot-upload-failed" }, 503);
+    }
+    const object = heading.value;
+    if (
+      object === null ||
+      object.version !== completedObject.version ||
+      object.etag !== completedObject.etag ||
+      !matchesSnapshotObject(object, metadata, "multipart-verified")
+    ) {
       return json({ error: "snapshot-upload-failed" }, 503);
     }
     const completed = this.snapshots.recordMultipartCompleted(

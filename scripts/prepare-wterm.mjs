@@ -8,12 +8,15 @@ const vp = fileURLToPath(new URL("../node_modules/vite-plus/bin/vp", import.meta
 const distDirectories = [
   "vendor/wterm/packages/@wterm/core/dist",
   "vendor/wterm/packages/@wterm/ghostty/dist",
+  "vendor/wterm/packages/@wterm/dom/dist",
 ];
 const requiredOutputs = [
   "vendor/wterm/packages/@wterm/core/dist/index.js",
   "vendor/wterm/packages/@wterm/core/dist/index.d.ts",
   "vendor/wterm/packages/@wterm/ghostty/dist/index.js",
   "vendor/wterm/packages/@wterm/ghostty/dist/index.d.ts",
+  "vendor/wterm/packages/@wterm/dom/dist/index.js",
+  "vendor/wterm/packages/@wterm/dom/dist/index.d.ts",
 ];
 
 execFileSync(process.execPath, ["scripts/verify-wterm-submodule.mjs"], {
@@ -30,10 +33,12 @@ await Promise.all(
   ),
 );
 
-execFileSync(process.execPath, [vp, "run", "--no-cache", "-t", "@wterm/ghostty#build"], {
-  cwd: root,
-  stdio: "inherit",
-});
+for (const target of ["@wterm/core#build", "@wterm/ghostty#build", "@wterm/dom#build"]) {
+  execFileSync(process.execPath, [vp, "run", "--no-cache", "-t", target], {
+    cwd: root,
+    stdio: "inherit",
+  });
+}
 
 await Promise.all(
   requiredOutputs.map((output) => access(new URL(`../${output}`, import.meta.url))),
