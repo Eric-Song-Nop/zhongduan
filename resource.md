@@ -106,40 +106,58 @@ type ServerFrame =
         | "journal-gap"
         | "slow-client"
         | "engine-mismatch"
-        | "epoch-changed";
+        | "epoch-changed"
+        | "data-disconnected"
+        | "host-reconnect";
+
+      // replacement credential 必须成对出现，并绑定当前 connection set/generation。
+      dataTicket?: string;
+      expiresAt?: number;
     });
 
 type ClientFrame =
   | {
       type: "attach";
-      sessionId: string;
+      engineId: string;
+      hasLiveReplica: false;
+    }
+  | {
+      type: "attach";
       engineId: string;
 
-      // 页面没刷新、原来的 libghostty Terminal 仍在时才为 true。
-      hasLiveReplica: boolean;
-
-      lastSessionEpoch?: U64;
-      lastEventSeq?: U64;
-      nextPtyOffset?: U64;
+      // 三个 cursor 来自发送 attach 这一刻的 active libghostty replica。
+      hasLiveReplica: true;
+      lastSessionEpoch: U64;
+      lastEventSeq: U64;
+      nextPtyOffset: U64;
     }
   | {
       type: "key";
       writerLease: string;
+      inputEpoch: string;
       clientInputSeq: U64;
+      observedEventSeq: U64;
+      code: string;
       key: string;
       text?: string;
       modifiers: number;
-      repeat: boolean;
+      action: "press" | "repeat" | "release";
+      altGraph: boolean;
+      composing: boolean;
+      consumedModifiers: number;
+      unshiftedCodepoint?: number;
     }
   | {
       type: "paste";
       writerLease: string;
+      inputEpoch: string;
       clientInputSeq: U64;
       data: Uint8Array;
     }
   | {
       type: "resize-request";
       writerLease: string;
+      inputEpoch: string;
       clientInputSeq: U64;
       cols: number;
       rows: number;
@@ -154,6 +172,29 @@ type ClientFrame =
       nextPtyOffset: U64;
     };
 ```
+
+`modifiers` 和 `consumedModifiers` 固定采用 Ghostty 位布局：
+
+```text
+Shift=1, Control=2, Alt=4, Super=8, CapsLock=16, NumLock=32
+```
+
+`unshiftedCodepoint` 如果存在，必须是 Unicode scalar，不能落在 surrogate 区间。
+两个 modifier 字段只能使用 `0x3f` 内的位，并且 `consumedModifiers` 必须是 `modifiers` 的子集；AltGraph 合成出的 Ctrl/Alt 不应伪装成真实 modifier。
+
+`ack` 只表示该 delivery generation 的 frame 已可靠到达，用于 512 KiB credit 计算，不代表 libghostty 已应用。ACK cursor 只保存在当前 data WebSocket 的 hibernation attachment 中，不写入 SQL，也不作为下一 connection set 的单调下界；full reconnect 必须以新 `attach` 的 live replica cursor 重新建立 credit baseline。Host 重连或浏览器 data 断线时，DO 会 bump generation、关闭旧 data、签发同一 connection set 的 30 秒单次 data ticket，并发送一个 `resync-required`。浏览器建立新 data 后，必须从当前 active replica 读取 cursor 并重新 `attach`；DO 不缓存 cursor 来自动 replay，从而消除“frame 已 apply、progress 尚未上报”的重复应用窗口。
+
+`hasLiveReplica: false` 不提供 delivery baseline。在 snapshot manifest 用明确 cut cursor seed 之前，DO 不接受 directed mutation 或 `ReplayCommit`；`hasLiveReplica: true` 则以完整三元 cursor 初始化严格的 event/PTY delivery 校验。
+
+directed replay 还必须受 DO canonical head 约束：mutation 的 event/PTY 端点不能超过当时已处理的 canonical head，`ReplayCommit` 必须精确等于该 head。MVP 不接受 Host 发来的 directed `Reset`；合法 reset 只能走 DO 的 generation bump、关闭旧 data、签发 replacement ticket、control `resync-required` 这一条显式路径。
+
+connection set 遵循 `reserved -> control-open/data-open -> paired -> ready -> replaced/closed`。每次转换都同时校验 `{peer, connectionSetId, connectionId, hostFence | (clientId, deliveryGeneration)}`。未消费 reservation 与已注册 browser identity 共用 16-client 原子 quota；同一 browser identity 或 Host subject 最多保留一个 pending set，新签会撤销旧票。quota 满时只按 LRU 回收同时满足“无 open/hibernating socket、无 pending ticket、无有效 writer lease”的断连 identity。这样“只签票不连 WS”和“批量签完再消费”都不能绕过限额，也不会把 16 变成 session 终身 clientId 上限。
+
+Hibernation socket 的 Error 事件直接执行同一套 fenced close lifecycle，不能假设 workerd 随后还会派发 Close。Host data error 会使当前 pair 下线；browser data error 会 bump generation 并签发 replacement ticket。后到的 Close 只会命中已推进的 fence/generation 并被幂等忽略。
+
+Host 的 control/data 是两条独立 WebSocket，不存在跨通道顺序保证。Host 发送 `host-ready` 后必须等待 relay 在同一 control socket 返回 `host-ready-ack { sessionEpoch, headEventSeq, nextPtyOffset }`，再放行 data；DO 只在校验并提交 session head、将当前 fenced pair 切到 ready、完成现有 browser delivery reset 后返回 ACK。当前 fenced Host 在 barrier 前发送 data 会 fail closed，不能静默丢弃或在 DO 内隐式缓存。
+
+入站消息在进入串行处理队列前完成 channel/type/size 校验。队列全局限制为 2048 条/32 MiB；Host data 单 socket 为 1024 条/16 MiB，browser control 为 8 条/16 MiB。Host 超限会 fail 当前 fenced pair，browser 超限只隔离对应客户端。
 
 ## 为什么既要 `eventSeq`，又要 `ptyOffset`
 
@@ -1165,8 +1206,13 @@ Shift+Enter
 ```text
 Client:
   KEY {
+    code = Enter
     key = Enter
     modifiers = Shift
+    action = press
+    altGraph = false
+    composing = false
+    consumedModifiers = 0
   }
 
 Host:
@@ -1356,6 +1402,8 @@ authoritative libghostty 被重新初始化且没有可靠 snapshot+tail
 Agent crash 导致输入/输出边界无法确定
 ```
 
+Host 创建 Cloud session 时必须显式提交一个随机、非零的 u64 `sessionEpoch`。Cloud API 不提供默认值；缺失字段直接返回 400，避免两个 PTY 生命周期意外复用相同 epoch。
+
 客户端看到 epoch 改变：
 
 ```text
@@ -1373,7 +1421,7 @@ Agent crash 导致输入/输出边界无法确定
 ```ts
 class TerminalSession {
   readonly sessionId: string;
-  sessionEpoch = 1n;
+  readonly sessionEpoch: bigint;
 
   eventSeq = 0n;
   nextPtyOffset = 0n;

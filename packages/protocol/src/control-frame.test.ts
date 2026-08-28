@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   ClientControlFrameSchema,
+  RelayToHostControlFrameSchema,
   ServerControlFrameSchema,
   decodeControlFrame,
 } from "./control-frame";
+import { KeyModifier } from "./keyboard";
+import { DecimalU64Schema, PositiveDecimalU64Schema } from "./scalars";
 
 describe("control frame validation", () => {
   it("accepts a warm attach cursor with decimal uint64 values", () => {
@@ -36,6 +39,42 @@ describe("control frame validation", () => {
         ClientControlFrameSchema,
       ),
     ).toThrow();
+    expect(() =>
+      ClientControlFrameSchema.parse({
+        type: "attach",
+        engineId: "engine",
+        hasLiveReplica: true,
+      }),
+    ).toThrow();
+    expect(() =>
+      ClientControlFrameSchema.parse({
+        type: "attach",
+        engineId: "engine",
+        hasLiveReplica: false,
+        lastSessionEpoch: "7",
+        lastEventSeq: "0",
+        nextPtyOffset: "0",
+      }),
+    ).toThrow();
+  });
+
+  it("bounds decimal uint64 values before BigInt conversion", () => {
+    expect(DecimalU64Schema.parse("18446744073709551615")).toBe("18446744073709551615");
+    expect(() => DecimalU64Schema.parse("18446744073709551616")).toThrow();
+    expect(() => DecimalU64Schema.parse("1".repeat(21))).toThrow();
+    expect(PositiveDecimalU64Schema.parse("1")).toBe("1");
+    expect(() => PositiveDecimalU64Schema.parse("0")).toThrow();
+  });
+
+  it("uses the Ghostty modifier bit layout on the wire", () => {
+    expect(KeyModifier).toEqual({
+      Shift: 1,
+      Control: 2,
+      Alt: 4,
+      Super: 8,
+      CapsLock: 16,
+      NumLock: 32,
+    });
   });
 
   it("requires a reconnect-stable input epoch for every semantic input", () => {
@@ -48,7 +87,11 @@ describe("control frame validation", () => {
       code: "Enter",
       key: "Enter",
       modifiers: 0,
-      repeat: false,
+      action: "press",
+      altGraph: false,
+      composing: false,
+      consumedModifiers: 0,
+      unshiftedCodepoint: 0x0d,
     };
 
     expect(ClientControlFrameSchema.parse(input)).toMatchObject({
@@ -57,6 +100,45 @@ describe("control frame validation", () => {
     });
     const { inputEpoch: _inputEpoch, ...missingEpoch } = input;
     expect(() => ClientControlFrameSchema.parse(missingEpoch)).toThrow();
+  });
+
+  it("preserves international keyboard metadata and rejects surrogate code points", () => {
+    const input = {
+      type: "key" as const,
+      writerLease: "lease_AAAAAAAAAAAA",
+      inputEpoch: "input_AAAAAAAAAAAA",
+      clientInputSeq: "43",
+      observedEventSeq: "19",
+      code: "KeyE",
+      key: "€",
+      text: "€",
+      modifiers: 0,
+      action: "press" as const,
+      altGraph: true,
+      composing: false,
+      consumedModifiers: 0,
+      unshiftedCodepoint: 0x65,
+    };
+
+    expect(ClientControlFrameSchema.parse(input)).toEqual(input);
+    expect(() =>
+      ClientControlFrameSchema.parse({ ...input, unshiftedCodepoint: 0xd800 }),
+    ).toThrow();
+    expect(() =>
+      ClientControlFrameSchema.parse({ ...input, consumedModifiers: KeyModifier.Shift }),
+    ).toThrow();
+  });
+
+  it("measures paste limits in UTF-8 bytes", () => {
+    expect(() =>
+      ClientControlFrameSchema.parse({
+        type: "paste",
+        writerLease: "lease_AAAAAAAAAAAA",
+        inputEpoch: "input_AAAAAAAAAAAA",
+        clientInputSeq: "44",
+        data: "中".repeat(350_000),
+      }),
+    ).toThrow();
   });
 
   it("echoes the input epoch in acknowledgements", () => {
@@ -69,6 +151,63 @@ describe("control frame validation", () => {
         authorityEventSeq: "19",
       }),
     ).toMatchObject({ inputEpoch: "input_AAAAAAAAAAAA", clientInputSeq: "42" });
+  });
+
+  it("validates a generation-scoped slow-client reset notification", () => {
+    expect(
+      RelayToHostControlFrameSchema.parse({
+        type: "delivery-reset",
+        connectionId: "connection_AAAAAAAAA",
+        streamId: 42,
+        deliveryGeneration: "9",
+        reason: "slow-client",
+      }),
+    ).toEqual({
+      type: "delivery-reset",
+      connectionId: "connection_AAAAAAAAA",
+      streamId: 42,
+      deliveryGeneration: "9",
+      reason: "slow-client",
+    });
+  });
+
+  it("validates the Host data-channel readiness barrier", () => {
+    expect(
+      RelayToHostControlFrameSchema.parse({
+        type: "host-ready-ack",
+        sessionEpoch: "7",
+        headEventSeq: "19",
+        nextPtyOffset: "4221",
+      }),
+    ).toEqual({
+      type: "host-ready-ack",
+      sessionEpoch: "7",
+      headEventSeq: "19",
+      nextPtyOffset: "4221",
+    });
+  });
+
+  it("accepts a replacement data ticket on resync", () => {
+    expect(
+      ServerControlFrameSchema.parse({
+        type: "resync-required",
+        deliveryGeneration: "9",
+        reason: "slow-client",
+        dataTicket: "ticket_AAAAAAAAAAAAAA",
+        expiresAt: 1_800_000_000_000,
+      }),
+    ).toMatchObject({
+      deliveryGeneration: "9",
+      dataTicket: "ticket_AAAAAAAAAAAAAA",
+    });
+    expect(() =>
+      ServerControlFrameSchema.parse({
+        type: "resync-required",
+        deliveryGeneration: "9",
+        reason: "data-disconnected",
+        dataTicket: "ticket_AAAAAAAAAAAAAA",
+      }),
+    ).toThrow();
   });
 
   it("validates an immutable HTTP snapshot manifest", () => {

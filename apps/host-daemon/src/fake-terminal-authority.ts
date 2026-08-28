@@ -1,6 +1,7 @@
 import type { ResizePayload } from "@zhongduan/protocol";
 
-import { KeyModifier, type SemanticKey, type TerminalAuthority } from "./terminal-authority";
+import { KeyModifier } from "@zhongduan/protocol";
+import type { SemanticKey, TerminalAuthority } from "./terminal-authority";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();

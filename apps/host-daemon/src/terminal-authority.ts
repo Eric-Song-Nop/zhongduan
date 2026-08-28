@@ -1,18 +1,15 @@
 import type { ResizePayload } from "@zhongduan/protocol";
 
-export const KeyModifier = {
-  Shift: 1 << 0,
-  Alt: 1 << 1,
-  Control: 1 << 2,
-  Meta: 1 << 3,
-} as const;
-
 export interface SemanticKey {
+  action: "press" | "repeat" | "release";
+  altGraph: boolean;
   code: string;
+  composing: boolean;
+  consumedModifiers: number;
   key: string;
   text?: string;
   modifiers: number;
-  repeat: boolean;
+  unshiftedCodepoint?: number;
 }
 
 export interface TerminalAuthority {
