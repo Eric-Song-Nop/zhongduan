@@ -1,6 +1,15 @@
 import { z } from "zod";
+import {
+  RecoveryV3CloudToHostControlFrameSchema,
+  RecoveryV3HostToCloudControlFrameSchema,
+} from "./recovery-v3-host-control";
+import {
+  RecoveryV3ClientControlFrameSchema,
+  RecoveryV3ServerControlFrameSchema,
+} from "./recovery-v3-control";
 import { DecimalU64Schema } from "./scalars";
 import { SnapshotContentMetadataSchema, SnapshotResourceIdSchema } from "./snapshot";
+import { RecoveryStrategySchema, type RecoveryStrategy } from "./wire-capabilities";
 
 const u64 = DecimalU64Schema;
 const id = z.string().min(1).max(128);
@@ -172,6 +181,25 @@ export const ClientControlFrameSchema = z.union([
 
 export type ClientControlFrame = z.infer<typeof ClientControlFrameSchema>;
 
+/**
+ * Browser-to-Cloud production controls for a generation that explicitly
+ * negotiated Recovery v3. Delivery receipt replaces the v2 `ack`; attach,
+ * lease, and semantic input remain shared controls.
+ */
+export const ClientControlFrameV3Schema = z.union([
+  attach,
+  writerLeaseRenew,
+  key,
+  text,
+  paste,
+  focus,
+  mouse,
+  resizeRequest,
+  RecoveryV3ClientControlFrameSchema,
+]);
+
+export type ClientControlFrameV3 = z.infer<typeof ClientControlFrameV3Schema>;
+
 const hostReady = z.strictObject({
   type: z.literal("host-ready"),
   engineId,
@@ -202,6 +230,18 @@ export const HostControlFrameSchema = z.discriminatedUnion("type", [
 ]);
 
 export type HostControlFrame = z.infer<typeof HostControlFrameSchema>;
+
+/**
+ * Host-to-Cloud controls accepted on a capability-enabled Host pair. The pair
+ * is session-scoped and may serve v2 and v3 Browser generations concurrently,
+ * so legacy Host outcomes remain valid beside Recovery v3 source outcomes.
+ */
+export const HostControlFrameV3Schema = z.union([
+  HostControlFrameSchema,
+  RecoveryV3HostToCloudControlFrameSchema,
+]);
+
+export type HostControlFrameV3 = z.infer<typeof HostControlFrameV3Schema>;
 
 const welcome = z.strictObject({
   type: z.literal("welcome"),
@@ -293,6 +333,22 @@ export const ServerControlFrameSchema = z.discriminatedUnion("type", [
 ]);
 
 export type ServerControlFrame = z.infer<typeof ServerControlFrameSchema>;
+
+/**
+ * Cloud-to-Browser production controls for Recovery v3. Recovery start owns
+ * the replacement delivery plan, so v2 replay-start and snapshot-manifest are
+ * intentionally absent.
+ */
+export const ServerControlFrameV3Schema = z.union([
+  welcome,
+  inputAck.omit({ connectionId: true }),
+  hostOffline,
+  writerLeaseStatus,
+  resyncRequired,
+  RecoveryV3ServerControlFrameSchema,
+]);
+
+export type ServerControlFrameV3 = z.infer<typeof ServerControlFrameV3Schema>;
 
 const attachRequestBase = {
   type: z.literal("attach-request"),
@@ -409,8 +465,97 @@ export const RelayToHostControlFrameSchema = z.union([
 
 export type RelayToHostControlFrame = z.infer<typeof RelayToHostControlFrameSchema>;
 
+/**
+ * Cloud-to-Host controls for a Recovery v3 source. This is a per-generation
+ * orchestration subset, not a connection-wide decoder: a capability-enabled
+ * Host pair may concurrently receive RelayToHostControlFrameSchema controls
+ * for v2 Browser generations. The v3 source itself replaces v2 attach-request,
+ * delivery-barrier-result, and delivery-reset.
+ */
+export const RelayToHostControlFrameV3Schema = z.union([
+  hostReadyAck,
+  forwardedKey,
+  forwardedText,
+  forwardedPaste,
+  forwardedFocus,
+  forwardedMouse,
+  forwardedResize,
+  RecoveryV3CloudToHostControlFrameSchema,
+]);
+
+export type RelayToHostControlFrameV3 = z.infer<typeof RelayToHostControlFrameV3Schema>;
+
 export function decodeControlFrame<T>(input: string, schema: z.ZodType<T>): T {
   return schema.parse(JSON.parse(input) as unknown);
+}
+
+type StrategyControlFrame<
+  Strategy extends RecoveryStrategy,
+  V2Frame,
+  V3Frame,
+> = Strategy extends "v3" ? V3Frame : V2Frame;
+
+function decodeStrategyControlFrame<V2Frame, V3Frame>(
+  input: string,
+  strategy: RecoveryStrategy,
+  v2Schema: z.ZodType<V2Frame>,
+  v3Schema: z.ZodType<V3Frame>,
+): V2Frame | V3Frame {
+  const selected = RecoveryStrategySchema.parse(strategy);
+  if (selected === "v3") return decodeControlFrame(input, v3Schema);
+  return decodeControlFrame(input, v2Schema);
+}
+
+/** Defaults to the isolated v2 Browser-to-Cloud decoder. */
+export function decodeClientControlFrame<Strategy extends RecoveryStrategy = "v2">(
+  input: string,
+  strategy: Strategy = "v2" as Strategy,
+): StrategyControlFrame<Strategy, ClientControlFrame, ClientControlFrameV3> {
+  return decodeStrategyControlFrame(
+    input,
+    strategy,
+    ClientControlFrameSchema,
+    ClientControlFrameV3Schema,
+  ) as StrategyControlFrame<Strategy, ClientControlFrame, ClientControlFrameV3>;
+}
+
+/** Defaults to the isolated v2 Host-to-Cloud decoder. */
+export function decodeHostControlFrame<Strategy extends RecoveryStrategy = "v2">(
+  input: string,
+  strategy: Strategy = "v2" as Strategy,
+): StrategyControlFrame<Strategy, HostControlFrame, HostControlFrameV3> {
+  return decodeStrategyControlFrame(
+    input,
+    strategy,
+    HostControlFrameSchema,
+    HostControlFrameV3Schema,
+  ) as StrategyControlFrame<Strategy, HostControlFrame, HostControlFrameV3>;
+}
+
+/** Defaults to the isolated v2 Cloud-to-Browser decoder. */
+export function decodeServerControlFrame<Strategy extends RecoveryStrategy = "v2">(
+  input: string,
+  strategy: Strategy = "v2" as Strategy,
+): StrategyControlFrame<Strategy, ServerControlFrame, ServerControlFrameV3> {
+  return decodeStrategyControlFrame(
+    input,
+    strategy,
+    ServerControlFrameSchema,
+    ServerControlFrameV3Schema,
+  ) as StrategyControlFrame<Strategy, ServerControlFrame, ServerControlFrameV3>;
+}
+
+/** Defaults to the isolated v2 Cloud-to-Host decoder. */
+export function decodeRelayToHostControlFrame<Strategy extends RecoveryStrategy = "v2">(
+  input: string,
+  strategy: Strategy = "v2" as Strategy,
+): StrategyControlFrame<Strategy, RelayToHostControlFrame, RelayToHostControlFrameV3> {
+  return decodeStrategyControlFrame(
+    input,
+    strategy,
+    RelayToHostControlFrameSchema,
+    RelayToHostControlFrameV3Schema,
+  ) as StrategyControlFrame<Strategy, RelayToHostControlFrame, RelayToHostControlFrameV3>;
 }
 
 export function encodeControlFrame(frame: object): string {

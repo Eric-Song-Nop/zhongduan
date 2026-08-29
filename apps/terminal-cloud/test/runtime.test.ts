@@ -1,5 +1,6 @@
 import {
   ClientControlFrameSchema,
+  ClientControlFrameV3Schema,
   HostControlFrameSchema,
   RELAY_CAPABILITIES_HEADER,
   RecoveryV3ClientControlFrameSchema,
@@ -450,7 +451,9 @@ describe("cloud relay runtime", () => {
 
     const thirdHost = await openReadyHost(session);
     const staleData = await upgrade(session.sessionId, "data", current.dataTicket);
-    expect(staleData.response.status).toBe(409);
+    // Advancing the Host fence closes the paired pre-Attach v3 generation and
+    // deletes its remaining ticket, so the stale data ticket is now unknown.
+    expect(staleData.response.status).toBe(401);
     await staleData.response.body?.cancel();
     const unchanged = await runInDurableObject(stub, (_instance, state) =>
       state.storage.sql
@@ -484,11 +487,22 @@ describe("cloud relay runtime", () => {
     expect(attachments).toHaveLength(2);
     expect(attachments).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ version: 2, channel: "control", hostFence: "3" }),
-        expect.objectContaining({ version: 2, channel: "data", hostFence: "3" }),
+        expect.objectContaining({
+          version: 3,
+          channel: "control",
+          hostFence: null,
+          recoveryStrategy: "v3",
+          recoveryLookupKey: null,
+        }),
+        expect.objectContaining({
+          version: 3,
+          channel: "data",
+          hostFence: null,
+          recoveryStrategy: "v3",
+          recoveryLookupKey: null,
+        }),
       ]),
     );
-    expect(attachments.every((attachment) => !("recoveryStrategy" in attachment))).toBe(true);
 
     firstHost.control.close(1000, "test complete");
     firstHost.data.close(1000, "test complete");
@@ -735,18 +749,21 @@ describe("cloud relay runtime", () => {
       );
     });
     await evictDurableObject(stub, { webSockets: "hibernate" });
+    await runInDurableObject(stub, (instance) => {
+      Reflect.set(instance, "recoveryV3Enabled", false);
+    });
 
     const v2Frame = {
       type: "writer-lease-renew",
       writerLease: "lease_runtime_hibernated_0001",
     } as const;
     expect(ClientControlFrameSchema.safeParse(v2Frame).success).toBe(true);
-    expect(RecoveryV3ClientControlFrameSchema.safeParse(v2Frame).success).toBe(false);
+    expect(ClientControlFrameV3Schema.safeParse(v2Frame).success).toBe(true);
     const closed = nextClose(control.socket);
     control.socket.send(JSON.stringify(v2Frame));
     await expect(closed).resolves.toMatchObject({
       code: 4400,
-      reason: "recovery v3 runtime unavailable",
+      reason: "Recovery v3 is disabled",
     });
     const durable = await runInDurableObject(stub, (_instance, state) => ({
       attempts: state.storage.sql

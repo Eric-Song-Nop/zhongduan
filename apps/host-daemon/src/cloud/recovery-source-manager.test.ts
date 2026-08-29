@@ -651,6 +651,50 @@ describe("RecoverySourceManager", () => {
     expect(manager.counters).toMatchObject({ ownedRecords: 0, ownedWireBytes: 0, sources: 0 });
   });
 
+  it("tombstones an exact reset that arrives before its prepare without weakening identity", async () => {
+    const { manager } = createHarness({ maxSources: 1 });
+    const owner = {};
+    const resetBeforePrepare = {
+      type: "recovery-source-reset",
+      ...routing(prepareFor(1, "1")),
+      reason: "generation-reset",
+    } as const;
+
+    expect(manager.reset(owner, resetBeforePrepare)).toBe(true);
+    expect(manager.reset(owner, { ...resetBeforePrepare, reason: "pair-fenced" })).toBe(true);
+    expect(manager.counters).toEqual({
+      ownedRecords: 0,
+      ownedWireBytes: 0,
+      pendingSources: 0,
+      sources: 1,
+    });
+    await expect(manager.prepare(owner, prepareFor(1, "1"), () => true)).resolves.toMatchObject({
+      status: "rejected",
+      rejection: { reason: "generation-fenced" },
+    });
+    expect(
+      manager.reset(owner, {
+        ...resetBeforePrepare,
+        connectionId: "connection-source-diverged",
+      }),
+    ).toBe(false);
+    expect(
+      manager.reset(owner, {
+        ...resetBeforePrepare,
+        recoveryId: "recovery-source-capacity",
+        streamId: 2,
+      }),
+    ).toBe(false);
+
+    expectPrepared(await manager.prepare(owner, prepareFor(1, "2"), () => true));
+    expect(manager.counters).toEqual({
+      ownedRecords: 1,
+      ownedWireBytes: 88,
+      pendingSources: 0,
+      sources: 1,
+    });
+  });
+
   it("bounds 16 isolated owners without promising scheduler fairness", async () => {
     const { manager } = createHarness({
       maxOwnedRecords: 16,

@@ -361,6 +361,17 @@ export class RecoveryAssembler {
     return this.#state;
   }
 
+  /** Exact next caller-driven deadline, or null after this generation becomes terminal. */
+  get nextDeadlineAtMs(): number | null {
+    if (this.#state === "reset" || this.#state === "closed" || this.#state === "complete") {
+      return null;
+    }
+    return Math.min(
+      this.#startedAtMs + this.#limits.recoveryDeadlineMs,
+      this.#lastProgressAtMs + this.#limits.noProgressDeadlineMs,
+    );
+  }
+
   get laneCursors(): RecoveryAssemblerLaneCursors {
     return {
       live: cloneLaneCursor(this.#laneCursors.live),
@@ -811,6 +822,11 @@ export class RecoveryAssembler {
    * may already be visible.
    */
   confirmHandoff(expectedCursor: ReplicaCursor, nowMs: number): boolean {
+    // A cold candidate may already be visible before this call. Relinquish disposal ownership
+    // before any deadline or cursor validation can reset the assembler.
+    if (this.#state === "handoff-eligible" && this.#mode === "cold" && this.#target !== null) {
+      this.#coldCandidateOwned = false;
+    }
     if (!this.#enter(nowMs)) {
       return (
         (this.#state === "adopted" || this.#state === "complete") &&
@@ -834,7 +850,6 @@ export class RecoveryAssembler {
       return false;
     }
 
-    if (this.#mode === "cold") this.#coldCandidateOwned = false;
     if (!sameReplicaCursor(this.#appliedCursor, expectedCursor)) {
       this.reset("ownership-uncertain");
       return false;
@@ -850,6 +865,21 @@ export class RecoveryAssembler {
     this.#state = "adopted";
     this.#noteProgress(nowMs);
     this.#completeIfReady();
+    return true;
+  }
+
+  /**
+   * Relinquishes a cold candidate after the host handoff API returned an uncertain outcome.
+   * The candidate may already be visible, so this transition must never dispose it or publish
+   * RecoveryAdopted.
+   */
+  abandonHandoffOutcomeUncertain(nowMs: number): boolean {
+    if (this.#state !== "handoff-eligible" || this.#mode !== "cold" || this.#target === null) {
+      return false;
+    }
+    this.#coldCandidateOwned = false;
+    this.#recordNow(nowMs);
+    this.reset("ownership-uncertain");
     return true;
   }
 

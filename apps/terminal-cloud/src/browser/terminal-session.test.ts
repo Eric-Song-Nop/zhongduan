@@ -2,7 +2,11 @@ import type { InputSink, TerminalInputEvent, TerminalMouseInputEvent } from "@wt
 import {
   DataFrameFlag,
   DataFrameKind,
+  RelayCapability,
   encodeDataFrame,
+  encodeDeliveryEnvelopeV3,
+  type DeliveryLane,
+  type RecoveryStart,
   type ReplicaCursor,
   type ResizePayload,
 } from "@zhongduan/protocol";
@@ -20,6 +24,15 @@ import { TerminalSession } from "./terminal-session";
 
 const SESSION_ID = "session_123456789";
 const ENGINE_ID = "ghostty:test-engine";
+const BROWSER_RECOVERY_V3_CAPABILITIES = [
+  RelayCapability.capabilityNegotiationV1,
+  RelayCapability.authorityDataV2,
+  RelayCapability.wireEndpointV3,
+  RelayCapability.deliveryEnvelopeV3,
+  RelayCapability.deliveryReceiveCreditV1,
+  RelayCapability.authorityApplyProgressV1,
+  RelayCapability.recoveryV3GapFillV1,
+] as const;
 // Freeze the acceptance boundary independently from the production implementation.
 const ATTACH_START_TIMEOUT_MS = 215_000;
 const RESIZE: TerminalInputEvent = {
@@ -144,6 +157,53 @@ function dataFrame(
     payload: Uint8Array.from(payload),
   });
   return encoded.buffer as ArrayBuffer;
+}
+
+function recoveryEnvelope(
+  lane: DeliveryLane,
+  ordinal: bigint,
+  previousBytes: bigint,
+  eventSeq: bigint,
+  ptyOffset: bigint,
+  payload: number[],
+  kind: DataFrameKind = DataFrameKind.PtyOutput,
+  generation = 3n,
+): { bytes: bigint; raw: ArrayBuffer } {
+  const canonical = encodeDataFrame({
+    kind,
+    flags: DataFrameFlag.None,
+    sessionEpoch: 1n,
+    deliveryGeneration: 0n,
+    eventSeq,
+    ptyOffset,
+    streamId: 0,
+    payload: Uint8Array.from(payload),
+  });
+  const bytes = previousBytes + 40n + BigInt(canonical.byteLength);
+  const envelope = encodeDeliveryEnvelopeV3({
+    lane,
+    deliveryGeneration: generation,
+    deliveryOrdinal: ordinal,
+    cumulativeEncodedBytes: bytes,
+    streamId: 7,
+    payload: canonical,
+  });
+  return { bytes, raw: envelope.buffer as ArrayBuffer };
+}
+
+function warmRecoveryStart(generation = 3n): RecoveryStart {
+  return {
+    type: "recovery-start",
+    recoveryId: "recovery_browser_0001",
+    deliveryGeneration: generation.toString(),
+    streamId: 7,
+    engineId: ENGINE_ID,
+    authorityDataVersion: 2,
+    base: { sessionEpoch: "1", eventSeq: "10", nextPtyOffset: "20" },
+    source: { kind: "warm" },
+    committedThrough: { sessionEpoch: "1", eventSeq: "11", nextPtyOffset: "21" },
+    liveFloor: { sessionEpoch: "1", nextEventSeq: "12", nextPtyOffset: "21" },
+  };
 }
 
 function snapshotManifest(generation: bigint): Record<string, unknown> {
@@ -338,6 +398,450 @@ describe("TerminalSession capability negotiation", () => {
     expect(new Headers(request.headers).get("x-zhongduan-relay-capabilities")).toBe(
       "capability-negotiation-v1,authority-data-v2",
     );
+    session.close();
+  });
+
+  it("requires exact confirmed Browser capability families before accepting a v3 strategy", async () => {
+    let requestInit: RequestInit | undefined;
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestInit = init;
+      return Response.json({
+        connectionSetId: "connection_set_v3_bad",
+        connectionId: "connection_id_v3_bad",
+        clientId: "browser_client_v3_bad",
+        streamId: 7,
+        deliveryGeneration: "3",
+        expiresAt: Date.now() + 30_000,
+        controlTicket: "control_ticket_v3_bad",
+        dataTicket: "data_ticket_v3_bad_1",
+        recoveryStrategy: "v3",
+        negotiatedCapabilities: BROWSER_RECOVERY_V3_CAPABILITIES.filter(
+          (capability) => capability !== RelayCapability.authorityApplyProgressV1,
+        ),
+      });
+    });
+    const capabilities = new CapabilityManager({
+      bootstrap: {
+        capability: "opaque",
+        expiresAt: Math.floor(Date.now() / 1_000) + 1_000,
+        issuedAt: Math.floor(Date.now() / 1_000),
+        role: "writer",
+        sessionId: SESSION_ID,
+      },
+      fetch,
+      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: vi.fn(),
+    });
+    const createWebSocket = vi.fn(() => new FakeSocket() as unknown as WebSocket);
+    const session = new TerminalSession({
+      capabilities,
+      engineId: ENGINE_ID,
+      host: {
+        engineId: ENGINE_ID,
+        active: new VisibleSink(),
+        restore: vi.fn<ReplicaHost["restore"]>(),
+        adopt: vi.fn(),
+      },
+      input: new InputDispatcher({
+        getObservedEventSeq: () => null,
+        inputEpoch: "input_epoch_v3_bad",
+      }),
+      sessionId: SESSION_ID,
+      snapshots: { load: vi.fn() },
+      relayCapabilities: BROWSER_RECOVERY_V3_CAPABILITIES,
+      fetch,
+      createWebSocket,
+      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: vi.fn(),
+    });
+
+    session.start();
+    await vi.waitFor(() => expect(session.snapshot.lastError).toBe("protocol"));
+    expect(createWebSocket).not.toHaveBeenCalled();
+    expect(new Headers(requestInit?.headers).get("x-zhongduan-relay-capabilities")).toBe(
+      BROWSER_RECOVERY_V3_CAPABILITIES.join(","),
+    );
+    session.close();
+  });
+
+  it("starts the v3 recovery deadline only when both sockets are ready to attach", async () => {
+    const timers = new ManualTimers();
+    timers.now = 2_000_000_000_000;
+    const response = {
+      connectionSetId: "connection_set_v3_slow_open",
+      connectionId: "connection_id_v3_slow_open",
+      clientId: "browser_client_v3_slow_open",
+      streamId: 7,
+      deliveryGeneration: "3",
+      expiresAt: timers.now + 30_000,
+      controlTicket: "control_ticket_v3_slow_open",
+      dataTicket: "data_ticket_v3_slow_open",
+      recoveryStrategy: "v3" as const,
+      negotiatedCapabilities: BROWSER_RECOVERY_V3_CAPABILITIES,
+    };
+    const fetch = vi.fn(async () => Response.json(response));
+    const capabilities = new CapabilityManager({
+      bootstrap: {
+        capability: "opaque",
+        expiresAt: Math.floor(timers.now / 1_000) + 1_000,
+        issuedAt: Math.floor(timers.now / 1_000),
+        role: "observer",
+        sessionId: SESSION_ID,
+      },
+      fetch,
+      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: vi.fn(),
+    });
+    const sockets: FakeSocket[] = [];
+    const session = new TerminalSession({
+      capabilities,
+      engineId: ENGINE_ID,
+      host: {
+        engineId: ENGINE_ID,
+        active: new VisibleSink(),
+        restore: vi.fn<ReplicaHost["restore"]>(),
+        adopt: vi.fn(),
+      },
+      input: new InputDispatcher({
+        getObservedEventSeq: () => null,
+        inputEpoch: "input_epoch_v3_slow_open",
+      }),
+      sessionId: SESSION_ID,
+      snapshots: { load: vi.fn() },
+      relayCapabilities: BROWSER_RECOVERY_V3_CAPABILITIES,
+      fetch,
+      createWebSocket: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+      makeWebSocketUrl: (path) => path,
+      now: () => timers.now,
+      random: () => 0,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    });
+
+    session.start();
+    await waitForSockets(sockets, 1);
+    const control = sockets[0]!;
+    await timers.advanceBy(9_000);
+    control.open();
+    await waitForSockets(sockets, 2);
+    const data = sockets[1]!;
+
+    await timers.advanceBy(9_000);
+    expect(control.readyState).toBe(1);
+    expect(data.readyState).toBe(0);
+    data.open();
+    await vi.waitFor(() =>
+      expect(controlFrames(control).some((frame) => frame.type === "attach")).toBe(true),
+    );
+    expect(session.snapshot).toMatchObject({
+      controlConnected: true,
+      dataConnected: true,
+      deliveryState: "awaiting-control",
+      lastError: null,
+      phase: "attaching",
+    });
+    expect(timers.nextDueIn()).toBe(15_000);
+    session.close();
+  });
+
+  it("selects one v3 generation owner, admits pre-start envelopes, and never emits a v2 ack", async () => {
+    const response = {
+      connectionSetId: "connection_set_v3_good",
+      connectionId: "connection_id_v3_good",
+      clientId: "browser_client_v3_good",
+      streamId: 7,
+      deliveryGeneration: "3",
+      expiresAt: Date.now() + 30_000,
+      controlTicket: "control_ticket_v3_good",
+      dataTicket: "data_ticket_v3_good_1",
+      recoveryStrategy: "v3",
+      negotiatedCapabilities: BROWSER_RECOVERY_V3_CAPABILITIES,
+    } as const;
+    const fetch = vi.fn(async () => Response.json(response));
+    const capabilities = new CapabilityManager({
+      bootstrap: {
+        capability: "opaque",
+        expiresAt: Math.floor(Date.now() / 1_000) + 1_000,
+        issuedAt: Math.floor(Date.now() / 1_000),
+        role: "writer",
+        sessionId: SESSION_ID,
+      },
+      fetch,
+      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: vi.fn(),
+    });
+    const sink = new VisibleSink();
+    const sockets: FakeSocket[] = [];
+    const input = new InputDispatcher({
+      getObservedEventSeq: () => null,
+      inputEpoch: "input_epoch_v3_good",
+      createInputEpoch: () => "input_epoch_v3_next",
+    });
+    const session = new TerminalSession({
+      capabilities,
+      engineId: ENGINE_ID,
+      host: {
+        engineId: ENGINE_ID,
+        active: sink,
+        restore: vi.fn<ReplicaHost["restore"]>(),
+        adopt: vi.fn(),
+      },
+      input,
+      initialCursor: {
+        sessionEpoch: 1n,
+        deliveryGeneration: 2n,
+        lastEventSeq: 10n,
+        nextPtyOffset: 20n,
+      },
+      sessionId: SESSION_ID,
+      snapshots: { load: vi.fn() },
+      relayCapabilities: BROWSER_RECOVERY_V3_CAPABILITIES,
+      fetch,
+      createWebSocket: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+      makeWebSocketUrl: (path) => path,
+    });
+
+    session.start();
+    await waitForSockets(sockets, 1);
+    const control = sockets[0]!;
+    control.open();
+    await waitForSockets(sockets, 2);
+    const data = sockets[1]!;
+    data.open();
+    await vi.waitFor(() =>
+      expect(controlFrames(control).some((frame) => frame.type === "attach")).toBe(true),
+    );
+    expect(controlFrames(control).find((frame) => frame.type === "attach")).toMatchObject({
+      hasLiveReplica: true,
+      deliveryGeneration: "3",
+      lastEventSeq: "10",
+    });
+
+    const recovery = recoveryEnvelope("recovery", 1n, 0n, 11n, 20n, [65]);
+    const done = recoveryEnvelope(
+      "recovery",
+      2n,
+      recovery.bytes,
+      11n,
+      21n,
+      [],
+      DataFrameKind.ReplayCommit,
+    );
+    const live = recoveryEnvelope("live", 1n, 0n, 12n, 21n, [66]);
+    data.message(live.raw);
+    data.message(recovery.raw);
+    data.message(done.raw);
+    expect(
+      controlFrames(control).filter((frame) => frame.type === "delivery-received"),
+    ).toHaveLength(0);
+
+    control.message(JSON.stringify(warmRecoveryStart()));
+    expect(sink.writes).toEqual([[65], [66]]);
+    expect(controlFrames(control).some((frame) => frame.type === "recovery-adopted")).toBe(true);
+    expect(
+      controlFrames(control).some(
+        (frame) => frame.type === "delivery-received" && frame.lane === "recovery",
+      ),
+    ).toBe(true);
+    expect(
+      controlFrames(control).some(
+        (frame) => frame.type === "delivery-received" && frame.lane === "live",
+      ),
+    ).toBe(true);
+    expect(controlFrames(control).filter((frame) => frame.type === "ack")).toHaveLength(0);
+
+    control.message(
+      JSON.stringify({
+        type: "recovery-source-closed",
+        recoveryId: "recovery_browser_0001",
+        deliveryGeneration: "3",
+        throughRecoveryOrdinal: "2",
+        throughRecoveryCumulativeEncodedBytes: done.bytes.toString(),
+      }),
+    );
+    expect(session.snapshot).toMatchObject({ deliveryState: "live", phase: "live" });
+    const inputEpoch = input.inputEpoch;
+    const welcome = {
+      type: "welcome",
+      connectionId: response.connectionId,
+      streamId: 7,
+      engineId: ENGINE_ID,
+      sessionEpoch: "1",
+      deliveryGeneration: "3",
+      headEventSeq: "12",
+      nextPtyOffset: "22",
+    } as const;
+    control.message(JSON.stringify({ ...welcome, writerLease: "writer_lease_v3_old" }));
+    control.message(JSON.stringify({ ...welcome, writerLease: "writer_lease_v3_old" }));
+    expect(input.inputEpoch).toBe(inputEpoch);
+    expect(session.snapshot).toMatchObject({
+      controlOwnership: "writer",
+      deliveryState: "live",
+    });
+    input.send(interruptKey());
+    await vi.waitFor(() =>
+      expect(controlFrames(control).some((frame) => frame.type === "key")).toBe(true),
+    );
+    expect(controlFrames(control).find((frame) => frame.type === "key")).toMatchObject({
+      inputEpoch,
+      writerLease: "writer_lease_v3_old",
+      clientInputSeq: "1",
+    });
+    control.message(JSON.stringify({ ...welcome, writerLease: "writer_lease_v3_new" }));
+    expect(input.inputEpoch).toBe("input_epoch_v3_next");
+    expect(session.snapshot).toMatchObject({
+      controlOwnership: "writer",
+      deliveryState: "live",
+    });
+    input.send(interruptKey());
+    await vi.waitFor(() =>
+      expect(controlFrames(control).filter((frame) => frame.type === "key")).toHaveLength(2),
+    );
+    expect(
+      controlFrames(control)
+        .filter((frame) => frame.type === "key")
+        .at(-1),
+    ).toMatchObject({
+      inputEpoch: "input_epoch_v3_next",
+      writerLease: "writer_lease_v3_new",
+      clientInputSeq: "1",
+    });
+    const next = recoveryEnvelope("live", 2n, live.bytes, 13n, 22n, [67]);
+    data.message(next.raw);
+    expect(sink.writes).toEqual([[65], [66], [67]]);
+    session.close();
+  });
+
+  it("does not reuse a v2 outcome-uncertain cursor as a warm base after switching to v3", async () => {
+    const responses = [
+      {
+        connectionSetId: "connection_set_v2_old",
+        connectionId: "connection_id_v2_old",
+        clientId: "browser_client_v2_old",
+        streamId: 7,
+        deliveryGeneration: "2",
+        expiresAt: Date.now() + 30_000,
+        controlTicket: "control_ticket_v2_old",
+        dataTicket: "data_ticket_v2_old_01",
+      },
+      {
+        connectionSetId: "connection_set_v3_next",
+        connectionId: "connection_id_v3_next",
+        clientId: "browser_client_v2_old",
+        streamId: 7,
+        deliveryGeneration: "3",
+        expiresAt: Date.now() + 30_000,
+        controlTicket: "control_ticket_v3_next",
+        dataTicket: "data_ticket_v3_next_1",
+        recoveryStrategy: "v3" as const,
+        negotiatedCapabilities: BROWSER_RECOVERY_V3_CAPABILITIES,
+      },
+    ];
+    const fetch = vi.fn(async () => Response.json(responses.shift()));
+    const capabilities = new CapabilityManager({
+      bootstrap: {
+        capability: "opaque",
+        expiresAt: Math.floor(Date.now() / 1_000) + 1_000,
+        issuedAt: Math.floor(Date.now() / 1_000),
+        role: "writer",
+        sessionId: SESSION_ID,
+      },
+      fetch,
+      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: vi.fn(),
+    });
+    const sink = new VisibleSink();
+    vi.spyOn(sink, "writePty").mockImplementation((data) => {
+      sink.writes.push([...data]);
+      throw new Error("visible effect outcome is uncertain");
+    });
+    const host: ReplicaHost = {
+      engineId: ENGINE_ID,
+      active: sink,
+      restore: vi.fn<ReplicaHost["restore"]>(),
+      adopt: vi.fn(),
+    };
+    const sockets: FakeSocket[] = [];
+    const session = new TerminalSession({
+      capabilities,
+      engineId: ENGINE_ID,
+      host,
+      input: new InputDispatcher({
+        getObservedEventSeq: () => null,
+        inputEpoch: "input_epoch_v2_uncertain",
+      }),
+      initialCursor: {
+        sessionEpoch: 1n,
+        deliveryGeneration: 1n,
+        lastEventSeq: 10n,
+        nextPtyOffset: 20n,
+      },
+      sessionId: SESSION_ID,
+      snapshots: { load: vi.fn() },
+      relayCapabilities: BROWSER_RECOVERY_V3_CAPABILITIES,
+      fetch,
+      createWebSocket: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+      makeWebSocketUrl: (path) => path,
+      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: vi.fn(),
+    });
+
+    session.start();
+    await waitForSockets(sockets, 1);
+    const firstControl = sockets[0]!;
+    firstControl.open();
+    await waitForSockets(sockets, 2);
+    const firstData = sockets[1]!;
+    firstData.open();
+    await vi.waitFor(() => expect(session.snapshot.dataConnected).toBe(true));
+    firstData.message(dataFrame(2n, 11n, 20n, [65]));
+    firstControl.message(
+      JSON.stringify({
+        type: "replay-start",
+        sessionEpoch: "1",
+        streamId: 7,
+        deliveryGeneration: "2",
+        baseEventSeq: "10",
+        basePtyOffset: "20",
+        commitEventSeq: "11",
+        commitPtyOffset: "21",
+      }),
+    );
+    expect(sink.writes).toEqual([[65]]);
+    expect(session.coordinator.activeCursor).toBeNull();
+
+    await Promise.resolve();
+    session.reconnectNow();
+    await waitForSockets(sockets, 3);
+    const secondControl = sockets[2]!;
+    secondControl.open();
+    await waitForSockets(sockets, 4);
+    const secondData = sockets[3]!;
+    secondData.open();
+    await vi.waitFor(() =>
+      expect(controlFrames(secondControl).some((frame) => frame.type === "attach")).toBe(true),
+    );
+    expect(controlFrames(secondControl).find((frame) => frame.type === "attach")).toMatchObject({
+      hasLiveReplica: false,
+      deliveryGeneration: "3",
+    });
+
+    secondControl.message(JSON.stringify(warmRecoveryStart()));
+    expect(secondControl.readyState).toBe(3);
+    expect(secondData.readyState).toBe(3);
+    expect(session.snapshot).toMatchObject({ lastError: "protocol", phase: "reconnecting" });
     session.close();
   });
 });
