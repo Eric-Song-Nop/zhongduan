@@ -6,7 +6,7 @@ import {
   type ResizePayload,
 } from "@zhongduan/protocol";
 
-import type { EventJournal, JournalCursor, JournalReplay } from "./journal";
+import type { EventJournal, JournalCursor, JournalReplay, JournalReplayPlan } from "./journal";
 import type { PtyProcess } from "./pty-process";
 import type { SemanticKey, SemanticMouse, TerminalAuthority } from "./terminal-authority";
 
@@ -184,6 +184,13 @@ export class TerminalSession {
       return { status: "gap" };
     }
     return this.#journal.replayThrough(base, commit);
+  }
+
+  planReplayThrough(base: ReplayCursor, commit: ReplayCursor): JournalReplayPlan {
+    if (base.sessionEpoch !== this.#sessionEpoch || commit.sessionEpoch !== this.#sessionEpoch) {
+      return { status: "gap" };
+    }
+    return this.#journal.planReplayThrough(base, commit);
   }
 
   subscribe(subscriber: (frame: Uint8Array) => void, cursor?: ReplayCursor): SubscriptionResult {

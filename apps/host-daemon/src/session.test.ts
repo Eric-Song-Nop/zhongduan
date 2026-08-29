@@ -255,6 +255,12 @@ describe("TerminalSession", () => {
         nextPtyOffset: 0n,
       }),
     ).toEqual({ status: "gap" });
+    expect(
+      session.planReplayThrough(
+        { sessionEpoch: 1n, lastEventSeq: 0n, nextPtyOffset: 0n },
+        { sessionEpoch: 2n, lastEventSeq: 0n, nextPtyOffset: 0n },
+      ),
+    ).toEqual({ status: "gap" });
   });
 
   it("preserves raw input bytes without a UTF-8 round trip", () => {

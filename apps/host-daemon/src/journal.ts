@@ -22,6 +22,15 @@ export interface JournalCursor {
 
 export type JournalReplay = { status: "ok"; frames: Uint8Array[] } | { status: "gap" };
 
+export type JournalReplayPlan =
+  | {
+      status: "ok";
+      exactEncodedBytes: number;
+      exactFrames: number;
+      materialize(): JournalReplay;
+    }
+  | { status: "gap" };
+
 interface JournalEntry {
   eventSeq: bigint;
   frame: Uint8Array;
@@ -45,6 +54,7 @@ export class EventJournal {
 
   #evictedCursor: JournalCursor = { lastEventSeq: 0n, nextPtyOffset: 0n };
   #headCursor: JournalCursor = { lastEventSeq: 0n, nextPtyOffset: 0n };
+  #revision = 0n;
   #sessionEpoch: bigint | undefined;
   #totalBytes = 0;
 
@@ -106,6 +116,7 @@ export class EventJournal {
     segment.byteLength += stored.byteLength;
     this.#totalBytes += stored.byteLength;
     this.#headCursor = { lastEventSeq: frame.eventSeq, nextPtyOffset };
+    this.#revision += 1n;
 
     if (segment.byteLength >= this.#segmentBytes || this.#totalBytes > this.#maxBytes) {
       segment.sealed = true;
@@ -126,6 +137,11 @@ export class EventJournal {
   replayThrough(cursor: JournalCursor, commit: JournalCursor): JournalReplay {
     this.#maintain();
     return this.#replayRange(cursor, commit);
+  }
+
+  planReplayThrough(cursor: JournalCursor, commit: JournalCursor): JournalReplayPlan {
+    this.#maintain();
+    return this.#planRange(cursor, commit);
   }
 
   #replayRange(cursor: JournalCursor, commit: JournalCursor): JournalReplay {
@@ -161,6 +177,79 @@ export class EventJournal {
     };
   }
 
+  #planRange(cursor: JournalCursor, commit: JournalCursor): JournalReplayPlan {
+    if (
+      cursor.lastEventSeq < this.#evictedCursor.lastEventSeq ||
+      cursor.lastEventSeq > commit.lastEventSeq ||
+      commit.lastEventSeq > this.#headCursor.lastEventSeq
+    ) {
+      return { status: "gap" };
+    }
+
+    const baseOffset = this.#offsetAfter(cursor.lastEventSeq);
+    const commitOffset = this.#offsetAfter(commit.lastEventSeq);
+    if (
+      baseOffset === undefined ||
+      cursor.nextPtyOffset !== baseOffset ||
+      commitOffset === undefined ||
+      commit.nextPtyOffset !== commitOffset
+    ) {
+      return { status: "gap" };
+    }
+
+    let exactEncodedBytes = 0;
+    let exactFrames = 0;
+    for (const segment of this.#segments) {
+      for (const entry of segment.entries) {
+        if (entry.eventSeq <= cursor.lastEventSeq || entry.eventSeq > commit.lastEventSeq) continue;
+        exactEncodedBytes += entry.frame.byteLength;
+        exactFrames += 1;
+      }
+    }
+    if (BigInt(exactFrames) !== commit.lastEventSeq - cursor.lastEventSeq) {
+      return { status: "gap" };
+    }
+
+    const ownedCursor = Object.freeze({ ...cursor });
+    const ownedCommit = Object.freeze({ ...commit });
+    const revision = this.#revision;
+    return Object.freeze({
+      status: "ok",
+      exactEncodedBytes,
+      exactFrames,
+      materialize: () =>
+        this.#materializeRange(ownedCursor, ownedCommit, revision, exactFrames, exactEncodedBytes),
+    });
+  }
+
+  #materializeRange(
+    cursor: JournalCursor,
+    commit: JournalCursor,
+    revision: bigint,
+    exactFrames: number,
+    exactEncodedBytes: number,
+  ): JournalReplay {
+    if (this.#revision !== revision) return { status: "gap" };
+    const frames: Uint8Array[] = [];
+    let materializedBytes = 0;
+    for (const segment of this.#segments) {
+      for (const entry of segment.entries) {
+        if (entry.eventSeq <= cursor.lastEventSeq || entry.eventSeq > commit.lastEventSeq) continue;
+        const frame = entry.frame.slice();
+        frames.push(frame);
+        materializedBytes += frame.byteLength;
+      }
+    }
+    if (
+      this.#revision !== revision ||
+      frames.length !== exactFrames ||
+      materializedBytes !== exactEncodedBytes
+    ) {
+      return { status: "gap" };
+    }
+    return { status: "ok", frames };
+  }
+
   #maintain(): void {
     const now = this.#now();
     this.#sealAgedActive(now);
@@ -175,6 +264,7 @@ export class EventJournal {
   }
 
   #prune(now: number): void {
+    let pruned = false;
     while (this.#segments.length > 0) {
       const oldest = this.#segments[0]!;
       const overAge = now - oldest.createdAt > this.#maxAgeMs;
@@ -182,6 +272,7 @@ export class EventJournal {
       if (!oldest.sealed || (!overAge && !overBytes)) break;
 
       this.#segments.shift();
+      pruned = true;
       this.#totalBytes -= oldest.byteLength;
       const last = oldest.entries.at(-1);
       if (last !== undefined) {
@@ -191,6 +282,7 @@ export class EventJournal {
         };
       }
     }
+    if (pruned) this.#revision += 1n;
   }
 
   #offsetAfter(eventSeq: bigint): bigint | undefined {
