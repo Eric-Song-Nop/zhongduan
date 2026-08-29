@@ -171,9 +171,8 @@ function answerBarrier(
           | "missing-live-seed"
           | "snapshot-missing"
           | "snapshot-metadata-mismatch"
-          | "browser-control-send-failed"
-          | "cloud-head-behind-cut";
-        retryScope?: "same-generation" | "refresh-checkpoint" | "reset-generation" | "drop-client";
+          | "browser-control-send-failed";
+        retryScope?: "same-generation" | "refresh-checkpoint" | "drop-client";
       } = { status: "ready" },
 ): void {
   const frame = decodeDataFrame(encoded);
@@ -432,10 +431,18 @@ describe("HostDeliveryScheduler", () => {
 
   it.each([
     [
-      "enriched",
+      "enriched snapshot-missing",
       {
         status: "rejected",
         reason: "snapshot-missing",
+        retryScope: "refresh-checkpoint",
+      } as const,
+    ],
+    [
+      "enriched snapshot-metadata-mismatch",
+      {
+        status: "rejected",
+        reason: "snapshot-metadata-mismatch",
         retryScope: "refresh-checkpoint",
       } as const,
     ],

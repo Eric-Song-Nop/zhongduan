@@ -356,47 +356,35 @@ const staleDeliveryBarrierStatus = {
   status: z.literal("stale"),
   reason: z.enum(["generation-fenced", "client-gone"]),
 };
-const rejectedDeliveryBarrierStatus = {
-  status: z.literal("rejected"),
-  reason: z.enum([
-    "missing-live-seed",
-    "snapshot-missing",
-    "snapshot-metadata-mismatch",
-    "browser-control-send-failed",
-    "cloud-head-behind-cut",
-  ]),
-  retryScope: z.enum(["same-generation", "refresh-checkpoint", "reset-generation", "drop-client"]),
-};
-const deliveryBarrierRetryScopeByReason = {
-  "missing-live-seed": "same-generation",
-  "snapshot-missing": "refresh-checkpoint",
-  "snapshot-metadata-mismatch": "refresh-checkpoint",
-  "browser-control-send-failed": "drop-client",
-  "cloud-head-behind-cut": "same-generation",
-} as const;
 const deliveryBarrierLegacyStatus = { status: z.enum(["ready", "stale", "rejected"]) };
-const rejectedDeliveryBarrierWarm = z
-  .strictObject({ ...deliveryBarrierWarm, ...rejectedDeliveryBarrierStatus })
-  .superRefine((value, context) => {
-    if (deliveryBarrierRetryScopeByReason[value.reason] !== value.retryScope) {
-      context.addIssue({
-        code: "custom",
-        message: "delivery barrier reason does not match its retry scope",
-        path: ["retryScope"],
-      });
-    }
-  });
-const rejectedDeliveryBarrierSnapshot = z
-  .strictObject({ ...deliveryBarrierSnapshot, ...rejectedDeliveryBarrierStatus })
-  .superRefine((value, context) => {
-    if (deliveryBarrierRetryScopeByReason[value.reason] !== value.retryScope) {
-      context.addIssue({
-        code: "custom",
-        message: "delivery barrier reason does not match its retry scope",
-        path: ["retryScope"],
-      });
-    }
-  });
+const rejectedDeliveryBarrierWarm = z.union([
+  z.strictObject({
+    ...deliveryBarrierWarm,
+    status: z.literal("rejected"),
+    reason: z.literal("missing-live-seed"),
+    retryScope: z.literal("same-generation"),
+  }),
+  z.strictObject({
+    ...deliveryBarrierWarm,
+    status: z.literal("rejected"),
+    reason: z.literal("browser-control-send-failed"),
+    retryScope: z.literal("drop-client"),
+  }),
+]);
+const rejectedDeliveryBarrierSnapshot = z.union([
+  z.strictObject({
+    ...deliveryBarrierSnapshot,
+    status: z.literal("rejected"),
+    reason: z.enum(["snapshot-missing", "snapshot-metadata-mismatch"]),
+    retryScope: z.literal("refresh-checkpoint"),
+  }),
+  z.strictObject({
+    ...deliveryBarrierSnapshot,
+    status: z.literal("rejected"),
+    reason: z.literal("browser-control-send-failed"),
+    retryScope: z.literal("drop-client"),
+  }),
+]);
 const deliveryBarrierResult = z.union([
   z.strictObject({ ...deliveryBarrierWarm, ...deliveryBarrierLegacyStatus }),
   z.strictObject({ ...deliveryBarrierSnapshot, ...deliveryBarrierLegacyStatus }),

@@ -1007,13 +1007,18 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       | { status: "stale"; reason: "generation-fenced" | "client-gone" }
       | {
           status: "rejected";
-          reason:
-            | "missing-live-seed"
-            | "snapshot-missing"
-            | "snapshot-metadata-mismatch"
-            | "browser-control-send-failed"
-            | "cloud-head-behind-cut";
-          retryScope: "same-generation" | "refresh-checkpoint" | "reset-generation" | "drop-client";
+          reason: "missing-live-seed";
+          retryScope: "same-generation";
+        }
+      | {
+          status: "rejected";
+          reason: "snapshot-missing" | "snapshot-metadata-mismatch";
+          retryScope: "refresh-checkpoint";
+        }
+      | {
+          status: "rejected";
+          reason: "browser-control-send-failed";
+          retryScope: "drop-client";
         },
   ): void {
     const supportsOutcomeDetails = readAttachment(webSocket)?.relayCapabilities.includes(

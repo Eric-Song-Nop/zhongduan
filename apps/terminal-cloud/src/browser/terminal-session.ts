@@ -551,7 +551,6 @@ export class TerminalSession {
         return;
       case "replay-start":
         if (!this.#matchesCurrentDelivery(frame)) return;
-        this.#cancelAttachStartWatchdog();
         this.#update({ hostOnline: true });
         this.coordinator.startWarmReplay(frame);
         this.#syncDeliveryState();
@@ -749,6 +748,7 @@ export class TerminalSession {
     const deliveryState = this.coordinator.state;
     let phase = this.#snapshot.phase;
     if (deliveryState === "live") {
+      this.#cancelAttachStartWatchdog();
       phase = "live";
       this.#cancelSnapshotRetry(true);
       this.#input.setReplicaCurrent(true);
@@ -866,7 +866,7 @@ export class TerminalSession {
       this.#attachStartTimer = null;
       if (
         !this.#isCurrentData(connectionEpoch, dataEpoch, generation) ||
-        this.#snapshot.phase !== "attaching"
+        this.coordinator.state === "live"
       ) {
         return;
       }

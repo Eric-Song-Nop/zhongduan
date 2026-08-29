@@ -456,7 +456,6 @@ Start/BarrierResult =
 retryScope =
   same-generation
   | refresh-checkpoint
-  | reset-generation
   | drop-client
 
 SchedulerAttempt =
@@ -467,28 +466,38 @@ SchedulerAttempt =
   | failed
 ```
 
-原因至少区分 `generation-fenced`、`client-gone`、`missing-live-seed`、`snapshot-missing`、
-`snapshot-metadata-mismatch`、`browser-control-send-failed`、`cloud-head-behind-cut`。例如 Browser control
-发送失败只能 reset/drop 当前客户端，不能全局 invalidate 健康 checkpoint；snapshot missing 才进入
-refresh-checkpoint；tail-unavailable 是 Host range gap/budget 检查派生的 planner reason，不伪装成基础设施
-retry。
+CURRENT barrier 原因严格限定为 `generation-fenced`、`client-gone`、`missing-live-seed`、
+`snapshot-missing`、`snapshot-metadata-mismatch` 和 `browser-control-send-failed`。warm 只允许
+`missing-live-seed/same-generation` 或 `browser-control-send-failed/drop-client`；snapshot 只允许
+`snapshot-missing|snapshot-metadata-mismatch/refresh-checkpoint` 或
+`browser-control-send-failed/drop-client`。Browser control 发送失败只能 isolate/drop 当前客户端，不能全局
+invalidate 健康 checkpoint；snapshot missing 才进入 refresh-checkpoint。
+
+CURRENT barrier rejection 不提供无 owner 的 `reset-generation` 占位符。generation reset 由现有
+`replay-unavailable` 或 Cloud delivery-reset 路径的明确 owner 发起；Recovery v3 若需要新的 reset outcome，
+必须在对应 owner 和状态转换同时落地时重新定义。`tail-unavailable` 是 Phase 1 Host range gap/budget 检查
+派生的 planner reason，不伪装成基础设施 retry。
 
 只有协议状态机明确证明 marker/start 未产生不确定结果时，才允许 same-generation retry。否则 fence
 generation，避免跨 attempt 拼接。
 
 ## 实施阶段与依赖
 
-### Phase 0：修 CURRENT 活性并建立事实
+### Phase 0：修 CURRENT recovery 活性
+
+Phase 0 的规范范围、直接测试证据与局限见 [Phase 0 验收契约](phase-0-acceptance-contract.md)。本阶段只收口
+CURRENT protocol v2 的 recovery 活性：
 
 - 保留 v2 pause/barrier/pinned commit correctness invariant；
 - 落地 `reason + retryScope`，修复 non-ready 被错误 complete 的 Browser freeze；
-- 增加 attach-start watchdog、明确 retry/reset/unavailable；
-- 测量同步 `encodeSnapshot()` actor pause、journal/serviceability、各队列和分段 recovery latency；
-- 将 input/interrupt SLO 拆成 transport RTT 与本地排队/处理，禁止用 600 ms RTT 场景要求固定 500 ms
-  端到端 ACK。
+- 增加 attach-start 与 warm-completion watchdog；明确 retry/drop，generation reset 只由已有显式 owner 发起；
+- 用 scheduler、queue、Browser session、Cloud relay 和 protocol 的状态机测试直接验证每个声明的转换。
 
-Gate：所有 rejected 路径最终 retry/live/reset；无静默 catching-up；dashboard 能区分网络 RTT、Cloud、
-Host queue、PTY write 和 app effect。
+Gate：验收契约的四个 required gate 全部通过。性能、production dashboard、纯 network 分解和通用
+application effect 验证后置，不阻止 Phase 0 收口，也不得由本阶段的 timeout 或状态机测试代替。
+
+Phase 1 只能从通过上述契约和完整 CI 的 exact Phase 0 revision 开始；它可以作为 stacked PR 的 parent，
+但在 Phase 0 合入 `main` 前不能把主线状态写成已完成。
 
 ### Phase 1：Checkpoint manager 与动态 serviceability
 
@@ -546,6 +555,9 @@ Gate：持续 50–100 ms output、从不 quiet 时 cut 仍有界前进，且 in
 这不是 Recovery v3、rolling snapshot 或输入 Mirrored 的前置条件。
 
 ## 验证矩阵与上线 gate
+
+以下矩阵服务于后续 TARGET recovery、完整上线与项目完成定义；除
+[Phase 0 验收契约](phase-0-acceptance-contract.md)明确列出的项目外，不是 Phase 0 的阻塞条件。
 
 ### 正确性与状态机
 
