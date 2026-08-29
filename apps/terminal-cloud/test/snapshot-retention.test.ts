@@ -2,6 +2,7 @@ import { SNAPSHOT_MEDIA_TYPE, type SnapshotMetadata } from "@zhongduan/protocol"
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { DURABLE_ALARM_FAILURE_RETRY_MS } from "../src/worker/durable-alarm-mux";
 import {
   hexToBytes,
   snapshotCustomMetadata,
@@ -15,6 +16,9 @@ import {
   createSession,
   encoder,
   engineId,
+  FORCED_SESSION_ALARM_NOW,
+  forceNextSessionAlarmDue,
+  forceSessionAlarmDue,
   getSnapshot,
   matchesSnapshotKey,
   metadataFor,
@@ -30,7 +34,9 @@ import {
 async function settleSnapshotMaintenance(sessionId: string): Promise<void> {
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const remaining = await runInDurableObject(sessionStub(sessionId), async (instance) => {
+      await Promise.resolve();
       const coordinator = Reflect.get(instance, "snapshotUploads") as object;
+      const alarmMux = Reflect.get(instance, "alarmMux") as object;
       const tasks = Reflect.get(coordinator, "snapshotMaintenanceTasks") as Map<
         string,
         Promise<void>
@@ -38,9 +44,7 @@ async function settleSnapshotMaintenance(sessionId: string): Promise<void> {
       const maintenance = Reflect.get(coordinator, "snapshotMaintenance") as
         | Promise<void>
         | undefined;
-      const alarmUpdate = Reflect.get(coordinator, "snapshotAlarmUpdate") as
-        | Promise<void>
-        | undefined;
+      const alarmUpdate = Reflect.get(alarmMux, "reconcileRun") as Promise<void> | undefined;
       await Promise.allSettled([
         ...tasks.values(),
         ...(maintenance === undefined ? [] : [maintenance]),
@@ -49,7 +53,7 @@ async function settleSnapshotMaintenance(sessionId: string): Promise<void> {
       return (
         tasks.size +
         (Reflect.get(coordinator, "snapshotMaintenance") === undefined ? 0 : 1) +
-        (Reflect.get(coordinator, "snapshotAlarmUpdate") === undefined ? 0 : 1)
+        (Reflect.get(alarmMux, "reconcileRun") === undefined ? 0 : 1)
       );
     });
     if (remaining === 0) return;
@@ -308,6 +312,7 @@ describe("snapshot multipart retention", () => {
         await alarmGate;
         await scheduleAlarm(timestamp);
       });
+      await forceSessionAlarmDue(instance);
       await instance.alarm();
     });
     await within(alarmStarted, "maintenance alarm persistence did not start");
@@ -494,6 +499,7 @@ describe("snapshot multipart retention", () => {
       }),
     );
     await runInDurableObject(sessionStub(session.sessionId), async (instance) => {
+      await forceSessionAlarmDue(instance);
       await instance.alarm();
     });
     await settleSnapshotMaintenance(session.sessionId);
@@ -516,6 +522,7 @@ describe("snapshot multipart retention", () => {
         "UPDATE snapshot_upload SET expires_at = 0 WHERE snapshot_id = ?",
         snapshotId,
       );
+      await forceSessionAlarmDue(instance);
       await instance.alarm();
     });
     await settleSnapshotMaintenance(session.sessionId);
@@ -596,6 +603,7 @@ describe("snapshot multipart retention", () => {
       }),
     );
 
+    await forceNextSessionAlarmDue(session.sessionId);
     const maintenance = runDurableObjectAlarm(sessionStub(session.sessionId));
     await abortStarted;
     const sameId = await uploadSnapshot(session, recoveringId);
@@ -722,6 +730,7 @@ describe("snapshot multipart retention", () => {
         }),
       );
 
+      await forceNextSessionAlarmDue(session.sessionId);
       const alarm = runDurableObjectAlarm(sessionStub(session.sessionId));
       await within(blocked, `blocked ${mode} did not start`);
       await within(independentlyDeleted, "independent retired object was not deleted");
@@ -830,6 +839,7 @@ describe("snapshot multipart retention", () => {
         Reflect.set(coordinator, "scheduleAlarm", async () => {
           throw new Error("injected maintenance alarm failure");
         });
+        await forceSessionAlarmDue(instance);
         await expect(instance.alarm()).rejects.toThrow("injected maintenance alarm failure");
         const owners = Reflect.get(coordinator, "snapshotOperationOwners") as Map<string, object>;
         return {
@@ -896,6 +906,7 @@ describe("snapshot multipart retention", () => {
       });
     });
 
+    await forceNextSessionAlarmDue(session.sessionId);
     await expect(runDurableObjectAlarm(sessionStub(session.sessionId))).rejects.toThrow(
       "injected real alarm failure",
     );
@@ -913,14 +924,12 @@ describe("snapshot multipart retention", () => {
       r2CallsAtFailure: { deleteCalls: 0, headCalls: 0 },
     });
     expect(failedState).toEqual({
-      alarm: null,
+      alarm: FORCED_SESSION_ALARM_NOW + DURABLE_ALARM_FAILURE_RETRY_MS,
       upload: { state: "preparing" },
     });
 
-    // cloudflare:test consumes the failed alarm, so explicitly model the runtime retry dispatch.
-    await runInDurableObject(sessionStub(session.sessionId), (_instance, durable) =>
-      durable.storage.setAlarm(Date.now() + 60_000),
-    );
+    // The mux durably restored a bounded retry; advance that component for the next dispatch.
+    await forceNextSessionAlarmDue(session.sessionId);
     expect(await runDurableObjectAlarm(sessionStub(session.sessionId))).toBe(true);
     await settleSnapshotMaintenance(session.sessionId);
     const afterRetry = await runInDurableObject(
@@ -997,6 +1006,7 @@ describe("snapshot multipart retention", () => {
       }),
     );
 
+    await forceNextSessionAlarmDue(session.sessionId);
     expect(await runDurableObjectAlarm(sessionStub(session.sessionId))).toBe(true);
     await settleSnapshotMaintenance(session.sessionId);
     const state = await runInDurableObject(
@@ -1039,6 +1049,7 @@ describe("snapshot multipart retention", () => {
     expect(await env.SNAPSHOTS.head(objectKey)).toBeNull();
 
     await evictDurableObject(sessionStub(session.sessionId));
+    await forceNextSessionAlarmDue(session.sessionId);
     expect(await runDurableObjectAlarm(sessionStub(session.sessionId))).toBe(true);
     await settleSnapshotMaintenance(session.sessionId);
     const afterMaintenance = await runInDurableObject(
@@ -1054,6 +1065,7 @@ describe("snapshot multipart retention", () => {
     expect(afterMaintenance.alarm).not.toBeNull();
     expect(await env.SNAPSHOTS.head(objectKey)).toBeNull();
 
+    await forceNextSessionAlarmDue(session.sessionId);
     expect(await runDurableObjectAlarm(sessionStub(session.sessionId))).toBe(true);
     const finalAlarm = await runInDurableObject(
       sessionStub(session.sessionId),
@@ -1076,6 +1088,7 @@ describe("snapshot multipart retention", () => {
       objectKeys.push(await storedSnapshotKey(session.sessionId, snapshotId));
     }
     await runInDurableObject(sessionStub(session.sessionId), async (instance) => {
+      await forceSessionAlarmDue(instance);
       await instance.alarm();
     });
     await settleSnapshotMaintenance(session.sessionId);
@@ -1219,6 +1232,7 @@ describe("snapshot multipart retention", () => {
 
     await evictDurableObject(sessionStub(session.sessionId));
     await runInDurableObject(sessionStub(session.sessionId), async (instance) => {
+      await forceSessionAlarmDue(instance);
       await instance.alarm();
     });
     await settleSnapshotMaintenance(session.sessionId);
@@ -1281,6 +1295,7 @@ describe("snapshot multipart retention", () => {
 
     releaseDelete?.();
     await runInDurableObject(sessionStub(session.sessionId), async (instance) => {
+      await forceSessionAlarmDue(instance);
       await instance.alarm();
     });
     await settleSnapshotMaintenance(session.sessionId);
@@ -1353,6 +1368,7 @@ describe("snapshot multipart retention", () => {
         "UPDATE snapshot_upload SET expires_at = 0 WHERE snapshot_id = ?",
         expiringId,
       );
+      await forceSessionAlarmDue(instance);
       await instance.alarm();
     });
     await settleSnapshotMaintenance(session.sessionId);
@@ -1450,6 +1466,7 @@ describe("snapshot multipart retention", () => {
           throw new Error("simulated termination after completed identity commit");
         },
       );
+      await forceSessionAlarmDue(instance);
       await instance.alarm();
     });
     await within(completed, "completed identity was not committed");
@@ -1460,10 +1477,11 @@ describe("snapshot multipart retention", () => {
     const committed = await runInDurableObject(
       sessionStub(session.sessionId),
       (instance, durable) => {
+        const alarmMux = Reflect.get(instance, "alarmMux") as object;
         const coordinator = Reflect.get(instance, "snapshotUploads") as object;
         return {
           activeBody: Reflect.get(coordinator, "activeSnapshotBodyUploadId"),
-          alarmUpdate: Reflect.get(coordinator, "snapshotAlarmUpdate"),
+          alarmUpdate: Reflect.get(alarmMux, "reconcileRun"),
           maintenance: Reflect.get(coordinator, "snapshotMaintenance"),
           maintenanceRequested: Reflect.get(coordinator, "snapshotMaintenanceRequested"),
           owners: (Reflect.get(coordinator, "snapshotOperationOwners") as Map<string, object>).size,
@@ -1628,6 +1646,7 @@ describe("snapshot multipart retention", () => {
       resumeCalls: 0,
     });
     await runInDurableObject(sessionStub(session.sessionId), async (instance) => {
+      await forceSessionAlarmDue(instance);
       await instance.alarm();
     });
     expect({ createCalls, headCalls, resumeCalls }).toEqual({
