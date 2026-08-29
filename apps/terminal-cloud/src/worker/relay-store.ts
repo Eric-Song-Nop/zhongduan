@@ -432,5 +432,162 @@ export function migrateRelayStore(state: DurableObjectState, sql: SqlStorage): v
       );
       state.storage.kv.put("schema-version", 8);
     });
+    version = 8;
+  }
+
+  if (version < 9) {
+    state.storage.transactionSync(() => {
+      sql.exec(`
+        CREATE TABLE IF NOT EXISTS recovery_delivery_record (
+          recovery_id TEXT NOT NULL,
+          lane TEXT NOT NULL CHECK (lane IN ('live', 'recovery')),
+          delivery_ordinal TEXT NOT NULL CHECK (
+            length(delivery_ordinal) BETWEEN 1 AND 20
+            AND delivery_ordinal <> '0'
+            AND delivery_ordinal NOT GLOB '*[^0-9]*'
+            AND (length(delivery_ordinal) = 1 OR substr(delivery_ordinal, 1, 1) <> '0')
+            AND (
+              length(delivery_ordinal) < 20
+              OR delivery_ordinal <= '18446744073709551615'
+            )
+          ),
+          cumulative_encoded_bytes TEXT NOT NULL CHECK (
+            length(cumulative_encoded_bytes) BETWEEN 1 AND 20
+            AND cumulative_encoded_bytes <> '0'
+            AND cumulative_encoded_bytes NOT GLOB '*[^0-9]*'
+            AND (
+              length(cumulative_encoded_bytes) = 1
+              OR substr(cumulative_encoded_bytes, 1, 1) <> '0'
+            )
+            AND (
+              length(cumulative_encoded_bytes) < 20
+              OR cumulative_encoded_bytes <= '18446744073709551615'
+            )
+          ),
+          encoded_bytes INTEGER NOT NULL CHECK (
+            encoded_bytes BETWEEN 1 AND 9007199254740991
+          ),
+          authority_cursor_after_json TEXT NOT NULL CHECK (
+            json_valid(authority_cursor_after_json)
+            AND length(authority_cursor_after_json) <= 512
+          ),
+          state TEXT NOT NULL CHECK (state IN ('queued', 'sending', 'sent')),
+          PRIMARY KEY (recovery_id, lane, delivery_ordinal),
+          UNIQUE (recovery_id, lane, cumulative_encoded_bytes),
+          FOREIGN KEY (recovery_id, lane)
+            REFERENCES recovery_delivery_lane(recovery_id, lane) ON DELETE CASCADE
+        ) STRICT
+      `);
+      sql.exec(`
+        CREATE INDEX IF NOT EXISTS recovery_delivery_record_state
+        ON recovery_delivery_record(state, recovery_id, lane)
+      `);
+      sql.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS recovery_delivery_record_one_sending
+        ON recovery_delivery_record(recovery_id) WHERE state = 'sending'
+      `);
+
+      const legacyLanes = sql
+        .exec(
+          `SELECT recovery_id, lane, sent_delivery_ordinal,
+                  sent_cumulative_encoded_bytes, sent_authority_cursor_json,
+                  received_delivery_ordinal, received_cumulative_encoded_bytes,
+                  received_authority_cursor_json
+           FROM recovery_delivery_lane
+           ORDER BY recovery_id, lane`,
+        )
+        .toArray() as unknown as {
+        lane: "live" | "recovery";
+        received_cumulative_encoded_bytes: string;
+        received_delivery_ordinal: string;
+        received_authority_cursor_json: string;
+        recovery_id: string;
+        sent_authority_cursor_json: string;
+        sent_cumulative_encoded_bytes: string;
+        sent_delivery_ordinal: string;
+      }[];
+      const invalidRecoveryIds = new Set<string>();
+      const maxU64 = (1n << 64n) - 1n;
+      const parseCanonicalU64 = (value: string): bigint => {
+        if (!/^(0|[1-9][0-9]{0,19})$/.test(value)) throw new Error("non-canonical u64");
+        const parsed = BigInt(value);
+        if (parsed > maxU64) throw new Error("u64 overflow");
+        return parsed;
+      };
+
+      for (const lane of legacyLanes) {
+        try {
+          const sentOrdinal = parseCanonicalU64(lane.sent_delivery_ordinal);
+          const receivedOrdinal = parseCanonicalU64(lane.received_delivery_ordinal);
+          const sentBytes = parseCanonicalU64(lane.sent_cumulative_encoded_bytes);
+          const receivedBytes = parseCanonicalU64(lane.received_cumulative_encoded_bytes);
+          if (
+            sentOrdinal === receivedOrdinal &&
+            sentBytes === receivedBytes &&
+            lane.sent_authority_cursor_json === lane.received_authority_cursor_json
+          ) {
+            continue;
+          }
+          // V8 wrote the sent scalar before the external WebSocket send. Any
+          // outstanding or mixed row is therefore outcome-uncertain across an
+          // upgrade/eviction and must fence the whole delivery owner.
+          invalidRecoveryIds.add(lane.recovery_id);
+        } catch {
+          invalidRecoveryIds.add(lane.recovery_id);
+        }
+      }
+
+      for (const recoveryId of invalidRecoveryIds) {
+        const attempt = sql
+          .exec(
+            `SELECT recovery_id, connection_id, stream_id, delivery_generation, state, updated_at
+             FROM recovery_attempt WHERE recovery_id = ?`,
+            recoveryId,
+          )
+          .toArray()[0] as
+          | {
+              connection_id: string;
+              delivery_generation: string;
+              recovery_id: string;
+              state: "assembling" | "complete" | "installed" | "preparing" | "resetting";
+              stream_id: number;
+              updated_at: number;
+            }
+          | undefined;
+        sql.exec("DELETE FROM recovery_delivery_lane WHERE recovery_id = ?", recoveryId);
+        if (attempt === undefined) continue;
+        if (attempt.state === "resetting") continue;
+        sql.exec("DELETE FROM recovery_control_outbox WHERE recovery_id = ?", recoveryId);
+        sql.exec(
+          `UPDATE recovery_attempt
+           SET state = 'resetting', reset_reason = 'ack-outcome-uncertain'
+           WHERE recovery_id = ?`,
+          recoveryId,
+        );
+        // A complete attempt has already closed its Host source. Its terminal
+        // delivery owner is fenced locally and retained as a tombstone; sending
+        // a new source reset to Host would be an invalid post-closure command.
+        if (attempt.state === "complete") continue;
+        const resetPayload = JSON.stringify({
+          type: "recovery-source-reset",
+          recoveryId: attempt.recovery_id,
+          connectionId: attempt.connection_id,
+          streamId: attempt.stream_id,
+          deliveryGeneration: attempt.delivery_generation,
+          reason: "ack-outcome-uncertain",
+        });
+        sql.exec(
+          `INSERT INTO recovery_control_outbox
+            (recovery_id, kind, destination, payload_json, created_at, updated_at)
+           VALUES (?, 'recovery-source-reset', 'host', ?, ?, ?)`,
+          recoveryId,
+          resetPayload,
+          attempt.updated_at,
+          attempt.updated_at,
+        );
+      }
+
+      state.storage.kv.put("schema-version", 9);
+    });
   }
 }
