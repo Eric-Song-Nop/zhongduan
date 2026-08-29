@@ -1,8 +1,14 @@
 import {
+  RecoveryV3CloudToHostControlFrameSchema,
+  RecoveryV3HostToCloudControlFrameSchema,
+  RelayCapability,
   RelayToHostControlFrameSchema,
   decodeControlFrame,
   encodeControlFrame,
   type HostControlFrame,
+  type RecoveryV3CloudToHostControlFrame,
+  type RecoveryV3HostRoutingIdentity,
+  type RecoveryV3HostToCloudControlFrame,
   type RelayToHostControlFrame,
 } from "@zhongduan/protocol";
 
@@ -11,18 +17,30 @@ import { HOST_CANONICAL_QUEUE_LIMITS } from "./canonical-publisher";
 import { HostDeliveryScheduler } from "./delivery-scheduler";
 import { dispatchForwardedInput, type ForwardedInput } from "./input-dispatcher";
 import type { HostSocketPair } from "./paired-websocket";
+import {
+  type RecoverySourceManager,
+  type RecoverySourceOwnerToken,
+} from "./recovery-source-manager";
 import type { SnapshotCheckpointManager } from "./snapshot-checkpoint-manager";
 
 export const HOST_READY_TIMEOUT_MS = 10_000;
 export const HOST_HEARTBEAT_INTERVAL_MS = 15_000;
 export const HOST_HEARTBEAT_TIMEOUT_MS = 45_000;
+export const HOST_RECOVERY_DEADLINE_TICK_MS = 1_000;
 export const HOST_CONTROL_QUEUE_LIMITS = {
   maxBytes: 8 * 1024 * 1024,
   maxCount: 64,
 } as const;
 const MAX_CONTROL_MESSAGE_CHARS = 6 * 1024 * 1024 + 4_096;
 const MAX_CONTROL_BUFFERED_BYTES = 1024 * 1024;
+const HOST_RECOVERY_DRAIN_MAX_WIRE_BYTES = 512 * 1024;
 const textEncoder = new TextEncoder();
+const HOST_RECOVERY_V3_CAPABILITIES = [
+  RelayCapability.capabilityNegotiationV1,
+  RelayCapability.authorityDataV2,
+  RelayCapability.wireEndpointV3,
+  RelayCapability.recoveryV3GapFillV1,
+] as const;
 
 export interface HostRelayConnectionOptions {
   heartbeatIntervalMs?: number;
@@ -30,6 +48,8 @@ export interface HostRelayConnectionOptions {
   monotonicNow?: () => number;
   pair: HostSocketPair;
   readyTimeoutMs?: number;
+  recoveryDeadlineTickMs?: number;
+  recoverySourceManager: RecoverySourceManager;
   session: TerminalSession;
   snapshotCheckpointManager: SnapshotCheckpointManager;
 }
@@ -42,6 +62,10 @@ export class HostRelayConnection {
   readonly #session: TerminalSession;
   readonly #scheduler: HostDeliveryScheduler;
   readonly #readyTimeoutMs: number;
+  readonly #recoveryDeadlineTickMs: number;
+  readonly #recoveryOwnerToken: RecoverySourceOwnerToken = {};
+  readonly #recoverySourceManager: RecoverySourceManager;
+  readonly #recoveryV3Enabled: boolean;
   readonly #readyPromise: Promise<void>;
   readonly #resolveReady: () => void;
   readonly #rejectReady: (error: unknown) => void;
@@ -58,6 +82,7 @@ export class HostRelayConnection {
   #queuedControlBytes = 0;
   #queuedControlCount = 0;
   #ready = false;
+  #recoveryDeadlineTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(options: HostRelayConnectionOptions) {
     this.#pair = options.pair;
@@ -77,6 +102,15 @@ export class HostRelayConnection {
     if (!Number.isInteger(this.#readyTimeoutMs) || this.#readyTimeoutMs <= 0) {
       throw new RangeError("host-ready timeout must be a positive integer");
     }
+    this.#recoveryDeadlineTickMs = options.recoveryDeadlineTickMs ?? HOST_RECOVERY_DEADLINE_TICK_MS;
+    if (!Number.isInteger(this.#recoveryDeadlineTickMs) || this.#recoveryDeadlineTickMs <= 0) {
+      throw new RangeError("recovery deadline tick must be a positive integer");
+    }
+    this.#recoverySourceManager = options.recoverySourceManager;
+    const negotiated = new Set(options.pair.connection.negotiatedCapabilities ?? []);
+    this.#recoveryV3Enabled = HOST_RECOVERY_V3_CAPABILITIES.every((capability) =>
+      negotiated.has(capability),
+    );
     let resolveReady!: () => void;
     let rejectReady!: (error: unknown) => void;
     this.#readyPromise = new Promise((resolve, reject) => {
@@ -215,7 +249,19 @@ export class HostRelayConnection {
     try {
       frame = decodeControlFrame(encoded, RelayToHostControlFrameSchema);
     } catch {
-      this.#close(1002, "invalid relay control frame");
+      if (!this.#recoveryV3Enabled) {
+        this.#close(1002, "invalid relay control frame");
+        return;
+      }
+      let recoveryFrame: RecoveryV3CloudToHostControlFrame;
+      try {
+        recoveryFrame = decodeControlFrame(encoded, RecoveryV3CloudToHostControlFrameSchema);
+      } catch {
+        this.#close(1002, "invalid relay control frame");
+        return;
+      }
+      if (!this.#ready) throw new Error("relay sent Recovery v3 traffic before host-ready ACK");
+      await this.#handleRecoveryControl(recoveryFrame);
       return;
     }
 
@@ -255,7 +301,100 @@ export class HostRelayConnection {
     this.#heartbeatLastControlAckAt = now;
     this.#heartbeatLastDataAckAt = now;
     this.#scheduleHeartbeat();
+    if (this.#recoveryV3Enabled) this.#scheduleRecoveryDeadlineTick();
     this.#resolveReady();
+  }
+
+  async #handleRecoveryControl(frame: RecoveryV3CloudToHostControlFrame): Promise<void> {
+    if (frame.type === "recovery-prepare") {
+      const pairFence = this.#pairFence;
+      const result = await this.#recoverySourceManager.prepare(
+        this.#recoveryOwnerToken,
+        frame,
+        (encoded) =>
+          !this.#closed &&
+          pairFence !== null &&
+          pairFence === this.#pairFence &&
+          this.#scheduler.tryEnqueueRecoveryStartFence(encoded),
+      );
+      if (this.#closed || pairFence === null || pairFence !== this.#pairFence) return;
+      if (result.status === "prepared") return;
+      if (result.status === "rejected") {
+        this.#sendRecoveryControl(result.rejection);
+        return;
+      }
+      throw new Error(`Recovery source prepare ${result.status}: ${result.reason}`);
+    }
+    if (frame.type === "recovery-start-ready") {
+      if (!this.#recoverySourceManager.startReady(this.#recoveryOwnerToken, frame)) {
+        throw new Error("invalid Recovery source start-ready identity");
+      }
+      this.#drainRecovery(frame);
+      return;
+    }
+    if (frame.type === "recovery-source-grant") {
+      if (!this.#recoverySourceManager.grant(this.#recoveryOwnerToken, frame)) {
+        throw new Error("invalid Recovery source grant identity");
+      }
+      this.#drainRecovery(frame);
+      return;
+    }
+    if (frame.type === "recovery-source-received") {
+      const result = this.#recoverySourceManager.received(this.#recoveryOwnerToken, frame);
+      if (result.status === "invalid") {
+        throw new Error(`invalid Recovery source receipt: ${result.reason}`);
+      }
+      if (result.status === "closed") this.#sendRecoveryControl(result.closed);
+      if (result.status === "partial" && result.advanced) this.#drainRecovery(frame);
+      return;
+    }
+    if (!this.#recoverySourceManager.reset(this.#recoveryOwnerToken, frame)) {
+      throw new Error("invalid Recovery source reset identity");
+    }
+  }
+
+  #drainRecovery(identity: RecoveryV3HostRoutingIdentity): void {
+    this.#recoverySourceManager.drainGranted(
+      this.#recoveryOwnerToken,
+      {
+        recoveryId: identity.recoveryId,
+        connectionId: identity.connectionId,
+        streamId: identity.streamId,
+        deliveryGeneration: identity.deliveryGeneration,
+      },
+      { maxRecords: 1, maxWireBytes: HOST_RECOVERY_DRAIN_MAX_WIRE_BYTES },
+      (encoded) => this.#sendRecoveryData(encoded),
+    );
+  }
+
+  #sendRecoveryControl(frame: RecoveryV3HostToCloudControlFrame): void {
+    this.#sendRawControl(encodeControlFrame(RecoveryV3HostToCloudControlFrameSchema.parse(frame)));
+  }
+
+  #scheduleRecoveryDeadlineTick(): void {
+    if (this.#closed || !this.#recoveryV3Enabled) return;
+    if (this.#recoveryDeadlineTimer !== undefined) clearTimeout(this.#recoveryDeadlineTimer);
+    this.#recoveryDeadlineTimer = setTimeout(() => {
+      this.#recoveryDeadlineTimer = undefined;
+      if (this.#closed) return;
+      try {
+        const expiration = this.#recoverySourceManager.checkDeadlines(this.#recoveryOwnerToken)[0];
+        if (expiration !== undefined) {
+          this.#close(
+            1012,
+            `Recovery source ${expiration.identity.recoveryId} ${expiration.reason}`,
+          );
+          return;
+        }
+      } catch (error) {
+        this.#close(
+          1011,
+          error instanceof Error ? error.message : "Recovery source deadline check failed",
+        );
+        return;
+      }
+      this.#scheduleRecoveryDeadlineTick();
+    }, this.#recoveryDeadlineTickMs);
   }
 
   #scheduleHeartbeat(): void {
@@ -325,6 +464,19 @@ export class HostRelayConnection {
     this.#pair.data.send(frame as Uint8Array<ArrayBuffer>);
   }
 
+  #sendRecoveryData(frame: Uint8Array): void {
+    if (this.#closed || this.#pair.data.readyState !== WebSocket.OPEN) {
+      throw new Error("Host data WebSocket is not open");
+    }
+    if (frame.byteLength > HOST_CANONICAL_QUEUE_LIMITS.maxBytes - this.#pair.data.bufferedAmount) {
+      throw new Error("Host data WebSocket buffer exceeded");
+    }
+    if (!(frame.buffer instanceof ArrayBuffer)) {
+      throw new Error("Host data frame must use an owned ArrayBuffer");
+    }
+    this.#pair.data.send(frame as Uint8Array<ArrayBuffer>);
+  }
+
   #sendRawDataHeartbeat(): void {
     if (this.#closed || this.#pair.data.readyState !== WebSocket.OPEN) {
       throw new Error("Host data WebSocket is not open");
@@ -350,7 +502,10 @@ export class HostRelayConnection {
     this.#ready = false;
     if (this.#heartbeatTimer !== undefined) clearTimeout(this.#heartbeatTimer);
     this.#heartbeatTimer = undefined;
+    if (this.#recoveryDeadlineTimer !== undefined) clearTimeout(this.#recoveryDeadlineTimer);
+    this.#recoveryDeadlineTimer = undefined;
     this.#unlisten();
+    this.#recoverySourceManager.resetOwner(this.#recoveryOwnerToken);
     this.#scheduler.dispose(reason);
     this.#rejectReady(new Error(reason));
     this.#pair.close(code, reason.slice(0, 120));

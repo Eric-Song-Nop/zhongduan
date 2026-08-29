@@ -72,7 +72,8 @@ export function confirmedRelayCapabilities(
   return canonicalCapabilities.filter((capability) => negotiatedSet.has(capability));
 }
 
-export type RecoveryStrategy = "v2" | "v3";
+export const RecoveryStrategySchema = z.enum(["v2", "v3"]);
+export type RecoveryStrategy = z.infer<typeof RecoveryStrategySchema>;
 
 export interface RecoveryStrategySelectorInput {
   readonly authorityDataVersion: 2;

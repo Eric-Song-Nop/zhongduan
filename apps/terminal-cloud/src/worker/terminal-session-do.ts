@@ -12,6 +12,7 @@ import {
   RelayCapabilitySchema,
   RelayToHostControlFrameSchema,
   selectRelayCapabilities,
+  selectRecoveryStrategy,
   ServerControlFrameSchema,
   decodeControlFrame,
   decodeDataFrame,
@@ -20,6 +21,7 @@ import {
   rewriteDelivery,
   type DataFrame,
   type DeliveryBarrierPayload,
+  type RecoveryStrategy,
 } from "@zhongduan/protocol";
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
@@ -87,6 +89,22 @@ const HOST_RELAY_CAPABILITIES = [
   ...BROWSER_RELAY_CAPABILITIES,
   RelayCapability.deliveryBarrierOutcomeV1,
 ] as const;
+const HOST_RECOVERY_V3_CAPABILITIES = [
+  RelayCapability.capabilityNegotiationV1,
+  RelayCapability.authorityDataV2,
+  RelayCapability.wireEndpointV3,
+  RelayCapability.recoveryV3GapFillV1,
+] as const;
+const BROWSER_RECOVERY_V3_CAPABILITIES = [
+  RelayCapability.capabilityNegotiationV1,
+  RelayCapability.authorityDataV2,
+  RelayCapability.wireEndpointV3,
+  RelayCapability.deliveryEnvelopeV3,
+  RelayCapability.deliveryReceiveCreditV1,
+  RelayCapability.authorityApplyProgressV1,
+  RelayCapability.recoveryV3GapFillV1,
+] as const;
+const CLOUD_RECOVERY_V3_CAPABILITIES = BROWSER_RECOVERY_V3_CAPABILITIES;
 
 interface AcquiredLease {
   fence: string;
@@ -186,12 +204,19 @@ function hasUnadvancedDeliveryCursor(attachment: SocketAttachment): boolean {
 function selectEnabledRelayCapabilities(
   header: string | null,
   peer: "browser" | "host",
+  recoveryV3Enabled: boolean,
 ): RelayCapability[] | undefined {
   const selected = selectRelayCapabilities(header);
   if (selected === undefined) return undefined;
   const requested = new Set(selected);
-  const enabled = peer === "host" ? HOST_RELAY_CAPABILITIES : BROWSER_RELAY_CAPABILITIES;
-  return enabled.filter((capability) => requested.has(capability));
+  const baseline = peer === "host" ? HOST_RELAY_CAPABILITIES : BROWSER_RELAY_CAPABILITIES;
+  const recoveryFamily =
+    peer === "host" ? HOST_RECOVERY_V3_CAPABILITIES : BROWSER_RECOVERY_V3_CAPABILITIES;
+  const familyOffered = recoveryFamily.every((capability) => requested.has(capability));
+  const enabled = new Set<RelayCapability>(
+    recoveryV3Enabled && familyOffered ? [...baseline, ...recoveryFamily] : baseline,
+  );
+  return selected.filter((capability) => enabled.has(capability));
 }
 
 export class TerminalSessionDO extends DurableObject<CloudEnv> {
@@ -204,9 +229,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   private readonly recoveryMaintenance: RelayRecoveryMaintenance;
   private readonly snapshotUploads: SnapshotUploadCoordinator;
   private readonly messageQueue = new BoundedSerialQueue<WebSocket>();
+  private readonly recoveryV3Enabled: boolean;
 
   constructor(ctx: DurableObjectState, env: CloudEnv) {
     super(ctx, env);
+    this.recoveryV3Enabled = env.RECOVERY_V3_ENABLED === "true";
     this.sql = ctx.storage.sql;
     this.store = new RelayStore(this.sql);
     migrateRelayStore(ctx, this.sql);
@@ -306,6 +333,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const attachment = readAttachment(webSocket);
     if (attachment === undefined) {
       closeProtocol(webSocket, "invalid attachment");
+      return undefined;
+    }
+    // A newer deployment may have persisted v3 attachments before a rollback.
+    // Until this runtime has a v3 dispatcher, never reinterpret them as v2.
+    if (attachment.recoveryStrategy === "v3") {
+      closeProtocol(webSocket, "recovery v3 runtime unavailable");
       return undefined;
     }
     if (attachment.channel === "control") {
@@ -581,6 +614,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const selectedCapabilitiesResult = selectEnabledRelayCapabilities(
       selectedCapabilitiesHeader,
       peer,
+      this.recoveryV3Enabled,
     );
     if (selectedCapabilitiesResult === undefined) {
       return json({ error: "invalid-connection-set" }, 400);
@@ -593,6 +627,27 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     ]);
     const now = Date.now();
     const expiresAt = now + TICKET_LIFETIME_MS;
+    const currentSession = this.session();
+    const currentReadyHost = this.currentReadyHostAttachment();
+    const hasPublishedSnapshot =
+      currentSession?.latest_snapshot_id !== null &&
+      currentSession?.latest_snapshot_id !== undefined &&
+      this.snapshots.published(currentSession.latest_snapshot_id) !== undefined;
+    const recoveryStrategy: RecoveryStrategy =
+      peer === "browser" && currentSession !== undefined
+        ? selectRecoveryStrategy({
+            authorityDataVersion: currentSession.authority_data_version,
+            browserCapabilities: selectedCapabilities,
+            cloudCapabilities: CLOUD_RECOVERY_V3_CAPABILITIES,
+            enabled: this.recoveryV3Enabled && hasPublishedSnapshot,
+            hostCapabilities: currentReadyHost?.relayCapabilities ?? [],
+          })
+        : "v2";
+    const recoveryHostFence =
+      recoveryStrategy === "v3" ? (currentReadyHost?.hostFence ?? null) : null;
+    if (recoveryStrategy === "v3" && recoveryHostFence === null) {
+      throw new Error("v3 reservation lost its ready Host witness");
+    }
     const reservation = this.connections.reserveConnectionSet({
       clientId: requestedClientId,
       connectionId,
@@ -603,6 +658,8 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       now,
       peer,
       principalIdHash,
+      recoveryHostFence,
+      recoveryStrategy,
       relayCapabilitiesJson: JSON.stringify(selectedCapabilities),
       role: parsed.data.role,
       subject: parsed.data.subject,
@@ -625,6 +682,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         expiresAt,
         controlTicket,
         dataTicket,
+        ...(reservation.recoveryStrategy === "v3" ? { recoveryStrategy: "v3" } : {}),
         ...(selectedCapabilities.includes(RelayCapability.capabilityNegotiationV1)
           ? { negotiatedCapabilities: selectedCapabilities }
           : {}),
@@ -656,17 +714,38 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     } catch {
       return json({ error: "invalid-ticket" }, 401);
     }
+    if (JSON.stringify(relayCapabilities) !== ticket.relay_capabilities_json) {
+      return json({ error: "invalid-ticket" }, 401);
+    }
+    if (ticket.recovery_strategy === "v3" && !this.recoveryV3Enabled) {
+      if (ticket.peer === "browser" && channel === "control") {
+        this.connections.discardReservation(ticket);
+      }
+      return json({ error: "client-reservation-unavailable" }, 409);
+    }
 
+    const readyHostFence = this.currentReadyHostAttachment()?.hostFence ?? undefined;
+    const ticketClient =
+      ticket.peer === "browser" && ticket.client_id !== null
+        ? this.clientById(ticket.client_id)
+        : undefined;
     const eligibleControl = eligibleControlForDataTicket(
       this.ctx,
       ticket,
       this.session()?.host_fence,
+      readyHostFence,
+      ticketClient?.recovery_strategy,
+      relayCapabilities,
     );
     if (channel === "data" && eligibleControl === undefined) {
       return json({ error: "control-channel-required" }, 409);
     }
     if (ticket.peer === "browser" && channel === "control") {
-      const claimedTicket = this.connections.claimBrowserControl(ticket);
+      const claimedTicket = this.connections.claimBrowserControl(
+        ticket,
+        readyHostFence,
+        this.recoveryV3Enabled,
+      );
       if (claimedTicket === undefined) {
         this.connections.discardReservation(ticket);
         return json({ error: "client-reservation-unavailable" }, 409);
@@ -1934,6 +2013,15 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         attachment.controlState === "active"
       );
     });
+  }
+
+  private currentReadyHostAttachment(): SocketAttachment | undefined {
+    const control = this.currentHostControl();
+    if (control === undefined) return undefined;
+    const attachment = readAttachment(control);
+    if (attachment === undefined) return undefined;
+    const connection = connectionSockets(this.ctx, attachment);
+    return connection.control === control && connection.phase === "ready" ? attachment : undefined;
   }
 
   private currentHostData(except?: WebSocket): WebSocket | undefined {

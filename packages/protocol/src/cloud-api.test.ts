@@ -8,6 +8,7 @@ import {
   ConnectionSetResponseSchema,
   HostCapabilityReclaimRequestSchema,
   CreateSessionRequestSchema,
+  RecoveryStrategySchema,
   RelayCapability,
   confirmedRelayCapabilities,
   selectRelayCapabilities,
@@ -66,8 +67,48 @@ describe("Cloud HTTP contracts", () => {
         expiresAt: 1_800_000_000_000,
         controlTicket: "control_ticket_AAAAAA",
         dataTicket: "data_ticket_AAAAAAAAA",
+        recoveryStrategy: "v3",
       }),
-    ).not.toHaveProperty("selectedCapabilities");
+    ).toMatchObject({ recoveryStrategy: "v3" });
+    expect(
+      ConnectionSetResponseSchema.parse({
+        connectionSetId: "connection_set_AAAAA",
+        connectionId: "connection_id_AAAAAA",
+        clientId: null,
+        streamId: 0,
+        deliveryGeneration: "0",
+        expiresAt: 1_800_000_000_000,
+        controlTicket: "control_ticket_AAAAAA",
+        dataTicket: "data_ticket_AAAAAAAAA",
+      }),
+    ).not.toHaveProperty("recoveryStrategy");
+    expect(() =>
+      ConnectionSetResponseSchema.parse({
+        connectionSetId: "connection_set_AAAAA",
+        connectionId: "connection_id_AAAAAA",
+        clientId: null,
+        streamId: 0,
+        deliveryGeneration: "0",
+        expiresAt: 1_800_000_000_000,
+        controlTicket: "control_ticket_AAAAAA",
+        dataTicket: "data_ticket_AAAAAAAAA",
+        recoveryStrategy: "future",
+      }),
+    ).toThrow();
+    expect(() =>
+      ConnectionSetResponseSchema.parse({
+        connectionSetId: "connection_set_AAAAA",
+        connectionId: "connection_id_AAAAAA",
+        clientId: null,
+        streamId: 0,
+        deliveryGeneration: "0",
+        expiresAt: 1_800_000_000_000,
+        controlTicket: "control_ticket_AAAAAA",
+        dataTicket: "data_ticket_AAAAAAAAA",
+        recoveryStrategy: "v2",
+      }),
+    ).toThrow();
+    expect(RecoveryStrategySchema.options).toEqual(["v2", "v3"]);
   });
 
   it("decodes raw negotiated lists but confirms only an offered bootstrap handshake", () => {

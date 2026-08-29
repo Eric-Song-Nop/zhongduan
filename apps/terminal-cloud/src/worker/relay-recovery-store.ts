@@ -215,6 +215,55 @@ export class RelayRecoveryStore {
       .toArray()[0] as RecoveryAttemptRow | undefined;
   }
 
+  /**
+   * Read-only routing lookup. The caller must still bind the returned row to
+   * the current Host and Browser socket identities before using it.
+   */
+  attemptByDeliveryIdentity(
+    streamId: number,
+    deliveryGeneration: string,
+  ): RecoveryAttemptRow | undefined {
+    this.#validateStreamId(streamId);
+    const generation = PositiveDecimalU64Schema.parse(deliveryGeneration);
+    const matches = this.sql
+      .exec(
+        `SELECT * FROM recovery_attempt
+         WHERE stream_id = ? AND delivery_generation = ?
+         LIMIT 2`,
+        streamId,
+        generation,
+      )
+      .toArray() as unknown as RecoveryAttemptRow[];
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  /**
+   * Read-only reconnect lookup. Exact durable identity locates an attempt but
+   * does not authorize a transition or an outbox acknowledgement.
+   */
+  attemptByConnectionIdentity(
+    clientId: string,
+    connectionId: string,
+    streamId: number,
+    deliveryGeneration: string,
+  ): RecoveryAttemptRow | undefined {
+    this.#validateStreamId(streamId);
+    const generation = PositiveDecimalU64Schema.parse(deliveryGeneration);
+    const matches = this.sql
+      .exec(
+        `SELECT * FROM recovery_attempt
+         WHERE client_id = ? AND connection_id = ?
+           AND stream_id = ? AND delivery_generation = ?
+         LIMIT 2`,
+        clientId,
+        connectionId,
+        streamId,
+        generation,
+      )
+      .toArray() as unknown as RecoveryAttemptRow[];
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
   lanes(recoveryId: string): RecoveryDeliveryLaneRow[] {
     return this.sql
       .exec(
@@ -236,6 +285,20 @@ export class RelayRecoveryStore {
         limit,
       )
       .toArray() as unknown as RecoveryControlOutboxRow[];
+  }
+
+  /** Exact read-only candidate lookup for a trusted runtime outbox drainer. */
+  outboxEntry(recoveryId: string, kind: RecoveryOutboxKind): RecoveryControlOutboxRow | undefined {
+    const matches = this.sql
+      .exec(
+        `SELECT * FROM recovery_control_outbox
+         WHERE recovery_id = ? AND kind = ?
+         LIMIT 2`,
+        recoveryId,
+        kind,
+      )
+      .toArray() as unknown as RecoveryControlOutboxRow[];
+    return matches.length === 1 ? matches[0] : undefined;
   }
 
   nextDeadline(): number | undefined {
@@ -413,7 +476,7 @@ export class RelayRecoveryStore {
       return rejected("head-mismatch");
     }
 
-    const prepareOutbox = this.#outboxEntry(fence.recoveryId, "recovery-prepare");
+    const prepareOutbox = this.outboxEntry(fence.recoveryId, "recovery-prepare");
     const entriesAfterInstall = prepareOutbox === undefined ? 2 : 1;
     if (!this.#hasOutboxCapacity(entriesAfterInstall)) return rejected("outbox-capacity");
 
@@ -498,8 +561,10 @@ export class RelayRecoveryStore {
     );
     if (ownership !== undefined) return rejected(ownership);
     if (attempt.stream_id !== envelope.streamId) return rejected("identity-mismatch");
-    if (!this.#canProgress(attempt)) return rejected("state-conflict");
-    if (this.#deadlineExpired(attempt, now)) return rejected("deadline-expired");
+    if (!this.#canLaneProgress(attempt, envelope.lane)) return rejected("state-conflict");
+    if (attempt.state !== "complete" && this.#deadlineExpired(attempt, now)) {
+      return rejected("deadline-expired");
+    }
     if (envelope.lane === "recovery" && attempt.recovery_done_ordinal !== null) {
       return rejected("recovery-done");
     }
@@ -511,6 +576,15 @@ export class RelayRecoveryStore {
     }
     const lane = this.#lane(recoveryId, envelope.lane);
     if (lane === undefined) return rejected("state-conflict");
+    // P2.4 deliberately permits one outstanding envelope per lane. Only the
+    // latest sent/received scalar pair is durable, so a second outstanding
+    // send would make an intermediate receipt impossible to authenticate.
+    if (
+      lane.sent_delivery_ordinal !== lane.received_delivery_ordinal ||
+      lane.sent_cumulative_encoded_bytes !== lane.received_cumulative_encoded_bytes
+    ) {
+      return rejected("invalid-progress");
+    }
     let nextLane: DeliveryLaneCursor;
     let nextAuthority: AuthorityCursor;
     try {
@@ -581,12 +655,6 @@ export class RelayRecoveryStore {
     if (ownership !== undefined) return rejected(ownership);
     const lane = this.#lane(progress.recoveryId, receipt.lane);
     if (lane === undefined) return rejected("state-conflict");
-    if (
-      BigInt(receipt.contiguousDeliveryOrdinal) > BigInt(lane.sent_delivery_ordinal) ||
-      BigInt(receipt.cumulativeEncodedBytes) > BigInt(lane.sent_cumulative_encoded_bytes)
-    ) {
-      return rejected("progress-ahead");
-    }
     const comparison = this.#compareScalarProgress(
       receipt.contiguousDeliveryOrdinal,
       receipt.cumulativeEncodedBytes,
@@ -594,10 +662,18 @@ export class RelayRecoveryStore {
       lane.received_cumulative_encoded_bytes,
     );
     if (comparison === "same") return ok(false);
-    if (!this.#canProgress(attempt)) return rejected("state-conflict");
-    if (this.#deadlineExpired(attempt, now)) return rejected("deadline-expired");
+    if (comparison === "invalid") return rejected("invalid-progress");
     if (
-      comparison === "invalid" ||
+      BigInt(receipt.contiguousDeliveryOrdinal) > BigInt(lane.sent_delivery_ordinal) ||
+      BigInt(receipt.cumulativeEncodedBytes) > BigInt(lane.sent_cumulative_encoded_bytes)
+    ) {
+      return rejected("progress-ahead");
+    }
+    if (!this.#canLaneProgress(attempt, receipt.lane)) return rejected("state-conflict");
+    if (attempt.state !== "complete" && this.#deadlineExpired(attempt, now)) {
+      return rejected("deadline-expired");
+    }
+    if (
       receipt.contiguousDeliveryOrdinal !== lane.sent_delivery_ordinal ||
       receipt.cumulativeEncodedBytes !== lane.sent_cumulative_encoded_bytes
     ) {
@@ -658,8 +734,10 @@ export class RelayRecoveryStore {
     if (ownership !== undefined) return rejected(ownership);
     const previous = parseCursor(attempt.replica_applied_json);
     if (sameCursor(previous, cursor)) return ok(false);
-    if (!this.#canProgress(attempt)) return rejected("state-conflict");
-    if (this.#deadlineExpired(attempt, now)) return rejected("deadline-expired");
+    if (!this.#canReplicaProgress(attempt)) return rejected("state-conflict");
+    if (attempt.state !== "complete" && this.#deadlineExpired(attempt, now)) {
+      return rejected("deadline-expired");
+    }
     const receivedCeiling = this.#receivedAuthorityCeiling(attempt);
     const session = this.relay.session();
     const head =
@@ -834,7 +912,7 @@ export class RelayRecoveryStore {
     now: number,
   ): RecoveryStoreResult {
     this.#validateTime(now);
-    const entry = this.#outboxEntry(recoveryId, kind);
+    const entry = this.outboxEntry(recoveryId, kind);
     if (entry === undefined) return ok(false);
     if (entry.payload_json !== payloadJson) return rejected("immutable-conflict");
     this.sql.exec(
@@ -1006,6 +1084,12 @@ export class RelayRecoveryStore {
     if (!Number.isSafeInteger(value) || value < 0) throw new RangeError("invalid recovery time");
   }
 
+  #validateStreamId(value: number): void {
+    if (!Number.isInteger(value) || value < 1 || value > 0xffff_ffff) {
+      throw new RangeError("invalid recovery stream id");
+    }
+  }
+
   #resetOrThrow(
     recoveryId: string,
     reason: RecoveryV3HostSourceReset["reason"],
@@ -1121,12 +1205,12 @@ export class RelayRecoveryStore {
     previousBytes: string,
   ): "advance" | "invalid" | "same" {
     if (nextOrdinal === previousOrdinal && nextBytes === previousBytes) return "same";
-    if (
-      BigInt(nextOrdinal) <= BigInt(previousOrdinal) ||
-      BigInt(nextBytes) <= BigInt(previousBytes)
-    ) {
-      return "invalid";
-    }
+    const ordinalDelta = BigInt(nextOrdinal) - BigInt(previousOrdinal);
+    const byteDelta = BigInt(nextBytes) - BigInt(previousBytes);
+    // Only the current received scalar is an authenticated idempotent retry.
+    // No receipt history or payload hash is durable, so lower, mixed, and
+    // unknown intermediate pairs must all fail closed.
+    if (ordinalDelta <= 0n || byteDelta <= 0n) return "invalid";
     return "advance";
   }
 
@@ -1178,6 +1262,14 @@ export class RelayRecoveryStore {
 
   #canProgress(attempt: RecoveryAttemptRow): boolean {
     return attempt.state === "installed" || attempt.state === "assembling";
+  }
+
+  #canLaneProgress(attempt: RecoveryAttemptRow, lane: RecoveryLane): boolean {
+    return this.#canProgress(attempt) || (attempt.state === "complete" && lane === "live");
+  }
+
+  #canReplicaProgress(attempt: RecoveryAttemptRow): boolean {
+    return this.#canProgress(attempt) || attempt.state === "complete";
   }
 
   #deadlineExpired(attempt: RecoveryAttemptRow, now: number): boolean {
@@ -1304,17 +1396,6 @@ export class RelayRecoveryStore {
     ).value;
   }
 
-  #outboxEntry(recoveryId: string, kind: RecoveryOutboxKind): RecoveryControlOutboxRow | undefined {
-    return this.sql
-      .exec(
-        `SELECT * FROM recovery_control_outbox
-         WHERE recovery_id = ? AND kind = ?`,
-        recoveryId,
-        kind,
-      )
-      .toArray()[0] as RecoveryControlOutboxRow | undefined;
-  }
-
   #hasOutboxCapacity(additional: number): boolean {
     const count = this.sql.exec("SELECT COUNT(*) AS value FROM recovery_control_outbox").one() as {
       value: number;
@@ -1327,8 +1408,7 @@ export class RelayRecoveryStore {
       value: number;
     };
     return (
-      this.#outboxEntry(recoveryId, kind) !== undefined ||
-      count.value < this.limits.maxOutboxEntries
+      this.outboxEntry(recoveryId, kind) !== undefined || count.value < this.limits.maxOutboxEntries
     );
   }
 

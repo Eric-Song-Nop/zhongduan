@@ -171,6 +171,11 @@ export class HostDeliveryScheduler {
     this.#barriers.handle(result);
   }
 
+  tryEnqueueRecoveryStartFence(encoded: Uint8Array): boolean {
+    if (this.#failed) return false;
+    return this.#canonicalPublisher.tryEnqueueRecoveryStartFence(encoded);
+  }
+
   dispose(reason = "delivery scheduler stopped"): void {
     if (this.#failed) return;
     this.#failed = true;
