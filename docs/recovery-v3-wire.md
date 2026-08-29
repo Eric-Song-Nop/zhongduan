@@ -1,6 +1,7 @@
 # Recovery v3 Wire Contract
 
-> 状态：P2.0 stacked candidate；所有生产 generation 仍选择 protocol v2
+> 状态：P2.0 wire/capability 与 P2.1 pure Browser RecoveryAssembler 为 stacked candidate；所有生产
+> generation 仍选择 protocol v2，Recovery v3 runtime 仍不可达
 >
 > 适用范围：Host authority data、Cloud delivery、Browser recovery 与滚动协商
 
@@ -151,21 +152,77 @@ identity cache。Cloud 只有 matching `RecoveryAdopted` 与 `RecoverySourceClos
 
 ## 当前启用状态与验证边界
 
-P2.0 只交付 strict schema、codec、capability transport、authority version migration 和 generation strategy
-的 v2 default。它不发送 v3 frame，不移除 v2 pause/barrier/pin，也不声称 Recovery v3 已启用。
-Start-ready 与累计 recovery grant 的 Host/Cloud control shape 由 P2.2 source-owner PR 冻结；P2.0 只固定其
-ownership/credit requirement，尚未声称完整 v3 runtime wire 已全部实现。
+### 当前保留的 stacked candidates
 
-直接测试必须覆盖：
+P2.0 保留 strict schema、codec、capability transport、authority version migration 和 generation strategy 的 v2
+default。它不发送 v3 frame，也不移除 v2 pause/barrier/pin。
+
+P2.1 只保留 `packages/session-client` 内 generation-scoped pure assembler。它接受 caller 提供的 start、完整
+envelope、cold candidate、source-closed certificate、monotonic tick 和 handoff confirmation，并输出稳定的
+receipt/apply/adopt/completion progress；它自己不做网络、HTTP 或真实 production WTerm wiring，只向 caller
+提供的 pure target 应用已验证 mutation。保留行为包括：
+
+- start 前有界拥有 payload copy，但 start 完整验证前不公开 receipt；matching immutable start 幂等，divergent
+  start fail closed；
+- per-lane ordinal/cumulative bytes 连续，同 ordinal retry 逐字节一致；recovery `(R,H]`、live
+  `[H+1,...)`，错误 range、canonical identity、offset、epoch、engine、generation、stream 或跨 lane duplicate
+  fail closed；
+- 只按小 quantum apply 连续 authority 前缀。cold target 未安装时 receipt 与 apply 分离；warm target 必须精确
+  位于 `R`，cold install 必须匹配 recovery attempt、base 与 engine；candidate 是否确由 start 中的 snapshot
+  manifest restore 而来，属于后续 HTTP/WTerm wiring owner 的义务，P2.1 尚不证明；
+- `RecoveryDone(H)` 是 recovery lane 的最后 record。它可早于 restore/apply 完成到达，但不能早于缺失的
+  lower recovery ordinal；Done 已验证且 applied 至少到 `H` 后才 handoff-eligible；
+- caller 完成真实 atomic handoff 后才 confirm，随后产生稳定 `RecoveryAdopted(K)`，其中 `K >= H`；
+- handoff confirmation 只把 cold core 的 dispose/visibility ownership 交给长期 replica host；在 attempt completion
+  之前，assembler 仍是该 core 唯一的 mutation ordering writer，并继续排空已经 receipt 的 live prefix；
+- source closed 与 adopted 可任意顺序到达；closure certificate 被本地 recovery receipt 覆盖后才释放 late-retry
+  identity cache，两者齐备且已经 receipt 的 live mutation 全部 apply 后，才输出 final authority 与 lane cursors；
+- cold candidate 的 install 返回 accepted 才转移 ownership；之后 failure/reset/close 由 assembler
+  dispose-once，handoff confirm 后把 dispose/visibility ownership 转给长期 replica host，completion 后才把 mutation
+  delivery ownership 转给长期 live receiver。只有已经尝试 write/resize 后发生的 warm failure 才把 borrowed target
+  标为 tainted；零 effect 的 start/admission conflict 保留可复用 base。所有 gap/no-progress deadline只由显式
+  monotonic tick 推进。
+
+### 当前不可达与后置 owner
+
+P2.1 没有接入 `TerminalSession` 或 v2 `SessionCoordinator`，也没有 endpoint advertise v3 capability；因此
+production attach、warm resync 和 cold recovery 都不能到达 pure assembler。它不包含：
+
+- HTTP snapshot download、WTerm restore/adopt 或真实 terminal handoff；
+- Host PreparedGap/start-fence source owner、Cloud generation/lane scheduling、receipt credit、apply progress、
+  closure transport 与 cleanup wiring；
+- WebSocket send/retry timer、generation replan，或 completion 后长期消费 live mutation 的 owner。
+
+滚动实现顺序保持 capability-first：先保留 P2.0 的显式 downgrade；再接 Host source owner 与 Cloud
+generation/credit/closure owner；最后接 Browser `TerminalSession`、真实 target handoff 和长期 live。完整三方
+negotiated state machine、owner fault tests、真实 snapshot continuation oracle 与 rolling downgrade/rollback gate
+全部通过后，才允许对**新的** delivery generation 一次性选择 v3，并同时切换掉该 v3 path 的 global pause、
+fixed-commit barrier 和 pin。不能提前单独关闭其中任何一项；v2 generation 与 v2 fallback 保持原 invariant。
+
+### 保留的直接证据
+
+P2.0 owner tests 覆盖：
 
 - negotiation-aware 与 legacy response shape；
 - 三方 capability selector 与 disabled kill switch；
 - v5 row migration 后 authority data version 为 `2`、strategy 为 `v2`；
-- Browser capability 在 connection ticket、hibernation attachment和 data-only replacement 后保持；
+- Browser capability 在 connection ticket、hibernation attachment 和 data-only replacement 后保持；
 - authority cursor、boundary、start、receipt/apply/closure strict schema；
-- envelope roundtrip、ordinal/bytes边界、非法 inner mutation 与 unknown version/kind；
-- v2 decoder 不接受 v3 envelope，v3 decoder 不把 v2 frame误判成 envelope。
+- envelope roundtrip、ordinal/bytes 边界、非法 inner mutation 与 unknown version/kind；
+- v2 decoder 不接受 v3 envelope，v3 decoder 不把 v2 frame 误判成 envelope。
 
-这些测试证明本地 wire/schema contract 和协商降级逻辑，不等价于运行旧 binary 或 production-like
-Cloud-first/rollback staging。它们也不证明 assembler、PreparedGap ownership、Cloud v3 state、fairness、
-真实 restore/adopt 或性能。后续各 owner PR 必须提供独立 model、deterministic integration 和 fault oracle。
+P2.1 owner tests 使用 pure target，覆盖 start-before/after-data、immutable start、lane ordinal/bytes、buffer copy
+ownership、相同/冲突 retry、range/identity/offset 错误、cold target install、warm/cold failure ownership、
+quantum apply、Done 相对 target readiness/apply 的时序、adoption/source-closed 两种顺序、budget/deadline 和
+release-once。短 lane merge 由保持各 lane 顺序的 exhaustive cases 覆盖，并在每一步对照不调用 production
+cursor/assembler helper 的独立 reference reducer；当前不引入随机 generator 或 `fast-check`，也不把 case
+数量当作 correctness 证据。
+
+这些证据只证明 pure wire/assembler contract 和显式 downgrade，不等价于 production-like 网络、真实
+WTerm/Ghostty state 或跨进程 owner。后续需要 owner-level deterministic fault integration、真实
+snapshot/parser-continuation/exact-tail oracle 和 Cloud-first/rollback staging。性能、load/soak、SLO 与 dashboard
+仍后置；当前 correctness gate 不编写或推断性能验证。
+
+P2.1 不修改 WTerm/Ghostty。若 Browser wiring 暴露真实 API 缺口，必须先在 `Eric-Song-Nop` 对应 fork 建立
+正式 PR 并完成 review/验证，再由 Zhongduan 的独立 stacked PR 更新固定 submodule；不得直接改 vendor、指向
+upstream 或 pin 未审 commit。
