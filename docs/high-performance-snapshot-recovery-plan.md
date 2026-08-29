@@ -1,9 +1,10 @@
 # 高性能远程终端 Snapshot 与 Recovery v3 实施计划
 
-> 状态：Phase 0/1 为 CURRENT stacked candidates；Phase 2 的 P2.0–P2.5a（wire/capability、
-> Browser/Host/Cloud owner、capability-gated runtime wiring，以及 no-payload delivery ledger/cold safety）
+> 状态：Phase 0/1 为 CURRENT stacked candidates；Phase 2 的 P2.0–P2.5b（wire/capability、
+> Browser/Host/Cloud owner、capability-gated runtime wiring、no-payload delivery ledger/cold safety，以及
+> Host recovery source 的 multi-outstanding/DRR scheduling）
 > 为 stacked candidates。默认生产 kill switch 与 Host/Browser capability offer 仍选择 v2，尚未 rollout；
-> P2.5 后续 scheduling slices、P2.6 与 Phase 3–5 为 TARGET
+> P2.5c、P2.6 与 Phase 3–5 为 TARGET
 >
 > 决策日期：2026-08-28
 >
@@ -275,8 +276,11 @@ authority actor 内建立 source 并排序 `H / fence(H) / H+1`；matching start
 bounded source drain；matching receipt 驱动后续 record 与 release-once closure；reset、pair fence、send
 outcome uncertain 和显式 deadline 都收口到 generation owner。Cloud 可能在 prepare 尚未到达
 Host 前就持久化 reset，所以 exact unknown-source reset 会安装有界 tombstone，阻止同代迟到
-prepare 复活，而不会关闭健康 Host pair。P2.5a 仍保留单 record stop-and-wait runtime；扩大 transport
-window 属于后续 slice，session aggregate 与多 source DRR 属于 P2.5c。
+prepare 复活，而不会关闭健康 Host pair。P2.5a 的 Cloud recovery path 已能接受连续
+obligation 并确认 exact sent prefix；当时 Host source emitter 每个 control turn 只 drain 一条，
+尚未主动填满已提交 grant。P2.5b 再将 Host retained source 打开为有界 multi-outstanding，
+并由 connection-local DRR 调度多 source；Cloud session aggregate/shared ring 与多 client/lane DRR 仍属于
+P2.5c。
 
 ### Cloud durable scalar owner、hibernation runtime 与 shared alarm
 
@@ -322,8 +326,8 @@ exact copy/hash 的 Host source 与 Browser assembler 完成。
 
 P2.5a 的 ledger 可以验证由多个 obligation 组成的连续链：新 record 以最后一个 obligation 为基线，不能只看
 `lane.sent`；Browser 的累计 receipt 必须精确命中 `sent` record，且被覆盖的 prefix 全部为 `sent`，再从该
-record 取得 authority cursor 并原子推进 received cursor。这个 Store contract 是扩大 window 的前置条件，
-不是当前 runtime 已经开放多 record window。
+record 取得 authority cursor 并原子推进 received cursor。这个 Store contract 是 P2.5b 打开 Host
+recovery window 的前置条件；它本身不包含 Host 侧公平调度，也不打开 live lane window。
 
 P2.4 runtime 在这些 durable facts 之上增加：
 
@@ -343,7 +347,7 @@ P2.4 runtime 在这些 durable facts 之上增加：
   client 存在 outstanding envelope 时收到下一条 canonical mutation、same-ordinal replay 或 data send
   outcome uncertain，只 reset/isolate 该 client generation；authority、v2 客户端和其他 v3 客户端继续。
 
-P2.5a 保留上述 stop-and-wait scheduling，但把一次 data send 的 durable 顺序固定为：在 caller-owned
+P2.5a 里程碑保留当时的 sender scheduling，但把一次 data send 的 durable 顺序固定为：在 caller-owned
 `transactionSync` 内依次 enqueue `queued` obligation 并 CAS 到 `sending`，事务提交后向重新核对过的 exact
 Browser data socket 调用同步 `send`，最后在新的 `transactionSync` 内把同一 record CAS 为 `sent` 并推进
 `lane.sent`。`send` 发生在 SQL transaction 外；confirm 必须实际改变 exact record，否则结果按 uncertain
@@ -363,6 +367,28 @@ v3 attachment/attempt；默认 Wrangler 配置为 `false`，Host `CloudApiClient
 的默认 capability offer 也仍是 v2 baseline。因此 P2.5a 证明的是 capability-gated runtime 加上
 no-payload ledger/cold safety，不表示生产已启用或已 rollout Recovery v3。
 
+### P2.5b Host recovery window 与 source scheduler
+
+P2.5b 不改 Cloud/Browser/protocol，只放宽 Host recovery-lane emitter：
+
+- `RecoverySourceManager` 只在 socket `send` 成功返回后推进 sent high-water；已 sent 但未 receipt
+  的 record 不再重发。同一累计 grant 可连续发出多条 retained record，send throw 前不推进，
+  direct retry 仍必须 byte-identical；
+- intermediate exact receipt 按连续 prefix 释放 Host 持有的 record/bytes，但保留有界 cumulative
+  identity 用于幂等 current duplicate 与倒退拒绝；只有覆盖 Done 的 final receipt 产生
+  `RecoverySourceClosed`；
+- 独立 `RecoverySourceScheduler` 只持有 exact identity、runnable queue 和 bounded deficit，不持有
+  payload 或 source truth。它以有界 byte quantum 做 deterministic DRR，每个异步 data turn 最多发
+  一条 record 后 yield，使 control/input/canonical live 先于下一个 recovery turn；
+- shared data socket 达到 high-water 只使 recovery source blocked 并经 bounded yield 重试，不关闭
+  Host pair、不推进 source cursor。真实 send throw 仍是 pair-level outcome-uncertain failure；
+- no-progress/absolute deadline 只 retire exact source/tombstone 并清理 scheduler entry，不关闭健康
+  Host pair。该 identity 的迟到 control 幂等忽略，其他 generation/identity 冲突仍 fail closed。
+
+Host 的 per-source/session `256 KiB / 512 canonical frames`、`2 MiB / 1024 retained records`、
+source-count 与 deadline 上限没有放宽。Cloud recovery lane 依靠 P2.5a ledger 可按顺序接收这个
+window；live lane 仍是 stop-and-wait。
+
 ### Holdback 放在 Browser，而不是 Cloud durable payload
 
 TARGET 优先让 Browser assembler 有界保存已收到的 live/recovery payload。Cloud 只持久化或挂载必要的
@@ -380,9 +406,10 @@ transport 可以无限发送。
 P2.5a 对单个 recovery ledger 使用与 Browser assembler 对齐的 `2 MiB / 1024 records` 上限，并暴露
 `granted cumulative bytes - recovery received cumulative bytes` 的 reservation 查询。它不宣称 Cloud 已经实现
 session aggregate reservation、multi-client allocator 或公平性；当前 Host source manager 仍以既有
-`2 MiB / 1024 records` session retained-envelope cap 约束实际 payload owner。P2.5c 才把 immutable canonical
+`2 MiB / 1024 records` session retained-envelope cap 约束实际 payload owner；P2.5b 只在该上限内增加
+Host source DRR。P2.5c 才把 immutable canonical
 bytes 放入 session-scoped ephemeral shared ring，统一计算 recovery grant reservation 与 live outstanding，
-并加入 writer/live reservation 和 DRR。shared-ring payload/refcount 仍只存在于内存，不能写入 v9 ledger；
+并加入 writer/live reservation 和 Cloud 多 client/lane DRR。shared-ring payload/refcount 仍只存在于内存，不能写入 v9 ledger；
 hibernation 后若只剩 `queued`/`sending` scalar witness，仍沿用 P2.5a 的 fail-closed fence。
 
 ### Transport receipt 与 ReplicaApplied 分离
@@ -720,7 +747,12 @@ Phase 1 stacked candidate 的最终行为是：
   obligation 为基线的 chain、`queued -> sending -> sent` CAS、exact sent-prefix receipt、bounded usage/
   grant reservation，以及 v8 uncertain outstanding 的 fail-closed migration。runtime evidence 检查
   enqueue/begin/send/confirm ordering、wake 时 transient state reset、`sent` 零重发、缺失 exact socket pair 的
-  owner fence，以及 complete generation 只做本地 terminal fence；调度仍按 stop-and-wait 断言。
+  owner fence，以及 complete generation 只做本地 terminal fence。这些是 Cloud ledger/cold-owner evidence，
+  不是 Host emitter 公平性 evidence；
+- P2.5b direct Host evidence 检查同 grant 下多个 sent-but-unreceived record、不重发、exact
+  intermediate prefix release、send-throw 不推进、多 source deterministic DRR、每 record yield、
+  shared-socket backpressure 只 blocked/retry、单 source deadline retire 以及健康 pair/canonical/input/V2
+  regression。这些测试不声称 Cloud 多 client 公平性、真实网络或性能/SLO。
 
 这些测试的证据来自明确状态、identity、frame ordering、资源 owner 和本地 Worker storage/R2 oracle。测试总数、
 绿色 CI、timeout 数值或 clean build 本身不证明这些状态。
@@ -737,10 +769,10 @@ Phase 1 stacked candidate 的最终行为是：
 - P2.5a 已在 P2.4 Host/Cloud/Browser runtime 上增加 no-payload ledger 与 cold-owner fence，但默认
   production Cloud kill switch 为 false，Host 与
   Browser 的默认 offer 也不 advertise v3 family，因此未 rollout；
-- Cloud scalar store 不保存 mutation payload/hash，P2.5a runtime 仍以 stop-and-wait 和 per-client
-  reset/isolation 在不可证 same-ordinal retry 或 cold transient send state 时 fail closed。ledger 已建立 window
-  prerequisite，但尚未让 runtime 同时发送多个 outstanding record；P2.5c 的 session aggregate、shared ring、
-  writer/live reservation 与 multi-client DRR 也尚未交付；
+- Cloud scalar store 不保存 mutation payload/hash，不可证 same-ordinal retry 或 cold transient send state
+  时仍按 per-client generation fail closed。P2.5b 已在现有 cap/grant 内打开 Host recovery source
+  multi-outstanding，但 live lane 仍是 stop-and-wait；P2.5c 的 Cloud session aggregate、shared ring、
+  writer/live reservation 与多 client/lane DRR 仍未交付；
 - P2.4 的 snapshot transport/replica-host seam 与本地 runtime tests 不证明真实 WTerm/Ghostty 的
   parser continuation、atomic adopt 或 terminal state equivalence。P2.6 的真实 continuity oracle、完整三方
   deterministic fault integration 与 rolling downgrade/rollback gate 仍待完成；
@@ -753,8 +785,8 @@ Phase 1 stacked candidate 的最终行为是：
   recovery scalar direct migration fixtures 已保留；
 - 真实 Cloudflare alarm retry/eviction、DO hibernation、R2 HEAD/PUT/delete、response loss、Host crash/restart 和
   generic uncertain reconciliation 的 fault injection；
-- P2.5 后续 slice 才扩大 bounded lane window；P2.5c 建立 session aggregate、ephemeral shared ring、
-  writer/live reservation 与 multi-client DRR；
+- P2.5c 建立 Cloud session aggregate、ephemeral shared ring、writer/live reservation、live window
+  与多 client/lane DRR；
 - P2.6 在完整三方 wiring 上扩展独立 reference model/property/fuzz 与 deterministic
   crash/loss integration，并用真实 WTerm/Ghostty parser continuation 与 exact tail-continuity oracle 验证
   snapshot restore/adopt 后续，最后验证 rolling capability downgrade/rollback；
@@ -775,9 +807,12 @@ Phase 1 stacked candidate 的最终行为是：
 - P2.5a 已增加 v9 no-payload delivery ledger、exact sent-prefix receipt、bounded usage/reservation query，
   并把 runtime send 固定为 enqueue/begin、transaction 外 socket send、confirm。wake 时 transient
   `queued`/`sending` 与失去 exact Browser pair 的 owner 会 fail closed；complete owner 只做本地 terminal
-  fence，不发送 Host reset。当前 runtime scheduling 仍是 per-lane stop-and-wait；
-- P2.5 后续 slice 才扩大 bounded lane window；P2.5c 才增加 session aggregate、ephemeral shared ring、
-  writer/live reservation 与多 client DRR。性能、load/soak、dashboard 与 SLO 继续后置，不作为 correctness
+  fence，不发送 Host reset；
+- P2.5b 已使 Host retained recovery source 在累计 grant 内保持多个 outstanding record，
+  并增加 connection-local source DRR、shared data backpressure yield 与 per-source deadline isolation。
+  control/input/canonical live 优先，live lane 仍是 stop-and-wait；
+- P2.5c 才增加 Cloud session aggregate、ephemeral shared ring、writer/live reservation、live window
+  与多 client/lane DRR。性能、load/soak、dashboard 与 SLO 继续后置，不作为 correctness
   的替代证据；
 - P2.6 才用 deterministic three-owner fault integration 和真实 WTerm/Ghostty snapshot/parser
   continuation/exact-tail oracle 完成 continuity 与 rolling gate。默认 kill switch/offer 在此前保持
@@ -790,7 +825,7 @@ snapshot 路径通过独立 reference model/property、owner-level deterministic
 snapshot/continuation equivalence。浏览器端到端只保留 capability downgrade 和 wiring smoke，并明确不作为
 lane interleaving、ownership、terminal state 或性能证明。
 
-P2.0–P2.5a 没有修改 WTerm/Ghostty。若 P2.5 后续 slice/P2.6 暴露真实 API 缺口，必须先在
+P2.0–P2.5b 没有修改 WTerm/Ghostty。若 P2.5c/P2.6 暴露真实 API 缺口，必须先在
 `Eric-Song-Nop` 的对应 fork 创建正式 PR、完成 review/验证，再由 Zhongduan 的独立 stacked PR
 更新固定 submodule 指针；不得直接修改
 vendor、指向 upstream 或 pin 未审 commit。
