@@ -10,7 +10,7 @@ import {
   type RelayToHostControlFrame,
 } from "@zhongduan/protocol";
 
-import type { ReplayCursor, SnapshotCapture, TerminalSession } from "../session";
+import type { ReplayCursor, TerminalSession } from "../session";
 import { CanonicalPublisher, HOST_CANONICAL_QUEUE_LIMITS } from "./canonical-publisher";
 import {
   DeliveryBarrierWaiter,
@@ -18,20 +18,25 @@ import {
   type DeliveryBarrierResult,
 } from "./delivery-barrier-waiter";
 import { DeliveryRecoveryQueue, recoveryKey, type AttachRequest } from "./delivery-recovery-queue";
-import { SnapshotCheckpointManager, type SnapshotCheckpoint } from "./snapshot-checkpoint-manager";
+import {
+  SnapshotEncodeBudgetError,
+  SnapshotCheckpointManager,
+  type SnapshotCheckpoint,
+} from "./snapshot-checkpoint-manager";
 import {
   RetryableSnapshotPublishError,
   SnapshotCleanupConfirmedError,
   SnapshotPendingSupersededError,
   SnapshotUnavailableError,
-  type PublishedSnapshot,
 } from "./snapshot-publisher";
 
 export { HOST_CANONICAL_QUEUE_LIMITS } from "./canonical-publisher";
+export {
+  SNAPSHOT_ENCODE_BUDGET_MS,
+  SNAPSHOT_PUBLISH_TIMEOUT_MS,
+} from "./snapshot-checkpoint-manager";
 export const WARM_REPLAY_MAX_OUTSTANDING_BYTES = 256 * 1024;
 export const WARM_REPLAY_MAX_FRAMES = 512;
-export const SNAPSHOT_ENCODE_BUDGET_MS = 5_000;
-export const SNAPSHOT_PUBLISH_TIMEOUT_MS = 120_000;
 export const DELIVERY_BARRIER_TIMEOUT_MS = 5_000;
 export const SNAPSHOT_RECOVERY_QUIET_MS = 250;
 export const SNAPSHOT_RECOVERY_MAX_RETRY_MS = 5_000;
@@ -54,12 +59,7 @@ interface ColdPreparation {
   checkpoint?: SnapshotCheckpoint;
   controller: AbortController;
   request: AttachRequest;
-  status: "publishing" | "ready";
-}
-
-interface PreparedCheckpoint {
-  capture?: SnapshotCapture;
-  published: PublishedSnapshot;
+  status: "refreshing" | "ready";
 }
 
 export interface HostDeliverySchedulerOptions {
@@ -91,7 +91,6 @@ export class HostDeliveryScheduler {
   readonly #recoveryQueue: DeliveryRecoveryQueue;
 
   #activeRecovery: ActiveRecovery | undefined;
-  #coldBuildInFlight: ColdPreparation | undefined;
   #coldCaptureNotBefore: number | undefined;
   #coldCaptureQuietDeadline: number | undefined;
   #failed = false;
@@ -178,7 +177,6 @@ export class HostDeliveryScheduler {
     this.#canonicalPublisher.dispose();
     this.#connectionAbort.abort(new Error(reason));
     this.#activeRecovery?.controller.abort(new Error(reason));
-    this.#coldBuildInFlight?.controller.abort(new Error(reason));
     for (const preparation of this.#coldPreparations.values()) {
       preparation.controller.abort(new Error(reason));
     }
@@ -278,7 +276,7 @@ export class HostDeliveryScheduler {
     const preparation = this.#coldPreparations.get(key);
     if (preparation?.status === "ready") return true;
     if (this.#snapshotCheckpointManager.latestValid() !== undefined) return true;
-    if (preparation?.status === "publishing" || this.#coldBuildInFlight !== undefined) return false;
+    if (preparation?.status === "refreshing") return false;
     return this.#coldCaptureReadyAt(request) <= this.#monotonicNow();
   }
 
@@ -299,7 +297,7 @@ export class HostDeliveryScheduler {
       const preparation = this.#coldPreparations.get(key);
       if (preparation?.status === "ready") earliest = 0;
       if (this.#snapshotCheckpointManager.latestValid() !== undefined) earliest = 0;
-      if (preparation?.status === "publishing" || this.#coldBuildInFlight !== undefined) return;
+      if (preparation?.status === "refreshing") return;
       earliest = Math.min(earliest, this.#coldCaptureReadyAt(request));
     });
     if (!Number.isFinite(earliest)) return;
@@ -373,10 +371,7 @@ export class HostDeliveryScheduler {
         this.#coldPreparations.set(key, preparation);
       }
       if (preparation === undefined) {
-        if (
-          this.#coldBuildInFlight === undefined &&
-          this.#coldCaptureReadyAt(request) <= this.#monotonicNow()
-        ) {
+        if (this.#coldCaptureReadyAt(request) <= this.#monotonicNow()) {
           this.#startColdPreparation(request);
         } else {
           this.#recoveryQueue.requeue(request);
@@ -398,7 +393,7 @@ export class HostDeliveryScheduler {
       }
       if (retryScope === "refresh-checkpoint") {
         if (preparation.checkpoint !== undefined) {
-          this.#invalidateCheckpoint(preparation.checkpoint);
+          this.#invalidateCheckpoint(preparation.checkpoint, preparation.checkpoint.base);
         }
         this.#discardColdPreparation(request);
       }
@@ -429,49 +424,49 @@ export class HostDeliveryScheduler {
 
   #startColdPreparation(request: AttachRequest): void {
     const key = recoveryKey(request);
-    if (this.#coldBuildInFlight !== undefined || this.#coldPreparations.has(key)) {
+    if (this.#coldPreparations.has(key)) {
       this.#recoveryQueue.requeue(request);
       return;
     }
     const preparation: ColdPreparation = {
       controller: new AbortController(),
       request,
-      status: "publishing",
+      status: "refreshing",
     };
-    this.#coldBuildInFlight = preparation;
     this.#coldPreparations.set(key, preparation);
-    void this.#prepareCold(preparation).then(
-      (prepared) => {
-        if (this.#coldBuildInFlight === preparation) this.#coldBuildInFlight = undefined;
-        if (
-          this.#failed ||
-          preparation.controller.signal.aborted ||
-          this.#coldPreparations.get(key) !== preparation
-        ) {
+    void this.#snapshotCheckpointManager
+      .refresh({
+        admitPending: this.#admitPendingSnapshot,
+        signal: preparation.controller.signal,
+      })
+      .then(
+        (checkpoint) => {
+          if (
+            this.#failed ||
+            preparation.controller.signal.aborted ||
+            this.#coldPreparations.get(key) !== preparation
+          ) {
+            this.#schedulePendingRecoveries();
+            return;
+          }
+          if (this.#snapshotCheckpointManager.latestValid()?.checkpoint !== checkpoint) {
+            this.#coldPreparations.delete(key);
+            this.#recoveryQueue.requeue(request);
+            this.#schedulePendingRecoveries();
+            return;
+          }
+          preparation.checkpoint = checkpoint;
+          preparation.status = "ready";
+          this.#coldCaptureNotBefore = undefined;
+          this.#coldCaptureQuietDeadline = undefined;
+          this.#recoveryQueue.requeue(request);
           this.#schedulePendingRecoveries();
-          return;
-        }
-        try {
-          preparation.checkpoint = this.#snapshotCheckpointManager.install(
-            prepared.published,
-            prepared.capture,
-          );
-        } catch (error) {
-          this.#handleColdPreparationFailure(preparation, key, error);
-          return;
-        }
-        preparation.status = "ready";
-        this.#coldCaptureNotBefore = undefined;
-        this.#coldCaptureQuietDeadline = undefined;
-        this.#recoveryQueue.requeue(request);
-        this.#schedulePendingRecoveries();
-      },
-      (error: unknown) => this.#handleColdPreparationFailure(preparation, key, error),
-    );
+        },
+        (error: unknown) => this.#handleColdPreparationFailure(preparation, key, error),
+      );
   }
 
   #handleColdPreparationFailure(preparation: ColdPreparation, key: string, error: unknown): void {
-    if (this.#coldBuildInFlight === preparation) this.#coldBuildInFlight = undefined;
     const isCurrent = this.#coldPreparations.get(key) === preparation;
     if (isCurrent) this.#coldPreparations.delete(key);
     if (this.#failed || preparation.controller.signal.aborted || !isCurrent) {
@@ -489,90 +484,6 @@ export class HostDeliveryScheduler {
       return;
     }
     this.#failPair(error instanceof Error ? error.message : "snapshot preparation failed");
-  }
-
-  async #prepareCold(preparation: ColdPreparation): Promise<PreparedCheckpoint> {
-    const resumed = this.#resumePendingSnapshot(preparation);
-    if (resumed !== undefined) {
-      const published = await resumed;
-      preparation.controller.signal.throwIfAborted();
-      return { published };
-    }
-    const snapshot = await this.#captureSnapshot(preparation);
-    preparation.controller.signal.throwIfAborted();
-    if (snapshot.encodeMs > SNAPSHOT_ENCODE_BUDGET_MS) {
-      throw new SnapshotEncodeBudgetError();
-    }
-    const published = await this.#publishSnapshot(snapshot, preparation);
-    preparation.controller.signal.throwIfAborted();
-    return { capture: snapshot, published };
-  }
-
-  #resumePendingSnapshot(preparation: ColdPreparation): Promise<PublishedSnapshot> | undefined {
-    const deadline = new AbortController();
-    const timeout = setTimeout(
-      () => deadline.abort(new DOMException("snapshot publish timed out", "TimeoutError")),
-      SNAPSHOT_PUBLISH_TIMEOUT_MS,
-    );
-    const signal = AbortSignal.any([
-      preparation.controller.signal,
-      deadline.signal,
-      this.#connectionAbort.signal,
-    ]);
-    let operation: Promise<PublishedSnapshot> | undefined;
-    try {
-      operation = this.#snapshotCheckpointManager.resumePending(signal, this.#admitPendingSnapshot);
-    } catch (error) {
-      clearTimeout(timeout);
-      throw error;
-    }
-    if (operation === undefined) {
-      clearTimeout(timeout);
-      return undefined;
-    }
-    return raceAbort(operation, signal).finally(() => clearTimeout(timeout));
-  }
-
-  async #captureSnapshot(preparation: ColdPreparation): Promise<SnapshotCapture> {
-    const deadline = new AbortController();
-    const timeout = setTimeout(
-      () => deadline.abort(new SnapshotEncodeBudgetError()),
-      SNAPSHOT_ENCODE_BUDGET_MS,
-    );
-    const signal = AbortSignal.any([
-      preparation.controller.signal,
-      deadline.signal,
-      this.#connectionAbort.signal,
-    ]);
-    try {
-      return await raceAbort(this.#session.captureSnapshot(), signal);
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-
-  async #publishSnapshot(
-    snapshot: SnapshotCapture,
-    preparation: ColdPreparation,
-  ): Promise<PublishedSnapshot> {
-    const deadline = new AbortController();
-    const timeout = setTimeout(
-      () => deadline.abort(new DOMException("snapshot publish timed out", "TimeoutError")),
-      SNAPSHOT_PUBLISH_TIMEOUT_MS,
-    );
-    const signal = AbortSignal.any([
-      preparation.controller.signal,
-      deadline.signal,
-      this.#connectionAbort.signal,
-    ]);
-    try {
-      return await raceAbort(
-        this.#snapshotCheckpointManager.publish(snapshot, signal, this.#admitPendingSnapshot),
-        signal,
-      );
-    } finally {
-      clearTimeout(timeout);
-    }
   }
 
   async #deliverWarm(
@@ -646,7 +557,7 @@ export class HostDeliveryScheduler {
     const commit = this.#session.cursor;
     const replayPlan = this.#planColdTail(base, commit);
     if (replayPlan === undefined) {
-      this.#invalidateCheckpoint(checkpoint);
+      this.#invalidateCheckpoint(checkpoint, commit);
       throw new ColdTailUnavailableError();
     }
     const replay = replayPlan.materialize();
@@ -656,7 +567,7 @@ export class HostDeliveryScheduler {
       replay.frames.reduce((total, frame) => total + frame.byteLength, 0) !==
         replayPlan.exactEncodedBytes
     ) {
-      this.#invalidateCheckpoint(checkpoint);
+      this.#invalidateCheckpoint(checkpoint, commit);
       throw new ColdTailUnavailableError();
     }
     await this.#flushCanonicalThrough(commit);
@@ -803,8 +714,14 @@ export class HostDeliveryScheduler {
     );
   }
 
-  #invalidateCheckpoint(checkpoint: SnapshotCheckpoint): void {
-    this.#snapshotCheckpointManager.invalidate(checkpoint);
+  #invalidateCheckpoint(checkpoint: SnapshotCheckpoint, replacementMinimumCut: ReplayCursor): void {
+    this.#snapshotCheckpointManager.invalidate(checkpoint, replacementMinimumCut);
+    for (const [key, preparation] of this.#coldPreparations) {
+      if (preparation.checkpoint !== checkpoint) continue;
+      preparation.controller.abort(new Error("snapshot checkpoint was invalidated"));
+      this.#coldPreparations.delete(key);
+      this.#recoveryQueue.requeue(preparation.request);
+    }
     this.#deferColdCaptures(SNAPSHOT_RECOVERY_QUIET_MS);
   }
 
@@ -863,35 +780,10 @@ function sameCursor(left: ReplayCursor, right: ReplayCursor): boolean {
   );
 }
 
-function raceAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) return Promise.reject(signal.reason);
-  return new Promise((resolve, reject) => {
-    const onAbort = () => reject(signal.reason);
-    signal.addEventListener("abort", onAbort, { once: true });
-    void operation.then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (error: unknown) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error);
-      },
-    );
-  });
-}
-
 class ColdTailUnavailableError extends Error {
   constructor() {
     super("snapshot tail is outside the bounded recovery window");
     this.name = "ColdTailUnavailableError";
-  }
-}
-
-class SnapshotEncodeBudgetError extends Error {
-  constructor() {
-    super("snapshot encoding exceeded its authority budget");
-    this.name = "SnapshotEncodeBudgetError";
   }
 }
 

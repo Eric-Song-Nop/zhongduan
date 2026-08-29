@@ -533,7 +533,11 @@ Phase 1 只能从通过上述契约和完整 CI 的 exact Phase 0 revision 开�
   否则按 cleanup-safe ownership abandon/supersede；失败不能 starvation、storm 或泄漏 immutable body。
 - **P1.4：manager-owned refresh single-flight**。把 `refreshInFlight`、合并后的更新压力和 waiter ownership 移入
   manager；单个 waiter supersede 不取消仍有价值的公共 build，connection replacement 可以接续同一 session
-  refresh。此步必须显式更新当前 generation-supersede 的 capture/publish 契约。
+  refresh。每个 waiter 的 signal 只拥有该 waiter；公共 capture、publish 和 install 只由 manager dispose 或
+  manager-owned deadline 终止。`minimumCut` 是 inclusive floor：旧 waiter 可以接收已满足自身 floor 的 `R`，
+  较新的 waiter 不得被同一结果降级，并至多合并出一个 follow-up flight。Generation replacement 本身不抬高
+  floor；只有 exact checkpoint invalidation 或 P1.3 pending supersede 提供新的 replacement floor。此步必须
+  显式更新当前 generation-supersede 的 capture/publish 契约。
 
 P1.1 的直接 gate 是：manager 在 30 秒边界后仍返回同一 latest 且 `ageFresh=false`；两个无 mutation 的 cold
 attach 相隔超过 30 秒仍使用同一 `snapshotId`，authority encode 和 publish 总计各一次。现有 16 attach
@@ -560,9 +564,22 @@ caller timeout、backoff 和后续相同响应都不能续期。generic `snapsho
 本层不改变 Cloud generic `uncertain` 的 alarm/GC 语义；Host 进程退出后该类 reservation 的 durable cleanup
 仍是后续 gate，不能由运行期的单个 local cleanup slot 推导。
 
-Gate：16 个 attach 只 build 一次；90–120 秒 upload/retry 中失去 serviceability 的 checkpoint 不会被 Host
-安装或交付（已经发出的 PUT 仍可能在 Cloud 完成）；idle checkpoint 不因 TTL 被错误删除；运行中的 Host
-不会出现 pending body starvation/storm 或无界 retained-body 增长。
+P1.4 的直接 gate 是：16 个尚未完成的 cold attach 都注册为真实 waiter，但 authority capture、encode、publish
+和 install 各至多一次；取消其中 15 个 waiter 不取消公共 flight。旧 relay connection 在 unresolved publish
+期间关闭时只取消旧 waiter，replacement connection 接续同一 flight，旧 connection 不收到 barrier/commit，
+replacement 才能完成 delivery。若 flight 在 `R` 完成时已有最低 `H>R` 的 live waiter，`R` 只满足允许它的旧
+waiter，manager 合并压力并启动恰好一个满足 `H` 的 follow-up；所有 waiter 已离开时，已有 flight 可以安装
+有用 checkpoint，但不得无 owner 地启动 follow-up。Exact shared checkpoint invalidation 必须清除所有 scheduler
+preparation 中的旧引用；迟到结果不得把它重新分配给 recovery。Waiter abort 不取消公共 flight；manager
+dispose 或 manager-owned deadline 会终止公共 flight，并使迟到 completion 无法安装。
+
+Phase 1 stacked-candidate gate 是：P1.1–P1.4 的直接证据和完整 CI 在同一 exact revision 上同时通过。其可声明
+16 个 attach 共享一个 session-owned refresh、90–120 秒 upload/retry 中失去 Host-local serviceability 的
+checkpoint 不会被 Host 安装或交付（已经发出的 PUT 仍可能在 Cloud 完成）、idle checkpoint 不因 TTL 被错误
+删除，且运行中的 Host 不会出现 pending body starvation/storm 或无界 retained-body 增长。它仍不证明 Cloud
+blob 对任意 Browser 完整 usable，不提供 Host 崩溃后 generic `uncertain` 的 durable cleanup，不把同步 full
+snapshot capture 伪装成可抢占的 actor hard deadline，也不关闭 Recovery v3、性能/SLO 或生产 rollout gate。
+在 parent PR 合入 `main` 前，只能称 stacked candidate 完成，不能称主线 Phase 1 已完成。
 
 ### Phase 2：Recovery v3，继续使用 full snapshot
 

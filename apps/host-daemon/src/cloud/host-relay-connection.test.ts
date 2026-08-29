@@ -3,6 +3,7 @@ import {
   HostControlFrameSchema,
   decodeControlFrame,
   decodeDataFrame,
+  decodeDeliveryBarrierPayload,
   type ConnectionSetResponse,
   type ResizePayload,
 } from "@zhongduan/protocol";
@@ -11,10 +12,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeTerminalAuthority } from "../fake-terminal-authority";
 import { EventJournal } from "../journal";
 import type { PtyProcess } from "../pty-process";
-import { TerminalSession } from "../session";
+import { TerminalSession, type SnapshotCapture } from "../session";
 import type { SemanticMouse } from "../terminal-authority";
 import { HostRelayConnection, HOST_CONTROL_QUEUE_LIMITS } from "./host-relay-connection";
 import type { HostSocketPair } from "./paired-websocket";
+import type { PublishedSnapshot } from "./snapshot-publisher";
 import {
   SnapshotCheckpointManager,
   type SnapshotPublisherLike,
@@ -92,6 +94,40 @@ const connectionSet: ConnectionSetResponse = {
   dataTicket: "data_ticket_AAAA",
 };
 
+function createRelayHarness(options: {
+  connection?: ConnectionSetResponse;
+  heartbeatIntervalMs?: number;
+  heartbeatTimeoutMs?: number;
+  readyTimeoutMs?: number;
+  session: TerminalSession;
+  snapshotCheckpointManager: SnapshotCheckpointManager;
+}) {
+  const control = new FakeWebSocket();
+  const data = new FakeWebSocket();
+  const pair: HostSocketPair = {
+    connection: options.connection ?? connectionSet,
+    control: control as unknown as WebSocket,
+    data: data as unknown as WebSocket,
+    close() {
+      data.close();
+      control.close();
+    },
+  };
+  const relay = new HostRelayConnection({
+    pair,
+    ...(options.heartbeatIntervalMs === undefined
+      ? {}
+      : { heartbeatIntervalMs: options.heartbeatIntervalMs }),
+    ...(options.heartbeatTimeoutMs === undefined
+      ? {}
+      : { heartbeatTimeoutMs: options.heartbeatTimeoutMs }),
+    ...(options.readyTimeoutMs === undefined ? {} : { readyTimeoutMs: options.readyTimeoutMs }),
+    session: options.session,
+    snapshotCheckpointManager: options.snapshotCheckpointManager,
+  });
+  return { control, data, pair, relay, session: options.session };
+}
+
 function createHarness(
   options: {
     authority?: FakeTerminalAuthority;
@@ -107,17 +143,6 @@ function createHarness(
     pty,
     sessionEpoch: 1n,
   });
-  const control = new FakeWebSocket();
-  const data = new FakeWebSocket();
-  const pair: HostSocketPair = {
-    connection: connectionSet,
-    control: control as unknown as WebSocket,
-    data: data as unknown as WebSocket,
-    close() {
-      data.close();
-      control.close();
-    },
-  };
   const snapshotPublisher: SnapshotPublisherLike = {
     publish: async (snapshot) => ({
       metadata: {
@@ -139,22 +164,15 @@ function createHarness(
     session,
     sessionId: "session_AAAAAAAAA",
   });
-  const relay = new HostRelayConnection({
-    pair,
-    ...(options.heartbeatIntervalMs === undefined
-      ? {}
-      : { heartbeatIntervalMs: options.heartbeatIntervalMs }),
-    ...(options.heartbeatTimeoutMs === undefined
-      ? {}
-      : { heartbeatTimeoutMs: options.heartbeatTimeoutMs }),
-    ...(options.readyTimeoutMs === undefined ? {} : { readyTimeoutMs: options.readyTimeoutMs }),
+  const relayHarness = createRelayHarness({
+    ...options,
     session,
     snapshotCheckpointManager,
   });
-  return { control, data, pair, pty, relay, session };
+  return { ...relayHarness, pty };
 }
 
-async function acknowledgeReady(harness: ReturnType<typeof createHarness>): Promise<void> {
+async function acknowledgeReady(harness: ReturnType<typeof createRelayHarness>): Promise<void> {
   const started = harness.relay.start();
   const ready = decodeControlFrame(harness.control.sent[0] as string, HostControlFrameSchema);
   if (ready.type !== "host-ready") throw new Error("expected host-ready");
@@ -174,6 +192,22 @@ async function settle(): Promise<void> {
   await Promise.resolve();
   await new Promise<void>((resolve) => setImmediate(resolve));
   await Promise.resolve();
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
+function sentDataFrames(socket: FakeWebSocket) {
+  return socket.sent.flatMap((encoded) =>
+    encoded instanceof Uint8Array ? [decodeDataFrame(encoded)] : [],
+  );
 }
 
 beforeEach(() => vi.stubGlobal("WebSocket", FakeWebSocket));
@@ -209,6 +243,148 @@ describe("HostRelayConnection", () => {
     });
     harness.relay.close();
     harness.session.dispose();
+  });
+
+  it("hands an unresolved session refresh to a replacement connection without duplicating work", async () => {
+    const authority = new FakeTerminalAuthority();
+    const encodeSnapshot = vi.spyOn(authority, "encodeSnapshot");
+    const pty = new ManualPty();
+    const session = new TerminalSession({
+      authority,
+      journal: new EventJournal(),
+      pty,
+      sessionEpoch: 1n,
+    });
+    const publishStarted = deferred<SnapshotCapture>();
+    const upload = deferred<PublishedSnapshot>();
+    let commonPublisherSignal: AbortSignal | undefined;
+    const publish = vi.fn((snapshot: SnapshotCapture, signal?: AbortSignal) => {
+      commonPublisherSignal = signal;
+      publishStarted.resolve(snapshot);
+      return upload.promise;
+    });
+    const snapshotCheckpointManager = new SnapshotCheckpointManager({
+      publisher: { publish },
+      session,
+      sessionId: "session_AAAAAAAAA",
+    });
+    const refresh = vi.spyOn(snapshotCheckpointManager, "refresh");
+    const original = createRelayHarness({ session, snapshotCheckpointManager });
+    await acknowledgeReady(original);
+
+    original.control.message(
+      JSON.stringify({
+        type: "attach-request",
+        connectionId: "connection_browser_A",
+        streamId: 1,
+        deliveryGeneration: "1",
+        engineId: session.engineId,
+        hasLiveReplica: false,
+      }),
+    );
+    const snapshot = await publishStarted.promise;
+    expect(refresh).toHaveBeenCalledOnce();
+    const originalWaiterSignal = refresh.mock.calls[0]?.[0].signal;
+    expect(originalWaiterSignal?.aborted).toBe(false);
+    expect(commonPublisherSignal?.aborted).toBe(false);
+
+    original.relay.close();
+    await original.relay.waitClosed();
+    expect(originalWaiterSignal?.aborted).toBe(true);
+    expect(commonPublisherSignal?.aborted).toBe(false);
+
+    const replacement = createRelayHarness({
+      connection: {
+        ...connectionSet,
+        connectionSetId: "connection_set_BB",
+        connectionId: "connection_BBBBB",
+        controlTicket: "control_ticket_B",
+        dataTicket: "data_ticket_BBBB",
+      },
+      session,
+      snapshotCheckpointManager,
+    });
+    await acknowledgeReady(replacement);
+    replacement.control.message(
+      JSON.stringify({
+        type: "attach-request",
+        connectionId: "connection_browser_B",
+        streamId: 2,
+        deliveryGeneration: "1",
+        engineId: session.engineId,
+        hasLiveReplica: false,
+      }),
+    );
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+    expect(refresh.mock.calls[1]?.[0].signal?.aborted).toBe(false);
+    expect(encodeSnapshot).toHaveBeenCalledOnce();
+    expect(publish).toHaveBeenCalledOnce();
+    expect(commonPublisherSignal?.aborted).toBe(false);
+
+    upload.resolve({
+      metadata: {
+        sessionId: "session_AAAAAAAAA",
+        snapshotId: "snapshot_RECONNECT_A",
+        engineId: snapshot.engineId,
+        sessionEpoch: snapshot.sessionEpoch.toString(),
+        cutEventSeq: snapshot.cutEventSeq.toString(),
+        nextPtyOffset: snapshot.nextPtyOffset.toString(),
+        compression: "zstd",
+        compressedLength: "1",
+        uncompressedLength: snapshot.bytes.byteLength.toString(),
+        sha256: "0".repeat(64),
+      },
+    });
+    await vi.waitFor(() =>
+      expect(
+        sentDataFrames(replacement.data).filter(
+          (frame) => frame.kind === DataFrameKind.DeliveryBarrier,
+        ),
+      ).toHaveLength(1),
+    );
+
+    const replacementFrames = sentDataFrames(replacement.data);
+    const barrier = replacementFrames.find((frame) => frame.kind === DataFrameKind.DeliveryBarrier);
+    if (barrier === undefined) throw new Error("expected replacement delivery barrier");
+    const barrierPayload = decodeDeliveryBarrierPayload(barrier.payload);
+    if (barrierPayload.mode !== "snapshot") throw new Error("expected snapshot barrier");
+    replacement.control.message(
+      JSON.stringify({
+        type: "delivery-barrier-result",
+        status: "ready",
+        mode: "snapshot",
+        connectionId: barrierPayload.connectionId,
+        snapshotId: barrierPayload.snapshotId,
+        streamId: barrier.streamId,
+        deliveryGeneration: barrier.deliveryGeneration.toString(),
+        commitEventSeq: barrier.eventSeq.toString(),
+        commitPtyOffset: barrier.ptyOffset.toString(),
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(
+        sentDataFrames(replacement.data).filter(
+          (frame) => frame.kind === DataFrameKind.ReplayCommit,
+        ),
+      ).toHaveLength(1),
+    );
+
+    expect(
+      sentDataFrames(original.data).filter(
+        (frame) =>
+          frame.kind === DataFrameKind.DeliveryBarrier || frame.kind === DataFrameKind.ReplayCommit,
+      ),
+    ).toEqual([]);
+    expect(sentDataFrames(replacement.data).map((frame) => frame.kind)).toEqual([
+      DataFrameKind.DeliveryBarrier,
+      DataFrameKind.ReplayCommit,
+    ]);
+    expect(encodeSnapshot).toHaveBeenCalledOnce();
+    expect(publish).toHaveBeenCalledOnce();
+
+    replacement.relay.close();
+    snapshotCheckpointManager.dispose();
+    session.dispose();
   });
 
   it("returns exact duplicate ACKs and fences an ACK if the pair closes during PTY write", async () => {
