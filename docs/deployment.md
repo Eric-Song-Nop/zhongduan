@@ -220,12 +220,10 @@ approximate 时都不能算 rollout gate 通过。只有人工确认 manifest �
 node scripts/cloud-telemetry-observability.mjs provision --apply
 ```
 
-这一层只完成 Cloud-local query contract。后续 `observability/browser-presentation-facts` 只在 Browser 本地补上
-input lifecycle 与 canonical presentation opportunity 事实，也不代表 Phase 0 gate 关闭。Browser/Host
-生产 export 与跨 runtime aggregation、synthetic E2E/SLO、同一 exact build 下插桩 `off`/`memory-v2` 的
-input latency/canonical throughput 不超过 5% 回归 ABBA canary，以及可靠信号存在时的真实 pixel paint
-仍开放；诊断不得写入 terminal wire、journal、snapshot、replay、SQLite schema 或 WebSocket
-attachment。
+这一层只完成 Cloud-local query contract。`observability/browser-presentation-facts` 只在 Browser 本地补上
+input lifecycle 与 canonical presentation opportunity 事实。本地 pre-live input/recovery-liveness smoke 另见
+第 7 节；它不是 Phase 0 完成判据。诊断不得写入 terminal wire、journal、snapshot、replay、SQLite schema 或
+WebSocket attachment。
 
 ## 5. 构建和启动 Host
 
@@ -343,13 +341,58 @@ pnpm --filter "@zhongduan/terminal-cloud" run dev -- --host "127.0.0.1" --port "
 另一个终端构建 Host，并将相同 bootstrap token 放入权限为 `0600` 的文件，然后使用
 `http://127.0.0.1:5173` 作为 `--url` 启动 Host。
 
-浏览器连接与输入 smoke test 需要 Python Playwright 和 Chromium。脚本会自行创建并删除
-`apps/terminal-cloud/.dev.vars`，因此运行前必须停止本地 dev server，并临时移走已有的
-`.dev.vars`：
+本地 synthetic pre-live input/recovery-liveness smoke 使用真实 Vite/workerd、Host relay 和 Chromium，
+但 Host child 是仓库内固定字节协议的 synthetic PTY。先在仓库外创建临时 venv，安装 source-controlled 的
+Playwright 直接依赖版本与其 managed Chromium；不要直接安装未锁版本：
 
 ```bash
-pnpm exec vp run verify-browser-e2e
+BROWSER_E2E_VENV="$(mktemp -d)/venv"
+python3 -m venv "$BROWSER_E2E_VENV"
+"$BROWSER_E2E_VENV/bin/python3" -m pip install -r scripts/requirements-browser-e2e.txt
+"$BROWSER_E2E_VENV/bin/python3" -m playwright install chromium
+PATH="$BROWSER_E2E_VENV/bin:$PATH" pnpm exec vp run verify-browser-recovery-smoke
 ```
+
+脚本会自行创建并删除 `apps/terminal-cloud/.dev.vars`，因此运行前必须停止本地 dev server，并临时移走已有的
+`.dev.vars`。不需要 Playwright 的 helper/contract 测试可单独运行，并且已进入普通根 `verify`：
+
+```bash
+pnpm exec vp run verify-browser-recovery-smoke-contract
+```
+
+该本地 smoke 只通过 `vite dev --mode browser-e2e` 选择一个拒绝非 loopback 请求的 alternate Worker/DO entry，
+并把本次 DO/R2 状态放入运行级临时目录。该 entry 只在自己的 coordinator 实例上接受当前 pinned Miniflare
+生成的 171 字符 opaque multipart part ETag；流式长度、SHA-256、最终对象大小、metadata 与 multipart
+object ETag 约束仍保持。默认 `wrangler.jsonc` 的 `main` 继续指向 production `index.ts`，production R2
+part ETag 仍必须精确匹配 MD5。禁止将 `browser-e2e` mode 用于远端、staging 或 production；Miniflare
+恢复 production MD5 语义后应删除这层兼容 entry，而不是放宽 production matcher。
+
+该 smoke 只验证以下固定本地链路：Browser 发起 cold snapshot GET 后，测试暂时 hold 该请求以固定 pre-live
+窗口；Playwright 通过真实 Chromium 的键盘事件路径在 `attaching` 或 `restoring` phase 发出 `Control+KeyC`，synthetic
+PTY 精确观察到一次 `0x03` effect。放行 snapshot GET 后 Browser
+最终进入 `live`；ready/interrupt sentinel 唯一可见后，固定 probe 只执行一次、synthetic result 只进入 terminal
+DOM 一次。最终 PTY capture 必须精确为 interrupt+probe，三个 sentinel 唯一且有序，Browser/Host/workerd 不得
+提前退出。Bounded retry/resync/fallback 本身不使 smoke 失败，只要最终恢复为 `live` 且上述 effect 不重复。
+成功输出只有固定 `browser-recovery-smoke-v1/passed`；失败
+诊断只保留固定 stage/phase/status label 与 count，不输出 URL、session/capability/ticket、input identity、payload、
+异常文本、process output、trace、video 或 screenshot。该结果只表示 pending-recovery 输入可达且系统最终恢复
+活性，不提供 latency、throughput、rendering 或 SLO 证据。
+
+边界必须按 smoke 解读：它只在单机 loopback 和带 local-only multipart ETag 兼容层的 Miniflare 上执行一个固定
+场景的一次运行；snapshot GET hold 是测试控制点，不是产品时序。不提供 Browser↔Cloud 与 Cloud↔Host 两条
+链路可独立控制的 RTT、jitter、loss，也不证明
+p95、p99、99.9% 成功率、`<=5%` 插桩开销、throughput 或资源上限。固定 synthetic child/result 不是通用 shell/TUI
+的 application effect，DOM result 也不是 pixel paint/composite。它不能替代 model/property/fuzz、故障注入、
+多客户端、公平性/load/soak 或 production staging 验收，也不覆盖 IME、Unicode、CapsLock、mouse、paste 等输入
+矩阵。local-only ETag 兼容层只让 Miniflare 能运行该 smoke，不验证生产 Cloudflare Durable Objects/R2；各 timeout
+只是防挂死预算，不是产品 latency 或 recovery SLO。观察到 snapshot GET 不证明该 snapshot 被 restore/adopt；
+因为 fallback 被允许，这个 smoke 只证明 recovery pending 时输入仍可达 synthetic child，且系统最终恢复活性。
+
+后续若要扩大验收，需要分别设计而不是叠加到这个 smoke：状态模型/property/fuzz 覆盖 generation、retry、reset、
+adopt；故障注入覆盖两条网络、断连和恢复分支；多客户端/writer transfer/output flood/load/soak 覆盖公平性与资源；
+真实 staging 覆盖生产 DO/R2；另需 snapshot adoption/tail continuity 与 ACK identity/status/dedup 的专门测试。
+性能验证需要另行设计受控且可复现的测试；当前暂不实现，也不把
+单次 smoke 的 timeout 或运行时间当作性能证据。
 
 ## 8. 运维边界
 

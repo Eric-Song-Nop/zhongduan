@@ -1931,6 +1931,7 @@ describe("live Durable Object relay", () => {
     expect(committedPin).toMatchObject({ dataState: "synced", snapshotId });
 
     await evictDurableObject(sessionStub(session.sessionId));
+    await installMiniflareMultipartEtagShim(session.sessionId);
     for (const nextSnapshotId of [
       "snapshot_retention_new_01",
       "snapshot_retention_new_02",

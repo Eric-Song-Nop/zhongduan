@@ -772,6 +772,33 @@ visibility listener、WTerm hook、presentation timer 或 RAF；WebSocket heartb
 monotonic clock/deadline timer 仍保留。两种模式都不改 wire、journal/snapshot/replay、SQLite/attachment，也没有新增
 Browser export。
 
+local synthetic pre-live input/recovery-liveness smoke 把上述输入边界接到一个固定场景，
+而不修改 input 协议或 authority。Browser 发起 cold snapshot GET 后，测试暂时 hold 该请求以固定 pre-live 窗口；
+Playwright 通过真实 Chromium 的键盘事件路径在 `attaching` 或 `restoring` phase 发送 `Control+KeyC`，要求 synthetic PTY
+精确观察到一次 `0x03` effect。放行 snapshot 后最终进入 `live`；ready/interrupt sentinel
+唯一可见后，固定 probe/result 恰好一次。Bounded retry/resync 被允许，只要最终 `live`
+且 PTY effect 不重复。
+
+该任务通过隔离 venv 中的 `scripts/requirements-browser-e2e.txt` 固定 Playwright 直接依赖版本，并使用其 managed Chromium
+运行 `pnpm exec vp run verify-browser-recovery-smoke`；无 Playwright 的 helper/contract 测试则由
+`pnpm exec vp run verify-browser-recovery-smoke-contract` 和普通根 `verify` 固定。输出只允许固定 protocol/stage/
+phase/status label 和 count；不得输出 URL、session/token、input identity、payload、异常文本或浏览器 artifact。
+该结果只表示 pending-recovery 输入可达与 eventual liveness 路径通过，不提供 latency、throughput、rendering 或 SLO 证据。
+
+该 smoke 只在单机 loopback 和带 local-only multipart ETag 兼容层的 Miniflare 上执行单个固定场景、单次运行；
+不能独立控制 Browser↔Cloud 与 Cloud↔Host 两条链路的 RTT/jitter/loss，也不证明 p95/p99、99.9% 成功率、
+`<=5%` 插桩开销、throughput 或资源上限。固定 synthetic child/result 不是通用 shell/TUI 的 application effect，
+DOM result 不是 pixel paint/composite。它不能替代 model/property/fuzz、故障注入、多客户端、公平性/load/soak
+或 production staging 验收，也不覆盖 IME、Unicode、CapsLock、mouse、paste 等输入矩阵。local-only ETag 兼容层
+不验证生产 Cloudflare DO/R2；timeout 只是防挂死预算，不是产品 latency 或 recovery SLO。
+观察到 snapshot GET 不证明该 snapshot 被 restore/adopt；fallback 被允许，因此最终 `live` 也不能单独证明
+snapshot adoption 或 tail continuity。
+
+后续测试需要分开设计：状态模型/property/fuzz 验证输入与 generation 状态机；故障注入验证断连、retry/reset；
+多客户端/writer transfer/output flood/load/soak 验证公平性和资源；真实 staging 验证生产 DO/R2 与两条网络 profile；
+另需 snapshot adoption/tail continuity 和 ACK identity/status/dedup 的专门测试。性能验证需要另行设计受控且
+可复现的测试，当前暂不实现。
+
 - Browser 完整 validate/admit 后才分配 seq；
 - Host 使用 strict `nextExpectedSeq`；确定性 reject 消费 seq，`uncertain` 终止 epoch；
 - 建立单一 per-writer sequencer，明确 urgent cancellation 与 resize ordering；
@@ -883,9 +910,11 @@ Browser 本机切片保留旧 `browser.input.ack` schema 供历史数据读取�
 apply→WTerm render commit→next-frame opportunity，并固定 `sampleWeight=64`、
 pending cap 64 和 2 秒 deadline，只进本地有界 ring。Render commit/next-frame opportunity 不能冒充
 pixel paint/composite；真实 paint 只能在 Browser 提供可靠信号时后续补充。Cloud Phase 0c 与 Cloud query
-contract 仍只补事实和 Cloud-local inspection。Phase 0 gate 没有关闭：Browser/Host 生产 export 与跨
-runtime aggregation、synthetic E2E/SLO、同一 exact build 下 `off`/`memory-v2` 的 input latency/canonical
-throughput `<=5%` ABBA 回归 gate，以及上述可靠真实 paint 信号仍开放。
+contract 仍只补事实和 Cloud-local inspection。本地 pre-live input/recovery-liveness smoke 只覆盖一个受控
+loopback+Miniflare 场景；它不提供 latency、throughput、rendering、SLO、snapshot adoption 或 production DO/R2
+结论。未来可能需要 model/property/fuzz、故障注入、多客户端/load/soak、staging、独立网络 profile、
+snapshot adoption/tail continuity 与 ACK identity/status/dedup 测试。性能验证需要另行设计，本层不实现；这些
+独立验证也不是当前 smoke 的完成条件。
 
 ### 初始发布门槛
 

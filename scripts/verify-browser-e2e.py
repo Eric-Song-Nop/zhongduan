@@ -13,15 +13,26 @@ import sys
 import tempfile
 import threading
 import time
-from urllib.parse import urlsplit
 from urllib.request import urlopen
+
+from browser_e2e_contract import (
+    INPUT_CAPTURE_ENV,
+    INTERRUPT_INPUT,
+    INTERRUPT_SENTINEL,
+    PROBE_INPUT,
+    READY_SENTINEL,
+    RESULT_SENTINEL,
+    validate_synthetic_capture,
+)
 
 try:
     from playwright.async_api import async_playwright
-except ImportError as error:
+except ImportError:
     raise SystemExit(
-        "Playwright for Python is required: python -m pip install playwright"
-    ) from error
+        "Playwright for Python is required: "
+        "python3 -m pip install -r scripts/requirements-browser-e2e.txt; "
+        "python3 -m playwright install chromium"
+    ) from None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,21 +50,28 @@ GENERATED_PATHS = (
 BOOTSTRAP_TOKEN = "e2e-bootstrap-token-with-at-least-32-bytes"
 CAPABILITY_KEY = "e2e-capability-key-with-at-least-32-bytes"
 TIMEOUT_SECONDS = int(os.environ.get("ZHONGDUAN_E2E_TIMEOUT_SECONDS", "30"))
+# This is a local smoke timeout, not a service recovery SLO.
+COLD_RECOVERY_TIMEOUT_SECONDS = int(
+    os.environ.get("ZHONGDUAN_E2E_COLD_RECOVERY_TIMEOUT_SECONDS", "30")
+)
 
 
 class ManagedProcess:
     def __init__(self, name: str, command: list[str], cwd: Path, env=None) -> None:
         self.name = name
         self.output = deque(maxlen=80)
-        self.process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            text=True,
-        )
+        try:
+            self.process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                text=True,
+            )
+        except Exception:
+            raise RuntimeError(f"{self.name} did not start") from None
         self.reader = threading.Thread(target=self._read_output, daemon=True)
         self.reader.start()
 
@@ -65,8 +83,9 @@ class ManagedProcess:
     def assert_running(self) -> None:
         status = self.process.poll()
         if status is not None:
-            output = "\n".join(self.output)
-            raise RuntimeError(f"{self.name} exited {status}\n{output}")
+            raise RuntimeError(
+                f"{self.name} exited {status}; captured process output was withheld"
+            )
 
     def stop(self) -> None:
         if self.process.poll() is not None:
@@ -102,7 +121,7 @@ def wait_for_http(url: str, process: ManagedProcess) -> None:
         except OSError:
             pass
         time.sleep(0.1)
-    raise TimeoutError(f"server did not become ready at {url}")
+    raise TimeoutError("local app server did not become ready")
 
 
 def wait_for_json(path: Path, process: ManagedProcess) -> dict:
@@ -113,159 +132,329 @@ def wait_for_json(path: Path, process: ManagedProcess) -> dict:
             return json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
             time.sleep(0.1)
-    raise TimeoutError(f"Host did not write {path}")
+    raise TimeoutError("Host did not write session bootstrap metadata")
 
 
-async def wait_for_marker(path: Path) -> None:
+async def wait_for_interrupt(path: Path) -> None:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if path.exists() and path.stat().st_size >= 1:
-            return
+        if path.exists():
+            capture = path.read_bytes()
+            if capture == INTERRUPT_INPUT:
+                return
+            if len(capture) >= len(INTERRUPT_INPUT):
+                raise RuntimeError(
+                    "synthetic PTY capture diverged before the fixed probe"
+                )
         await asyncio.sleep(0.1)
     raise TimeoutError("Ctrl-C did not reach the Host PTY during cold restore")
 
 
-async def wait_for_socket_events(events, expected: set[str]) -> None:
+async def wait_for_capture(path: Path) -> bytes:
+    expected_length = len(INTERRUPT_INPUT) + len(PROBE_INPUT)
     deadline = time.monotonic() + TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        if expected.issubset(events):
-            return
-        await asyncio.sleep(0.1)
-    missing = sorted(expected.difference(events))
-    raise TimeoutError(f"browser WebSocket events did not arrive: {missing}")
+        if path.exists():
+            capture = path.read_bytes()
+            if len(capture) >= expected_length:
+                validate_synthetic_capture(capture)
+                return capture
+        await asyncio.sleep(0.05)
+    raise TimeoutError(
+        "synthetic PTY did not receive the complete fixed input sequence"
+    )
+
+
+def capture_state_label(path: Path) -> str:
+    try:
+        capture = path.read_bytes()
+    except OSError:
+        return "missing"
+    if capture == INTERRUPT_INPUT:
+        return "interrupt-only"
+    if capture == INTERRUPT_INPUT + PROBE_INPUT:
+        return "complete"
+    if capture.startswith(INTERRUPT_INPUT) and PROBE_INPUT.startswith(
+        capture[len(INTERRUPT_INPUT) :]
+    ):
+        return "partial-probe"
+    return "unexpected"
+
+
+def capture_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+async def wait_for_grid_text(
+    page, sentinel: str, label: str, timeout_seconds: int = TIMEOUT_SECONDS
+) -> None:
+    try:
+        await page.wait_for_function(
+            """({ sentinel }) => {
+                const grid = document.querySelector('.term-grid');
+                return grid !== null && (grid.textContent ?? '').includes(sentinel);
+            }""",
+            arg={"sentinel": sentinel},
+            timeout=timeout_seconds * 1000,
+        )
+    except Exception:
+        raise TimeoutError(
+            f"terminal grid did not expose the {label} sentinel"
+        ) from None
+
+
+async def grid_text_occurrences(page, sentinel: str) -> int:
+    value = await page.locator(".term-grid").evaluate(
+        "(grid, text) => (grid.textContent ?? '').split(text).length - 1", sentinel
+    )
+    return int(value)
+
+
+async def grid_sentinels_are_ordered(page) -> bool:
+    value = await page.locator(".term-grid").evaluate(
+        """(grid, sentinels) => {
+            const text = grid.textContent ?? '';
+            const indexes = sentinels.map((sentinel) => text.indexOf(sentinel));
+            return indexes.every((index) => index >= 0)
+                && indexes[0] < indexes[1]
+                && indexes[1] < indexes[2];
+        }""",
+        [READY_SENTINEL, INTERRUPT_SENTINEL, RESULT_SENTINEL],
+    )
+    return bool(value)
 
 
 def chromium_executable() -> str | None:
-    configured = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
-    if configured:
-        return configured
-    for command in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
-        executable = shutil.which(command)
-        if executable:
-            return executable
-    return None
+    return os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE") or None
 
 
-async def verify_browser(base_url: str, session: dict, marker: Path) -> None:
-    page_errors: list[str] = []
-    console_errors: list[str] = []
-    socket_events = deque(maxlen=80)
-    api_events = deque(maxlen=40)
+async def install_interrupt_phase_capture(page) -> None:
+    await page.add_init_script(
+        """(() => {
+            const state = { captured: false, phase: null };
+            const onKeydown = (event) => {
+                if (
+                    !event.isTrusted ||
+                    event.code !== 'KeyC' ||
+                    event.key !== 'c' ||
+                    !event.ctrlKey ||
+                    event.altKey ||
+                    event.metaKey ||
+                    event.shiftKey
+                ) {
+                    return;
+                }
+                state.captured = true;
+                state.phase = document.querySelector('main')?.dataset.phase ?? null;
+                document.removeEventListener('keydown', onKeydown, true);
+            };
+            document.addEventListener('keydown', onKeydown, true);
+            Object.defineProperty(window, '__zhongduanBrowserRecoverySmokeInterruptV1', {
+                configurable: true,
+                value: state,
+            });
+        })();"""
+    )
+
+
+async def safe_page_label(page, selector: str, attribute: str | None = None) -> str:
+    try:
+        locator = page.locator(selector)
+        value = (
+            await locator.get_attribute(attribute)
+            if attribute is not None
+            else await locator.inner_text()
+        )
+        return value if isinstance(value, str) else "unavailable"
+    except Exception:
+        return "unavailable"
+
+
+async def run_browser_recovery_smoke(
+    base_url: str, session: dict, capture_path: Path
+) -> dict[str, str]:
     async with async_playwright() as playwright:
         executable = chromium_executable()
         launch_options = {"headless": True}
         if executable is not None:
             launch_options["executable_path"] = executable
         browser = await playwright.chromium.launch(**launch_options)
-        page = await browser.new_page(viewport={"width": 1280, "height": 800})
-        page.on("pageerror", lambda error: page_errors.append(str(error)))
-        page.on(
-            "console",
-            lambda message: console_errors.append(message.text)
-            if message.type == "error"
-            else None,
-        )
+        # Trace, video, and screenshots are intentionally disabled for this local smoke.
+        context = await browser.new_context(viewport={"width": 1280, "height": 800})
+        page = await context.new_page()
+        await install_interrupt_phase_capture(page)
 
-        def frame_label(payload) -> str:
-            if isinstance(payload, bytes):
-                return f"binary:{len(payload)}"
-            try:
-                decoded = json.loads(payload)
-                return str(decoded.get("type", "json"))
-            except (AttributeError, json.JSONDecodeError):
-                return payload[:32]
+        snapshot_get_held = asyncio.Event()
+        release_snapshot_get = asyncio.Event()
 
-        def observe_socket(web_socket) -> None:
-            if "/api/v1/sessions/" not in web_socket.url:
+        async def hold_snapshot_get(route, request) -> None:
+            if request.method != "GET":
+                await route.continue_()
                 return
-            channel = "control" if "/ws/control" in web_socket.url else "data"
-            socket_events.append(f"{channel}:open")
-            web_socket.on(
-                "framesent",
-                lambda payload: socket_events.append(f"{channel}:sent:{frame_label(payload)}"),
-            )
-            web_socket.on(
-                "framereceived",
-                lambda payload: socket_events.append(
-                    f"{channel}:received:{frame_label(payload)}"
-                ),
-            )
-            web_socket.on("socketerror", lambda error: socket_events.append(f"{channel}:error:{error}"))
-            web_socket.on("close", lambda _: socket_events.append(f"{channel}:close"))
+            snapshot_get_held.set()
+            await release_snapshot_get.wait()
+            await route.continue_()
 
-        page.on("websocket", observe_socket)
-
-        def api_path(url: str) -> str:
-            return urlsplit(url).path
-
-        page.on(
-            "response",
-            lambda response: api_events.append(
-                f"response:{response.status}:{api_path(response.url)}"
-            )
-            if "/api/" in response.url
-            else None,
-        )
-        page.on(
-            "requestfailed",
-            lambda request: api_events.append(
-                f"failed:{api_path(request.url)}:{request.failure}"
-            )
-            if "/api/" in request.url
-            else None,
+        # Hold the exact snapshot download so pre-live input has no timing race.
+        await page.route(
+            f"{base_url}/api/v1/sessions/*/snapshots/*",
+            hold_snapshot_get,
         )
 
         target = (
             f"{base_url}/sessions/{session['sessionId']}"
-            f"#capability={session['writerCapability']}"
+            f"?browserDiagnostics=off#capability={session['writerCapability']}"
         )
+        stage = "navigation"
         try:
-            await page.goto(target, wait_until="domcontentloaded", timeout=TIMEOUT_SECONDS * 1000)
-            surface = page.get_by_test_id("wterm-surface")
-            await surface.wait_for(state="visible", timeout=TIMEOUT_SECONDS * 1000)
-            bounds = await surface.bounding_box()
-            if bounds is None or bounds["width"] < 100 or bounds["height"] < 100:
-                raise AssertionError("terminal first screen has no stable visible surface")
-            if "capability=" in page.url or "#" in page.url:
-                raise AssertionError("browser capability was not scrubbed from the address bar")
+            await page.goto(
+                target,
+                wait_until="commit",
+                timeout=TIMEOUT_SECONDS * 1000,
+            )
+            stage = "snapshot-get-hold"
+            try:
+                await asyncio.wait_for(
+                    snapshot_get_held.wait(),
+                    timeout=COLD_RECOVERY_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                raise TimeoutError(
+                    "browser did not request the cold snapshot"
+                ) from None
 
-            attaching = page.locator("main[data-phase='attaching']")
-            await attaching.wait_for(
+            stage = "cold-input-readiness"
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        const textarea = document.querySelector(
+                            '[data-testid="wterm-surface"] textarea'
+                        );
+                        const main = document.querySelector('main');
+                        const ownership = document.querySelector('.ownership-button');
+                        return textarea instanceof HTMLTextAreaElement
+                            && ownership?.getAttribute('data-owned') === 'true'
+                            && (main?.dataset.phase === 'attaching'
+                                || main?.dataset.phase === 'restoring');
+                    }""",
+                    polling="raf",
+                    timeout=TIMEOUT_SECONDS * 1000,
+                )
+            except Exception:
+                raise TimeoutError(
+                    "terminal input did not become writable during pre-live cold recovery"
+                ) from None
+            terminal_input = page.locator('[data-testid="wterm-surface"] textarea')
+            await terminal_input.focus()
+            if not await terminal_input.evaluate(
+                "textarea => document.activeElement === textarea"
+            ):
+                raise AssertionError("terminal input did not retain focus")
+            stage = "cold-interrupt"
+            await page.keyboard.press("Control+KeyC")
+            interrupt_phase = await page.evaluate(
+                "() => window.__zhongduanBrowserRecoverySmokeInterruptV1"
+            )
+            if not isinstance(interrupt_phase, dict) or not interrupt_phase.get(
+                "captured"
+            ):
+                raise AssertionError(
+                    "Ctrl-C keydown was not captured in the terminal page"
+                )
+            if interrupt_phase.get("phase") not in ("attaching", "restoring"):
+                raise AssertionError(
+                    "Ctrl-C was not triggered during pre-live cold recovery"
+                )
+            await wait_for_interrupt(capture_path)
+            release_snapshot_get.set()
+
+            stage = "ready-dom"
+            await wait_for_grid_text(
+                page,
+                READY_SENTINEL,
+                "ready",
+                timeout_seconds=COLD_RECOVERY_TIMEOUT_SECONDS,
+            )
+            await wait_for_grid_text(page, INTERRUPT_SENTINEL, "interrupt")
+            await page.locator("main[data-phase='live']").wait_for(
                 timeout=TIMEOUT_SECONDS * 1000
             )
-            await wait_for_socket_events(
-                socket_events,
-                {"control:open", "data:open", "control:received:welcome"},
-            )
-            if await page.locator(".ownership-button").inner_text() != "已控制":
-                raise AssertionError("writer ownership was not granted")
-            await surface.click()
-            await page.keyboard.press("Control+C")
-            await wait_for_marker(marker)
-            await wait_for_socket_events(
-                socket_events,
-                {
-                    "control:sent:key",
-                    "control:received:input-ack",
-                    "control:received:writer-lease-status",
-                    "control:received:pong",
-                    "data:received:pong",
-                },
-            )
-            if await page.locator(".connection-status").inner_text() != "同步终端":
-                raise AssertionError("browser left cold recovery unexpectedly")
-            if page_errors:
-                raise AssertionError(f"browser page errors: {page_errors}")
-        except Exception as error:
-            phase = await page.locator("main").get_attribute("data-phase")
-            status = await page.locator(".connection-status").inner_text()
+            if await grid_text_occurrences(page, READY_SENTINEL) != 1:
+                raise AssertionError(
+                    "ready sentinel was missing or duplicated in the terminal grid"
+                )
+            if await grid_text_occurrences(page, INTERRUPT_SENTINEL) != 1:
+                raise AssertionError(
+                    "interrupt sentinel was missing or duplicated in the terminal grid"
+                )
+            if await grid_text_occurrences(page, RESULT_SENTINEL) != 0:
+                raise AssertionError("result sentinel appeared before the fixed probe")
+
+            stage = "fixed-probe"
+            try:
+                probe_text = PROBE_INPUT[:-1].decode("ascii")
+            except UnicodeDecodeError:
+                raise RuntimeError("fixed recovery smoke probe must be ASCII") from None
+            await page.keyboard.type(probe_text)
+            await page.keyboard.press("Enter")
+
+            stage = "result-dom"
+            await wait_for_grid_text(page, RESULT_SENTINEL, "result")
+            await wait_for_capture(capture_path)
+
+            stage = "final-invariants"
+            if await grid_text_occurrences(page, RESULT_SENTINEL) != 1:
+                raise AssertionError(
+                    "result sentinel was missing or duplicated in the terminal grid"
+                )
+            if await grid_text_occurrences(page, READY_SENTINEL) != 1:
+                raise AssertionError("ready sentinel changed during the recovery smoke")
+            if await grid_text_occurrences(page, INTERRUPT_SENTINEL) != 1:
+                raise AssertionError(
+                    "interrupt sentinel changed during the recovery smoke"
+                )
+            if not await grid_sentinels_are_ordered(page):
+                raise AssertionError(
+                    "terminal sentinels were not preserved in canonical order"
+                )
+            if await page.locator("main").get_attribute("data-phase") != "live":
+                raise AssertionError(
+                    "browser did not finish the recovery smoke in live phase"
+                )
+            try:
+                final_capture = capture_path.read_bytes()
+            except OSError:
+                raise AssertionError(
+                    "synthetic PTY capture was unavailable at final validation"
+                ) from None
+            validate_synthetic_capture(final_capture)
+
+            return {
+                "schemaVersion": "browser-recovery-smoke-v1",
+                "outcome": "passed",
+            }
+        except Exception:
+            phase = await safe_page_label(page, "main", "data-phase")
+            status = await safe_page_label(page, ".connection-status")
             raise RuntimeError(
-                f"browser smoke failed in phase={phase!r}, status={status!r}, "
-                f"page_errors={page_errors!r}, console_errors={console_errors!r}, "
-                f"socket_events={list(socket_events)!r}, api_events={list(api_events)!r}"
-            ) from error
+                f"browser recovery smoke failed at stage={stage!r}, phase={phase!r}, "
+                f"status={status!r}, "
+                f"capture_state={capture_state_label(capture_path)!r}, "
+                f"capture_bytes={capture_size(capture_path)}"
+            ) from None
         finally:
-            await browser.close()
+            release_snapshot_get.set()
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
 async def main() -> None:
@@ -277,13 +466,10 @@ async def main() -> None:
     node = shutil.which("node")
     if node is None:
         raise RuntimeError("Node.js is not installed")
-    preexisting_generated_paths = {
-        path for path in GENERATED_PATHS if path.exists()
-    }
-    temporary = Path(tempfile.mkdtemp(prefix="zhongduan-browser-e2e-"))
+    preexisting_generated_paths = {path for path in GENERATED_PATHS if path.exists()}
+    temporary = Path(tempfile.mkdtemp(prefix="zhongduan-browser-recovery-smoke-"))
     session_info = temporary / "session.json"
-    marker = temporary / "interrupts"
-    pty_probe = temporary / "pty-probe.py"
+    capture_path = temporary / "input-capture"
     server = None
     host = None
     try:
@@ -293,32 +479,37 @@ async def main() -> None:
             encoding="utf-8",
         )
         DEV_VARS.chmod(0o600)
-        pty_probe.write_text(
-            "import os\n"
-            "import sys\n"
-            "import tty\n"
-            "tty.setraw(sys.stdin.fileno())\n"
-            "os.write(sys.stdout.fileno(), b'\\x1b[2J\\x1b[HZhongduan E2E ready\\r\\n')\n"
-            "while True:\n"
-            "    data = os.read(sys.stdin.fileno(), 1)\n"
-            "    with open(os.environ['ZHONGDUAN_E2E_INTERRUPT_MARKER'], 'ab', buffering=0) as output:\n"
-            "        output.write(data)\n",
-            encoding="utf-8",
-        )
         subprocess.run([node, str(VP), "run", "build"], cwd=ROOT, check=True)
 
         port = free_port()
         base_url = f"http://127.0.0.1:{port}"
+        server_env = os.environ.copy()
+        server_env["ZHONGDUAN_E2E_CLOUDFLARE_STATE_PATH"] = str(
+            temporary / "cloudflare-state"
+        )
         server = ManagedProcess(
             "Vite workerd",
-            [node, str(VP), "dev", "--host", "127.0.0.1", "--port", str(port), "--strictPort"],
+            [
+                node,
+                str(VP),
+                "dev",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--strictPort",
+                "--mode",
+                "browser-e2e",
+            ],
             APP_ROOT,
+            server_env,
         )
         wait_for_http(base_url, server)
 
         host_env = os.environ.copy()
         host_env["ZHONGDUAN_BOOTSTRAP_TOKEN"] = BOOTSTRAP_TOKEN
-        host_env["ZHONGDUAN_E2E_INTERRUPT_MARKER"] = str(marker)
+        host_env[INPUT_CAPTURE_ENV] = str(capture_path)
+        host_env["PYTHONDONTWRITEBYTECODE"] = "1"
         host = ManagedProcess(
             "Host relay",
             [
@@ -331,22 +522,16 @@ async def main() -> None:
                 str(session_info),
                 "--",
                 sys.executable,
-                str(pty_probe),
+                str(ROOT / "scripts" / "browser_e2e_contract.py"),
             ],
             ROOT,
             host_env,
         )
         session = wait_for_json(session_info, host)
-        await verify_browser(base_url, session, marker)
+        result = await run_browser_recovery_smoke(base_url, session, capture_path)
         host.assert_running()
         server.assert_running()
-        print("real workerd, Host, and browser cold-recovery smoke passed")
-    except Exception:
-        if host is not None:
-            print("Host relay output:\n" + "\n".join(host.output), file=sys.stderr)
-        if server is not None:
-            print("Vite workerd output:\n" + "\n".join(server.output), file=sys.stderr)
-        raise
+        print(json.dumps(result, separators=(",", ":")))
     finally:
         if host is not None:
             host.stop()

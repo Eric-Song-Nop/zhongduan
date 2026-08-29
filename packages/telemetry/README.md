@@ -165,10 +165,27 @@ The Host stderr adapter stops writing while the stream reports backpressure and 
 until `drain`, so telemetry cannot grow an unbounded application-owned output queue. Phase 0c is only a
 Cloud fact layer: per-input SHA-256 plus SQLite lease renewal and the larger Phase A correctness/hot-path
 work remain unchanged. The Cloud query-contract layer makes these Cloud-local facts inspectable without
-claiming a cross-runtime dashboard. Browser presentation segmentation is now locally observable, but
-Phase 0 is not closed: synthetic end-to-end/SLO facts, Browser/Host production export and cross-runtime
-aggregation, an exact-build `off`/`memory-v2` ABBA canary proving no more than 5% input-latency or
-canonical-throughput regression, and real pixel paint if a reliable signal exists remain open gates.
+claiming a cross-runtime dashboard. Browser presentation segmentation is now locally observable. A
+separate local synthetic pre-live input/recovery-liveness smoke exercises one fixed scenario: it holds a
+cold snapshot GET at a test-only control point, verifies one pre-live Ctrl-C has one synthetic PTY effect,
+then releases recovery and requires final `live` plus one fixed probe/result. Bounded retry/resync is
+allowed; the invariant is eventual `live` without duplicate PTY effect. Its pass/fail result proves only
+pending-recovery input reachability and eventual liveness, with no latency, throughput, rendering, or SLO evidence.
+The smoke is one run of one scenario over loopback and Miniflare with a local-only multipart ETag
+compatibility entry. It has no independently controlled Browser-to-Cloud and Cloud-to-Host RTT, jitter,
+or loss, and proves no p95/p99, 99.9% success rate, at-most-5% instrumentation overhead, throughput, or
+resource bound. Its fixed synthetic child/result is not a generic application effect, and a DOM result
+is not pixel paint/composite. It does not replace model/property/fuzz, fault injection, multi-client,
+fairness/load/soak, or production-staging validation. It also does not cover the IME, Unicode, CapsLock,
+mouse, or paste input matrix. The local-only ETag
+compatibility entry does not validate production Cloudflare Durable Objects or R2, and its timeouts are
+hang guards rather than latency or recovery SLOs. Observing the snapshot GET does not prove that snapshot
+was restored or adopted; fallback is allowed, so final `live` does not establish snapshot or tail continuity.
+Future validation needs separate state-model/property/fuzz tests, fault injection, multi-client and
+writer-transfer scenarios, load/soak tests, production staging, and independently controlled link
+profiles, plus snapshot-adoption/tail-continuity and ACK identity/status/dedup tests. Performance
+validation needs a separately designed, controlled, and reproducible test; this smoke does not implement
+it, and those possible future tests are not completion conditions for the current smoke.
 Ordinary directed recovery fanout currently remains weight 1 as a deliberate
 P1 follow-up: measure its volume first, then give successful/stale/not-targeted outcomes an unbiased
 producer sample without hiding bounded recovery failures. URL query-string redaction is also tracked

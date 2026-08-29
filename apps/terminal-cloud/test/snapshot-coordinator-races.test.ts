@@ -9,6 +9,7 @@ import {
   bucketWithOverrides,
   createSession,
   encoder,
+  installMiniflareMultipartEtagShimOnCoordinator,
   metadataFor,
   sessionStub,
   snapshotHeaders,
@@ -541,6 +542,7 @@ describe("snapshot coordinator replacement races", () => {
           new SnapshotStore(durable, sql, new RelayStore(sql), 16),
           () => new Set(),
         );
+        installMiniflareMultipartEtagShimOnCoordinator(replacementCoordinator);
 
         await oldCoordinator.maintain();
         await within(deleteStarted, "old snapshot delete did not start");
@@ -640,6 +642,7 @@ describe("snapshot coordinator replacement races", () => {
           new SnapshotStore(durable, sql, new RelayStore(sql), 16),
           () => new Set(),
         );
+        installMiniflareMultipartEtagShimOnCoordinator(replacementCoordinator);
 
         await oldCoordinator.maintain();
         await within(oldHeadStarted, "old aborted cleanup HEAD did not start");

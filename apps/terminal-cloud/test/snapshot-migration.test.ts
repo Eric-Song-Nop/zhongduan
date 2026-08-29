@@ -9,6 +9,7 @@ import {
   createSession,
   engineId,
   getSnapshot,
+  installMiniflareMultipartEtagShim,
   sessionStub,
   uploadSnapshot,
   within,
@@ -142,6 +143,7 @@ describe("snapshot retention migration", () => {
     const coldGet = await getSnapshot(session, "snapshot_cold_get_missing");
     expect(coldGet.status).toBe(404);
     await coldGet.body?.cancel();
+    await installMiniflareMultipartEtagShim(session.sessionId);
     const migrated = await runInDurableObject(
       sessionStub(session.sessionId),
       async (_instance, durable) => ({

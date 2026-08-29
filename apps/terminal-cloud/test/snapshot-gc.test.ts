@@ -1,4 +1,5 @@
 import { SNAPSHOT_MEDIA_TYPE } from "@zhongduan/protocol";
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import {
   hexToBytes,
@@ -7,6 +8,7 @@ import {
   snapshotCustomMetadata,
 } from "../src/worker/snapshot-contract";
 import { deleteRetiredSnapshotObjects } from "../src/worker/snapshot-gc";
+import { matchesMiniflareMultipartPartEtag } from "../src/worker/miniflare-snapshot-compat";
 import type { RetiredSnapshotObject } from "../src/worker/snapshot-store";
 import { metadataFor } from "./snapshot-test-helpers";
 
@@ -16,6 +18,28 @@ describe("snapshot object garbage collection", () => {
     expect(matchesMultipartPartEtag(md5, md5)).toBe(true);
     expect(matchesMultipartPartEtag(`"${md5.toUpperCase()}"`, md5)).toBe(true);
     expect(matchesMultipartPartEtag("opaque-r2-part-etag", md5)).toBe(false);
+  });
+
+  it("recognizes only the pinned Miniflare opaque multipart ETag shape", () => {
+    const miniflareEtag = "A".repeat(171);
+
+    expect(matchesMiniflareMultipartPartEtag(miniflareEtag)).toBe(true);
+    expect(matchesMiniflareMultipartPartEtag("A".repeat(170))).toBe(false);
+    expect(matchesMiniflareMultipartPartEtag("f".repeat(32))).toBe(false);
+    expect(matchesMiniflareMultipartPartEtag(`"${miniflareEtag}"`)).toBe(false);
+  });
+
+  it("keeps the real Miniflare part ETag outside the production MD5 contract", async () => {
+    const multipart = await env.SNAPSHOTS.createMultipartUpload(
+      `miniflare-etag-contract/${crypto.randomUUID()}`,
+    );
+    try {
+      const part = await multipart.uploadPart(1, new Uint8Array([1, 2, 3]));
+      expect(matchesMiniflareMultipartPartEtag(part.etag)).toBe(true);
+      expect(matchesMultipartPartEtag(part.etag, "5289df737df57326fcdd22597afb1fac")).toBe(false);
+    } finally {
+      await multipart.abort();
+    }
   });
 
   it("requires a multipart ETag even when R2 exposes a SHA-256 checksum", async () => {

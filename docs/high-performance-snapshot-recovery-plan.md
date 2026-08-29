@@ -515,11 +515,21 @@ generation，避免跨 attempt 拼接。
   Browser 内存 ring，不写 wire、journal/snapshot/replay、SQLite/attachment 或 export；`off` 不创建
   tracker/ring、telemetry-only clock/maps/listener/WTerm hook/presentation timer/RAF，但 heartbeat
   correctness 自身的 monotonic clock/deadline timer 仍保留；
-- Phase 0 gate 仍未关闭：synthetic E2E/SLO、Browser/Host 生产 export/跨 runtime aggregation，以及同一
-  exact build 下 `off`/`memory-v2` 的 input latency/canonical throughput 不超过 5% 回归的 ABBA
-  canary 必须由后续 stacked layer 补齐。WTerm render commit 和 next-frame opportunity 都绝不是 pixel
-  paint/composite；只有 Browser 提供可靠 paint 信号时才能在后续补这一层。Host/Browser relay RTT 都包含各自本地
-  event-loop/socket queue 与 Cloud auto-response，不能冒充纯网络 RTT；`written` 也不是 child/app effect ACK。
+- local synthetic pre-live input/recovery-liveness smoke 在 Browser 发起
+  cold snapshot GET 后用测试控制点暂时 hold 请求，固定 pre-live 输入窗口；Playwright 通过真实 Chromium 的键盘事件
+  路径发出 `Control+KeyC`，在 pre-live `attaching` 或 `restoring` phase 进入现有 input path，并在 synthetic PTY 产生恰好一次
+  `0x03` effect；放行 snapshot 后最终进入 `live`，固定 probe/result 恰好一次，PTY capture 无重复 effect。两次
+  输入由 PTY 精确字节和唯一 DOM result 直接证明；bounded retry/resync 被允许，只要最终 `live`；
+- 结果只表示上述 input reachability 与 eventual liveness 路径通过，不提供 latency、throughput、rendering 或 SLO 证据。它只在单机
+  loopback 和带 local-only multipart ETag 兼容层的 Miniflare 上运行一个固定场景、单次执行；不提供两条网络
+  link 独立 RTT/jitter/loss，不证明 p95/p99、99.9% 成功率、`<=5%` 插桩开销、throughput 或资源上限。Synthetic
+  child/result 不是通用 application effect，DOM result 不是 pixel paint/composite；该 smoke 不能替代
+  model/property/fuzz、故障注入、多客户端、公平性/load/soak 或 production staging 验收，也不覆盖
+  IME/Unicode/CapsLock/mouse/paste 输入矩阵。local-only ETag 兼容层不验证生产 Cloudflare DO/R2，timeout 只是防挂死预算。
+  观察到 snapshot GET 不证明 snapshot 被 restore/adopt；允许 fallback 意味着它只证明 pending-recovery 输入可达与最终活性；
+- 后续需要独立设计状态模型/property/fuzz、故障注入、多客户端/writer transfer/output flood/load/soak、生产
+  staging DO/R2 和两条网络 profile，以及 snapshot adoption/tail continuity、ACK identity/status/dedup；性能验证
+  需要另行设计受控且可复现的测试，本层暂不实现。这些是可能需要的独立验证，不是当前 smoke 的完成条件。
 
 - 保留 v2 pause/barrier/pinned commit correctness invariant；
 - 落地 `reason + retryScope`，修复 non-ready 被错误 complete 的 Browser freeze；
@@ -669,10 +679,15 @@ direct key/type。Producer volume 使用 `SUM(sampleWeight)`；raw row count 只
 不自动覆盖或删除。真实 staging source/key shape 与非 approximate aggregate 仍必须在部署时验证。
 
 Phase 0c 没有移除每次 semantic input 上的 writer token SHA-256 和 SQLite lease renewal，Phase A correctness/hot
-path 仍未完成。Cloud-local query contract 也不等于跨 runtime dashboard。Browser presentation 分段事实已经
-补上，但 synthetic E2E/SLO、Browser/Host export/aggregation、exact-build `off`/`memory-v2` 的 `<=5%`
-performance ABBA canary，以及可靠信号可用时的真实 pixel paint 仍是开放的 Phase 0 gate。这些观测
-切片也不改 wire、journal、snapshot、replay、SQLite schema 或 WebSocket attachment。
+path 仍未完成。Cloud-local query contract 也不等于跨 runtime dashboard。本地 pre-live input/recovery-liveness
+smoke 可按部署文档在隔离 venv 中安装 pinned Python requirements/Chromium 后用
+`pnpm exec vp run verify-browser-recovery-smoke` 重现，安全输出只含固定 label 与 count。它只覆盖单机
+loopback+Miniflare 下一个固定场景、单次运行；snapshot GET hold 只是测试控制点，观察到 GET 不证明 snapshot
+restore/adopt。该结果只证明 pending-recovery 输入可达与最终活性，不提供 latency、throughput、rendering、SLO、
+通用 app effect 或 production DO/R2 证据。后续可能需要状态模型/property/fuzz、故障注入、多客户端/load/soak、
+生产 staging、独立网络 profile、snapshot adoption/tail continuity 和 ACK identity/status/dedup 测试；性能验证
+需要另行设计受控且可复现的测试，本层不实现。这些观测切片也不改 wire、journal、snapshot、replay、SQLite
+schema 或 WebSocket attachment。
 普通 directed recovery fanout 当前仍为 weight 1；先用本层事实量出实际体量，再在后续性能/简化 PR 对
 completed/stale/not-targeted outcome 做无偏 producer sampling，异常恢复转移继续保留，不在本 PR 猜测调参。
 

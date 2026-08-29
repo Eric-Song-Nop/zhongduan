@@ -3,6 +3,7 @@ import { env, exports as workerExports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { expect } from "vitest";
 import { isSnapshotObjectKey } from "../src/worker/snapshot-contract";
+import { installMiniflareMultipartEtagCompatibility } from "../src/worker/miniflare-snapshot-compat";
 
 export interface CreatedSession {
   hostCapability: string;
@@ -191,8 +192,10 @@ export function snapshotHeaders(
 export async function installMiniflareMultipartEtagShim(sessionId: string): Promise<void> {
   const stub = env.TERMINAL_SESSIONS.get(env.TERMINAL_SESSIONS.idFromName(`v1:${sessionId}`));
   await runInDurableObject(stub, (instance) => {
-    // Miniflare uses opaque multipart part ETags; production R2 returns the part MD5.
-    const coordinator = Reflect.get(instance, "snapshotUploads") as object;
-    Reflect.set(Object.getPrototypeOf(coordinator), "snapshotPartEtagMatches", () => true);
+    installMiniflareMultipartEtagCompatibility(instance);
   });
+}
+
+export function installMiniflareMultipartEtagShimOnCoordinator(coordinator: object): void {
+  installMiniflareMultipartEtagCompatibility({ snapshotUploads: coordinator });
 }

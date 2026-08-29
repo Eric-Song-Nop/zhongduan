@@ -37,6 +37,7 @@ export default defineConfig({
           "node scripts/verify-no-source-emit.mjs",
           "vp test --run",
           "vp run @zhongduan/terminal-cloud#test",
+          "python3 -B -m unittest scripts/test_browser_e2e_contract.py",
           "vp run @zhongduan/terminal-cloud#test:browser",
         ],
         cache: false,
@@ -53,8 +54,12 @@ export default defineConfig({
         command: "node scripts/verify-clean-browser-build.mjs",
         cache: false,
       },
-      "verify-browser-e2e": {
-        command: "python scripts/verify-browser-e2e.py",
+      "verify-browser-recovery-smoke": {
+        command: "python3 -B scripts/verify-browser-e2e.py",
+        cache: false,
+      },
+      "verify-browser-recovery-smoke-contract": {
+        command: "python3 -B -m unittest scripts/test_browser_e2e_contract.py",
         cache: false,
       },
     },
