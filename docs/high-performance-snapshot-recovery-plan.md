@@ -1,7 +1,7 @@
 # 高性能远程终端 Snapshot 与 Recovery v3 实施计划
 
-> 状态：Phase 0/1 为 CURRENT stacked candidate；Phase 2 的 wire/capability 层为 stacked candidate，
-> Recovery v3 runtime 仍为 TARGET；Phase 3–5 为 TARGET
+> 状态：Phase 0/1 为 CURRENT stacked candidate；Phase 2 的 wire/capability 与 pure Browser
+> RecoveryAssembler 为 stacked candidate，但生产 Recovery v3 runtime 仍不可达；Phase 3–5 为 TARGET
 >
 > 决策日期：2026-08-28
 >
@@ -192,7 +192,9 @@ session/snapshot id、engine/epoch/cut、compression、长度、checksum、与�
 
 ### Browser RecoveryAssembler
 
-每个 generation 建立独立 assembler：
+P2.1 stacked candidate 只冻结 `packages/session-client` 内的 pure、generation-scoped assembler。它不接入
+`TerminalSession` 或现有 v2 `SessionCoordinator`，生产 endpoint 也不 advertise v3 capability，因此当前没有
+任何 production attach/resync 能到达这条路径。每个 generation 的纯状态为：
 
 ```text
 base R
@@ -200,37 +202,51 @@ nextExpected = R + 1
 framesByEventSeq = bounded map
 appliedIdentityByEventSeq = bounded same-lane late-retry cache
 recoveryDoneThrough = optional H
-bufferedBytes / bufferedFrames / oldestBufferedAt
-targetCore = existing active replica@R（warm）或 detached snapshot replica@R（cold）
+bufferedBytes / bufferedFrames / startedAt / lastContinuousProgressAt
+targetCore = caller 提供的 existing replica@R（warm）或 detached replica@R（cold）
 ```
 
-处理规则：
+P2.1 保留的 pure 行为是：
 
-1. recovery lane 只接受 `(R,H]`，live lane 从 `liveFloor` 开始；start 到达前的同 generation frame
-   可以进入有界 pre-start buffer；
-2. 任一 lane 到达的 mutation 先验证 epoch、cursor、offset 和 exact identity；跨 lane 同 eventSeq 立即
-   fail closed；已经 apply 并从 reorder map 删除的同 lane late retry 仍与
-   `appliedIdentityByEventSeq` 中的完整 canonical fields/payload 比较；
-3. 只有 `nextExpected` 存在时才 apply，并循环推进连续前缀；较新 frame 留在 map 中；warm 可在 active
-   replica 上逐个展示这些连续前缀，cold 只更新 detached candidate；
-4. cold snapshot 尚未下载/restore 完成时只拥有并缓存 bounded copy，不推进 candidate cursor；
-5. 收到 `RecoveryDone(H)`、target core 已连续 apply 到至少 `H` 后，handoff 才 eligible；
-6. cold 原子 adopt candidate；warm 不 clone/swap core，只原子提交 local handoff。随后 Browser 发送
-   `RecoveryAdopted(K)`；Cloud 记录 generation/cursor，但只有 matching `RecoverySourceClosed` 也成立后才
-   释放 generation state 并标记 synced；
-7. ACK、Done 或 Adopted 丢失可以在同 generation 幂等重发；任何 identity 冲突、hole deadline 或
-   ownership 不确定都 reset 该客户端，不影响 authority 和其他客户端。Cold conflict 直接 discard candidate；
-   warm conflict 必须把 active replica 标记为 non-current/tainted，下一 generation 强制 cold rebase，不能复用。
+- start 前同 generation envelope 先复制进有硬 bytes/frames 上限的 pre-start buffer；完整且 immutable 的
+  start 到达后再校验，matching start 幂等，divergent start fail closed；start 未验证前不产生 receipt progress；
+- recovery lane 只接受 `(R,H]`，live lane 只接受 `liveFloor = MutationBoundary(H)` 之后的 mutation；同 lane
+  ordinal 与 cumulative encoded bytes 必须连续，同 ordinal retry 必须逐字节一致；
+- 每条 mutation 验证 generation、stream、engine、epoch、kind、event sequence、PTY offset、semantic flags 和
+  payload exact identity；新 ordinal 重复 canonical event 或跨 lane 同 event sequence 均 fail closed；
+- 只有 `nextExpected` 存在时才按小 quantum apply 连续 authority 前缀。cold target 尚未由 caller 安装时可以
+  receipt 已拥有的 bounded copy，但不推进 applied cursor；cold install 必须匹配 recovery attempt、base 与
+  engine，warm target 必须精确位于 base `R`。candidate 是否确由 start 中的 snapshot manifest restore 而来，
+  属于后续 HTTP/WTerm wiring owner 的义务，P2.1 尚不证明；
+- `RecoveryDone(H)` 必须是 recovery lane 的最后一条 record，并拥有稳定 ordinal/bytes。Done 可以早于
+  snapshot restore 或连续 apply 完成到达，但不能越过缺失的较低 recovery ordinal；只有 Done 已验证且
+  applied cursor 至少为 `H` 时 handoff 才 eligible；
+- assembler 只报告 eligible handoff；caller 完成真实 warm handoff 或 cold adopt 后，必须回传 matching
+  confirmation，assembler 才产生稳定、可幂等重发的 `RecoveryAdopted(K)` progress，其中 `K >= H`；
+- confirmation 只把 cold core 的 dispose/visibility ownership 交给长期 replica host；在 attempt completion 前，
+  assembler 仍是这个 core 唯一的 mutation ordering writer，并继续排空已经 receipt 的 live prefix；
+- matching `RecoverySourceClosed` 可先于或后于 adoption 到达；只有 closure certificate 被本地 recovery
+  ordinal/bytes receipt 覆盖后才 release recovery late-retry identity cache。两者都成立且已经 receipt 的 live
+  mutation 全部 apply 后才输出 completion authority/lane cursors，且只有此时 mutation delivery ownership 才交给
+  长期 live receiver；
+- identity conflict、hole/no-progress deadline、预算溢出或 target apply failure 都 fail closed。cold candidate
+  只有在 install 返回 accepted 后才把 ownership 转给 assembler；返回 rejected 时仍由 caller 负责。转移后
+  failure/reset/close 由 assembler dispose once，handoff confirmation 后只转移 dispose/visibility ownership；
+  warm target 只有在已经尝试 write/resize 后发生 failure 时才被标记 tainted、不得作为下一 generation 的
+  base；零 effect 的 start/admission conflict 仍可返回 reusable base。所有 deadline 使用 caller 提供的
+  monotonic tick，不在 pure core 内启动 timer。
 
 Applied identity cache 计入 per-generation bytes/frames；只保留仍可能被同 lane late retry 命中的区间。
-Browser 发出 `DeliveryReceived` 后仍须保留 recovery identity cache；只有收到 Host/source 在实际处理
-receipt 后返回的 matching `RecoverySourceClosed`，且本地 recovery lane cursor 同时覆盖
+pure assembler 暴露稳定 receipt/apply/adopt progress 供 caller 幂等发送，但自己不发送 socket control，也不
+授予或回收 credit。caller 发送 `DeliveryReceived` 后仍须保留 recovery identity cache；只有收到 Host/source
+在实际处理 receipt 后返回的 matching `RecoverySourceClosed`，且本地 recovery lane cursor 同时覆盖
 `throughRecoveryOrdinal` 与 `throughRecoveryCumulativeEncodedBytes`，才可释放。Closure 丢失时幂等
 请求/重发，最终走有界 deadline/reset；不能为了完整比较保留无界 session history。
 
 live `H+1...` 可能先于 `RecoveryStart`、snapshot 或 recovery frame 到达，也可能在 adopt 前已经连续
 apply 到 `K > H`；这不改变 adoption 条件。Assembler 始终采用同一 log 的连续前缀，不能因“画面看起来
-更新”跳过缺口。
+更新”跳过缺口。P2.1 不负责 HTTP snapshot download、WTerm restore/adopt、WebSocket send/retry timer、
+generation replan，也不在 completion 后长期消费 live；这些必须由后续 Browser/Cloud/Host wiring owner 接通。
 
 ### Holdback 放在 Browser，而不是 Cloud durable payload
 
@@ -553,6 +569,14 @@ Phase 1 stacked candidate 的最终行为是：
   unresolved flight，且旧 connection 不接收 marker；
 - `apps/terminal-cloud/test/snapshot-retention.test.ts` 检查 completed row、R2 object verification、cursor-ahead 和
   bounded upload/cleanup ledger。
+- P2.0 wire/capability direct tests 检查 strict v3 schema/codec、显式 capability downgrade、authority version
+  migration、generation strategy 的 v2 default，以及 v2/v3 decoder 隔离；
+- P2.1 `packages/session-client` owner tests 在 pure target 上检查 start-before/after-data、immutable start、lane
+  ordinal/bytes、同 lane retry、跨 lane conflict、cold receipt/apply 分离、warm/cold ownership、Done/handoff/
+  target-readiness 时序、adoption/source-closed 两种顺序、budget/deadline 与 release-once；它们还穷举保持各
+  lane 顺序的短 interleaving，并用
+  不调用 production cursor/assembler helper 的独立 reference reducer 逐步核对 effect、receipt 和 applied
+  progress。当前 gate 使用仓库已有 Vitest 工具，不新增随机 generator 或 `fast-check` 依赖。
 
 这些测试的证据来自明确状态、identity、frame ordering、资源 owner 和本地 Worker storage/R2 oracle。测试总数、
 绿色 CI、timeout 数值或 clean build 本身不证明这些状态。
@@ -566,8 +590,12 @@ Phase 1 stacked candidate 的最终行为是：
 - JavaScript deadline 不能抢占同步 full snapshot WASM encode，因此 5 秒 capture budget 不是 actor hard max；
 - 本地 cleanup slot 只约束运行中的 Host；进程崩溃后 generic `uncertain` upload 的 durable reconciliation 仍未
   完成；
-- Phase 0/1 不证明 Recovery v3、multi-client fairness、load/soak、性能/SLO、production dashboard 或真实滚动
-  发布。
+- P2.1 assembler 没有接入 `TerminalSession`/v2 `SessionCoordinator`，没有 HTTP snapshot、WTerm
+  restore/adopt、WebSocket control、长期 live owner、Host PreparedGap、Cloud generation/credit/closure wiring；
+  production capability 不 advertise v3 token，所以该路径当前不可达；
+- pure target tests 不证明真实 WTerm/Ghostty 的 parser continuation、atomic adopt 或 terminal state
+  equivalence，也不证明跨进程 ownership、multi-client fairness、load/soak、性能/SLO、production dashboard
+  或真实滚动发布。
 
 ### 后续需要的测试
 
@@ -575,18 +603,23 @@ Phase 1 stacked candidate 的最终行为是：
   migration fixture 已由 P2.0 保留；
 - DO hibernation、R2 HEAD/PUT/delete、response loss、Host crash/restart 和 generic uncertain reconciliation 的
   fault injection；
-- 真实 snapshot restore/adopt、parser continuation 与 exact tail-continuity oracle；
-- Recovery v3 的 state model、property/fuzz、duplicate/gap/reset/adopt/closure 和 multi-client aggregate budget；
+- Browser wiring owner 接入 HTTP snapshot、真实 WTerm restore/adopt 与长期 live handoff，并用 parser
+  continuation 和 exact tail-continuity oracle 验证 pure target seam；
+- Host/Cloud owner 接入 PreparedGap/start fence、lane scheduling、receipt credit、apply progress、closure 与
+  generation cleanup，再做跨 owner duplicate/gap/reset/adopt/closure fault integration 和 multi-client aggregate
+  budget；
+- 在完整三方 wiring 上扩展独立 reference model/property/fuzz，并验证 rolling capability downgrade/rollback；
 - 性能验证只在 workload、link profile、环境隔离、warm-up、样本量和统计方法另行批准后实施。
 
 ### Phase 2：Recovery v3，继续使用 full snapshot
 
-- 完成 protocol capability negotiation：authority data version 固定到 session epoch，recovery strategy 在
-  新 delivery generation 选择三方兼容交集；同 generation 不混用 v2/v3 ordering；
-- 实现 committed-through-H start fence、live floor、`RecoveryStart/Done/Adopted/SourceClosed`；
-- 实现 Browser bounded assembler、同 lane exact retry、跨 lane conflict、gap/deadline/reset；
-- 分离 `DeliveryReceived` credit 与 `ReplicaApplied`；
-- 建立 live/recovery logical lane 和有界公平调度；
+- P2.0 已冻结 protocol capability negotiation、v2 authority identity、v3 delivery envelope 与 generation
+  strategy 的 v2 default；P2.1 已冻结不可达的 pure Browser bounded assembler、同 lane exact retry、跨 lane
+  conflict、gap/deadline/reset 与 receipt/apply/adopt progress；
+- 后续 Host/Cloud owner 实现 committed-through-H start fence、PreparedGap、live/recovery logical lane、receipt
+  credit、closure 与有界公平调度；
+- 后续 Browser wiring owner 才把 pure assembler 接入 `TerminalSession`、HTTP snapshot、WTerm
+  restore/adopt、socket progress/retry 和 completion 后的长期 live；
 - 完整 negotiated state-machine gate 通过后，一次性删除 v3 路径的 global pause、fixed-commit barrier 和
   pin；保留有序
   `RecoveryStartFence`，v2 fallback 不变。
@@ -640,7 +673,8 @@ Gate：持续 50–100 ms output、从不 quiet 时 cut 仍有界前进，且 in
 - 随机选择 `R/H/K`，验证 `snapshot@R + continuous log(R,K]` 与 uninterrupted authority 的可见
   screen、cursor、modes、offset 和后续 parser 行为一致；
 - 覆盖 UTF-8、CSI/OSC/DCS continuation、primary/alternate、resize/reflow、sync output 和 scrollback；
-- live/recovery 任意乱序、同 lane retry、Done-before-frame、Start-after-live、Adopted/ACK/SourceClosed loss；
+- live/recovery 跨 lane 任意乱序但各 lane ordinal 保持连续、同 lane retry、Done-before-restore/apply（不越过
+  recovery lane lower ordinal）、Start-after-live、Adopted/ACK/SourceClosed loss；
 - 同 lane、同 ordinal duplicate 逐字节一致时幂等；跨 lane 同 eventSeq、divergent duplicate、gap、错误
   epoch/engine/generation/offset 一律 fail closed；
 - v2 pause/barrier 和 v3 gap-fill 分别模型测试，不允许半 v2/半 v3 状态。
