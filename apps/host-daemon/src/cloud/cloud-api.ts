@@ -13,6 +13,7 @@ import {
   type ConnectionSetRequest,
   type ConnectionSetResponse,
   type CreateSessionResponse,
+  type RelayCapability as RelayCapabilityValue,
   type SnapshotMetadata,
   type SnapshotUploadResponse,
 } from "@zhongduan/protocol";
@@ -48,12 +49,14 @@ export class CloudTransportError extends Error {
 
 export interface CloudApiClientOptions {
   fetch?: CloudFetch;
+  relayCapabilities?: readonly RelayCapabilityValue[];
 }
 
 export class CloudApiClient {
   readonly #basePath: string;
   readonly #baseUrl: URL;
   readonly #fetch: CloudFetch;
+  readonly #relayCapabilities: readonly RelayCapabilityValue[];
 
   constructor(baseUrl: string | URL, options: CloudApiClientOptions = {}) {
     const parsed = new URL(baseUrl);
@@ -71,6 +74,9 @@ export class CloudApiClient {
     parsed.pathname = this.#basePath === "" ? "/" : this.#basePath;
     this.#baseUrl = parsed;
     this.#fetch = options.fetch ?? fetch;
+    this.#relayCapabilities = Object.freeze([
+      ...(options.relayCapabilities ?? HOST_RELAY_CAPABILITIES),
+    ]);
   }
 
   async createSession(
@@ -110,10 +116,10 @@ export class CloudApiClient {
       ConnectionSetResponseSchema,
       signal,
       {
-        [RELAY_CAPABILITIES_HEADER]: HOST_RELAY_CAPABILITIES.join(","),
+        [RELAY_CAPABILITIES_HEADER]: this.#relayCapabilities.join(","),
       },
     );
-    const confirmed = confirmedRelayCapabilities(connection, HOST_RELAY_CAPABILITIES);
+    const confirmed = confirmedRelayCapabilities(connection, this.#relayCapabilities);
     if (confirmed.length === 0) delete connection.negotiatedCapabilities;
     else connection.negotiatedCapabilities = confirmed;
     return connection;

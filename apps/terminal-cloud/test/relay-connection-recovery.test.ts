@@ -82,16 +82,18 @@ function seedClient(
   clientId: string,
   generation = "1",
   streamId = 1,
+  recoveryStrategy: "v2" | "v3" = "v2",
 ): void {
   durable.storage.sql.exec(
     `INSERT INTO client_delivery
       (client_id, principal_id_hash, role, stream_id, delivery_generation,
        updated_at, registered_at, reservation_expires_at, recovery_strategy)
-     VALUES (?, ?, 'observer', ?, ?, 1, 1, NULL, 'v3')`,
+     VALUES (?, ?, 'observer', ?, ?, 1, 1, NULL, ?)`,
     clientId,
     `principal_${clientId}`,
     streamId,
     generation,
+    recoveryStrategy,
   );
 }
 
@@ -105,6 +107,8 @@ function seedTicket(
     deliveryGeneration: string;
     hostFence?: string;
     peer: "browser" | "host";
+    relayCapabilitiesJson?: string;
+    recoveryStrategy?: "v2" | "v3";
     role: "host" | "observer";
     streamId: number;
     ticketDigest: string;
@@ -114,8 +118,8 @@ function seedTicket(
     `INSERT INTO connection_ticket
       (ticket_digest, connection_set_id, connection_id, peer, channel, client_id,
        subject, role, stream_id, delivery_generation, host_fence, expires_at,
-       relay_capabilities_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]')`,
+       relay_capabilities_json, recovery_strategy)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     input.ticketDigest,
     input.connectionSetId,
     input.connectionId,
@@ -128,6 +132,8 @@ function seedTicket(
     input.deliveryGeneration,
     input.hostFence ?? null,
     Date.now() + 60_000,
+    input.relayCapabilitiesJson ?? "[]",
+    input.recoveryStrategy ?? "v2",
   );
 }
 
@@ -214,10 +220,25 @@ describe("RelayConnectionStore recovery fences", () => {
         connectionId: "connection_claim_recovery_0001",
         connectionSetId: "connection_set_claim_recovery_0001",
         deliveryGeneration: "2",
+        hostFence: "7",
         peer: "browser",
+        recoveryStrategy: "v3",
         role: "observer",
         streamId: 1,
         ticketDigest: "ticket_claim_recovery_00000001",
+      });
+      seedTicket(durable, {
+        channel: "data",
+        clientId,
+        connectionId: "connection_claim_recovery_0001",
+        connectionSetId: "connection_set_claim_recovery_0001",
+        deliveryGeneration: "2",
+        hostFence: "7",
+        peer: "browser",
+        recoveryStrategy: "v3",
+        role: "observer",
+        streamId: 1,
+        ticketDigest: "ticket_claim_recovery_data_0001",
       });
       const relay = new RelayStore(durable.storage.sql);
       const ticket = relay.ticket("ticket_claim_recovery_00000001");
@@ -230,17 +251,61 @@ describe("RelayConnectionStore recovery fences", () => {
         maintenanceSignals += 1;
       });
 
-      expect(() => connections.claimBrowserControl(ticket)).toThrow(
+      durable.storage.sql.exec(
+        `UPDATE connection_ticket SET relay_capabilities_json = '["authority-data-v2"]'
+         WHERE connection_set_id = ? AND channel = 'data'`,
+        ticket.connection_set_id,
+      );
+      expect(connections.claimBrowserControl(ticket, "7", true)).toBeUndefined();
+      durable.storage.sql.exec(
+        `UPDATE connection_ticket SET relay_capabilities_json = '[]'
+         WHERE connection_set_id = ? AND channel = 'data'`,
+        ticket.connection_set_id,
+      );
+      durable.storage.sql.exec(
+        "DELETE FROM connection_ticket WHERE connection_set_id = ? AND channel = 'data'",
+        ticket.connection_set_id,
+      );
+      expect(connections.claimBrowserControl(ticket, "7", true)).toBeUndefined();
+      seedTicket(durable, {
+        channel: "data",
+        clientId,
+        connectionId: "connection_claim_recovery_0001",
+        connectionSetId: "connection_set_claim_recovery_0001",
+        deliveryGeneration: "2",
+        hostFence: "7",
+        peer: "browser",
+        recoveryStrategy: "v3",
+        role: "observer",
+        streamId: 1,
+        ticketDigest: "ticket_claim_recovery_data_0002",
+      });
+      expect(connections.claimBrowserControl(ticket, "7", false)).toBeUndefined();
+      expect(connections.claimBrowserControl(ticket, "8", true)).toBeUndefined();
+      expect(relay.clientById(clientId)).toMatchObject({
+        delivery_generation: "1",
+        recovery_strategy: "v2",
+      });
+      expect(() => connections.claimBrowserControl(ticket, "7", true)).toThrow(
         "injected recovery fence capacity failure",
       );
-      expect(relay.clientById(clientId)?.delivery_generation).toBe("1");
+      expect(relay.clientById(clientId)).toMatchObject({
+        delivery_generation: "1",
+        recovery_strategy: "v2",
+      });
       expect(sessionFacts(durable).snapshot_retention_backlog).toBe(retentionBacklogBefore);
       expect(maintenanceSignals).toBe(0);
 
       recoveries.shouldThrow = false;
       recoveries.fencedIds = [];
-      expect(connections.claimBrowserControl(ticket)).toMatchObject({ delivery_generation: "2" });
-      expect(relay.clientById(clientId)?.delivery_generation).toBe("2");
+      expect(connections.claimBrowserControl(ticket, "7", true)).toMatchObject({
+        delivery_generation: "2",
+        recovery_strategy: "v3",
+      });
+      expect(relay.clientById(clientId)).toMatchObject({
+        delivery_generation: "2",
+        recovery_strategy: "v3",
+      });
       expect(recoveries.calls.at(-1)).toMatch(new RegExp(`^client:${clientId}:2:`));
       expect(maintenanceSignals).toBe(1);
     });
@@ -300,8 +365,43 @@ describe("RelayConnectionStore recovery fences", () => {
       expect(relay.ticket("ticket_replace_old_000000001")).toBeUndefined();
       expect(relay.ticket("ticket_replace_new_000000001")).toMatchObject({
         delivery_generation: "2",
+        host_fence: null,
+        recovery_strategy: "v2",
       });
       expect(maintenanceSignals).toBe(1);
+    });
+  });
+
+  it("refuses a data-only replacement for a v3 generation", async () => {
+    const sessionId = await createSession();
+    await runInDurableObject(sessionStub(sessionId), (_instance, durable) => {
+      const clientId = "client_v3_replace_recovery_001";
+      seedClient(durable, clientId, "1", 1, "v3");
+      const recoveries = new RecoveryFenceProbe(durable.storage.sql);
+      const connections = connectionStore(durable, recoveries, () => undefined);
+
+      expect(
+        connections.replaceBrowserDelivery({
+          clientId,
+          connectionId: "connection_v3_replace_new_001",
+          connectionSetId: "connection_set_v3_replace_new_001",
+          currentGeneration: "1",
+          expiresAt: Date.now() + 60_000,
+          nextGeneration: "2",
+          relayCapabilitiesJson: "[]",
+          role: "observer",
+          streamId: 1,
+          subject: "subject_v3_replace_recovery_001",
+          ticketDigest: "ticket_v3_replace_new_000001",
+        }),
+      ).toBe(false);
+      const relay = new RelayStore(durable.storage.sql);
+      expect(relay.clientById(clientId)).toMatchObject({
+        delivery_generation: "1",
+        recovery_strategy: "v3",
+      });
+      expect(relay.ticket("ticket_v3_replace_new_000001")).toBeUndefined();
+      expect(recoveries.calls).toEqual([]);
     });
   });
 
@@ -334,7 +434,9 @@ describe("RelayConnectionStore recovery fences", () => {
         now: Date.now(),
         peer: "browser" as const,
         principalIdHash: `principal_${newClientId}`,
+        recoveryHostFence: null,
         relayCapabilitiesJson: "[]",
+        recoveryStrategy: "v2" as const,
         role: "observer" as const,
         subject: "subject_reserved_recovery_000001",
       };

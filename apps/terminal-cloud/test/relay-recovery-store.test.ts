@@ -229,7 +229,7 @@ describe("RelayRecoveryStore", () => {
 
     await runInDurableObject(stub, (_instance, durable) => {
       const sql = durable.storage.sql;
-      expect(durable.storage.kv.get<number>("schema-version")).toBe(7);
+      expect(durable.storage.kv.get<number>("schema-version")).toBe(8);
       expect(
         sql
           .exec(
@@ -354,6 +354,97 @@ describe("RelayRecoveryStore", () => {
     });
   });
 
+  it("locates attempts and outbox entries only by exact durable identity", async () => {
+    const fixture = await createSession();
+    await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
+      seedClient(durable, fixture, "v3");
+      installAuthority(durable, committed);
+      const store = recoveryStore(durable);
+      transaction(durable, () => store.beginPreparing(beginInput(fixture)));
+
+      const attempt = store.attempt(fixture.recoveryId);
+      expect(store.attemptByDeliveryIdentity(1, "1")).toEqual(attempt);
+      expect(
+        store.attemptByConnectionIdentity(fixture.clientId, fixture.connectionId, 1, "1"),
+      ).toEqual(attempt);
+
+      const duplicateColumns = `
+        (recovery_id, client_id, connection_id, host_fence, stream_id, delivery_generation,
+         engine_id, state, prepare_json, start_json, base_cursor_json, committed_through_json,
+         live_floor_json, granted_cumulative_encoded_bytes, recovery_done_through_json,
+         recovery_done_ordinal, recovery_done_cumulative_encoded_bytes, replica_applied_json,
+         adopted_json, source_closed_json, hard_deadline_at, no_progress_timeout_ms,
+         no_progress_deadline_at, reset_reason, created_at, updated_at)`;
+      const duplicateProjection = `
+        SELECT ?, ?, ?, host_fence, stream_id, delivery_generation,
+               engine_id, state, prepare_json, start_json, base_cursor_json,
+               committed_through_json, live_floor_json, granted_cumulative_encoded_bytes,
+               recovery_done_through_json, recovery_done_ordinal,
+               recovery_done_cumulative_encoded_bytes, replica_applied_json, adopted_json,
+               source_closed_json, hard_deadline_at, no_progress_timeout_ms,
+               no_progress_deadline_at, reset_reason, created_at, updated_at
+        FROM recovery_attempt WHERE recovery_id = ?`;
+      const duplicateRecoveryId = `${fixture.recoveryId}_delivery_duplicate`;
+      durable.storage.sql.exec(
+        `INSERT INTO recovery_attempt ${duplicateColumns} ${duplicateProjection}`,
+        duplicateRecoveryId,
+        `${fixture.clientId}_delivery_duplicate`,
+        `${fixture.connectionId}_delivery_duplicate`,
+        fixture.recoveryId,
+      );
+      expect(store.attemptByDeliveryIdentity(1, "1")).toBeUndefined();
+      expect(
+        store.attemptByConnectionIdentity(fixture.clientId, fixture.connectionId, 1, "1"),
+      ).toEqual(attempt);
+      durable.storage.sql.exec(
+        "DELETE FROM recovery_attempt WHERE recovery_id = ?",
+        duplicateRecoveryId,
+      );
+
+      // The schema's (client_id, delivery_generation) uniqueness prevents an
+      // exact reconnect identity duplicate before the bounded lookup runs.
+      expect(() =>
+        durable.storage.sql.exec(
+          `INSERT INTO recovery_attempt ${duplicateColumns} ${duplicateProjection}`,
+          `${fixture.recoveryId}_connection_duplicate`,
+          fixture.clientId,
+          fixture.connectionId,
+          fixture.recoveryId,
+        ),
+      ).toThrow();
+      expect(store.attemptByDeliveryIdentity(2, "1")).toBeUndefined();
+      expect(store.attemptByDeliveryIdentity(1, "2")).toBeUndefined();
+      expect(
+        store.attemptByConnectionIdentity(
+          `${fixture.clientId}_other`,
+          fixture.connectionId,
+          1,
+          "1",
+        ),
+      ).toBeUndefined();
+      expect(
+        store.attemptByConnectionIdentity(
+          fixture.clientId,
+          `${fixture.connectionId}_other`,
+          1,
+          "1",
+        ),
+      ).toBeUndefined();
+
+      const prepare = store.outboxEntry(fixture.recoveryId, "recovery-prepare");
+      expect(prepare).toMatchObject({
+        destination: "host",
+        kind: "recovery-prepare",
+        recovery_id: fixture.recoveryId,
+      });
+      expect(store.outboxEntry(fixture.recoveryId, "recovery-start")).toBeUndefined();
+      expect(store.outboxEntry(`${fixture.recoveryId}_other`, "recovery-prepare")).toBeUndefined();
+
+      expect(store.attempt(fixture.recoveryId)).toEqual(attempt);
+      expect(store.outbox()).toEqual([prepare]);
+    });
+  });
+
   it("keeps lane cursors independent and fails closed when a sent ordinal cannot be authenticated", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
@@ -427,6 +518,25 @@ describe("RelayRecoveryStore", () => {
             store.recordValidatedLaneSend(fixture.recoveryId, encoded, 220 + index),
           ),
         ).toEqual({ changed: true, ok: true });
+        if (index < 2) {
+          expect(
+            transaction(durable, () =>
+              store.markLaneReceived(
+                {
+                  receipt: {
+                    type: "delivery-received",
+                    deliveryGeneration: "1",
+                    lane: "recovery",
+                    contiguousDeliveryOrdinal: (index + 1).toString(),
+                    cumulativeEncodedBytes: ["90", "180"][index]!,
+                  },
+                  recoveryId: fixture.recoveryId,
+                },
+                220 + index,
+              ),
+            ),
+          ).toEqual({ changed: true, ok: true });
+        }
       }
       expect(
         transaction(durable, () =>
@@ -583,6 +693,100 @@ describe("RelayRecoveryStore", () => {
     });
   });
 
+  it("uses stop-and-wait receipts and accepts only the exact current scalar retry", async () => {
+    const fixture = await createSession();
+    await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
+      seedClient(durable, fixture, "v3");
+      installAuthority(durable, committed);
+      const store = recoveryStore(durable);
+      transaction(durable, () => store.beginPreparing(beginInput(fixture)));
+      transaction(durable, () => store.installFence(installInput(fixture)));
+      installAuthority(durable, { sessionEpoch: "7", eventSeq: "7", nextPtyOffset: "15" });
+
+      const first = deliveryEnvelope("live", 1n, 90n, {
+        eventSeq: 6n,
+        kind: DataFrameKind.PtyOutput,
+        payload: new Uint8Array([1, 2]),
+        ptyOffset: 12n,
+      });
+      const second = deliveryEnvelope("live", 2n, 179n, {
+        eventSeq: 7n,
+        kind: DataFrameKind.PtyOutput,
+        payload: new Uint8Array([3]),
+        ptyOffset: 14n,
+      });
+      const receipt = (ordinal: string, bytes: string) => ({
+        receipt: {
+          type: "delivery-received" as const,
+          deliveryGeneration: "1",
+          lane: "live" as const,
+          contiguousDeliveryOrdinal: ordinal,
+          cumulativeEncodedBytes: bytes,
+        },
+        recoveryId: fixture.recoveryId,
+      });
+
+      expect(
+        transaction(durable, () => store.recordValidatedLaneSend(fixture.recoveryId, first, 210)),
+      ).toEqual({ changed: true, ok: true });
+      expect(
+        transaction(durable, () => store.recordValidatedLaneSend(fixture.recoveryId, second, 211)),
+      ).toEqual({ ok: false, reason: "invalid-progress" });
+      expect(transaction(durable, () => store.markLaneReceived(receipt("1", "90"), 212))).toEqual({
+        changed: true,
+        ok: true,
+      });
+      expect(
+        transaction(durable, () => store.recordValidatedLaneSend(fixture.recoveryId, first, 213)),
+      ).toEqual({ ok: false, reason: "invalid-progress" });
+      expect(
+        transaction(durable, () => store.recordValidatedLaneSend(fixture.recoveryId, second, 214)),
+      ).toEqual({ changed: true, ok: true });
+
+      // No intermediate scalar history is durable. Only the exact sent cursor may
+      // advance; mixed ordinal/byte pairs are divergent and must stay rejected.
+      expect(transaction(durable, () => store.markLaneReceived(receipt("2", "178"), 215))).toEqual({
+        ok: false,
+        reason: "invalid-progress",
+      });
+      expect(transaction(durable, () => store.markLaneReceived(receipt("1", "179"), 216))).toEqual({
+        ok: false,
+        reason: "invalid-progress",
+      });
+      expect(transaction(durable, () => store.markLaneReceived(receipt("3", "180"), 217))).toEqual({
+        ok: false,
+        reason: "progress-ahead",
+      });
+      expect(transaction(durable, () => store.markLaneReceived(receipt("2", "179"), 218))).toEqual({
+        changed: true,
+        ok: true,
+      });
+
+      // The store has no receipt history or payload hash. A genuinely older
+      // accepted pair and a fabricated pair at that ordinal are both
+      // unauthenticated once the durable current scalar advances.
+      expect(transaction(durable, () => store.markLaneReceived(receipt("1", "90"), 219))).toEqual({
+        ok: false,
+        reason: "invalid-progress",
+      });
+      expect(transaction(durable, () => store.markLaneReceived(receipt("1", "91"), 220))).toEqual({
+        ok: false,
+        reason: "invalid-progress",
+      });
+      expect(transaction(durable, () => store.markLaneReceived(receipt("2", "179"), 221))).toEqual({
+        changed: false,
+        ok: true,
+      });
+      expect(store.lanes(fixture.recoveryId)[0]).toMatchObject({
+        lane: "live",
+        received_cumulative_encoded_bytes: "179",
+        received_delivery_ordinal: "2",
+        sent_cumulative_encoded_bytes: "179",
+        sent_delivery_ordinal: "2",
+      });
+    });
+  });
+
   it.each(["source-closed-first", "adopted-first"] as const)(
     "keeps lane receipt/apply independent and completes in %s order",
     async (order) => {
@@ -641,6 +845,25 @@ describe("RelayRecoveryStore", () => {
               store.recordValidatedLaneSend(fixture.recoveryId, encoded, 220 + index),
             ),
           ).toEqual({ changed: true, ok: true });
+          if (index < 3) {
+            expect(
+              transaction(durable, () =>
+                store.markLaneReceived(
+                  {
+                    receipt: {
+                      type: "delivery-received",
+                      deliveryGeneration: "1",
+                      lane: "recovery",
+                      contiguousDeliveryOrdinal: (index + 1).toString(),
+                      cumulativeEncodedBytes: ["90", "180", "272"][index]!,
+                    },
+                    recoveryId: fixture.recoveryId,
+                  },
+                  220 + index,
+                ),
+              ),
+            ).toEqual({ changed: true, ok: true });
+          }
         }
         expect(store.attempt(fixture.recoveryId)).toMatchObject({
           recovery_done_cumulative_encoded_bytes: "360",
@@ -652,7 +875,7 @@ describe("RelayRecoveryStore", () => {
           transaction(durable, () =>
             store.markReplicaApplied(fixture.recoveryId, "1", committed, 231),
           ),
-        ).toEqual({ ok: false, reason: "invalid-progress" });
+        ).toEqual({ changed: true, ok: true });
         expect(
           transaction(durable, () =>
             store.markLaneReceived(
@@ -691,9 +914,9 @@ describe("RelayRecoveryStore", () => {
           transaction(durable, () =>
             store.markReplicaApplied(fixture.recoveryId, "1", committed, 234),
           ),
-        ).toEqual({ changed: true, ok: true });
+        ).toEqual({ changed: false, ok: true });
         expect(store.attempt(fixture.recoveryId)).toMatchObject({
-          no_progress_deadline_at: 1_234,
+          no_progress_deadline_at: 1_233,
           no_progress_timeout_ms: 1_000,
         });
 
@@ -726,9 +949,203 @@ describe("RelayRecoveryStore", () => {
         expect(store.attempt(fixture.recoveryId)?.state).toBe("complete");
         expect(transaction(durable, first)).toEqual({ changed: false, ok: true });
         expect(transaction(durable, second)).toEqual({ changed: false, ok: true });
+
+        installAuthority(durable, { sessionEpoch: "7", eventSeq: "7", nextPtyOffset: "15" });
+        const continuedLive = [
+          {
+            cumulativeEncodedBytes: "90",
+            cursor: { sessionEpoch: "7", eventSeq: "6", nextPtyOffset: "14" },
+            encoded: deliveryEnvelope("live", 1n, 90n, {
+              eventSeq: 6n,
+              kind: DataFrameKind.PtyOutput,
+              payload: new Uint8Array([1, 2]),
+              ptyOffset: 12n,
+            }),
+            ordinal: "1",
+          },
+          {
+            cumulativeEncodedBytes: "179",
+            cursor: { sessionEpoch: "7", eventSeq: "7", nextPtyOffset: "15" },
+            encoded: deliveryEnvelope("live", 2n, 179n, {
+              eventSeq: 7n,
+              kind: DataFrameKind.PtyOutput,
+              payload: new Uint8Array([3]),
+              ptyOffset: 14n,
+            }),
+            ordinal: "2",
+          },
+        ] as const;
+        for (const [index, live] of continuedLive.entries()) {
+          const now = 20_000 + index * 3;
+          expect(
+            transaction(durable, () =>
+              store.recordValidatedLaneSend(fixture.recoveryId, live.encoded, now),
+            ),
+          ).toEqual({ changed: true, ok: true });
+          expect(
+            transaction(durable, () =>
+              store.markLaneReceived(
+                {
+                  receipt: {
+                    type: "delivery-received",
+                    deliveryGeneration: "1",
+                    lane: "live",
+                    contiguousDeliveryOrdinal: live.ordinal,
+                    cumulativeEncodedBytes: live.cumulativeEncodedBytes,
+                  },
+                  recoveryId: fixture.recoveryId,
+                },
+                now + 1,
+              ),
+            ),
+          ).toEqual({ changed: true, ok: true });
+          expect(
+            transaction(durable, () =>
+              store.markReplicaApplied(fixture.recoveryId, "1", live.cursor, now + 2),
+            ),
+          ).toEqual({ changed: true, ok: true });
+        }
+        expect(store.attempt(fixture.recoveryId)).toMatchObject({
+          hard_deadline_at: 10_000,
+          replica_applied_json: JSON.stringify(continuedLive[1].cursor),
+          state: "complete",
+        });
+        expect(store.lanes(fixture.recoveryId)[0]).toMatchObject({
+          lane: "live",
+          received_cumulative_encoded_bytes: "179",
+          received_delivery_ordinal: "2",
+          sent_cumulative_encoded_bytes: "179",
+          sent_delivery_ordinal: "2",
+        });
+
+        for (const entry of store.outbox()) {
+          expect(
+            transaction(durable, () =>
+              store.acknowledgeOutbox(fixture.recoveryId, entry.kind, entry.payload_json, 20_100),
+            ),
+          ).toEqual({ changed: true, ok: true });
+        }
+        expect(store.outbox()).toEqual([]);
+        expect(transaction(durable, () => store.expireDeadlines(20_101))).toEqual([]);
+        expect(transaction(durable, () => store.pruneFencedTerminalAttempts())).toEqual([]);
+        expect(store.attempt(fixture.recoveryId)?.state).toBe("complete");
       });
     },
   );
+
+  it("keeps a current complete attempt as the live-lane owner only", async () => {
+    const fixture = await createSession();
+    await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
+      seedClient(durable, fixture, "v3");
+      installAuthority(durable, committed);
+      const store = recoveryStore(durable);
+      transaction(durable, () => store.beginPreparing(beginInput(fixture)));
+      transaction(durable, () => store.installFence(installInput(fixture)));
+      durable.storage.sql.exec(
+        `UPDATE recovery_attempt
+         SET state = 'complete', recovery_done_through_json = ?,
+             recovery_done_ordinal = '1', recovery_done_cumulative_encoded_bytes = '88',
+             updated_at = 250
+         WHERE recovery_id = ?`,
+        JSON.stringify(committed),
+        fixture.recoveryId,
+      );
+      durable.storage.sql.exec(
+        `UPDATE recovery_delivery_lane
+         SET sent_delivery_ordinal = '1', sent_cumulative_encoded_bytes = '88',
+             sent_authority_cursor_json = ?, received_delivery_ordinal = '1',
+             received_cumulative_encoded_bytes = '88', received_authority_cursor_json = ?
+         WHERE recovery_id = ? AND lane = 'recovery'`,
+        JSON.stringify(committed),
+        JSON.stringify(committed),
+        fixture.recoveryId,
+      );
+      installAuthority(durable, { sessionEpoch: "7", eventSeq: "6", nextPtyOffset: "14" });
+
+      const live = deliveryEnvelope("live", 1n, 90n, {
+        eventSeq: 6n,
+        kind: DataFrameKind.PtyOutput,
+        payload: new Uint8Array([1, 2]),
+        ptyOffset: 12n,
+      });
+      expect(
+        transaction(durable, () => store.recordValidatedLaneSend(fixture.recoveryId, live, 20_000)),
+      ).toEqual({ changed: true, ok: true });
+      expect(
+        transaction(durable, () =>
+          store.markLaneReceived(
+            {
+              receipt: {
+                type: "delivery-received",
+                deliveryGeneration: "1",
+                lane: "live",
+                contiguousDeliveryOrdinal: "1",
+                cumulativeEncodedBytes: "90",
+              },
+              recoveryId: fixture.recoveryId,
+            },
+            20_001,
+          ),
+        ),
+      ).toEqual({ changed: true, ok: true });
+      expect(
+        transaction(durable, () =>
+          store.markReplicaApplied(
+            fixture.recoveryId,
+            "1",
+            { sessionEpoch: "7", eventSeq: "6", nextPtyOffset: "14" },
+            20_002,
+          ),
+        ),
+      ).toEqual({ changed: true, ok: true });
+
+      expect(
+        transaction(durable, () =>
+          store.recordValidatedLaneSend(
+            fixture.recoveryId,
+            deliveryEnvelope("recovery", 1n, 90n, {
+              eventSeq: 3n,
+              kind: DataFrameKind.PtyOutput,
+              payload: new Uint8Array([1, 2]),
+              ptyOffset: 4n,
+            }),
+            20_003,
+          ),
+        ),
+      ).toEqual({ ok: false, reason: "state-conflict" });
+      expect(
+        transaction(durable, () =>
+          store.markAdopted(
+            {
+              type: "recovery-adopted",
+              recoveryId: fixture.recoveryId,
+              deliveryGeneration: "1",
+              replicaApplied: committed,
+            },
+            20_004,
+          ),
+        ),
+      ).toEqual({ ok: false, reason: "state-conflict" });
+      expect(
+        transaction(durable, () =>
+          store.markSourceClosed(
+            {
+              type: "recovery-source-closed",
+              recoveryId: fixture.recoveryId,
+              connectionId: fixture.connectionId,
+              streamId: 1,
+              deliveryGeneration: "1",
+              throughRecoveryOrdinal: "1",
+              throughRecoveryCumulativeEncodedBytes: "90",
+            },
+            20_005,
+          ),
+        ),
+      ).toEqual({ ok: false, reason: "state-conflict" });
+      expect(store.attempt(fixture.recoveryId)?.state).toBe("complete");
+      expect(store.pruneFencedTerminalAttempts()).toEqual([]);
+    });
+  });
 
   it("rejects new progress at the hard deadline without breaking exact scalar retries", async () => {
     const fixture = await createSession();
@@ -779,9 +1196,30 @@ describe("RelayRecoveryStore", () => {
         }),
       ];
       for (const [index, encoded] of recoverySent.entries()) {
-        transaction(durable, () =>
-          store.recordValidatedLaneSend(fixture.recoveryId, encoded, 220 + index),
-        );
+        expect(
+          transaction(durable, () =>
+            store.recordValidatedLaneSend(fixture.recoveryId, encoded, 220 + index * 2),
+          ),
+        ).toEqual({ changed: true, ok: true });
+        if (index < 3) {
+          expect(
+            transaction(durable, () =>
+              store.markLaneReceived(
+                {
+                  receipt: {
+                    type: "delivery-received",
+                    deliveryGeneration: "1",
+                    lane: "recovery",
+                    contiguousDeliveryOrdinal: (index + 1).toString(),
+                    cumulativeEncodedBytes: ["90", "180", "272"][index]!,
+                  },
+                  recoveryId: fixture.recoveryId,
+                },
+                221 + index * 2,
+              ),
+            ),
+          ).toEqual({ changed: true, ok: true });
+        }
       }
       const recoveryReceipt = {
         type: "delivery-received",

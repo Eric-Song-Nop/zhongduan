@@ -105,6 +105,32 @@ describe("CloudApiClient", () => {
     );
   });
 
+  it("offers an explicitly injected Host-v3 capability set without changing the default", async () => {
+    const relayCapabilities = [
+      RelayCapability.capabilityNegotiationV1,
+      RelayCapability.authorityDataV2,
+      RelayCapability.deliveryBarrierOutcomeV1,
+      RelayCapability.wireEndpointV3,
+      RelayCapability.recoveryV3GapFillV1,
+    ] as const;
+    const response = { ...hostConnection, negotiatedCapabilities: [...relayCapabilities] };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      jsonResponse(response),
+    );
+    const api = new CloudApiClient("https://cloud.example", {
+      fetch: fetchMock as unknown as typeof fetch,
+      relayCapabilities,
+    });
+
+    await expect(api.createConnectionSet("session_AAAAAAAAA", "host-cap")).resolves.toEqual(
+      response,
+    );
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(new Headers(init?.headers).get(RELAY_CAPABILITIES_HEADER)).toBe(
+      relayCapabilities.join(","),
+    );
+  });
+
   it("keeps negotiation unconfirmed when an old Cloud omits the response field", async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
       jsonResponse(hostConnection),

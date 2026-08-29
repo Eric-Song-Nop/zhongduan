@@ -15,12 +15,23 @@ import {
   type HostCapabilityProvider,
   type SnapshotUploadApi,
 } from "./snapshot-publisher";
+import { RecoverySourceManager, type RecoverySourceManagerLimits } from "./recovery-source-manager";
 import {
   SnapshotCheckpointManager,
   type SnapshotPublisherLike,
 } from "./snapshot-checkpoint-manager";
 
 export type HostCloudApi = HostConnectionApi & SnapshotUploadApi;
+
+export const HOST_RECOVERY_SOURCE_LIMITS = {
+  maxCanonicalBytesPerSource: 256 * 1024,
+  maxCanonicalFramesPerSource: 512,
+  maxOwnedRecords: 1_024,
+  maxOwnedWireBytes: 2 * 1024 * 1024,
+  maxSources: 16,
+  noProgressDeadlineMs: 15_000,
+  recoveryDeadlineMs: 60_000,
+} as const satisfies RecoverySourceManagerLimits;
 
 export interface HostCloudRelayOptions {
   api: HostCloudApi;
@@ -30,6 +41,7 @@ export interface HostCloudRelayOptions {
   monotonicNow?: () => number;
   random?: () => number;
   reconnectDelayMs?: number;
+  recoverySourceManager?: RecoverySourceManager;
   session: TerminalSession;
   sessionId: string;
   snapshotPublisher?: SnapshotPublisherLike;
@@ -45,6 +57,7 @@ export class HostCloudRelay {
   readonly #monotonicNow: () => number;
   readonly #random: () => number;
   readonly #reconnectDelayMs: number;
+  readonly #recoverySourceManager: RecoverySourceManager;
   readonly #session: TerminalSession;
   readonly #sessionId: string;
   readonly #snapshotCheckpointManager: SnapshotCheckpointManager;
@@ -80,6 +93,13 @@ export class HostCloudRelay {
     this.#monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
     this.#session = options.session;
     this.#sessionId = options.sessionId;
+    this.#recoverySourceManager =
+      options.recoverySourceManager ??
+      new RecoverySourceManager({
+        limits: HOST_RECOVERY_SOURCE_LIMITS,
+        monotonicNow: this.#monotonicNow,
+        session: this.#session,
+      });
     const snapshotPublisher =
       options.snapshotPublisher ??
       new SnapshotPublisher({
@@ -131,7 +151,11 @@ export class HostCloudRelay {
     try {
       await this.#runPromise;
     } finally {
-      this.#snapshotCheckpointManager.dispose(reason);
+      try {
+        this.#snapshotCheckpointManager.dispose(reason);
+      } finally {
+        this.#recoverySourceManager.dispose();
+      }
     }
   }
 
@@ -154,7 +178,9 @@ export class HostCloudRelay {
             : { webSocketFactory: this.#webSocketFactory }),
         });
         const connection = new HostRelayConnection({
+          monotonicNow: this.#monotonicNow,
           pair,
+          recoverySourceManager: this.#recoverySourceManager,
           session: this.#session,
           snapshotCheckpointManager: this.#snapshotCheckpointManager,
         });
