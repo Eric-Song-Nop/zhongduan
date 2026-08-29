@@ -1,8 +1,8 @@
 # Recovery v3 Wire Contract
 
-> 状态：P2.0 wire/capability、P2.1 pure Browser RecoveryAssembler、P2.2 pure Host
-> PreparedGap/source owner 与 P2.3 Cloud durable scalar owner 为 stacked candidates；所有生产 generation
-> 仍选择 protocol v2，Recovery v3 runtime 仍不可达
+> 状态：P2.0–P2.4 为 stacked candidates；Recovery v3 的 Host/Cloud/Browser runtime 已在完整
+> capability gate 后接通。默认 production kill switch 和 Host/Browser offers 仍选择 protocol v2，
+> 所以尚未 rollout
 >
 > 适用范围：Host authority data、Cloud delivery、Browser recovery 与滚动协商
 
@@ -38,13 +38,14 @@ Endpoint 通过 `x-zhongduan-relay-capabilities` 提交有界 token offer。只�
 - 历史 `selectedCapabilities` 仅为旧 DO response 的 decode shim，不能确认任何 v3 能力；
 - endpoint 只有在实现对应状态机后才能 advertise 该能力，不能把预告 token 当 feature flag。
 
-P2.0 只允许生产 endpoint advertise 已实现的：
+默认 production endpoint 仍只 advertise v2 baseline：
 
 - `capability-negotiation-v1`；
 - `authority-data-v2`；
 - Host 已有的 `delivery-barrier-outcome-v1`。
 
-以下 token 只建立 schema，后续 owner PR 完成前不得由生产 endpoint advertise：
+P2.4 runtime 已实现以下 v3 family，但默认 Host/Browser offer 不包含它们；只能通过
+明确 rollout/test seam 提交对应 endpoint 所需的完整 family，不能只开其中一部分：
 
 - `wire-endpoint-v3`；
 - `delivery-envelope-v3`；
@@ -54,7 +55,11 @@ P2.0 只允许生产 endpoint advertise 已实现的：
 
 新 generation 只有在 Cloud kill switch 开启、session authority data version 匹配，并且 Host 与 Browser 的
 confirmed capability 分别满足完整依赖时才能选择 v3。缺少任一依赖都选择完整 v2；同一 generation 的
-strategy 不可切换。
+strategy 不可切换。Browser 侧 strategy-aware strict decoder 保证 v2 generation 不接受 v3
+control/envelope，v3 generation 也不接受 v2 replay-start、snapshot-manifest、ACK 或 data frame。
+Host relay pair 属于整个 session，必须同时服务 v2 与 v3 Browser generations；因此 Host 连接先严格分派
+共享/legacy control，再分派 Recovery v3 source control，不能把某个 Browser generation 的 strategy
+提升为整条 Host pair 的唯一 decoder。
 
 ## Cursor 与 boundary
 
@@ -153,15 +158,16 @@ identity cache。Cloud 只有 matching `RecoveryAdopted` 与 `RecoverySourceClos
 
 ## 当前启用状态与验证边界
 
-### 当前保留的 stacked candidates
+### P2.0–P2.4 stacked candidates
 
 P2.0 保留 strict schema、codec、capability transport、authority version migration 和 generation strategy 的 v2
-default。它不发送 v3 frame，也不移除 v2 pause/barrier/pin。
+default。P2.4 增加按 generation strategy 隔离的 Browser↔Cloud 与 Cloud↔Host strict control union；
+v2 decoder 仍保持原 shape。v2 fallback 的 pause/barrier/pin 没有改变。
 
-P2.1 只保留 `packages/session-client` 内 generation-scoped pure assembler。它接受 caller 提供的 start、完整
+P2.1 保留 `packages/session-client` 内 generation-scoped pure assembler。它接受 caller 提供的 start、完整
 envelope、cold candidate、source-closed certificate、monotonic tick 和 handoff confirmation，并输出稳定的
-receipt/apply/adopt/completion progress；它自己不做网络、HTTP 或真实 production WTerm wiring，只向 caller
-提供的 pure target 应用已验证 mutation。保留行为包括：
+receipt/apply/adopt/completion progress；它自己不做网络、HTTP 或 WTerm wiring，只向 caller
+提供的 target 应用已验证 mutation。保留行为包括：
 
 - start 前有界拥有 payload copy，但 start 完整验证前不公开 receipt；matching immutable start 幂等，divergent
   start fail closed；
@@ -170,7 +176,8 @@ receipt/apply/adopt/completion progress；它自己不做网络、HTTP 或真实
   fail closed；
 - 只按小 quantum apply 连续 authority 前缀。cold target 未安装时 receipt 与 apply 分离；warm target 必须精确
   位于 `R`，cold install 必须匹配 recovery attempt、base 与 engine；candidate 是否确由 start 中的 snapshot
-  manifest restore 而来，属于后续 HTTP/WTerm wiring owner 的义务，P2.1 尚不证明；
+  manifest restore 而来不属于 P2.1 pure owner 的证明边界；P2.4 接入 exact snapshot transport，
+  真实 WTerm/Ghostty continuation oracle 仍属于 P2.6；
 - `RecoveryDone(H)` 是 recovery lane 的最后 record。它可早于 restore/apply 完成到达，但不能早于缺失的
   lower recovery ordinal；Done 已验证且 applied 至少到 `H` 后才 handoff-eligible；
 - caller 完成真实 atomic handoff 后才 confirm，随后产生稳定 `RecoveryAdopted(K)`，其中 `K >= H`；
@@ -184,7 +191,13 @@ receipt/apply/adopt/completion progress；它自己不做网络、HTTP 或真实
   标为 tainted；零 effect 的 start/admission conflict 保留可复用 base。所有 gap/no-progress deadline只由显式
   monotonic tick 推进。
 
-P2.2 只保留 Host 内尚未接 production control union 或 relay connection 的 source primitives：
+P2.4 `RecoveryRuntime` 现在把这个 assembler 接入 Browser `TerminalSession`：它使用
+`RecoveryStart` 内的 exact manifest 执行 HTTP snapshot restore，将 detached cold candidate adopt 到
+`ReplicaHost`，为 warm handoff 确认现有 target，并稳定重试 receipt/apply/adopt progress 与
+source-closed 收敛。只有 assembler completion 后才把 mutation ordering ownership 交给长期 live
+receiver；deadline、restore abort、dispose/adopt 不可判定结果和 tainted warm base 都有明确 owner。
+
+P2.2 保留 Host 内 bounded source primitives：
 
 - `TerminalSession` 在一个 actor turn 内固定 `H`，对 `(R,H]` 先做 exact journal range/cap 检查，再拥有
   materialized frame copy，并同步执行 fence commit；callback 拒绝或抛错只返回 unavailable，不改变 authority；
@@ -199,14 +212,20 @@ P2.2 只保留 Host 内尚未接 production control union 或 relay connection �
 - per-source canonical cap、session-owned envelope cap、source-count cap、no-progress/absolute deadline 和
   owner-token fence 均由 caller 显式配置或驱动；这一层不拥有 socket、timer、Cloud state 或公平调度。
 
-P2.3 只保留尚未接 production v3 control/data handler 的 Cloud durable owner：
+P2.4 已把 source owner 接入 strict `HostRelayConnection`：Cloud prepare 在 authority actor 内建立
+source 并产生 ordered fence，start-ready/grant 驱动单 record bounded drain，verified receipt 驱动后续
+record 和 release-once `RecoverySourceClosed`。reset、pair replacement、send outcome uncertain 与 deadline 都
+fence exact owner；Cloud 在 prepare 送达前持久化的 exact reset 会安装有界 generation tombstone，
+防止同代迟到 prepare 复活，不会误关健康 Host pair。
+
+P2.3 保留 Cloud hibernation-safe durable owner：
 
 - schema v7 的 STRICT `recovery_attempt`、`recovery_delivery_lane` 与 `recovery_control_outbox` 保存 immutable
   prepare/start、base/committed/live floor、grant/Done、每 lane sent/received cursor scalar、replica-applied、adopted、
   source-closed、deadline/reset 与 bounded control intent；它们是 hibernation-safe scalar truth；
 - strict versioned hibernation attachment 完整保留 V2 legacy delivery state；V3 只保存 socket identity、
   capability、`recoveryStrategy=v3` 与可选 Browser recovery lookup key，Host lookup 必须为空，不持久化 legacy
-  delivery fields，未知 version/field fail closed；production socket 目前仍只创建 V2 attachment；
+  delivery fields，未知 version/field fail closed；
 - generation replacement/activation、Host fence 与 client removal 在各自 connection mutation 的同一
   `transactionSync` 中 fence recovery。reset outbox 无容量时整个 connection/recovery transition 回滚；alarm、
   snapshot cleanup 和其他外部工作只在 transaction 之后请求；
@@ -214,31 +233,44 @@ P2.3 只保留尚未接 production v3 control/data handler 的 Cloud durable own
   recovery 共用一个 persisted earliest-deadline alarm mux，首次 `initialized` marker 只接管一次 pre-mux
   snapshot alarm，stale early delivery 不提前执行 future deadline；handler failure 从完成时钟后做 bounded retry；
 - Cloud 不保存 delivery mutation envelope payload 或 hash。已记录 ordinal 的 envelope retry 无法只靠 scalar
-  cursor 证明 byte-identical，因此 Cloud 必须 fail closed，并由后续 runtime reset/replan；exact retry 证明仍由
+  cursor 证明 byte-identical，因此 Cloud 必须 fail closed 并 reset/replan；exact retry 证明仍由
   持有 retained copy/hash 的 Host source 与 Browser assembler 负责。
 
-P2.3 的 outbox 还没有 drain/ACK owner，prepare/start/envelope/receipt/apply/adopt/source-closed 也未绑定当前
-socket identity，因此这些 durable facts 当前不能使 production v3 可达。
+P2.4 Cloud runtime 在这些 durable facts 上完成：
 
-### 当前不可达与后置 owner
+- outbox 只向 exact current Host/Browser socket identity 发送，socket send 在 `transactionSync`
+  之外；ACK 用 exact destination、kind 和 payload JSON 做 CAS，stale socket 或不可判定 send
+  outcome 不能消费 durable intent；hibernation 后从 strict attachment 与 SQL 重建 exact 路由；
+- Host data 严格保持 `H / fence(H) / H+1`。start fence 在处理 `H+1` 前原子安装
+  attempt/start/live floor；Host 只能发 recovery-lane envelope，Cloud 只从 canonical mutation 生成
+  live-lane envelope，Host 注入 live lane 会被 fence；
+- prepare/start/envelope、`DeliveryReceived`、`ReplicaApplied`、`RecoveryAdopted` 和
+  `RecoverySourceClosed` 全部绑定 exact recovery/client/connection/stream/generation 与 Host fence。
+  writer Welcome/token、lease renew、semantic input 和 Host input ACK 也只使用 exact active v3 owner；
+- P2.4 以每 lane strict stop-and-wait 代替尚未实现的 dynamic credit。当当前 client 存在
+  outstanding envelope 时又来一条 canonical mutation、看到 same ordinal 或 data send outcome
+  uncertain，只 reset/isolate 该 client generation；authority、v2 客户端与其他 v3 客户端继续。
 
-P2.1 assembler 没有接入 Browser `TerminalSession` 或 v2 `SessionCoordinator`，P2.2 Host primitives 也没有
-接入 `HostRelayConnection`、production control union 或 delivery scheduler；P2.3 Cloud scalar store/outbox 也
-没有 production drain、socket binding 或 v3 handler。endpoint 仍不 advertise v3 capability。因此 production
-attach、warm resync 和 cold recovery 都不能到达这些 primitives。当前不包含：
+### 默认生产启用状态与后置 gate
 
-- HTTP snapshot download、WTerm restore/adopt 或真实 terminal handoff；
-- Cloud outbox drain、current-socket binding，以及 prepare/start/envelope/receipt/apply/adopt/closure transport；
-- Host source primitive 到实际 relay control/data socket 的接线和多 source 公平调度；
-- WebSocket send/retry timer、generation replan，或 completion 后长期消费 live mutation 的 owner。
+P2.4 的 runtime wiring 已经存在，但默认配置不会选中它：
 
-滚动实现顺序保持 capability-first：P2.0 保留显式 downgrade，P2.1/P2.2 冻结两端 pure owner，P2.3 冻结 Cloud
-durable scalar/attachment/alarm owner；P2.4 才 drain outbox 并接 Host/Browser runtime、真实 target handoff 和长期
-live，P2.5 再建立 bounded lane credit 与 multi-client fairness。完整三方 negotiated state machine、owner fault
-tests、真实 snapshot continuation oracle 与 rolling downgrade/rollback gate 全部通过后，才允许对**新的**
-delivery generation 一次性选择 v3，并同时切换掉该 v3 path 的 global pause、fixed-commit barrier 和 pin。不能
-提前单独关闭其中任何一项；v2 generation 与 v2 fallback 保持原 invariant。性能验证继续后置，不能替代这些
-correctness gates。
+- Wrangler 的 `RECOVERY_V3_ENABLED` 默认为 `"false"`；
+- Host `CloudApiClient` 与 Browser `TerminalSession` 的默认 capability offer 只包含 v2 baseline；
+- 只有 kill switch、已发布 snapshot、authority version 与 Host/Browser/Cloud 完整 capability family
+  同时成立，新 Browser generation 才选择 v3；
+- kill switch 关闭时，Cloud 在 v2 decode 或 outbox drain 前 fail closed 任何已持久化 v3
+  attachment/attempt，不发送 pending v3 outbox intent。
+
+因此当前状态是“capability-gated runtime 已接通”，而不是“Recovery v3 已上线”。v3
+generation 不使用 v2 global pause/fixed-commit barrier/pin；默认 v2 generation 和 rolling fallback
+仍完整保留 pause/barrier/pin invariant，不得因 P2.4 wiring 单独放宽。
+
+P2.5 仍需建立 dynamic per-lane credit、session aggregate cap、writer/live reservation 与 multi-client
+fair scheduling；P2.4 的 fixed grant/stop-and-wait 只是有界 correctness 路径。P2.6 仍需完成
+three-owner deterministic crash/loss integration、真实 WTerm/Ghostty snapshot/parser continuation 与 exact-tail
+continuity oracle，以及 rolling downgrade/rollback gate。性能、load/soak、SLO 和 dashboard 继续后置，
+不能替代 correctness gates。
 
 ### 保留的直接证据
 
@@ -262,7 +294,7 @@ cursor/assembler helper 的独立 reference reducer；当前不引入随机 gene
 P2.2 owner tests 覆盖 actor 内固定 `(R,H]`、真实 `TerminalSession -> CanonicalPublisher` 的
 `H / fence(H) / H+1` 出队顺序、R=H 时唯一 Done record 的 literal 40-byte envelope/cumulative bytes、cap 与
 cap+1、grant boundary、send throw 后 byte-identical retry、伪造/提前 receipt 不释放、exact Done closure retry、
-generation tombstone、16-source aggregate bound、deadline、reset 与 dispose。既有 v2 delivery scheduler regression
+generation tombstone、session aggregate bound、deadline、reset 与 dispose。既有 v2 delivery scheduler regression
 仍单独证明 pause/barrier/pin fallback 未改变；这些测试不声称已证明 socket fairness 或 Cloud hibernation。
 
 P2.3 owner tests 保留 v6→v7 strict migration 与 V2 default、prepare/install/outbox 原子性、独立 lane
@@ -271,12 +303,23 @@ V2/V3 attachment strict roundtrip、eviction 后 SQL deadline 重建，以及 sn
 one-time initialized marker、stale early delivery、active retry fact 与 completion-clock bounded retry。它们也明确
 证明 Cloud 不保存 mutation payload/hash 时不能认证同 ordinal replay。
 
-这些证据只证明 pure wire/assembler contract、Cloud scalar/attachment/alarm owner 和显式 downgrade，不等价于
-production-like 网络、outbox drain、真实 WTerm/Ghostty state 或跨进程 owner。P2.4 需要 current-socket-bound
-outbox send/ACK、same-ordinal reset、duplicate/gap/adopt/closure/crash fault integration 与真实
-snapshot/parser-continuation/exact-tail oracle；P2.5 需要 multi-client aggregate/fair scheduling。性能、load/soak、
-SLO 与 dashboard 仍后置；当前 correctness gate 不编写或推断性能验证。
+P2.4 owner-level wiring tests 保留以下直接证据：
 
-P2.0–P2.3 不修改 WTerm/Ghostty。若后续 wiring 暴露真实 API 缺口，必须先在 `Eric-Song-Nop` 对应 fork 建立
-正式 PR 并完成 review/验证，再由 Zhongduan 的独立 stacked PR 更新固定 submodule；不得直接改 vendor、指向
+- Host strict control union、`H / fence(H) / H+1`、bounded source drain、partial/Done receipt、exact
+  source reset/tombstone、send outcome 与 deadline fence；
+- Cloud exact Host/Browser/payload outbox CAS、DO hibernation 后路由、start/live/recovery 顺序、strict
+  envelope/progress/closure、writer lease activation crash cut、Host/Browser fence、kill-switch 关闭和
+  per-client stop-and-wait/reset isolation；
+- Browser 完整 capability family 选择、HTTP snapshot restore/adopt、warm/cold handoff、三类 progress
+  retry、monotonic deadline、outcome-uncertain ownership 与 completion 后长期 live receiver；
+- 既有 v2 decoder、pause/barrier/pin、connection replacement 和 input path regression 仍保持隔离。
+
+P2.4 证据是本地 workerd/Miniflare、fake WebSocket、fake timer/clock 与 caller-provided replica seam
+上的 wiring evidence。它不证明真实网络、production Cloudflare/R2、真实 WTerm/Ghostty parser
+continuation 与 tail equivalence，也不证明 lane credit、multi-client fairness、性能或 SLO；这些分别
+属于 P2.5/P2.6 及后续环境 gate。
+
+P2.0–P2.4 不修改 WTerm/Ghostty。若 P2.5/P2.6 暴露真实 API 缺口，必须先在
+`Eric-Song-Nop` 对应 fork 建立正式 PR 并完成 review/验证，再由 Zhongduan 的独立 stacked PR
+更新固定 submodule；不得直接改 vendor、指向
 upstream 或 pin 未审 commit。

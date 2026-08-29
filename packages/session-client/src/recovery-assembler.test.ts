@@ -738,6 +738,19 @@ describe("RecoveryAssembler", () => {
     expect(spam.resetResult?.reason).toBe("no-progress-deadline");
   });
 
+  it("exposes the exact next caller-driven deadline without extending it for non-progress", () => {
+    const assembler = createColdAssembler({
+      limits: { noProgressDeadlineMs: 10, recoveryDeadlineMs: 100 },
+    });
+    expect(assembler.nextDeadlineAtMs).toBe(10);
+    expect(assembler.acceptEnvelope(fixture().live[0]!.raw, 2)).toBe(true);
+    expect(assembler.nextDeadlineAtMs).toBe(10);
+    expect(assembler.acceptStart(coldStart(), 3)).toBe(true);
+    expect(assembler.nextDeadlineAtMs).toBe(13);
+    assembler.reset("protocol-conflict");
+    expect(assembler.nextDeadlineAtMs).toBeNull();
+  });
+
   it("requires the exact Done ordinal and bytes and completes in either closure/adoption order", () => {
     for (const order of ["closure-first", "adoption-first"] as const) {
       const { assembler, now: initialNow, records } = driveWarmToHandoff(false);
@@ -927,6 +940,63 @@ describe("RecoveryAssembler", () => {
     expect(candidate.disposeCalls).toBe(0);
     assembler.close();
     expect(candidate.disposeCalls).toBe(0);
+  });
+
+  it("relinquishes only the exact current cold handoff after an uncertain host outcome", () => {
+    const assembler = createColdAssembler({ limits: { maxApplyFramesPerCall: 8 } });
+    const records = fixture();
+    const candidate = new FakeReplica();
+    let now = 0;
+    expect(assembler.acceptStart(coldStart(), now++)).toBe(true);
+    expect(assembler.installSnapshotCandidate(candidateIdentity(), candidate, now++)).toBe(true);
+    for (const record of records.recovery) {
+      expect(assembler.acceptEnvelope(record.raw, now++)).toBe(true);
+    }
+    expect(assembler.continueApply(now++)).toBe(2);
+    expect(assembler.abandonHandoffOutcomeUncertain(now++)).toBe(true);
+    expect(assembler.resetResult?.reason).toBe("ownership-uncertain");
+    expect(assembler.recoveryAdopted).toBeNull();
+    expect(candidate.disposeCalls).toBe(0);
+    expect(assembler.abandonHandoffOutcomeUncertain(now++)).toBe(false);
+    assembler.close();
+    expect(candidate.disposeCalls).toBe(0);
+
+    const warm = driveWarmToHandoff(false);
+    expect(warm.assembler.abandonHandoffOutcomeUncertain(warm.now)).toBe(false);
+    expect(warm.assembler.state).toBe("handoff-eligible");
+    expect(warm.replica.disposeCalls).toBe(0);
+  });
+
+  it("relinquishes a visible cold handoff before deadline checks in both outcome paths", () => {
+    for (const outcome of ["confirm", "uncertain"] as const) {
+      const assembler = createColdAssembler({
+        limits: {
+          maxApplyFramesPerCall: 8,
+          noProgressDeadlineMs: 10,
+          recoveryDeadlineMs: 10,
+        },
+      });
+      const records = fixture();
+      const candidate = new FakeReplica();
+      expect(assembler.acceptStart(coldStart(), 0)).toBe(true);
+      expect(assembler.installSnapshotCandidate(candidateIdentity(), candidate, 0)).toBe(true);
+      for (const record of records.recovery) {
+        expect(assembler.acceptEnvelope(record.raw, 0)).toBe(true);
+      }
+      expect(assembler.continueApply(0)).toBe(2);
+      expect(assembler.state).toBe("handoff-eligible");
+
+      if (outcome === "confirm") {
+        expect(assembler.confirmHandoff(replicaCursor(12n, 102n), 10)).toBe(false);
+        expect(assembler.resetResult?.reason).toBe("generation-deadline");
+      } else {
+        expect(assembler.abandonHandoffOutcomeUncertain(10)).toBe(true);
+        expect(assembler.resetResult?.reason).toBe("ownership-uncertain");
+      }
+      expect(candidate.disposeCalls).toBe(0);
+      assembler.close();
+      expect(candidate.disposeCalls).toBe(0);
+    }
   });
 
   it("taints a mutated warm target, disposes an owned cold candidate once, and ignores late actions", () => {

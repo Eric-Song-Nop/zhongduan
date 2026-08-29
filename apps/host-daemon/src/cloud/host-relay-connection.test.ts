@@ -504,6 +504,51 @@ describe("HostRelayConnection", () => {
     v3.session.dispose();
   });
 
+  it("accepts an exact source reset before prepare without closing the Host pair", async () => {
+    const v3 = createHarness({
+      connection: {
+        ...connectionSet,
+        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
+      },
+    });
+    await acknowledgeReady(v3);
+    const prepare = recoveryPrepare(v3.session);
+    const beforeResetControl = v3.control.sent.length;
+
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-source-reset",
+        recoveryId: prepare.recoveryId,
+        connectionId: prepare.connectionId,
+        streamId: prepare.streamId,
+        deliveryGeneration: prepare.deliveryGeneration,
+        reason: "generation-reset",
+      }),
+    );
+    await settle();
+
+    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
+    expect(v3.recoverySourceManager.counters).toMatchObject({
+      ownedRecords: 0,
+      sources: 1,
+    });
+
+    v3.control.message(JSON.stringify(prepare));
+    await vi.waitFor(() => expect(v3.control.sent).toHaveLength(beforeResetControl + 1));
+    expect(
+      decodeControlFrame(v3.control.sent.at(-1) as string, RecoveryV3HostToCloudControlFrameSchema),
+    ).toMatchObject({
+      type: "recovery-prepare-rejected",
+      recoveryId: prepare.recoveryId,
+      reason: "generation-fenced",
+    });
+    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
+    v3.relay.close();
+    v3.session.dispose();
+  });
+
   it("fences the v3 owner on a recovery data send throw before later grants can reuse the pair", async () => {
     const v3 = createHarness({
       connection: {

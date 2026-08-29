@@ -116,17 +116,23 @@ export function eligibleControlForDataTicket(
     if (
       ticket.client_id === null ||
       attachment.clientId !== ticket.client_id ||
-      ticket.recovery_strategy !== browserRecoveryStrategy ||
-      attachment.hostFence !== ticket.host_fence
+      ticket.recovery_strategy !== browserRecoveryStrategy
     ) {
       return undefined;
     }
     if (ticket.recovery_strategy === "v3") {
-      return ticket.host_fence !== null && ticket.host_fence === currentReadyHostFence
+      return attachment.recoveryStrategy === "v3" &&
+        attachment.hostFence === null &&
+        ticket.host_fence !== null &&
+        ticket.host_fence === currentReadyHostFence
         ? attachment
         : undefined;
     }
-    return ticket.host_fence === null ? attachment : undefined;
+    return attachment.recoveryStrategy === "v2" &&
+      attachment.hostFence === null &&
+      ticket.host_fence === null
+      ? attachment
+      : undefined;
   }
   return undefined;
 }

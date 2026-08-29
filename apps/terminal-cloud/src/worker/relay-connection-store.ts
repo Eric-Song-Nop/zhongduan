@@ -59,13 +59,18 @@ export interface RelayConnectionRecoveryLifecycle {
   fenceRemovedClient(clientId: string, now: number): readonly string[];
 }
 
+export type RecoveryFenceScope =
+  | { clientId: string; currentGeneration: string; kind: "client-generation" }
+  | { clientId: string; kind: "removed-client" }
+  | { currentHostFence: string; kind: "host" };
+
 export class RelayConnectionStore {
   constructor(
     private readonly state: DurableObjectState,
     private readonly sql: SqlStorage,
     private readonly store: RelayStore,
     private readonly recoveries: RelayConnectionRecoveryLifecycle,
-    private readonly onRecoveriesFenced: () => void,
+    private readonly onRecoveriesFenced: (scope: RecoveryFenceScope) => void,
     private readonly maxBrowserClients: number,
     private readonly maxPendingSets: number,
   ) {}
@@ -78,7 +83,7 @@ export class RelayConnectionStore {
       throw new Error("invalid recovery strategy reservation witness");
     }
     let result: ConnectionSetReservationResult | undefined;
-    let recoveriesFenced = false;
+    let recoveryFenceScope: RecoveryFenceScope | undefined;
     this.state.storage.transactionSync(() => {
       this.#cleanupExpired(input.now);
       if (
@@ -121,8 +126,8 @@ export class RelayConnectionStore {
           input.role,
           input.expiresAt,
           input.now,
-          () => {
-            recoveriesFenced = true;
+          (scope) => {
+            recoveryFenceScope = scope;
           },
         );
         if (!reservation.ok) {
@@ -167,7 +172,7 @@ export class RelayConnectionStore {
         recoveryStrategy: input.recoveryStrategy,
       };
     });
-    if (recoveriesFenced) this.onRecoveriesFenced();
+    if (recoveryFenceScope !== undefined) this.onRecoveriesFenced(recoveryFenceScope);
     if (result === undefined) throw new Error("connection reservation did not resolve");
     return result;
   }
@@ -179,7 +184,7 @@ export class RelayConnectionStore {
   ): TicketRow | undefined {
     if (ticket.client_id === null || ticket.channel !== "control") return undefined;
     let claimed: TicketRow | undefined;
-    let recoveriesFenced = false;
+    let recoveryFenceScope: RecoveryFenceScope | undefined;
     this.state.storage.transactionSync(() => {
       const now = Date.now();
       this.#cleanupExpired(now);
@@ -268,11 +273,15 @@ export class RelayConnectionStore {
           activatedClient.delivery_generation,
           now,
         );
-        recoveriesFenced = true;
+        recoveryFenceScope = {
+          kind: "client-generation",
+          clientId: activatedClient.client_id,
+          currentGeneration: activatedClient.delivery_generation,
+        };
         claimed = this.store.ticket(ticket.ticket_digest);
       }
     });
-    if (recoveriesFenced) this.onRecoveriesFenced();
+    if (recoveryFenceScope !== undefined) this.onRecoveriesFenced(recoveryFenceScope);
     return claimed;
   }
 
@@ -315,7 +324,7 @@ export class RelayConnectionStore {
 
   advanceHostFence(connectionSetId: string): string {
     let nextFence = "0";
-    let recoveriesFenced = false;
+    let recoveryFenceScope: RecoveryFenceScope | undefined;
     this.state.storage.transactionSync(() => {
       const now = Date.now();
       const session = this.store.session();
@@ -334,15 +343,15 @@ export class RelayConnectionStore {
         connectionSetId,
       );
       this.recoveries.fenceHost(nextFence, now);
-      recoveriesFenced = true;
+      recoveryFenceScope = { kind: "host", currentHostFence: nextFence };
     });
-    if (recoveriesFenced) this.onRecoveriesFenced();
+    if (recoveryFenceScope !== undefined) this.onRecoveriesFenced(recoveryFenceScope);
     return nextFence;
   }
 
   invalidateHostConnection(connectionSetId: string, expectedFence: string): boolean {
     let invalidated = false;
-    let recoveriesFenced = false;
+    let recoveryFenceScope: RecoveryFenceScope | undefined;
     this.state.storage.transactionSync(() => {
       const now = Date.now();
       const session = this.store.session();
@@ -355,16 +364,19 @@ export class RelayConnectionStore {
       );
       this.sql.exec("DELETE FROM connection_ticket WHERE connection_set_id = ?", connectionSetId);
       this.recoveries.fenceHost((BigInt(expectedFence) + 1n).toString(), now);
-      recoveriesFenced = true;
+      recoveryFenceScope = {
+        kind: "host",
+        currentHostFence: (BigInt(expectedFence) + 1n).toString(),
+      };
       invalidated = true;
     });
-    if (recoveriesFenced) this.onRecoveriesFenced();
+    if (recoveryFenceScope !== undefined) this.onRecoveriesFenced(recoveryFenceScope);
     return invalidated;
   }
 
   replaceBrowserDelivery(input: BrowserDeliveryReplacement): boolean {
     let replaced = false;
-    let recoveriesFenced = false;
+    let recoveryFenceScope: RecoveryFenceScope | undefined;
     this.state.storage.transactionSync(() => {
       const now = Date.now();
       const client = this.store.clientById(input.clientId);
@@ -410,10 +422,14 @@ export class RelayConnectionStore {
         "v2",
       );
       this.recoveries.fenceClientGeneration(input.clientId, input.nextGeneration, now);
-      recoveriesFenced = true;
+      recoveryFenceScope = {
+        kind: "client-generation",
+        clientId: input.clientId,
+        currentGeneration: input.nextGeneration,
+      };
       replaced = true;
     });
-    if (recoveriesFenced) this.onRecoveriesFenced();
+    if (recoveryFenceScope !== undefined) this.onRecoveriesFenced(recoveryFenceScope);
     return replaced;
   }
 
@@ -423,7 +439,7 @@ export class RelayConnectionStore {
     role: "writer" | "observer",
     expiresAt: number,
     now: number,
-    onRecoveriesFenced: () => void,
+    onRecoveriesFenced: (scope: RecoveryFenceScope) => void,
   ): ClientReservationResult {
     const existing = this.store.clientById(clientId);
     if (existing !== undefined) {
@@ -497,7 +513,10 @@ export class RelayConnectionStore {
     return (currentGeneration + 1n).toString();
   }
 
-  #evictInactiveClient(now: number, onRecoveriesFenced: () => void): boolean {
+  #evictInactiveClient(
+    now: number,
+    onRecoveriesFenced: (scope: RecoveryFenceScope) => void,
+  ): boolean {
     const candidates = this.sql
       .exec("SELECT * FROM client_delivery ORDER BY updated_at ASC")
       .toArray() as unknown as ClientRow[];
@@ -530,7 +549,7 @@ export class RelayConnectionStore {
         now,
       );
       if (this.store.clientById(candidate.client_id) === undefined) {
-        onRecoveriesFenced();
+        onRecoveriesFenced({ kind: "removed-client", clientId: candidate.client_id });
         return true;
       }
     }
