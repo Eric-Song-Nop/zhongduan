@@ -133,6 +133,116 @@ function installV5Fixture(durable: DurableObjectState): void {
   });
 }
 
+function installV8DeliveryFixture(durable: DurableObjectState): {
+  activeRecoveryId: string;
+  cleanRecoveryId: string;
+  completeRecoveryId: string;
+  v2ClientId: string;
+} {
+  const activeRecoveryId = "recovery_migration_active_0001";
+  const completeRecoveryId = "recovery_migration_complete_01";
+  const cleanRecoveryId = "recovery_migration_clean_00001";
+  const v2ClientId = "client_migration_v2_000000001";
+  const baseline = JSON.stringify({ sessionEpoch: "7", eventSeq: "5", nextPtyOffset: "12" });
+  const sent = JSON.stringify({ sessionEpoch: "7", eventSeq: "6", nextPtyOffset: "14" });
+  durable.storage.transactionSync(() => {
+    const sql = durable.storage.sql;
+    sql.exec(
+      `UPDATE session_state
+       SET host_fence = '3', head_event_seq = '6', next_pty_offset = '14', updated_at = 1
+       WHERE singleton = 1`,
+    );
+    const fixtures = [
+      {
+        clientId: "client_migration_active_000001",
+        connectionId: "connection_migration_active_001",
+        recoveryId: activeRecoveryId,
+        state: "assembling",
+        streamId: 1,
+      },
+      {
+        clientId: "client_migration_complete_0001",
+        connectionId: "connection_migration_complete_1",
+        recoveryId: completeRecoveryId,
+        state: "complete",
+        streamId: 2,
+      },
+      {
+        clientId: "client_migration_clean_0000001",
+        connectionId: "connection_migration_clean_00001",
+        recoveryId: cleanRecoveryId,
+        state: "assembling",
+        streamId: 3,
+      },
+    ] as const;
+    for (const fixture of fixtures) {
+      sql.exec(
+        `INSERT INTO client_delivery
+          (client_id, principal_id_hash, role, stream_id, delivery_generation,
+           updated_at, registered_at, reservation_expires_at, recovery_strategy)
+         VALUES (?, ?, 'observer', ?, '1', 1, 1, NULL, 'v3')`,
+        fixture.clientId,
+        `principal_${fixture.clientId}`,
+        fixture.streamId,
+      );
+      sql.exec(
+        `INSERT INTO recovery_attempt
+          (recovery_id, client_id, connection_id, host_fence, stream_id,
+           delivery_generation, engine_id, state, prepare_json, start_json,
+           base_cursor_json, committed_through_json, live_floor_json,
+           granted_cumulative_encoded_bytes, replica_applied_json,
+           hard_deadline_at, no_progress_timeout_ms, no_progress_deadline_at,
+           created_at, updated_at)
+         VALUES (?, ?, ?, '3', ?, '1', ?, ?, '{}', '{}', ?, ?, '{}', '1000', ?,
+                 10000, 1000, 1100, 1, 1)`,
+        fixture.recoveryId,
+        fixture.clientId,
+        fixture.connectionId,
+        fixture.streamId,
+        "ghostty:test+snapshot-v1+wterm:test",
+        fixture.state,
+        baseline,
+        baseline,
+        baseline,
+      );
+      for (const lane of ["live", "recovery"] as const) {
+        const isOutstanding = lane === "live" && fixture.recoveryId !== cleanRecoveryId;
+        sql.exec(
+          `INSERT INTO recovery_delivery_lane
+            (recovery_id, lane, sent_delivery_ordinal, sent_cumulative_encoded_bytes,
+             sent_authority_cursor_json, received_delivery_ordinal,
+             received_cumulative_encoded_bytes, received_authority_cursor_json, updated_at)
+           VALUES (?, ?, ?, ?, ?, '0', '0', ?, 1)`,
+          fixture.recoveryId,
+          lane,
+          isOutstanding ? "1" : "0",
+          isOutstanding ? "90" : "0",
+          isOutstanding ? sent : baseline,
+          baseline,
+        );
+      }
+      if (fixture.recoveryId !== cleanRecoveryId) {
+        sql.exec(
+          `INSERT INTO recovery_control_outbox
+            (recovery_id, kind, destination, payload_json, created_at, updated_at)
+           VALUES (?, 'recovery-start', 'browser', '{}', 1, 1)`,
+          fixture.recoveryId,
+        );
+      }
+    }
+    sql.exec(
+      `INSERT INTO client_delivery
+        (client_id, principal_id_hash, role, stream_id, delivery_generation,
+         updated_at, registered_at, reservation_expires_at, recovery_strategy)
+       VALUES (?, 'principal_migration_v2', 'observer', 4, '1', 1, 1, NULL, 'v2')`,
+      v2ClientId,
+    );
+    sql.exec("DROP TABLE recovery_delivery_record");
+    durable.storage.kv.put("schema-version", 8);
+  });
+  return { activeRecoveryId, cleanRecoveryId, completeRecoveryId, v2ClientId };
+}
+
 describe("relay capability migration", () => {
   it("migrates v5 session, client, and ticket rows to fixed v2 defaults", async () => {
     const session = await createSession();
@@ -221,7 +331,7 @@ describe("relay capability migration", () => {
         { channel: "control", recovery_strategy: "v2" },
         { channel: "data", recovery_strategy: "v2" },
       ],
-      version: 8,
+      version: 9,
     });
     expect(migrated.columns.client).toContain("recovery_strategy");
     expect(migrated.columns.session).toContain("authority_data_version");
@@ -323,6 +433,107 @@ describe("relay capability migration", () => {
         .toArray(),
     );
     expect(cold).toEqual(warm.rows);
+  });
+
+  it("fails closed v8 outcome-uncertain delivery while preserving clean and v2 rows", async () => {
+    const session = await createSession();
+    const stub = sessionStub(session.sessionId);
+    const fixture = await runInDurableObject(stub, (_instance, durable) =>
+      installV8DeliveryFixture(durable),
+    );
+    await evictDurableObject(stub);
+
+    const migrated = await runInDurableObject(stub, (_instance, durable) => ({
+      attempts: durable.storage.sql
+        .exec(
+          `SELECT recovery_id, state, reset_reason FROM recovery_attempt
+           WHERE recovery_id IN (?, ?, ?) ORDER BY recovery_id`,
+          fixture.activeRecoveryId,
+          fixture.completeRecoveryId,
+          fixture.cleanRecoveryId,
+        )
+        .toArray(),
+      lanes: durable.storage.sql
+        .exec(
+          `SELECT recovery_id, lane FROM recovery_delivery_lane
+           WHERE recovery_id IN (?, ?, ?) ORDER BY recovery_id, lane`,
+          fixture.activeRecoveryId,
+          fixture.completeRecoveryId,
+          fixture.cleanRecoveryId,
+        )
+        .toArray(),
+      outbox: durable.storage.sql
+        .exec(
+          `SELECT recovery_id, kind, destination, payload_json
+           FROM recovery_control_outbox ORDER BY recovery_id, kind`,
+        )
+        .toArray(),
+      records: durable.storage.sql.exec("SELECT * FROM recovery_delivery_record").toArray(),
+      strict: durable.storage.sql
+        .exec("SELECT strict FROM pragma_table_list WHERE name = 'recovery_delivery_record'")
+        .one().strict,
+      v2: durable.storage.sql
+        .exec(
+          "SELECT recovery_strategy FROM client_delivery WHERE client_id = ?",
+          fixture.v2ClientId,
+        )
+        .one(),
+      version: durable.storage.kv.get<number>("schema-version"),
+    }));
+    expect(migrated).toMatchObject({
+      attempts: [
+        {
+          recovery_id: fixture.activeRecoveryId,
+          reset_reason: "ack-outcome-uncertain",
+          state: "resetting",
+        },
+        {
+          recovery_id: fixture.cleanRecoveryId,
+          reset_reason: "generation-reset",
+          state: "resetting",
+        },
+        {
+          recovery_id: fixture.completeRecoveryId,
+          reset_reason: "ack-outcome-uncertain",
+          state: "resetting",
+        },
+      ],
+      lanes: [],
+      records: [],
+      strict: 1,
+      v2: { recovery_strategy: "v2" },
+      version: 9,
+    });
+    expect(migrated.outbox).toHaveLength(2);
+    expect(migrated.outbox[0]).toMatchObject({
+      destination: "host",
+      kind: "recovery-source-reset",
+      recovery_id: fixture.activeRecoveryId,
+    });
+    const resetPayload = migrated.outbox[0]?.payload_json;
+    if (typeof resetPayload !== "string") throw new Error("migration reset payload missing");
+    expect(JSON.parse(resetPayload)).toMatchObject({
+      reason: "ack-outcome-uncertain",
+      recoveryId: fixture.activeRecoveryId,
+      type: "recovery-source-reset",
+    });
+    expect(migrated.outbox[1]).toMatchObject({
+      destination: "host",
+      kind: "recovery-source-reset",
+      recovery_id: fixture.cleanRecoveryId,
+    });
+
+    await evictDurableObject(stub);
+    const cold = await runInDurableObject(stub, (_instance, durable) => ({
+      outbox: durable.storage.sql.exec("SELECT recovery_id FROM recovery_control_outbox").toArray(),
+      records: durable.storage.sql.exec("SELECT * FROM recovery_delivery_record").toArray(),
+      version: durable.storage.kv.get<number>("schema-version"),
+    }));
+    expect(cold).toEqual({
+      outbox: [{ recovery_id: fixture.activeRecoveryId }, { recovery_id: fixture.cleanRecoveryId }],
+      records: [],
+      version: 9,
+    });
   });
 
   it("decodes a hibernated v2 attachment created before capability persistence", () => {

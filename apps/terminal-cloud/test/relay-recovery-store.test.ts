@@ -25,6 +25,8 @@ const origin = "https://terminal.example.test";
 const engineId = "ghostty:test+snapshot-v1+wterm:test";
 const limits: RelayRecoveryStoreLimits = {
   maxAttempts: 16,
+  maxDeliveryEncodedBytes: 2 * 1024 * 1024,
+  maxDeliveryRecords: 1024,
   maxOutboxEntries: 64,
 };
 let sessionCounter = 0;
@@ -112,6 +114,19 @@ function recoveryStore(
 
 function transaction<T>(durable: DurableObjectState, operation: () => T): T {
   return durable.storage.transactionSync(operation);
+}
+
+function sendValidatedLaneDelivery(
+  store: RelayRecoveryStore,
+  recoveryId: string,
+  encoded: ArrayBuffer | Uint8Array,
+  now: number,
+) {
+  const queued = store.enqueueValidatedLaneDelivery(recoveryId, encoded, now);
+  if (!queued.ok) return queued;
+  const begun = store.beginLaneDeliverySend(queued.record, now);
+  if (!begun.ok) return begun;
+  return store.confirmLaneDeliverySend(queued.record, now);
 }
 
 const base: AuthorityCursor = { sessionEpoch: "7", eventSeq: "2", nextPtyOffset: "4" };
@@ -215,7 +230,7 @@ function deliveryEnvelope(
 }
 
 describe("RelayRecoveryStore", () => {
-  it("migrates an intact v6 relay to bounded strict v7 tables and keeps v2 defaulted", async () => {
+  it("migrates an intact v6 relay through the bounded strict v9 ledger and keeps v2 defaulted", async () => {
     const fixture = await createSession();
     const stub = sessionStub(fixture.sessionId);
     await runInDurableObject(stub, (_instance, durable) => {
@@ -229,7 +244,7 @@ describe("RelayRecoveryStore", () => {
 
     await runInDurableObject(stub, (_instance, durable) => {
       const sql = durable.storage.sql;
-      expect(durable.storage.kv.get<number>("schema-version")).toBe(8);
+      expect(durable.storage.kv.get<number>("schema-version")).toBe(9);
       expect(
         sql
           .exec(
@@ -241,6 +256,7 @@ describe("RelayRecoveryStore", () => {
         { name: "recovery_attempt", strict: 1 },
         { name: "recovery_control_outbox", strict: 1 },
         { name: "recovery_delivery_lane", strict: 1 },
+        { name: "recovery_delivery_record", strict: 1 },
       ]);
       expect(
         sql
@@ -303,6 +319,7 @@ describe("RelayRecoveryStore", () => {
         granted_cumulative_encoded_bytes: "1000",
         state: "installed",
       });
+      expect(store.recoveryGrantReservation(fixture.recoveryId)).toBe("1000");
       expect(store.lanes(fixture.recoveryId)).toMatchObject([
         {
           lane: "live",
@@ -474,22 +491,24 @@ describe("RelayRecoveryStore", () => {
         ptyOffset: 12n,
       });
       expect(
-        transaction(durable, () => store.recordValidatedLaneSend(fixture.recoveryId, liveAtH, 210)),
-      ).toEqual({ ok: false, reason: "invalid-progress" });
-      expect(
         transaction(durable, () =>
-          store.recordValidatedLaneSend(fixture.recoveryId, liveSkipped, 211),
+          sendValidatedLaneDelivery(store, fixture.recoveryId, liveAtH, 210),
         ),
       ).toEqual({ ok: false, reason: "invalid-progress" });
       expect(
         transaction(durable, () =>
-          store.recordValidatedLaneSend(fixture.recoveryId, liveNext, 212),
+          sendValidatedLaneDelivery(store, fixture.recoveryId, liveSkipped, 211),
+        ),
+      ).toEqual({ ok: false, reason: "invalid-progress" });
+      expect(
+        transaction(durable, () =>
+          sendValidatedLaneDelivery(store, fixture.recoveryId, liveNext, 212),
         ),
       ).toEqual({ changed: true, ok: true });
       // No durable bytes/hash exist to prove an equal ordinal is an exact retry.
       expect(
         transaction(durable, () =>
-          store.recordValidatedLaneSend(fixture.recoveryId, liveNext, 213),
+          sendValidatedLaneDelivery(store, fixture.recoveryId, liveNext, 213),
         ),
       ).toEqual({ ok: false, reason: "invalid-progress" });
 
@@ -515,7 +534,7 @@ describe("RelayRecoveryStore", () => {
       ].entries()) {
         expect(
           transaction(durable, () =>
-            store.recordValidatedLaneSend(fixture.recoveryId, encoded, 220 + index),
+            sendValidatedLaneDelivery(store, fixture.recoveryId, encoded, 220 + index),
           ),
         ).toEqual({ changed: true, ok: true });
         if (index < 2) {
@@ -540,7 +559,8 @@ describe("RelayRecoveryStore", () => {
       }
       expect(
         transaction(durable, () =>
-          store.recordValidatedLaneSend(
+          sendValidatedLaneDelivery(
+            store,
             fixture.recoveryId,
             deliveryEnvelope("recovery", 4n, 362n, {
               eventSeq: 6n,
@@ -612,7 +632,8 @@ describe("RelayRecoveryStore", () => {
 
       expect(
         transaction(durable, () =>
-          store.recordValidatedLaneSend(
+          sendValidatedLaneDelivery(
+            store,
             fixture.recoveryId,
             deliveryEnvelope("recovery", 4n, 360n, {
               eventSeq: 5n,
@@ -650,7 +671,8 @@ describe("RelayRecoveryStore", () => {
       installAuthority(durable, { sessionEpoch: "7", eventSeq: "7", nextPtyOffset: "15" });
       expect(
         transaction(durable, () =>
-          store.recordValidatedLaneSend(
+          sendValidatedLaneDelivery(
+            store,
             fixture.recoveryId,
             deliveryEnvelope("live", 2n, 179n, {
               eventSeq: 7n,
@@ -693,7 +715,7 @@ describe("RelayRecoveryStore", () => {
     });
   });
 
-  it("uses stop-and-wait receipts and accepts only the exact current scalar retry", async () => {
+  it("owns a staged multi-record window and releases only an exact sent prefix", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
       seedClient(durable, fixture, "v3");
@@ -701,7 +723,7 @@ describe("RelayRecoveryStore", () => {
       const store = recoveryStore(durable);
       transaction(durable, () => store.beginPreparing(beginInput(fixture)));
       transaction(durable, () => store.installFence(installInput(fixture)));
-      installAuthority(durable, { sessionEpoch: "7", eventSeq: "7", nextPtyOffset: "15" });
+      installAuthority(durable, { sessionEpoch: "7", eventSeq: "8", nextPtyOffset: "16" });
 
       const first = deliveryEnvelope("live", 1n, 90n, {
         eventSeq: 6n,
@@ -715,6 +737,12 @@ describe("RelayRecoveryStore", () => {
         payload: new Uint8Array([3]),
         ptyOffset: 14n,
       });
+      const third = deliveryEnvelope("live", 3n, 268n, {
+        eventSeq: 8n,
+        kind: DataFrameKind.PtyOutput,
+        payload: new Uint8Array([4]),
+        ptyOffset: 15n,
+      });
       const receipt = (ordinal: string, bytes: string) => ({
         receipt: {
           type: "delivery-received" as const,
@@ -726,25 +754,77 @@ describe("RelayRecoveryStore", () => {
         recoveryId: fixture.recoveryId,
       });
 
-      expect(
-        transaction(durable, () => store.recordValidatedLaneSend(fixture.recoveryId, first, 210)),
-      ).toEqual({ changed: true, ok: true });
-      expect(
-        transaction(durable, () => store.recordValidatedLaneSend(fixture.recoveryId, second, 211)),
-      ).toEqual({ ok: false, reason: "invalid-progress" });
-      expect(transaction(durable, () => store.markLaneReceived(receipt("1", "90"), 212))).toEqual({
-        changed: true,
-        ok: true,
+      const firstQueued = transaction(durable, () =>
+        store.enqueueValidatedLaneDelivery(fixture.recoveryId, first, 210),
+      );
+      if (!firstQueued.ok) throw new Error(firstQueued.reason);
+      expect(firstQueued).toMatchObject({ changed: true, ok: true });
+      expect(firstQueued.record).toMatchObject({
+        cumulativeEncodedBytes: "90",
+        deliveryOrdinal: "1",
+        encodedBytes: 90,
+        lane: "live",
       });
-      expect(
-        transaction(durable, () => store.recordValidatedLaneSend(fixture.recoveryId, first, 213)),
-      ).toEqual({ ok: false, reason: "invalid-progress" });
-      expect(
-        transaction(durable, () => store.recordValidatedLaneSend(fixture.recoveryId, second, 214)),
-      ).toEqual({ changed: true, ok: true });
+      expect(store.deliveryRecords(fixture.recoveryId)).toMatchObject([
+        { delivery_ordinal: "1", state: "queued" },
+      ]);
+      expect(store.lanes(fixture.recoveryId)[0]).toMatchObject({
+        lane: "live",
+        sent_delivery_ordinal: "0",
+      });
 
-      // No intermediate scalar history is durable. Only the exact sent cursor may
-      // advance; mixed ordinal/byte pairs are divergent and must stay rejected.
+      // The second admission chains from the last queued obligation, not from
+      // the still-unadvanced sent lane high-water.
+      const secondQueued = transaction(durable, () =>
+        store.enqueueValidatedLaneDelivery(fixture.recoveryId, second, 211),
+      );
+      if (!secondQueued.ok) throw new Error(secondQueued.reason);
+      expect(secondQueued.record).toMatchObject({
+        cumulativeEncodedBytes: "179",
+        deliveryOrdinal: "2",
+        encodedBytes: 89,
+      });
+      const thirdQueued = transaction(durable, () =>
+        store.enqueueValidatedLaneDelivery(fixture.recoveryId, third, 211),
+      );
+      if (!thirdQueued.ok) throw new Error(thirdQueued.reason);
+      expect(store.deliveryUsage(fixture.recoveryId)).toEqual({ encodedBytes: 268, records: 3 });
+      expect(store.deliveryRecoveryIdsRequiringReset()).toEqual([fixture.recoveryId]);
+      expect(
+        transaction(durable, () => store.beginLaneDeliverySend(secondQueued.record, 212)),
+      ).toEqual({ ok: false, reason: "state-conflict" });
+
+      expect(
+        transaction(durable, () => store.beginLaneDeliverySend(firstQueued.record, 212)),
+      ).toEqual({ changed: true, ok: true });
+      expect(transaction(durable, () => store.markLaneReceived(receipt("1", "90"), 212))).toEqual({
+        ok: false,
+        reason: "progress-ahead",
+      });
+      expect(store.deliveryRecords(fixture.recoveryId)).toMatchObject([
+        { delivery_ordinal: "1", state: "sending" },
+        { delivery_ordinal: "2", state: "queued" },
+        { delivery_ordinal: "3", state: "queued" },
+      ]);
+      expect(
+        transaction(durable, () => store.confirmLaneDeliverySend(firstQueued.record, 213)),
+      ).toEqual({ changed: true, ok: true });
+      expect(
+        transaction(durable, () => store.beginLaneDeliverySend(secondQueued.record, 214)),
+      ).toEqual({ changed: true, ok: true });
+      expect(
+        transaction(durable, () => store.confirmLaneDeliverySend(secondQueued.record, 215)),
+      ).toEqual({ changed: true, ok: true });
+      expect(
+        transaction(durable, () => store.beginLaneDeliverySend(thirdQueued.record, 216)),
+      ).toEqual({ changed: true, ok: true });
+      expect(
+        transaction(durable, () => store.confirmLaneDeliverySend(thirdQueued.record, 217)),
+      ).toEqual({ changed: true, ok: true });
+      expect(store.deliveryRecoveryIdsRequiringReset()).toEqual([]);
+      expect(store.deliveryRecordsAwaitingReceipt(fixture.recoveryId)).toHaveLength(3);
+
+      // Unknown, mixed, and ahead scalar pairs cannot authenticate a ledger row.
       expect(transaction(durable, () => store.markLaneReceived(receipt("2", "178"), 215))).toEqual({
         ok: false,
         reason: "invalid-progress",
@@ -753,7 +833,7 @@ describe("RelayRecoveryStore", () => {
         ok: false,
         reason: "invalid-progress",
       });
-      expect(transaction(durable, () => store.markLaneReceived(receipt("3", "180"), 217))).toEqual({
+      expect(transaction(durable, () => store.markLaneReceived(receipt("4", "269"), 217))).toEqual({
         ok: false,
         reason: "progress-ahead",
       });
@@ -761,31 +841,457 @@ describe("RelayRecoveryStore", () => {
         changed: true,
         ok: true,
       });
+      expect(store.deliveryRecords(fixture.recoveryId)).toMatchObject([
+        { delivery_ordinal: "3", state: "sent" },
+      ]);
+      expect(store.deliveryUsage(fixture.recoveryId)).toEqual({ encodedBytes: 89, records: 1 });
+      expect(store.lanes(fixture.recoveryId)[0]).toMatchObject({
+        lane: "live",
+        received_authority_cursor_json: JSON.stringify({
+          sessionEpoch: "7",
+          eventSeq: "7",
+          nextPtyOffset: "15",
+        }),
+        received_delivery_ordinal: "2",
+        sent_delivery_ordinal: "3",
+      });
+      expect(transaction(durable, () => store.markLaneReceived(receipt("3", "268"), 219))).toEqual({
+        changed: true,
+        ok: true,
+      });
 
-      // The store has no receipt history or payload hash. A genuinely older
-      // accepted pair and a fabricated pair at that ordinal are both
-      // unauthenticated once the durable current scalar advances.
-      expect(transaction(durable, () => store.markLaneReceived(receipt("1", "90"), 219))).toEqual({
+      expect(store.deliveryUsage(fixture.recoveryId)).toEqual({ encodedBytes: 0, records: 0 });
+      expect(store.deliveryRecordsAwaitingReceipt(fixture.recoveryId)).toEqual([]);
+      expect(transaction(durable, () => store.markLaneReceived(receipt("1", "90"), 220))).toEqual({
         ok: false,
         reason: "invalid-progress",
       });
-      expect(transaction(durable, () => store.markLaneReceived(receipt("1", "91"), 220))).toEqual({
+      expect(transaction(durable, () => store.markLaneReceived(receipt("1", "91"), 221))).toEqual({
         ok: false,
         reason: "invalid-progress",
       });
-      expect(transaction(durable, () => store.markLaneReceived(receipt("2", "179"), 221))).toEqual({
+      expect(transaction(durable, () => store.markLaneReceived(receipt("3", "268"), 222))).toEqual({
         changed: false,
         ok: true,
       });
       expect(store.lanes(fixture.recoveryId)[0]).toMatchObject({
         lane: "live",
-        received_cumulative_encoded_bytes: "179",
-        received_delivery_ordinal: "2",
-        sent_cumulative_encoded_bytes: "179",
-        sent_delivery_ordinal: "2",
+        received_cumulative_encoded_bytes: "268",
+        received_delivery_ordinal: "3",
+        sent_cumulative_encoded_bytes: "268",
+        sent_delivery_ordinal: "3",
       });
     });
   });
+
+  it("enforces literal aggregate record and encoded-byte caps across both lanes", async () => {
+    const recordFixture = await createSession();
+    await runInDurableObject(sessionStub(recordFixture.sessionId), (_instance, durable) => {
+      seedClient(durable, recordFixture, "v3");
+      installAuthority(durable, committed);
+      const store = recoveryStore(durable, {
+        maxAttempts: 16,
+        maxDeliveryEncodedBytes: 2 * 1024 * 1024,
+        maxDeliveryRecords: 2,
+        maxOutboxEntries: 64,
+      });
+      transaction(durable, () => store.beginPreparing(beginInput(recordFixture)));
+      transaction(durable, () => store.installFence(installInput(recordFixture)));
+      installAuthority(durable, { sessionEpoch: "7", eventSeq: "7", nextPtyOffset: "15" });
+      const liveFirst = deliveryEnvelope("live", 1n, 90n, {
+        eventSeq: 6n,
+        kind: DataFrameKind.PtyOutput,
+        payload: new Uint8Array([1, 2]),
+        ptyOffset: 12n,
+      });
+      const liveSecond = deliveryEnvelope("live", 2n, 179n, {
+        eventSeq: 7n,
+        kind: DataFrameKind.PtyOutput,
+        payload: new Uint8Array([3]),
+        ptyOffset: 14n,
+      });
+      const recoveryFirst = deliveryEnvelope("recovery", 1n, 90n, {
+        eventSeq: 3n,
+        kind: DataFrameKind.PtyOutput,
+        payload: new Uint8Array([4, 5]),
+        ptyOffset: 4n,
+      });
+      expect(
+        transaction(durable, () =>
+          store.enqueueValidatedLaneDelivery(recordFixture.recoveryId, liveFirst, 210),
+        ),
+      ).toMatchObject({ changed: true, ok: true });
+      expect(
+        transaction(durable, () =>
+          store.enqueueValidatedLaneDelivery(recordFixture.recoveryId, recoveryFirst, 211),
+        ),
+      ).toMatchObject({ changed: true, ok: true });
+      expect(store.deliveryUsage(recordFixture.recoveryId)).toEqual({
+        encodedBytes: liveFirst.byteLength + recoveryFirst.byteLength,
+        records: 2,
+      });
+      expect(
+        transaction(durable, () =>
+          store.enqueueValidatedLaneDelivery(recordFixture.recoveryId, liveSecond, 212),
+        ),
+      ).toEqual({ ok: false, reason: "delivery-capacity" });
+    });
+
+    const literalRecordFixture = await createSession();
+    await runInDurableObject(sessionStub(literalRecordFixture.sessionId), (_instance, durable) => {
+      seedClient(durable, literalRecordFixture, "v3");
+      installAuthority(durable, committed);
+      const store = recoveryStore(durable);
+      transaction(durable, () => store.beginPreparing(beginInput(literalRecordFixture)));
+      transaction(durable, () => store.installFence(installInput(literalRecordFixture)));
+      for (const [lane, authority] of [
+        ["live", committed],
+        ["recovery", base],
+      ] as const) {
+        durable.storage.sql.exec(
+          `WITH RECURSIVE seq(value) AS (
+             VALUES(1) UNION ALL SELECT value + 1 FROM seq WHERE value < 512
+           )
+           INSERT INTO recovery_delivery_record
+             (recovery_id, lane, delivery_ordinal, cumulative_encoded_bytes,
+              encoded_bytes, authority_cursor_after_json, state)
+           SELECT ?, ?, CAST(value AS TEXT), CAST(value AS TEXT), 1, ?, 'queued' FROM seq`,
+          literalRecordFixture.recoveryId,
+          lane,
+          JSON.stringify(authority),
+        );
+      }
+      expect(store.deliveryUsage(literalRecordFixture.recoveryId)).toEqual({
+        encodedBytes: 1024,
+        records: 1024,
+      });
+      installAuthority(durable, { sessionEpoch: "7", eventSeq: "6", nextPtyOffset: "14" });
+      expect(
+        transaction(durable, () =>
+          store.enqueueValidatedLaneDelivery(
+            literalRecordFixture.recoveryId,
+            deliveryEnvelope("live", 513n, 602n, {
+              eventSeq: 6n,
+              kind: DataFrameKind.PtyOutput,
+              payload: new Uint8Array([1, 2]),
+              ptyOffset: 12n,
+            }),
+            210,
+          ),
+        ),
+      ).toEqual({ ok: false, reason: "delivery-capacity" });
+    });
+
+    const literalByteCap = 2 * 1024 * 1024;
+    const capPlusOneFixture = await createSession();
+    await runInDurableObject(sessionStub(capPlusOneFixture.sessionId), (_instance, durable) => {
+      seedClient(durable, capPlusOneFixture, "v3");
+      installAuthority(durable, committed);
+      const store = recoveryStore(durable);
+      transaction(durable, () => store.beginPreparing(beginInput(capPlusOneFixture)));
+      transaction(durable, () => store.installFence(installInput(capPlusOneFixture)));
+      const payload = new Uint8Array(literalByteCap + 1 - 88);
+      installAuthority(durable, {
+        sessionEpoch: "7",
+        eventSeq: "6",
+        nextPtyOffset: (12 + payload.byteLength).toString(),
+      });
+      const envelope = deliveryEnvelope("live", 1n, BigInt(literalByteCap + 1), {
+        eventSeq: 6n,
+        kind: DataFrameKind.PtyOutput,
+        payload,
+        ptyOffset: 12n,
+      });
+      expect(
+        transaction(durable, () =>
+          store.enqueueValidatedLaneDelivery(capPlusOneFixture.recoveryId, envelope, 210),
+        ),
+      ).toEqual({ ok: false, reason: "delivery-capacity" });
+    });
+
+    const exactCapFixture = await createSession();
+    await runInDurableObject(sessionStub(exactCapFixture.sessionId), (_instance, durable) => {
+      seedClient(durable, exactCapFixture, "v3");
+      installAuthority(durable, committed);
+      const store = recoveryStore(durable);
+      transaction(durable, () => store.beginPreparing(beginInput(exactCapFixture)));
+      transaction(durable, () => store.installFence(installInput(exactCapFixture)));
+      const payload = new Uint8Array(literalByteCap - 88);
+      installAuthority(durable, {
+        sessionEpoch: "7",
+        eventSeq: "6",
+        nextPtyOffset: (12 + payload.byteLength).toString(),
+      });
+      const envelope = deliveryEnvelope("live", 1n, BigInt(literalByteCap), {
+        eventSeq: 6n,
+        kind: DataFrameKind.PtyOutput,
+        payload,
+        ptyOffset: 12n,
+      });
+      expect(
+        transaction(durable, () =>
+          store.enqueueValidatedLaneDelivery(exactCapFixture.recoveryId, envelope, 210),
+        ),
+      ).toMatchObject({ changed: true, ok: true });
+      expect(store.deliveryUsage(exactCapFixture.recoveryId)).toEqual({
+        encodedBytes: literalByteCap,
+        records: 1,
+      });
+    });
+  });
+
+  it("orders decimal ordinals numerically, rejects a missing sent prefix, and admits MAX_U64", async () => {
+    const fixture = await createSession();
+    await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
+      seedClient(durable, fixture, "v3");
+      installAuthority(durable, committed);
+      const store = recoveryStore(durable);
+      transaction(durable, () => store.beginPreparing(beginInput(fixture)));
+      transaction(durable, () => store.installFence(installInput(fixture)));
+      durable.storage.sql.exec(
+        `UPDATE recovery_delivery_lane
+         SET sent_delivery_ordinal = '8', sent_cumulative_encoded_bytes = '800',
+             sent_authority_cursor_json = ?, received_delivery_ordinal = '8',
+             received_cumulative_encoded_bytes = '800', received_authority_cursor_json = ?
+         WHERE recovery_id = ? AND lane = 'live'`,
+        JSON.stringify(committed),
+        JSON.stringify(committed),
+        fixture.recoveryId,
+      );
+      installAuthority(durable, { sessionEpoch: "7", eventSeq: "7", nextPtyOffset: "15" });
+      const ninth = deliveryEnvelope("live", 9n, 890n, {
+        eventSeq: 6n,
+        kind: DataFrameKind.PtyOutput,
+        payload: new Uint8Array([1, 2]),
+        ptyOffset: 12n,
+      });
+      const tenth = deliveryEnvelope("live", 10n, 979n, {
+        eventSeq: 7n,
+        kind: DataFrameKind.PtyOutput,
+        payload: new Uint8Array([3]),
+        ptyOffset: 14n,
+      });
+      for (const [index, encoded] of [ninth, tenth].entries()) {
+        const queued = transaction(durable, () =>
+          store.enqueueValidatedLaneDelivery(fixture.recoveryId, encoded, 210 + index),
+        );
+        if (!queued.ok) throw new Error(queued.reason);
+        expect(
+          transaction(durable, () => store.beginLaneDeliverySend(queued.record, 212 + index)),
+        ).toEqual({
+          changed: true,
+          ok: true,
+        });
+        expect(
+          transaction(durable, () => store.confirmLaneDeliverySend(queued.record, 214 + index)),
+        ).toEqual({ changed: true, ok: true });
+      }
+      expect(store.deliveryRecords(fixture.recoveryId).map((row) => row.delivery_ordinal)).toEqual([
+        "9",
+        "10",
+      ]);
+
+      durable.storage.sql.exec(
+        `DELETE FROM recovery_delivery_record
+         WHERE recovery_id = ? AND lane = 'live' AND delivery_ordinal = '9'`,
+        fixture.recoveryId,
+      );
+      expect(
+        transaction(durable, () =>
+          store.markLaneReceived(
+            {
+              receipt: {
+                type: "delivery-received",
+                deliveryGeneration: "1",
+                lane: "live",
+                contiguousDeliveryOrdinal: "10",
+                cumulativeEncodedBytes: "979",
+              },
+              recoveryId: fixture.recoveryId,
+            },
+            220,
+          ),
+        ),
+      ).toEqual({ ok: false, reason: "invalid-progress" });
+
+      durable.storage.sql.exec(
+        "DELETE FROM recovery_delivery_record WHERE recovery_id = ?",
+        fixture.recoveryId,
+      );
+      const beforeMax = ((1n << 64n) - 2n).toString();
+      durable.storage.sql.exec(
+        `UPDATE recovery_delivery_lane
+         SET sent_delivery_ordinal = ?, sent_cumulative_encoded_bytes = '0',
+             sent_authority_cursor_json = ?, received_delivery_ordinal = ?,
+             received_cumulative_encoded_bytes = '0', received_authority_cursor_json = ?
+         WHERE recovery_id = ? AND lane = 'live'`,
+        beforeMax,
+        JSON.stringify(committed),
+        beforeMax,
+        JSON.stringify(committed),
+        fixture.recoveryId,
+      );
+      installAuthority(durable, { sessionEpoch: "7", eventSeq: "6", nextPtyOffset: "14" });
+      const atMax = deliveryEnvelope("live", (1n << 64n) - 1n, 90n, {
+        eventSeq: 6n,
+        kind: DataFrameKind.PtyOutput,
+        payload: new Uint8Array([1, 2]),
+        ptyOffset: 12n,
+      });
+      expect(
+        transaction(durable, () =>
+          store.enqueueValidatedLaneDelivery(fixture.recoveryId, atMax, 221),
+        ),
+      ).toMatchObject({ changed: true, ok: true });
+      expect(store.deliveryRecords(fixture.recoveryId)[0]?.delivery_ordinal).toBe(
+        "18446744073709551615",
+      );
+      expect(() =>
+        durable.storage.sql.exec(
+          `INSERT INTO recovery_delivery_record
+            (recovery_id, lane, delivery_ordinal, cumulative_encoded_bytes,
+             encoded_bytes, authority_cursor_after_json, state)
+           VALUES (?, 'recovery', '18446744073709551616', '1', 1, ?, 'queued')`,
+          fixture.recoveryId,
+          JSON.stringify(base),
+        ),
+      ).toThrow();
+    });
+  });
+
+  it.each([
+    { complete: false, phase: "queued", reset: "unsafe", sendsHostReset: true },
+    { complete: true, phase: "queued", reset: "unsafe", sendsHostReset: false },
+    { complete: true, phase: "sent", reset: "undeliverable", sendsHostReset: false },
+    { complete: true, phase: "empty", reset: "undeliverable", sendsHostReset: false },
+  ] as const)(
+    "fences $phase delivery ownership for complete=$complete without an invalid Host reset",
+    async ({ complete, phase, reset, sendsHostReset }) => {
+      const fixture = await createSession();
+      await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
+        seedClient(durable, fixture, "v3");
+        installAuthority(durable, committed);
+        const store = recoveryStore(durable);
+        transaction(durable, () => store.beginPreparing(beginInput(fixture)));
+        transaction(durable, () => store.installFence(installInput(fixture)));
+        if (complete) {
+          durable.storage.sql.exec(
+            "UPDATE recovery_attempt SET state = 'complete' WHERE recovery_id = ?",
+            fixture.recoveryId,
+          );
+        }
+        installAuthority(durable, { sessionEpoch: "7", eventSeq: "6", nextPtyOffset: "14" });
+        const queued =
+          phase === "empty"
+            ? undefined
+            : transaction(durable, () =>
+                store.enqueueValidatedLaneDelivery(
+                  fixture.recoveryId,
+                  deliveryEnvelope("live", 1n, 90n, {
+                    eventSeq: 6n,
+                    kind: DataFrameKind.PtyOutput,
+                    payload: new Uint8Array([1, 2]),
+                    ptyOffset: 12n,
+                  }),
+                  210,
+                ),
+              );
+        if (queued !== undefined && !queued.ok) throw new Error(queued.reason);
+        if (phase === "sent") {
+          if (queued === undefined || !queued.ok) throw new Error("queued record missing");
+          transaction(durable, () => store.beginLaneDeliverySend(queued.record, 211));
+          transaction(durable, () => store.confirmLaneDeliverySend(queued.record, 212));
+        }
+        expect(store.deliveryRecoveryIdsRequiringReset()).toEqual(
+          phase === "queued" ? [fixture.recoveryId] : [],
+        );
+
+        const result = transaction(durable, () =>
+          reset === "unsafe"
+            ? store.resetUnsafeDeliveryOutcome(fixture.recoveryId, 220)
+            : store.resetUndeliverableDeliveryOwner(fixture.recoveryId, 220),
+        );
+        expect(result).toEqual({ changed: true, ok: true });
+        expect(
+          transaction(durable, () =>
+            reset === "unsafe"
+              ? store.resetUnsafeDeliveryOutcome(fixture.recoveryId, 221)
+              : store.resetUndeliverableDeliveryOwner(fixture.recoveryId, 221),
+          ),
+        ).toEqual({ changed: false, ok: true });
+        expect(store.attempt(fixture.recoveryId)).toMatchObject({
+          reset_reason: reset === "unsafe" ? "ack-outcome-uncertain" : "generation-reset",
+          state: "resetting",
+        });
+        expect(store.deliveryRecords(fixture.recoveryId)).toEqual([]);
+        expect(store.lanes(fixture.recoveryId)).toEqual([]);
+        expect(store.outbox()).toMatchObject(
+          sendsHostReset ? [{ destination: "host", kind: "recovery-source-reset" }] : [],
+        );
+
+        if (sendsHostReset) {
+          const outbox = store.outbox()[0];
+          if (outbox === undefined) throw new Error("reset outbox missing");
+          transaction(durable, () =>
+            store.acknowledgeOutbox(fixture.recoveryId, outbox.kind, outbox.payload_json, 221),
+          );
+        }
+        expect(store.pruneFencedTerminalAttempts()).toEqual([]);
+        durable.storage.sql.exec(
+          "UPDATE client_delivery SET delivery_generation = '2' WHERE client_id = ?",
+          fixture.clientId,
+        );
+        expect(store.pruneFencedTerminalAttempts()).toEqual([fixture.recoveryId]);
+      });
+    },
+  );
+
+  it.each(["generation", "host"] as const)(
+    "cascades the scalar ledger exactly once when the %s fence advances",
+    async (fence) => {
+      const fixture = await createSession();
+      await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
+        seedClient(durable, fixture, "v3");
+        installAuthority(durable, committed);
+        const store = recoveryStore(durable);
+        transaction(durable, () => store.beginPreparing(beginInput(fixture)));
+        transaction(durable, () => store.installFence(installInput(fixture)));
+        installAuthority(durable, { sessionEpoch: "7", eventSeq: "6", nextPtyOffset: "14" });
+        expect(
+          transaction(durable, () =>
+            store.enqueueValidatedLaneDelivery(
+              fixture.recoveryId,
+              deliveryEnvelope("live", 1n, 90n, {
+                eventSeq: 6n,
+                kind: DataFrameKind.PtyOutput,
+                payload: new Uint8Array([1, 2]),
+                ptyOffset: 12n,
+              }),
+              210,
+            ),
+          ),
+        ).toMatchObject({ changed: true, ok: true });
+
+        const fenced = transaction(durable, () => {
+          if (fence === "generation") {
+            durable.storage.sql.exec(
+              "UPDATE client_delivery SET delivery_generation = '2' WHERE client_id = ?",
+              fixture.clientId,
+            );
+            return store.fenceClientGeneration(fixture.clientId, "2", 220);
+          }
+          durable.storage.sql.exec("UPDATE session_state SET host_fence = '4' WHERE singleton = 1");
+          return store.fenceHost("4", 220);
+        });
+        expect(fenced).toEqual([fixture.recoveryId]);
+        expect(store.deliveryRecords(fixture.recoveryId)).toEqual([]);
+        expect(store.lanes(fixture.recoveryId)).toEqual([]);
+        expect(store.outbox()).toMatchObject([
+          { destination: "host", kind: "recovery-source-reset" },
+        ]);
+      });
+    },
+  );
 
   it.each(["source-closed-first", "adopted-first"] as const)(
     "keeps lane receipt/apply independent and completes in %s order",
@@ -800,7 +1306,8 @@ describe("RelayRecoveryStore", () => {
 
         expect(
           transaction(durable, () =>
-            store.recordValidatedLaneSend(
+            sendValidatedLaneDelivery(
+              store,
               fixture.recoveryId,
               deliveryEnvelope("recovery", 2n, 90n, {
                 eventSeq: 3n,
@@ -842,7 +1349,7 @@ describe("RelayRecoveryStore", () => {
         for (const [index, encoded] of sent.entries()) {
           expect(
             transaction(durable, () =>
-              store.recordValidatedLaneSend(fixture.recoveryId, encoded, 220 + index),
+              sendValidatedLaneDelivery(store, fixture.recoveryId, encoded, 220 + index),
             ),
           ).toEqual({ changed: true, ok: true });
           if (index < 3) {
@@ -979,7 +1486,7 @@ describe("RelayRecoveryStore", () => {
           const now = 20_000 + index * 3;
           expect(
             transaction(durable, () =>
-              store.recordValidatedLaneSend(fixture.recoveryId, live.encoded, now),
+              sendValidatedLaneDelivery(store, fixture.recoveryId, live.encoded, now),
             ),
           ).toEqual({ changed: true, ok: true });
           expect(
@@ -1069,7 +1576,9 @@ describe("RelayRecoveryStore", () => {
         ptyOffset: 12n,
       });
       expect(
-        transaction(durable, () => store.recordValidatedLaneSend(fixture.recoveryId, live, 20_000)),
+        transaction(durable, () =>
+          sendValidatedLaneDelivery(store, fixture.recoveryId, live, 20_000),
+        ),
       ).toEqual({ changed: true, ok: true });
       expect(
         transaction(durable, () =>
@@ -1101,7 +1610,8 @@ describe("RelayRecoveryStore", () => {
 
       expect(
         transaction(durable, () =>
-          store.recordValidatedLaneSend(
+          sendValidatedLaneDelivery(
+            store,
             fixture.recoveryId,
             deliveryEnvelope("recovery", 1n, 90n, {
               eventSeq: 3n,
@@ -1165,7 +1675,7 @@ describe("RelayRecoveryStore", () => {
       });
       expect(
         transaction(durable, () =>
-          store.recordValidatedLaneSend(fixture.recoveryId, liveFirst, 210),
+          sendValidatedLaneDelivery(store, fixture.recoveryId, liveFirst, 210),
         ),
       ).toEqual({ changed: true, ok: true });
 
@@ -1198,7 +1708,7 @@ describe("RelayRecoveryStore", () => {
       for (const [index, encoded] of recoverySent.entries()) {
         expect(
           transaction(durable, () =>
-            store.recordValidatedLaneSend(fixture.recoveryId, encoded, 220 + index * 2),
+            sendValidatedLaneDelivery(store, fixture.recoveryId, encoded, 220 + index * 2),
           ),
         ).toEqual({ changed: true, ok: true });
         if (index < 3) {
@@ -1278,7 +1788,8 @@ describe("RelayRecoveryStore", () => {
       const outboxBeforeExpiredProgress = store.outbox();
       const expiredResults = [
         transaction(durable, () =>
-          store.recordValidatedLaneSend(
+          sendValidatedLaneDelivery(
+            store,
             fixture.recoveryId,
             deliveryEnvelope("live", 2n, 180n, {
               eventSeq: 7n,
@@ -1500,6 +2011,8 @@ describe("RelayRecoveryStore", () => {
       installAuthority(durable, committed);
       const bounded = recoveryStore(durable, {
         maxAttempts: 2,
+        maxDeliveryEncodedBytes: 2 * 1024 * 1024,
+        maxDeliveryRecords: 1024,
         maxOutboxEntries: 1,
       });
       for (const [candidate, streamId] of [
@@ -1541,6 +2054,8 @@ describe("RelayRecoveryStore", () => {
       installAuthority(durable, committed);
       const bounded = recoveryStore(durable, {
         maxAttempts: 2,
+        maxDeliveryEncodedBytes: 2 * 1024 * 1024,
+        maxDeliveryRecords: 1024,
         maxOutboxEntries: 1,
       });
       expect(
