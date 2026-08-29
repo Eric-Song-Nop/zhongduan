@@ -27,7 +27,7 @@ const SOCKET_OPEN_TIMEOUT_MS = 10_000;
 // encoding and 120s publishing before each Browser then consumes up to a 5s barrier window. Keep a
 // 10s scheduling margin beyond that 205s service envelope. A later capability replaces this
 // duplicated cross-app budget with generation-scoped progress.
-export const ATTACH_START_TIMEOUT_MS = 5_000 + 120_000 + 16 * 5_000 + 10_000;
+const ATTACH_START_TIMEOUT_MS = 5_000 + 120_000 + 16 * 5_000 + 10_000;
 const DATA_REPLACEMENT_GRACE_MS = 350;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 45_000;

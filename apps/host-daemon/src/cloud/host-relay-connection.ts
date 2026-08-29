@@ -7,7 +7,8 @@ import {
 } from "@zhongduan/protocol";
 
 import type { ReplayCursor, TerminalSession } from "../session";
-import { HOST_CANONICAL_QUEUE_LIMITS, HostDeliveryScheduler } from "./delivery-scheduler";
+import { HOST_CANONICAL_QUEUE_LIMITS } from "./canonical-publisher";
+import { HostDeliveryScheduler } from "./delivery-scheduler";
 import { dispatchForwardedInput, type ForwardedInput } from "./input-dispatcher";
 import type { HostSocketPair } from "./paired-websocket";
 import type { SnapshotCheckpointManager } from "./snapshot-checkpoint-manager";

@@ -94,7 +94,7 @@ generation 中替换它；所有 v2 attempt 继续保持原语义。
 | Host paused canonical queue              | 8 MiB / 1024 frames                                              |
 | Browser recovery tail buffer             | 2 MiB / 1024 frames                                              |
 | Browser snapshot load + restore deadline | 5 s                                                              |
-| Snapshot metadata cache TTL              | 30 s                                                             |
+| Checkpoint age classification            | 30 s；不删除或隐藏 checkpoint                                    |
 | Snapshot recovery quiet                  | 250 ms                                                           |
 | Snapshot 最小构建间隔                    | 1 s                                                              |
 | Snapshot blob                            | 32 MiB compressed / 128 MiB uncompressed                         |

@@ -16,10 +16,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import { CapabilityManager } from "./capability";
 import { InputDispatcher } from "./input-dispatcher";
-import { ATTACH_START_TIMEOUT_MS, TerminalSession } from "./terminal-session";
+import { TerminalSession } from "./terminal-session";
 
 const SESSION_ID = "session_123456789";
 const ENGINE_ID = "ghostty:test-engine";
+// Freeze the acceptance boundary independently from the production implementation.
+const ATTACH_START_TIMEOUT_MS = 215_000;
 const RESIZE: TerminalInputEvent = {
   type: "resize",
   cols: 100,

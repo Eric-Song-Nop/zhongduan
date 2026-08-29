@@ -6,4 +6,3 @@ export * from "./host-relay-connection";
 export * from "./input-dispatcher";
 export * from "./paired-websocket";
 export * from "./snapshot-publisher";
-export * from "./snapshot-checkpoint-manager";

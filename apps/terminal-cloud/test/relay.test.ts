@@ -30,7 +30,6 @@ interface ConnectionSet {
   dataTicket: string;
   deliveryGeneration: string;
   streamId: number;
-  selectedCapabilities?: string[];
 }
 
 interface SocketEndpoint {
@@ -389,9 +388,6 @@ async function openHost(
     session.hostCapability,
     undefined,
     negotiateOutcomeDetails ? [RelayCapability.deliveryBarrierOutcomeV1] : [],
-  );
-  expect(connection.selectedCapabilities).toEqual(
-    negotiateOutcomeDetails ? [RelayCapability.deliveryBarrierOutcomeV1] : undefined,
   );
   const control = await upgrade(session.sessionId, "control", connection.controlTicket);
   const data = await upgrade(session.sessionId, "data", connection.dataTicket);

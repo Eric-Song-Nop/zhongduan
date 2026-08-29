@@ -65,6 +65,7 @@ export const ConnectionSetResponseSchema = z.strictObject({
   expiresAt: z.number().int().positive(),
   controlTicket: CloudResourceIdSchema,
   dataTicket: CloudResourceIdSchema,
+  // Decode-only rolling shim for Durable Objects that still echo the selected intersection.
   selectedCapabilities: z.array(RelayCapabilitySchema).max(16).optional(),
 });
 

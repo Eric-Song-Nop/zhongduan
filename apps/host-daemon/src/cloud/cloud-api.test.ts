@@ -68,7 +68,7 @@ describe("CloudApiClient", () => {
     });
   });
 
-  it("advertises relay capabilities without changing the strict request body", async () => {
+  it("advertises relay capabilities and decodes the rolling response echo", async () => {
     const response = {
       connectionSetId: "connection_set_host01",
       connectionId: "connection_id_host001",

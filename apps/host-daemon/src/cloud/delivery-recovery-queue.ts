@@ -2,7 +2,7 @@ import type { RelayToHostControlFrame } from "@zhongduan/protocol";
 
 export type AttachRequest = Extract<RelayToHostControlFrame, { type: "attach-request" }>;
 
-export interface DeliveryRecoveryQueueOptions {
+interface DeliveryRecoveryQueueOptions {
   maxQuietWaitMs: number;
   maxRetryMs: number;
   monotonicNow: () => number;

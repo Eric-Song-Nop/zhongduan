@@ -1,7 +1,6 @@
 import { env, exports as workerExports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
-import { CreateConnectionSetSchema } from "../src/worker/terminal-session-do";
 
 interface CreatedSession {
   hostCapability: string;
@@ -120,19 +119,38 @@ afterEach(async () => {
 });
 
 describe("cloud relay runtime", () => {
-  it("keeps the edge-to-DO connection-set JSON compatible with the legacy strict schema", () => {
+  it("accepts the legacy internal connection-set body and rejects a capability body field", async () => {
+    const session = await createSession();
+    const stub = env.TERMINAL_SESSIONS.get(
+      env.TERMINAL_SESSIONS.idFromName(`v1:${session.sessionId}`),
+    );
     const legacyBody = {
-      sessionId: "session_runtime_0000000000000001",
+      sessionId: session.sessionId,
       subject: "subject_runtime_0000000000000001",
       role: "host",
     } as const;
-    expect(CreateConnectionSetSchema.parse(legacyBody)).toEqual(legacyBody);
-    expect(() =>
-      CreateConnectionSetSchema.parse({
-        ...legacyBody,
-        selectedCapabilities: ["delivery-barrier-outcome-v1"],
+    const legacyResponse = await stub.fetch(
+      new Request("https://do.internal/internal/connection-sets", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(legacyBody),
       }),
-    ).toThrow();
+    );
+    expect(legacyResponse.status).toBe(200);
+    await expect(legacyResponse.json()).resolves.not.toHaveProperty("selectedCapabilities");
+
+    const capabilityBodyResponse = await stub.fetch(
+      new Request("https://do.internal/internal/connection-sets", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...legacyBody,
+          selectedCapabilities: ["delivery-barrier-outcome-v1"],
+        }),
+      }),
+    );
+    expect(capabilityBodyResponse.status).toBe(400);
+    await capabilityBodyResponse.body?.cancel();
   });
 
   it("ignores valid unknown capabilities at the edge-to-DO negotiation hop", async () => {
@@ -157,9 +175,7 @@ describe("cloud relay runtime", () => {
     );
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({
-      selectedCapabilities: ["delivery-barrier-outcome-v1"],
-    });
+    await expect(response.json()).resolves.not.toHaveProperty("selectedCapabilities");
   });
 
   it("authenticates session and connection-set creation", async () => {
