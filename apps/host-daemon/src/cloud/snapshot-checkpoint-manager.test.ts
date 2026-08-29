@@ -178,6 +178,78 @@ describe("SnapshotCheckpointManager", () => {
     expect(publish).not.toHaveBeenCalled();
   });
 
+  it("validates pending lineage before exposing a frozen replay base to admission policy", async () => {
+    const snapshot = capture(7n, 11n);
+    const uploaded = published(snapshot, "snapshot_AAAAAAAAAAAAAAAA");
+    const bases: object[] = [];
+    const policy = vi.fn((base: object) => {
+      bases.push(base);
+      return true;
+    });
+    const publish = vi.fn<SnapshotPublisherLike["publish"]>(async (_capture, _signal, admit) => {
+      expect(admit?.(uploaded.metadata)).toBe(true);
+      return uploaded;
+    });
+    const resumePending = vi.fn<NonNullable<SnapshotPublisherLike["resumePending"]>>(
+      async (_signal, admit) => {
+        expect(admit?.(uploaded.metadata)).toBe(true);
+        return uploaded;
+      },
+    );
+    const checkpointManager = manager({ publish, resumePending });
+
+    await checkpointManager.publish(snapshot, undefined, policy);
+    await checkpointManager.resumePending(undefined, policy);
+
+    expect(policy).toHaveBeenCalledTimes(2);
+    expect(bases).toEqual([
+      { lastEventSeq: 7n, nextPtyOffset: 11n, sessionEpoch: 1n },
+      { lastEventSeq: 7n, nextPtyOffset: 11n, sessionEpoch: 1n },
+    ]);
+    expect(bases.every((base) => Object.isFrozen(base))).toBe(true);
+  });
+
+  it("rejects mismatched pending lineage before calling admission policy", async () => {
+    const snapshot = capture();
+    const mismatched = published(snapshot, "snapshot_AAAAAAAAAAAAAAAA", { sessionEpoch: "2" });
+    const resumePending = vi.fn<NonNullable<SnapshotPublisherLike["resumePending"]>>(
+      async (_signal, admit) => {
+        admit?.(mismatched.metadata);
+        return mismatched;
+      },
+    );
+    const policy = vi.fn(() => true);
+    const checkpointManager = manager({
+      publish: vi.fn<SnapshotPublisherLike["publish"]>(),
+      resumePending,
+    });
+
+    await expect(checkpointManager.resumePending(undefined, policy)).rejects.toThrow(
+      "published snapshot metadata does not match its terminal session",
+    );
+    expect(policy).not.toHaveBeenCalled();
+  });
+
+  it("disposes publisher ownership once and fences later manager use", async () => {
+    const snapshot = capture();
+    const dispose = vi.fn();
+    const checkpointManager = manager({
+      dispose,
+      publish: async () => published(snapshot, "snapshot_AAAAAAAAAAAAAAAA"),
+    });
+    const checkpoint = await publishAndInstall(checkpointManager, snapshot);
+    const reason = new Error("relay stopped");
+
+    checkpointManager.dispose(reason);
+    checkpointManager.dispose(new Error("late stop"));
+
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(dispose).toHaveBeenCalledWith(reason);
+    expect(checkpointManager.latestValid()).toBeUndefined();
+    expect(() => checkpointManager.install(checkpoint.published, snapshot)).toThrow(reason);
+    expect(() => checkpointManager.publish(snapshot)).toThrow(reason);
+  });
+
   it("rejects session, engine, and epoch identity mismatches", () => {
     const snapshot = capture();
     const checkpointManager = manager({ publish: vi.fn<SnapshotPublisherLike["publish"]>() });

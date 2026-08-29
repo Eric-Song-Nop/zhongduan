@@ -85,6 +85,7 @@ export class HostCloudRelay {
       new SnapshotPublisher({
         api: options.api,
         capabilities: options.capabilities,
+        monotonicNow: this.#monotonicNow,
         sessionId: options.sessionId,
       });
     this.#snapshotCheckpointManager = new SnapshotCheckpointManager({
@@ -124,9 +125,14 @@ export class HostCloudRelay {
   }
 
   async stop(): Promise<void> {
-    this.#stopController.abort(new DOMException("Host relay stopped", "AbortError"));
+    const reason = new DOMException("Host relay stopped", "AbortError");
+    this.#stopController.abort(reason);
     this.#connection?.close();
-    await this.#runPromise;
+    try {
+      await this.#runPromise;
+    } finally {
+      this.#snapshotCheckpointManager.dispose(reason);
+    }
   }
 
   async #run(): Promise<void> {

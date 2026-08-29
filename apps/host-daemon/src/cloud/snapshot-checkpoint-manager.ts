@@ -1,7 +1,10 @@
 import { SnapshotMetadataSchema, type SnapshotMetadata } from "@zhongduan/protocol";
 
 import type { ReplayCursor, SnapshotCapture, TerminalSession } from "../session";
-import type { PublishedSnapshot } from "./snapshot-publisher";
+import type {
+  PublishedSnapshot,
+  SnapshotPendingAdmission as PublisherPendingAdmission,
+} from "./snapshot-publisher";
 
 export const SNAPSHOT_CHECKPOINT_FRESHNESS_MS = 30_000;
 
@@ -16,9 +19,19 @@ export interface SnapshotCheckpointState {
   readonly checkpoint: SnapshotCheckpoint;
 }
 
+export type SnapshotCheckpointAdmission = (base: Readonly<ReplayCursor>) => boolean;
+
 export interface SnapshotPublisherLike {
-  publish(snapshot: SnapshotCapture, signal?: AbortSignal): Promise<PublishedSnapshot>;
-  resumePending?(signal?: AbortSignal): Promise<PublishedSnapshot> | undefined;
+  dispose?(reason?: unknown): void;
+  publish(
+    snapshot: SnapshotCapture,
+    signal?: AbortSignal,
+    admit?: PublisherPendingAdmission,
+  ): Promise<PublishedSnapshot>;
+  resumePending?(
+    signal?: AbortSignal,
+    admit?: PublisherPendingAdmission,
+  ): Promise<PublishedSnapshot> | undefined;
 }
 
 export interface SnapshotCheckpointManagerOptions {
@@ -42,6 +55,7 @@ export class SnapshotCheckpointManager {
   readonly #sessionEpoch: bigint;
   readonly #sessionId: string;
 
+  #disposedReason: Error | undefined;
   #highWater: SnapshotCheckpoint | undefined;
   #latestValid: InstalledCheckpoint | undefined;
 
@@ -58,6 +72,7 @@ export class SnapshotCheckpointManager {
   }
 
   latestValid(): SnapshotCheckpointState | undefined {
+    if (this.#disposedReason !== undefined) return undefined;
     const latest = this.#latestValid;
     if (latest === undefined) return undefined;
     return Object.freeze({
@@ -66,15 +81,36 @@ export class SnapshotCheckpointManager {
     });
   }
 
-  publish(snapshot: SnapshotCapture, signal?: AbortSignal): Promise<PublishedSnapshot> {
-    return this.#publisher.publish(snapshot, signal);
+  publish(
+    snapshot: SnapshotCapture,
+    signal?: AbortSignal,
+    admit?: SnapshotCheckpointAdmission,
+  ): Promise<PublishedSnapshot> {
+    this.#throwIfDisposed();
+    return this.#publisher.publish(snapshot, signal, this.#adaptAdmission(admit));
   }
 
-  resumePending(signal?: AbortSignal): Promise<PublishedSnapshot> | undefined {
-    return this.#publisher.resumePending?.(signal);
+  resumePending(
+    signal?: AbortSignal,
+    admit?: SnapshotCheckpointAdmission,
+  ): Promise<PublishedSnapshot> | undefined {
+    this.#throwIfDisposed();
+    return this.#publisher.resumePending?.(signal, this.#adaptAdmission(admit));
+  }
+
+  dispose(reason: unknown = new Error("snapshot checkpoint manager disposed")): void {
+    if (this.#disposedReason !== undefined) return;
+    this.#disposedReason =
+      reason instanceof Error
+        ? reason
+        : new Error("snapshot checkpoint manager disposed", { cause: reason });
+    this.#latestValid = undefined;
+    this.#highWater = undefined;
+    this.#publisher.dispose?.(this.#disposedReason);
   }
 
   install(published: PublishedSnapshot, capture?: SnapshotCapture): SnapshotCheckpoint {
+    this.#throwIfDisposed();
     return this.#install(published, capture);
   }
 
@@ -84,12 +120,7 @@ export class SnapshotCheckpointManager {
 
   #install(published: PublishedSnapshot, capture?: SnapshotCapture): SnapshotCheckpoint {
     const metadata = SnapshotMetadataSchema.parse(published.metadata);
-    this.#assertAuthorityLineage(metadata, capture);
-    const base = Object.freeze({
-      sessionEpoch: BigInt(metadata.sessionEpoch),
-      lastEventSeq: BigInt(metadata.cutEventSeq),
-      nextPtyOffset: BigInt(metadata.nextPtyOffset),
-    });
+    const base = this.#validatedBase(metadata, capture);
     const latest = this.#latestValid?.checkpoint;
     const highWater = this.#highWater;
     if (highWater !== undefined) {
@@ -138,6 +169,30 @@ export class SnapshotCheckpointManager {
     ) {
       throw new Error("published snapshot metadata does not match its authority cut");
     }
+  }
+
+  #adaptAdmission(
+    admit: SnapshotCheckpointAdmission | undefined,
+  ): PublisherPendingAdmission | undefined {
+    if (admit === undefined) return undefined;
+    return (metadata) => {
+      this.#throwIfDisposed();
+      const parsed = SnapshotMetadataSchema.parse(metadata);
+      return admit(this.#validatedBase(parsed));
+    };
+  }
+
+  #validatedBase(metadata: SnapshotMetadata, capture?: SnapshotCapture): Readonly<ReplayCursor> {
+    this.#assertAuthorityLineage(metadata, capture);
+    return Object.freeze({
+      sessionEpoch: BigInt(metadata.sessionEpoch),
+      lastEventSeq: BigInt(metadata.cutEventSeq),
+      nextPtyOffset: BigInt(metadata.nextPtyOffset),
+    });
+  }
+
+  #throwIfDisposed(): void {
+    if (this.#disposedReason !== undefined) throw this.#disposedReason;
   }
 }
 

@@ -173,7 +173,7 @@ describe("SnapshotPublisher", () => {
     await expect(publisher.publish(snapshot())).resolves.toMatchObject({
       metadata: { snapshotId: expect.any(String) },
     });
-    expect(recoverRejected).toHaveBeenCalledWith("revoked-host-cap", undefined);
+    expect(recoverRejected).toHaveBeenCalledWith("revoked-host-cap", expect.any(AbortSignal));
     expect(uploadSnapshot).toHaveBeenCalledTimes(2);
     expect(uploadSnapshot.mock.calls[0]![0]).toBe(uploadSnapshot.mock.calls[1]![0]);
     expect(uploadSnapshot.mock.calls[0]![1]).toBe(uploadSnapshot.mock.calls[1]![1]);
@@ -399,7 +399,7 @@ describe("SnapshotPublisher", () => {
     expect(requestBodies[1]).toBe(requestBodies[0]);
   });
 
-  it("retains cursor-ahead conflicts until created:false confirms the exact object", async () => {
+  it("keeps a generic legacy conflict rolling-safe until exact success", async () => {
     let now = 0;
     const ids: string[] = [];
     const uploadSnapshot = vi.fn(async (metadata: SnapshotMetadata) => {
@@ -429,6 +429,527 @@ describe("SnapshotPublisher", () => {
     expect(ids).toHaveLength(5);
     expect(new Set(ids).size).toBe(1);
     expect(publisher.resumePending()).toBeUndefined();
+  });
+
+  it("drops a local-only body before PUT when its authority cut is no longer admissible", async () => {
+    const compress = vi.fn(async () => Uint8Array.of(1));
+    const uploadSnapshot = vi.fn(async (metadata: SnapshotMetadata) => ({
+      created: true,
+      snapshot: metadata,
+    }));
+    const publisher = new SnapshotPublisher({
+      api: { uploadSnapshot },
+      buildMinIntervalMs: 0,
+      capabilities: capabilities(),
+      compress,
+      sessionId: "session_AAAAAAAAA",
+    });
+
+    await expect(publisher.publish(snapshot(), undefined, () => false)).rejects.toMatchObject({
+      name: "SnapshotPendingSupersededError",
+    });
+    expect(uploadSnapshot).not.toHaveBeenCalled();
+
+    await expect(publisher.publish(snapshot(0x51), undefined, () => true)).resolves.toMatchObject({
+      metadata: { cutEventSeq: "81" },
+    });
+    expect(compress).toHaveBeenCalledTimes(2);
+  });
+
+  it("rechecks admission after capability lookup immediately before the first PUT", async () => {
+    const capability = deferred<string>();
+    const current = vi.fn(() => capability.promise);
+    const uploadSnapshot = vi.fn(async (metadata: SnapshotMetadata) => ({
+      created: true,
+      snapshot: metadata,
+    }));
+    let admitted = true;
+    const publisher = new SnapshotPublisher({
+      api: { uploadSnapshot },
+      capabilities: { current, recoverRejected: async () => "host-cap-recovered" },
+      compress: async () => Uint8Array.of(1),
+      sessionId: "session_AAAAAAAAA",
+    });
+
+    const publishing = publisher.publish(snapshot(), undefined, () => admitted);
+    await vi.waitFor(() => expect(current).toHaveBeenCalledOnce());
+    admitted = false;
+    capability.resolve("host-cap");
+
+    await expect(publishing).rejects.toMatchObject({ name: "SnapshotPendingSupersededError" });
+    expect(uploadSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("rechecks admission after exact upload success and never returns a born-unserviceable body", async () => {
+    let uploaded = false;
+    const uploadSnapshot = vi.fn(async (metadata: SnapshotMetadata) => {
+      uploaded = true;
+      return { created: true, snapshot: metadata };
+    });
+    const publisher = new SnapshotPublisher({
+      api: { uploadSnapshot },
+      capabilities: capabilities(),
+      compress: async () => Uint8Array.of(1),
+      sessionId: "session_AAAAAAAAA",
+    });
+
+    await expect(publisher.publish(snapshot(), undefined, () => !uploaded)).rejects.toMatchObject({
+      name: "SnapshotPendingSupersededError",
+    });
+    expect(uploadSnapshot).toHaveBeenCalledOnce();
+    expect(publisher.resumePending()).toBeUndefined();
+  });
+
+  it("bounds exact cursor-ahead waiting by the pending identity without renewing on resume", async () => {
+    let now = 0;
+    const uploadSnapshot = vi.fn(async (metadata: SnapshotMetadata) => {
+      if (metadata.cutEventSeq === "65") {
+        throw new CloudApiError(409, "snapshot-cursor-ahead");
+      }
+      return { created: true, snapshot: metadata };
+    });
+    const publisher = new SnapshotPublisher({
+      api: { uploadSnapshot },
+      buildMinIntervalMs: 0,
+      capabilities: capabilities(),
+      compress: async () => Uint8Array.of(1),
+      cursorAheadMaxWaitMs: 120,
+      failureBackoffBaseMs: 1,
+      failureBackoffMaxMs: 1,
+      monotonicNow: () => now,
+      retryAttempts: 1,
+      retryDelayMs: 0,
+      sessionId: "session_AAAAAAAAA",
+    });
+
+    await expect(publisher.publish(snapshot(), undefined, () => true)).rejects.toMatchObject({
+      name: "RetryableSnapshotPublishError",
+    });
+    now = 119;
+    await expect(publisher.resumePending(undefined, () => true)).rejects.toMatchObject({
+      name: "RetryableSnapshotPublishError",
+    });
+    now = 120;
+    await expect(publisher.resumePending(undefined, () => true)).rejects.toMatchObject({
+      name: "SnapshotPendingSupersededError",
+    });
+    expect(uploadSnapshot).toHaveBeenCalledTimes(2);
+
+    await expect(publisher.publish(snapshot(0x51), undefined, () => true)).resolves.toMatchObject({
+      metadata: { cutEventSeq: "81" },
+    });
+  });
+
+  it("aborts an in-flight retry when its exact cursor-ahead identity deadline expires", async () => {
+    vi.useFakeTimers();
+    try {
+      let now = 0;
+      let retrySignal: AbortSignal | undefined;
+      const uploadSnapshot = vi.fn(
+        (
+          metadata: SnapshotMetadata,
+          _body: Uint8Array,
+          _capability: string,
+          signal?: AbortSignal,
+        ) => {
+          if (uploadSnapshot.mock.calls.length === 1) {
+            return Promise.reject(new CloudApiError(409, "snapshot-cursor-ahead"));
+          }
+          retrySignal = signal;
+          return new Promise<never>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        },
+      );
+      const publisher = new SnapshotPublisher({
+        api: { uploadSnapshot },
+        capabilities: capabilities(),
+        compress: async () => Uint8Array.of(1),
+        cursorAheadMaxWaitMs: 120,
+        failureBackoffBaseMs: 1,
+        failureBackoffMaxMs: 1,
+        monotonicNow: () => now,
+        retryAttempts: 1,
+        retryDelayMs: 0,
+        sessionId: "session_AAAAAAAAA",
+      });
+
+      await expect(publisher.publish(snapshot(), undefined, () => true)).rejects.toMatchObject({
+        name: "RetryableSnapshotPublishError",
+      });
+      now = 1;
+      const retry = publisher.resumePending(undefined, () => true)!;
+      await vi.waitFor(() => expect(uploadSnapshot).toHaveBeenCalledTimes(2));
+      const rejected = expect(retry).rejects.toMatchObject({
+        name: "SnapshotPendingSupersededError",
+      });
+      now = 120;
+      await vi.advanceTimersByTimeAsync(120);
+      await rejected;
+
+      expect(retrySignal?.aborted).toBe(true);
+      expect(publisher.resumePending()).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("moves an unserviceable ambiguous body into one cleanup slot and publishes a newer cut", async () => {
+    let now = 0;
+    let oldCalls = 0;
+    const calls: Array<{ body: Uint8Array; metadata: SnapshotMetadata }> = [];
+    const uploadSnapshot = vi.fn(async (metadata: SnapshotMetadata, body: Uint8Array) => {
+      calls.push({ body, metadata });
+      if (metadata.cutEventSeq === "65") {
+        oldCalls += 1;
+        if (oldCalls === 1) throw new CloudTransportError(new Error("response lost"));
+        if (oldCalls === 2) throw new CloudApiError(409, "snapshot-conflict");
+      }
+      return { created: metadata.cutEventSeq !== "65", snapshot: metadata };
+    });
+    const compress = vi.fn(async () => Uint8Array.of(1));
+    const publisher = new SnapshotPublisher({
+      api: { uploadSnapshot },
+      buildMinIntervalMs: 0,
+      capabilities: capabilities(),
+      compress,
+      failureBackoffBaseMs: 1,
+      failureBackoffMaxMs: 1,
+      monotonicNow: () => now,
+      retryAttempts: 1,
+      retryDelayMs: 0,
+      sessionId: "session_AAAAAAAAA",
+    });
+
+    await expect(
+      publisher.publish(snapshot(), undefined, () => oldCalls === 0),
+    ).rejects.toMatchObject({ name: "SnapshotPendingSupersededError" });
+    const replacement = await publisher.publish(snapshot(0x51), undefined, () => true);
+    await vi.waitFor(() => expect(oldCalls).toBe(2));
+    expect(publisher.resumePending()).toBeUndefined();
+    expect(oldCalls).toBe(2);
+    now = 1;
+    expect(publisher.resumePending()).toBeUndefined();
+    await vi.waitFor(() => expect(oldCalls).toBe(3));
+
+    expect(replacement.metadata.cutEventSeq).toBe("81");
+    expect(compress).toHaveBeenCalledTimes(2);
+    const oldBodies = calls
+      .filter(({ metadata }) => metadata.cutEventSeq === "65")
+      .map(({ body }) => body);
+    expect(oldBodies).toHaveLength(3);
+    expect(oldBodies.every((body) => body === oldBodies[0])).toBe(true);
+  });
+
+  it("keeps a third body out while cleanup is occupied and releases the gate after exact cleanup", async () => {
+    let now = 0;
+    const cleanup = deferred<{ created: boolean; snapshot: SnapshotMetadata }>();
+    const calls = new Map<string, number>();
+    const uploadSnapshot = vi.fn((metadata: SnapshotMetadata) => {
+      const call = (calls.get(metadata.cutEventSeq) ?? 0) + 1;
+      calls.set(metadata.cutEventSeq, call);
+      if (metadata.cutEventSeq === "65") {
+        if (call === 1) return Promise.reject(new CloudTransportError(new Error("response lost")));
+        return cleanup.promise;
+      }
+      if (metadata.cutEventSeq === "81") {
+        if (call === 1) return Promise.reject(new CloudTransportError(new Error("response lost")));
+        return Promise.reject(new CloudApiError(409, "snapshot-cursor-ahead"));
+      }
+      return Promise.resolve({ created: true, snapshot: metadata });
+    });
+    const compress = vi.fn(async () => Uint8Array.of(1));
+    const publisher = new SnapshotPublisher({
+      api: { uploadSnapshot },
+      buildMinIntervalMs: 0,
+      capabilities: capabilities(),
+      compress,
+      failureBackoffBaseMs: 1,
+      failureBackoffMaxMs: 1,
+      monotonicNow: () => now,
+      retryAttempts: 1,
+      retryDelayMs: 0,
+      sessionId: "session_AAAAAAAAA",
+    });
+
+    await expect(
+      publisher.publish(snapshot(), undefined, (metadata) =>
+        metadata.cutEventSeq === "65" ? (calls.get("65") ?? 0) === 0 : true,
+      ),
+    ).rejects.toMatchObject({ name: "SnapshotPendingSupersededError" });
+    await vi.waitFor(() => expect(calls.get("65")).toBe(2));
+
+    await expect(
+      publisher.publish(snapshot(0x51), undefined, (metadata) =>
+        metadata.cutEventSeq === "81" ? (calls.get("81") ?? 0) === 0 : true,
+      ),
+    ).rejects.toMatchObject({ name: "RetryableSnapshotPublishError" });
+    await expect(publisher.publish(snapshot(0x61), undefined, () => false)).rejects.toMatchObject({
+      name: "RetryableSnapshotPublishError",
+    });
+    expect(compress).toHaveBeenCalledTimes(2);
+
+    const oldMetadata = uploadSnapshot.mock.calls.find(
+      ([metadata]) => metadata.cutEventSeq === "65",
+    )![0];
+    cleanup.resolve({ created: false, snapshot: oldMetadata });
+    await Promise.resolve();
+    await Promise.resolve();
+    now = 10;
+    await expect(publisher.resumePending(undefined, () => false)).rejects.toMatchObject({
+      name: "SnapshotPendingSupersededError",
+    });
+    await expect(publisher.publish(snapshot(0x61), undefined, () => true)).resolves.toMatchObject({
+      metadata: { cutEventSeq: "97" },
+    });
+    expect(compress).toHaveBeenCalledTimes(3);
+  });
+
+  it("cancels sibling capability work before releasing an active body beside cleanup", async () => {
+    const stalledCapability = deferred<string>();
+    let capabilityCalls = 0;
+    let siblingExited = false;
+    let siblingSignal: AbortSignal | undefined;
+    let oldCalls = 0;
+    const current = vi.fn((signal?: AbortSignal) => {
+      capabilityCalls += 1;
+      if (capabilityCalls === 3) {
+        siblingSignal = signal;
+        return stalledCapability.promise;
+      }
+      return Promise.resolve("host-cap");
+    });
+    const uploadSnapshot = vi.fn(
+      (
+        metadata: SnapshotMetadata,
+        _body: Uint8Array,
+        _capability: string,
+        signal?: AbortSignal,
+      ) => {
+        if (metadata.cutEventSeq !== "65") {
+          return Promise.resolve({ created: true, snapshot: metadata });
+        }
+        oldCalls += 1;
+        if (oldCalls === 1) {
+          return Promise.reject(new CloudTransportError(new Error("response lost")));
+        }
+        return new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+    );
+    const compress = vi.fn(async () => Uint8Array.of(1));
+    const publisher = new SnapshotPublisher({
+      api: { uploadSnapshot },
+      buildMinIntervalMs: 0,
+      capabilities: { current, recoverRejected: async () => "host-cap-recovered" },
+      compress,
+      retryAttempts: 1,
+      retryDelayMs: 0,
+      sessionId: "session_AAAAAAAAA",
+    });
+
+    await expect(
+      publisher.publish(snapshot(), undefined, () => oldCalls === 0),
+    ).rejects.toMatchObject({ name: "SnapshotPendingSupersededError" });
+    await vi.waitFor(() => expect(oldCalls).toBe(2));
+
+    const sibling = publisher.publish(snapshot(0x51), undefined, () => true);
+    const siblingResult = sibling.then(
+      () => {
+        siblingExited = true;
+        return undefined;
+      },
+      (error: unknown) => {
+        siblingExited = true;
+        return error;
+      },
+    );
+    await vi.waitFor(() => expect(capabilityCalls).toBe(3));
+    await expect(publisher.resumePending(undefined, () => false)).rejects.toMatchObject({
+      name: "SnapshotPendingSupersededError",
+    });
+
+    expect(siblingSignal?.aborted).toBe(true);
+    await expect(siblingResult).resolves.toMatchObject({
+      name: "SnapshotPendingSupersededError",
+    });
+    expect(siblingExited).toBe(true);
+    await expect(publisher.publish(snapshot(0x61), undefined, () => true)).resolves.toMatchObject({
+      metadata: { cutEventSeq: "97" },
+    });
+    expect(compress).toHaveBeenCalledTimes(3);
+    publisher.dispose();
+  });
+
+  it("never lets a late old upload clear or publish an active replacement", async () => {
+    const attempts = [
+      deferred<{ created: boolean; snapshot: SnapshotMetadata }>(),
+      deferred<{ created: boolean; snapshot: SnapshotMetadata }>(),
+      deferred<{ created: boolean; snapshot: SnapshotMetadata }>(),
+    ];
+    const calls: SnapshotMetadata[] = [];
+    const uploadSnapshot = vi.fn((metadata: SnapshotMetadata) => {
+      calls.push(metadata);
+      return attempts[calls.length - 1]!.promise;
+    });
+    const publisher = new SnapshotPublisher({
+      api: { uploadSnapshot },
+      buildMinIntervalMs: 0,
+      capabilities: capabilities(),
+      compress: async () => Uint8Array.of(1),
+      sessionId: "session_AAAAAAAAA",
+    });
+
+    const old = publisher.publish(snapshot(), undefined, () => true);
+    const oldRejected = expect(old).rejects.toMatchObject({
+      name: "SnapshotPendingSupersededError",
+    });
+    await vi.waitFor(() => expect(uploadSnapshot).toHaveBeenCalledOnce());
+    await expect(publisher.resumePending(undefined, () => false)).rejects.toMatchObject({
+      name: "SnapshotPendingSupersededError",
+    });
+    await oldRejected;
+    await vi.waitFor(() => expect(uploadSnapshot).toHaveBeenCalledTimes(2));
+
+    const replacement = publisher.publish(snapshot(0x51), undefined, () => true);
+    await vi.waitFor(() => expect(uploadSnapshot).toHaveBeenCalledTimes(3));
+    attempts[0]!.resolve({ created: false, snapshot: calls[0]! });
+    attempts[2]!.resolve({ created: true, snapshot: calls[2]! });
+    await expect(replacement).resolves.toMatchObject({ metadata: { cutEventSeq: "81" } });
+    attempts[1]!.resolve({ created: false, snapshot: calls[1]! });
+  });
+
+  it("backs off an internally timed-out cleanup identity before another opportunity retries it", async () => {
+    let now = 0;
+    let oldCalls = 0;
+    const uploadSnapshot = vi.fn(
+      (
+        metadata: SnapshotMetadata,
+        _body: Uint8Array,
+        _capability: string,
+        signal?: AbortSignal,
+      ) => {
+        if (metadata.cutEventSeq !== "65") {
+          return Promise.resolve({ created: true, snapshot: metadata });
+        }
+        oldCalls += 1;
+        if (oldCalls === 1) {
+          return Promise.reject(new CloudTransportError(new Error("response lost")));
+        }
+        if (oldCalls === 2) {
+          return new Promise<never>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+        return Promise.reject(new CloudApiError(409, "snapshot-cursor-ahead"));
+      },
+    );
+    const publisher = new SnapshotPublisher({
+      api: { uploadSnapshot },
+      buildMinIntervalMs: 0,
+      capabilities: capabilities(),
+      cleanupAttemptTimeoutMs: 10,
+      compress: async () => Uint8Array.of(1),
+      failureBackoffBaseMs: 100,
+      failureBackoffMaxMs: 100,
+      monotonicNow: () => now,
+      retryAttempts: 1,
+      retryDelayMs: 0,
+      sessionId: "session_AAAAAAAAA",
+    });
+
+    await expect(
+      publisher.publish(snapshot(), undefined, () => oldCalls === 0),
+    ).rejects.toMatchObject({ name: "SnapshotPendingSupersededError" });
+    await vi.waitFor(() => expect(oldCalls).toBe(2));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      expect(publisher.resumePending()).toBeUndefined();
+    }
+    expect(oldCalls).toBe(2);
+
+    now = 100;
+    expect(publisher.resumePending()).toBeUndefined();
+    await vi.waitFor(() => expect(oldCalls).toBe(3));
+    publisher.dispose();
+  });
+
+  it("disposes cleanup ownership idempotently and aborts its bounded attempt", async () => {
+    let calls = 0;
+    let cleanupSignal: AbortSignal | undefined;
+    const uploadSnapshot = vi.fn(
+      (
+        metadata: SnapshotMetadata,
+        _body: Uint8Array,
+        _capability: string,
+        signal?: AbortSignal,
+      ) => {
+        calls += 1;
+        if (calls === 1) {
+          return Promise.reject(new CloudTransportError(new Error("response lost")));
+        }
+        cleanupSignal = signal;
+        return new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+    );
+    const publisher = new SnapshotPublisher({
+      api: { uploadSnapshot },
+      buildMinIntervalMs: 0,
+      capabilities: capabilities(),
+      cleanupAttemptTimeoutMs: 1_000,
+      compress: async () => Uint8Array.of(1),
+      retryAttempts: 1,
+      retryDelayMs: 0,
+      sessionId: "session_AAAAAAAAA",
+    });
+
+    await expect(publisher.publish(snapshot(), undefined, () => calls === 0)).rejects.toMatchObject(
+      { name: "SnapshotPendingSupersededError" },
+    );
+    await vi.waitFor(() => expect(calls).toBe(2));
+    const disposed = new Error("session stopped");
+    publisher.dispose(disposed);
+    publisher.dispose(new Error("late dispose"));
+
+    expect(cleanupSignal?.aborted).toBe(true);
+    expect(() => publisher.resumePending()).toThrow(disposed);
+  });
+
+  it("aborts an active upload with the exact dispose reason", async () => {
+    let uploadSignal: AbortSignal | undefined;
+    const uploadSnapshot = vi.fn(
+      (
+        _metadata: SnapshotMetadata,
+        _body: Uint8Array,
+        _capability: string,
+        signal?: AbortSignal,
+      ) => {
+        uploadSignal = signal;
+        return new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+    );
+    const publisher = new SnapshotPublisher({
+      api: { uploadSnapshot },
+      capabilities: capabilities(),
+      compress: async () => Uint8Array.of(1),
+      sessionId: "session_AAAAAAAAA",
+    });
+
+    const publishing = publisher.publish(snapshot());
+    await vi.waitFor(() => expect(uploadSnapshot).toHaveBeenCalledOnce());
+    const disposed = new Error("session stopped");
+    const rejected = expect(publishing).rejects.toBe(disposed);
+    publisher.dispose(disposed);
+
+    await rejected;
+    expect(uploadSignal?.aborted).toBe(true);
+    expect(() => publisher.resumePending()).toThrow(disposed);
   });
 
   it("retains invalid success and other 422 results but releases cleanup-safe checksum failure", async () => {

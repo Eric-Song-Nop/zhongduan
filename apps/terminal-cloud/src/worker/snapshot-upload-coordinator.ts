@@ -673,7 +673,10 @@ export class SnapshotUploadCoordinator {
     const finalized = this.snapshots.finalize(snapshot, this.retentionPins());
     if (!finalized.ok) {
       return json(
-        { error: "snapshot-conflict" },
+        {
+          error:
+            finalized.reason === "cursor-ahead" ? "snapshot-cursor-ahead" : "snapshot-conflict",
+        },
         finalized.reason === "retention-backlog" || finalized.reason === "attempt-changed"
           ? 503
           : 409,

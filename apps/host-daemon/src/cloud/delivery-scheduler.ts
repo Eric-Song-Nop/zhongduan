@@ -22,6 +22,7 @@ import { SnapshotCheckpointManager, type SnapshotCheckpoint } from "./snapshot-c
 import {
   RetryableSnapshotPublishError,
   SnapshotCleanupConfirmedError,
+  SnapshotPendingSupersededError,
   SnapshotUnavailableError,
   type PublishedSnapshot,
 } from "./snapshot-publisher";
@@ -84,6 +85,8 @@ export class HostDeliveryScheduler {
   readonly #session: TerminalSession;
   readonly #snapshotCheckpointManager: SnapshotCheckpointManager;
   readonly #yieldIo: () => Promise<void>;
+  readonly #admitPendingSnapshot = (base: ReplayCursor): boolean =>
+    this.#planColdTail(base, this.#session.cursor) !== undefined;
   readonly #coldPreparations = new Map<string, ColdPreparation>();
   readonly #recoveryQueue: DeliveryRecoveryQueue;
 
@@ -518,7 +521,7 @@ export class HostDeliveryScheduler {
     ]);
     let operation: Promise<PublishedSnapshot> | undefined;
     try {
-      operation = this.#snapshotCheckpointManager.resumePending(signal);
+      operation = this.#snapshotCheckpointManager.resumePending(signal, this.#admitPendingSnapshot);
     } catch (error) {
       clearTimeout(timeout);
       throw error;
@@ -563,7 +566,10 @@ export class HostDeliveryScheduler {
       this.#connectionAbort.signal,
     ]);
     try {
-      return await raceAbort(this.#snapshotCheckpointManager.publish(snapshot, signal), signal);
+      return await raceAbort(
+        this.#snapshotCheckpointManager.publish(snapshot, signal, this.#admitPendingSnapshot),
+        signal,
+      );
     } finally {
       clearTimeout(timeout);
     }
@@ -638,15 +644,8 @@ export class HostDeliveryScheduler {
     active.controller.signal.throwIfAborted();
     const base = checkpoint.base;
     const commit = this.#session.cursor;
-    const replayPlan = this.#session.planReplayThrough(base, commit);
-    if (
-      replayPlan.status !== "ok" ||
-      deliveryOutstandingBytes(
-        { eventSeq: base.lastEventSeq, nextPtyOffset: base.nextPtyOffset },
-        { eventSeq: commit.lastEventSeq, nextPtyOffset: commit.nextPtyOffset },
-      ) > BigInt(WARM_REPLAY_MAX_OUTSTANDING_BYTES) ||
-      replayPlan.exactFrames > WARM_REPLAY_MAX_FRAMES
-    ) {
+    const replayPlan = this.#planColdTail(base, commit);
+    if (replayPlan === undefined) {
       this.#invalidateCheckpoint(checkpoint);
       throw new ColdTailUnavailableError();
     }
@@ -699,6 +698,21 @@ export class HostDeliveryScheduler {
     active.phase = "committed";
     this.#resumeCanonical();
     return result;
+  }
+
+  #planColdTail(base: ReplayCursor, commit: ReplayCursor) {
+    const replayPlan = this.#session.planReplayThrough(base, commit);
+    if (
+      replayPlan.status !== "ok" ||
+      deliveryOutstandingBytes(
+        { eventSeq: base.lastEventSeq, nextPtyOffset: base.nextPtyOffset },
+        { eventSeq: commit.lastEventSeq, nextPtyOffset: commit.nextPtyOffset },
+      ) > BigInt(WARM_REPLAY_MAX_OUTSTANDING_BYTES) ||
+      replayPlan.exactFrames > WARM_REPLAY_MAX_FRAMES
+    ) {
+      return undefined;
+    }
+    return replayPlan;
   }
 
   async #sendDirectedReplay(
@@ -885,6 +899,7 @@ function isRetryableColdRecoveryError(error: unknown): boolean {
   return (
     error instanceof ColdTailUnavailableError ||
     error instanceof SnapshotEncodeBudgetError ||
+    error instanceof SnapshotPendingSupersededError ||
     error instanceof RetryableSnapshotPublishError ||
     error instanceof SnapshotCleanupConfirmedError ||
     error instanceof SnapshotUnavailableError ||
