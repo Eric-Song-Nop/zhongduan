@@ -33,6 +33,13 @@ type SessionMessage =
       fence?: (snapshot: SnapshotCapture) => void;
       resolve: (snapshot: SnapshotCapture) => void;
       reject: (error: unknown) => void;
+    }
+  | {
+      type: "prepare-recovery-gap";
+      base: ReplayCursor;
+      limits: RecoveryGapLimits;
+      commit: (gap: PreparedRecoveryGap) => boolean;
+      resolve: (result: PrepareRecoveryGapResult) => void;
     };
 
 export interface TerminalSessionOptions {
@@ -69,6 +76,26 @@ export interface SemanticInputIdentity {
 export interface ReplayCursor extends JournalCursor {
   sessionEpoch: bigint;
 }
+
+export interface RecoveryGapLimits {
+  maxEncodedBytes: number;
+  maxFrames: number;
+}
+
+export interface PreparedRecoveryGap {
+  base: ReplayCursor;
+  committedThrough: ReplayCursor;
+  exactEncodedBytes: number;
+  exactFrames: number;
+  frames: readonly Uint8Array[];
+}
+
+export type PrepareRecoveryGapResult =
+  | { status: "prepared"; gap: PreparedRecoveryGap }
+  | {
+      status: "unavailable";
+      reason: "journal-gap" | "capacity" | "fence-unavailable";
+    };
 
 export type InputAckStatus = "written" | "duplicate" | "rejected" | "uncertain";
 
@@ -321,6 +348,28 @@ export class TerminalSession {
     });
   }
 
+  prepareRecoveryGap(
+    base: ReplayCursor,
+    limits: RecoveryGapLimits,
+    commit: (gap: PreparedRecoveryGap) => boolean,
+  ): Promise<PrepareRecoveryGapResult> {
+    if (!nonNegativeSafeInteger(limits.maxEncodedBytes)) {
+      return Promise.reject(new RangeError("maxEncodedBytes must be a non-negative safe integer"));
+    }
+    if (!nonNegativeSafeInteger(limits.maxFrames)) {
+      return Promise.reject(new RangeError("maxFrames must be a non-negative safe integer"));
+    }
+    return new Promise((resolve) => {
+      this.#enqueue({
+        type: "prepare-recovery-gap",
+        base: { ...base },
+        limits: { ...limits },
+        commit,
+        resolve,
+      });
+    });
+  }
+
   waitForExit(): Promise<PtyExit> {
     return this.#exitPromise;
   }
@@ -380,6 +429,9 @@ export class TerminalSession {
               next.reject(error);
               throw error;
             }
+            break;
+          case "prepare-recovery-gap":
+            next.resolve(this.#prepareRecoveryGap(next.base, next.limits, next.commit));
             break;
         }
       }
@@ -550,6 +602,52 @@ export class TerminalSession {
     };
   }
 
+  #prepareRecoveryGap(
+    base: ReplayCursor,
+    limits: RecoveryGapLimits,
+    commit: (gap: PreparedRecoveryGap) => boolean,
+  ): PrepareRecoveryGapResult {
+    const committedThrough = this.cursor;
+    let plan: JournalReplayPlan;
+    try {
+      plan = this.planReplayThrough(base, committedThrough);
+    } catch {
+      return { status: "unavailable", reason: "journal-gap" };
+    }
+    if (plan.status === "gap") {
+      return { status: "unavailable", reason: "journal-gap" };
+    }
+    if (plan.exactEncodedBytes > limits.maxEncodedBytes || plan.exactFrames > limits.maxFrames) {
+      return { status: "unavailable", reason: "capacity" };
+    }
+
+    let replay: JournalReplay;
+    try {
+      replay = plan.materialize();
+    } catch {
+      return { status: "unavailable", reason: "journal-gap" };
+    }
+    if (replay.status === "gap") {
+      return { status: "unavailable", reason: "journal-gap" };
+    }
+
+    const gap: PreparedRecoveryGap = Object.freeze({
+      base: Object.freeze({ ...base }),
+      committedThrough: Object.freeze({ ...committedThrough }),
+      exactEncodedBytes: plan.exactEncodedBytes,
+      exactFrames: plan.exactFrames,
+      frames: Object.freeze(replay.frames.map((frame) => frame.slice())),
+    });
+    try {
+      if (!commit(gap)) {
+        return { status: "unavailable", reason: "fence-unavailable" };
+      }
+    } catch {
+      return { status: "unavailable", reason: "fence-unavailable" };
+    }
+    return { status: "prepared", gap };
+  }
+
   #publish(frame: Uint8Array): void {
     this.#journal.append(frame);
     const subscribers = Array.from(this.#subscribers);
@@ -601,6 +699,9 @@ export class TerminalSession {
       if (queued.type === "submitted-input") {
         queued.resolve(this.#inputAck(queued.identity, "rejected"));
       }
+      if (queued.type === "prepare-recovery-gap") {
+        queued.resolve({ status: "unavailable", reason: "fence-unavailable" });
+      }
     }
   }
 
@@ -624,4 +725,8 @@ function cloneMouse(mouse: SemanticMouse): SemanticMouse {
     ...mouse,
     surface: { ...mouse.surface },
   };
+}
+
+function nonNegativeSafeInteger(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0;
 }

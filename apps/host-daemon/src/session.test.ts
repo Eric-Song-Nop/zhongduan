@@ -635,6 +635,136 @@ describe("TerminalSession", () => {
     expect(pty.writes).toEqual([Uint8Array.of(0x03)]);
   });
 
+  it("prepares an owned gap and commits its H fence before reentrant H+1", async () => {
+    const pty = new ManualPty();
+    const journal = new EventJournal();
+    const session = new TerminalSession({
+      authority: new FakeTerminalAuthority(),
+      journal,
+      pty,
+      sessionEpoch: 1n,
+    });
+    const order: string[] = [];
+    session.subscribe((encoded) => order.push(`event:${decodeDataFrame(encoded).eventSeq}`));
+    pty.emit(Uint8Array.of(0x41));
+
+    const result = await session.prepareRecoveryGap(
+      { sessionEpoch: 1n, lastEventSeq: 0n, nextPtyOffset: 0n },
+      { maxEncodedBytes: 1024, maxFrames: 1 },
+      (gap) => {
+        order.push(`fence:${gap.committedThrough.lastEventSeq}`);
+        pty.emit(Uint8Array.of(0x42));
+        return true;
+      },
+    );
+
+    expect(result.status).toBe("prepared");
+    if (result.status !== "prepared") throw new Error("expected a prepared recovery gap");
+    expect(result.gap).toMatchObject({
+      base: { sessionEpoch: 1n, lastEventSeq: 0n, nextPtyOffset: 0n },
+      committedThrough: { sessionEpoch: 1n, lastEventSeq: 1n, nextPtyOffset: 1n },
+      exactFrames: 1,
+    });
+    expect(result.gap.exactEncodedBytes).toBe(result.gap.frames[0]!.byteLength);
+    expect(decodeDataFrame(result.gap.frames[0]!).eventSeq).toBe(1n);
+    expect(order).toEqual(["event:1", "fence:1", "event:2"]);
+    expect(journal.entries()).toHaveLength(2);
+  });
+
+  it("rejects gap and capacity misses before invoking the recovery fence", async () => {
+    const pty = new ManualPty();
+    const session = new TerminalSession({
+      authority: new FakeTerminalAuthority(),
+      journal: new EventJournal(),
+      pty,
+      sessionEpoch: 1n,
+    });
+    pty.emit(Uint8Array.of(0x41));
+    let commits = 0;
+    const commit = () => {
+      commits += 1;
+      return true;
+    };
+
+    await expect(
+      session.prepareRecoveryGap(
+        { sessionEpoch: 2n, lastEventSeq: 0n, nextPtyOffset: 0n },
+        { maxEncodedBytes: 1024, maxFrames: 1 },
+        commit,
+      ),
+    ).resolves.toEqual({ status: "unavailable", reason: "journal-gap" });
+    await expect(
+      session.prepareRecoveryGap(
+        { sessionEpoch: 1n, lastEventSeq: 0n, nextPtyOffset: 0n },
+        { maxEncodedBytes: 1024, maxFrames: 0 },
+        commit,
+      ),
+    ).resolves.toEqual({ status: "unavailable", reason: "capacity" });
+    expect(commits).toBe(0);
+  });
+
+  it("keeps the session live when a recovery fence refuses or throws", async () => {
+    const pty = new ManualPty();
+    const journal = new EventJournal();
+    const session = new TerminalSession({
+      authority: new FakeTerminalAuthority(),
+      journal,
+      pty,
+      sessionEpoch: 1n,
+    });
+    pty.emit(Uint8Array.of(0x41));
+    const base = { sessionEpoch: 1n, lastEventSeq: 0n, nextPtyOffset: 0n };
+    const limits = { maxEncodedBytes: 1024, maxFrames: 1 };
+
+    await expect(session.prepareRecoveryGap(base, limits, () => false)).resolves.toEqual({
+      status: "unavailable",
+      reason: "fence-unavailable",
+    });
+    await expect(
+      session.prepareRecoveryGap(base, limits, () => {
+        throw new Error("fence queue full");
+      }),
+    ).resolves.toEqual({ status: "unavailable", reason: "fence-unavailable" });
+
+    pty.emit(Uint8Array.of(0x42));
+    expect(session.eventSeq).toBe(2n);
+    expect(journal.entries().map((encoded) => decodeDataFrame(encoded).eventSeq)).toEqual([1n, 2n]);
+  });
+
+  it("retains prepared frame ownership after the journal advances and prunes", async () => {
+    let now = 0;
+    const pty = new ManualPty();
+    const journal = new EventJournal({
+      maxAgeMs: 1,
+      now: () => now,
+      segmentAgeMs: 1,
+      segmentBytes: 1,
+    });
+    const session = new TerminalSession({
+      authority: new FakeTerminalAuthority(),
+      journal,
+      pty,
+      sessionEpoch: 1n,
+    });
+    pty.emit(Uint8Array.of(0x41));
+    const result = await session.prepareRecoveryGap(
+      { sessionEpoch: 1n, lastEventSeq: 0n, nextPtyOffset: 0n },
+      { maxEncodedBytes: 1024, maxFrames: 1 },
+      () => true,
+    );
+    if (result.status !== "prepared") throw new Error("expected a prepared recovery gap");
+
+    now = 10;
+    pty.emit(Uint8Array.of(0x42));
+
+    expect(journal.entries().map((encoded) => decodeDataFrame(encoded).eventSeq)).toEqual([2n]);
+    expect(result.gap.frames).toHaveLength(1);
+    expect(decodeDataFrame(result.gap.frames[0]!)).toMatchObject({
+      eventSeq: 1n,
+      payload: Uint8Array.of(0x41),
+    });
+  });
+
   it("fails the authority epoch when Ghostty snapshot encoding throws", async () => {
     const pty = new ManualPty();
     const session = new TerminalSession({
