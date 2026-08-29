@@ -168,7 +168,7 @@ describe("RecoverySourceManager", () => {
       manager.drainGranted(owner, routing(prepare), { maxRecords: 1, maxWireBytes: 88 }, () => {
         throw new Error("must not send before start-ready");
       }),
-    ).toEqual({ records: 0, wireBytes: 0 });
+    ).toEqual({ status: "stale", records: 0, wireBytes: 0 });
 
     expect(
       manager.startReady(owner, {
@@ -189,7 +189,7 @@ describe("RecoverySourceManager", () => {
       manager.drainGranted(owner, routing(prepare), { maxRecords: 1, maxWireBytes: 88 }, () => {
         throw new Error("must not split a record at a partial grant");
       }),
-    ).toEqual({ records: 0, wireBytes: 0 });
+    ).toEqual({ status: "credit-blocked", records: 0, wireBytes: 0 });
 
     expect(
       manager.grant(owner, {
@@ -198,12 +198,17 @@ describe("RecoverySourceManager", () => {
         cumulativeGrantedEncodedBytes: "88",
       }),
     ).toBe(true);
+    expect(
+      manager.drainGranted(owner, routing(prepare), { maxRecords: 1, maxWireBytes: 87 }, () => {
+        throw new Error("a scheduler deficit must not split a record");
+      }),
+    ).toEqual({ status: "runnable", records: 0, wireBytes: 0 });
     const sent: Uint8Array[] = [];
     expect(
       manager.drainGranted(owner, routing(prepare), { maxRecords: 1, maxWireBytes: 88 }, (bytes) =>
         sent.push(bytes),
       ),
-    ).toEqual({ records: 1, wireBytes: 88 });
+    ).toEqual({ status: "complete", records: 1, wireBytes: 88 });
     const envelope = inspectEnvelope(sent[0]!);
     expect(envelope).toMatchObject({ deliveryOrdinal: 1n, cumulativeEncodedBytes: 88n });
     expect(decodeDataFrame(envelope.payload)).toMatchObject({
@@ -348,7 +353,7 @@ describe("RecoverySourceManager", () => {
           retry.push(bytes);
         },
       ),
-    ).toEqual({ records: 1, wireBytes: 89 });
+    ).toEqual({ status: "credit-blocked", records: 1, wireBytes: 89 });
     expect(retry[0]).toEqual(firstAttempt);
     const first = inspectEnvelope(retry[0]!);
     expect(first).toMatchObject({ deliveryOrdinal: 1n, cumulativeEncodedBytes: 89n });
@@ -416,7 +421,7 @@ describe("RecoverySourceManager", () => {
       manager.drainGranted(owner, routing(prepare), { maxRecords: 1, maxWireBytes: 88 }, () => {
         throw new Error("Done must wait for its complete cumulative grant");
       }),
-    ).toEqual({ records: 0, wireBytes: 0 });
+    ).toEqual({ status: "credit-blocked", records: 0, wireBytes: 0 });
     expect(
       manager.grant(owner, {
         type: "recovery-source-grant",
@@ -430,7 +435,7 @@ describe("RecoverySourceManager", () => {
       manager.drainGranted(owner, routing(prepare), { maxRecords: 1, maxWireBytes: 88 }, (bytes) =>
         doneRecords.push(bytes),
       ),
-    ).toEqual({ records: 1, wireBytes: 88 });
+    ).toEqual({ status: "complete", records: 1, wireBytes: 88 });
     const done = inspectEnvelope(doneRecords[0]!);
     expect(done).toMatchObject({ deliveryOrdinal: 2n, cumulativeEncodedBytes: 177n });
     expect(decodeDataFrame(done.payload)).toMatchObject({
@@ -468,31 +473,37 @@ describe("RecoverySourceManager", () => {
     });
   });
 
-  it("keeps one successful record outstanding until receipt unlocks the next granted record", async () => {
-    const { clock, manager, pty } = createHarness();
+  it("keeps multiple granted records outstanding without replay and releases exact receipt prefixes", async () => {
+    const { clock, manager, pty } = createHarness({
+      maxOwnedRecords: 3,
+      maxOwnedWireBytes: 266,
+      maxSources: 2,
+    });
     const owner = {};
     const prepare = prepareFor(1);
     pty.emit(Uint8Array.of(0x41));
+    pty.emit(Uint8Array.of(0x42));
     const result = await manager.prepare(owner, prepare, () => true);
     expectPrepared(result);
     const ready = {
       type: "recovery-start-ready" as const,
       ...routing(prepare),
       committedThrough: result.committedThrough,
-      cumulativeGrantedEncodedBytes: "177",
+      cumulativeGrantedEncodedBytes: "266",
     };
     expect(manager.startReady(owner, ready)).toBe(true);
 
-    const first: Uint8Array[] = [];
+    const firstWindow: Uint8Array[] = [];
     expect(
-      manager.drainGranted(owner, routing(prepare), { maxRecords: 2, maxWireBytes: 178 }, (bytes) =>
-        first.push(bytes),
+      manager.drainGranted(owner, routing(prepare), { maxRecords: 3, maxWireBytes: 266 }, (bytes) =>
+        firstWindow.push(bytes),
       ),
-    ).toEqual({ records: 1, wireBytes: 89 });
-    expect(inspectEnvelope(first[0]!)).toMatchObject({
-      deliveryOrdinal: 1n,
-      cumulativeEncodedBytes: 89n,
-    });
+    ).toEqual({ status: "complete", records: 3, wireBytes: 266 });
+    expect(firstWindow.map((encoded) => inspectEnvelope(encoded).deliveryOrdinal)).toEqual([
+      1n,
+      2n,
+      3n,
+    ]);
 
     expect(manager.startReady(owner, ready)).toBe(true);
     const retries: Uint8Array[] = [];
@@ -500,20 +511,20 @@ describe("RecoverySourceManager", () => {
       manager.drainGranted(owner, routing(prepare), { maxRecords: 1, maxWireBytes: 89 }, (bytes) =>
         retries.push(bytes),
       ),
-    ).toEqual({ records: 1, wireBytes: 89 });
+    ).toEqual({ status: "complete", records: 0, wireBytes: 0 });
     expect(
       manager.grant(owner, {
         type: "recovery-source-grant",
         ...routing(prepare),
-        cumulativeGrantedEncodedBytes: "177",
+        cumulativeGrantedEncodedBytes: "266",
       }),
     ).toBe(true);
     expect(
       manager.drainGranted(owner, routing(prepare), { maxRecords: 1, maxWireBytes: 89 }, (bytes) =>
         retries.push(bytes),
       ),
-    ).toEqual({ records: 1, wireBytes: 89 });
-    expect(retries).toEqual([first[0], first[0]]);
+    ).toEqual({ status: "complete", records: 0, wireBytes: 0 });
+    expect(retries).toEqual([]);
 
     expect(
       manager.received(owner, {
@@ -524,33 +535,58 @@ describe("RecoverySourceManager", () => {
         cumulativeEncodedBytes: "89",
       }),
     ).toMatchObject({ status: "partial", advanced: true });
-    const done: Uint8Array[] = [];
+    expect(manager.counters).toMatchObject({ ownedRecords: 2, ownedWireBytes: 177 });
     expect(
-      manager.drainGranted(owner, routing(prepare), { maxRecords: 1, maxWireBytes: 88 }, (bytes) =>
-        done.push(bytes),
-      ),
-    ).toEqual({ records: 1, wireBytes: 88 });
-    expect(inspectEnvelope(done[0]!)).toMatchObject({
-      deliveryOrdinal: 2n,
-      cumulativeEncodedBytes: 177n,
-    });
+      manager.received(owner, {
+        type: "recovery-source-received",
+        ...routing(prepare),
+        lane: "recovery",
+        contiguousDeliveryOrdinal: "1",
+        cumulativeEncodedBytes: "89",
+      }),
+    ).toMatchObject({ status: "partial", advanced: false });
+    expect(manager.counters).toMatchObject({ ownedRecords: 2, ownedWireBytes: 177 });
+
+    const secondPrepare = prepareFor(2, "1", result.committedThrough);
+    expectPrepared(await manager.prepare({}, secondPrepare, () => true));
+    expect(manager.counters).toMatchObject({ ownedRecords: 3, ownedWireBytes: 265 });
+
     expect(
       manager.received(owner, {
         type: "recovery-source-received",
         ...routing(prepare),
         lane: "recovery",
         contiguousDeliveryOrdinal: "2",
-        cumulativeEncodedBytes: "177",
+        cumulativeEncodedBytes: "178",
+      }),
+    ).toMatchObject({ status: "partial", advanced: true });
+    expect(manager.counters).toMatchObject({ ownedRecords: 2, ownedWireBytes: 176 });
+    expect(
+      manager.received(owner, {
+        type: "recovery-source-received",
+        ...routing(prepare),
+        lane: "recovery",
+        contiguousDeliveryOrdinal: "1",
+        cumulativeEncodedBytes: "89",
+      }),
+    ).toEqual({ status: "invalid", reason: "non-monotonic" });
+    expect(
+      manager.received(owner, {
+        type: "recovery-source-received",
+        ...routing(prepare),
+        lane: "recovery",
+        contiguousDeliveryOrdinal: "3",
+        cumulativeEncodedBytes: "266",
       }),
     ).toMatchObject({ status: "closed", duplicate: false });
 
     clock.now = DEFAULT_LIMITS.recoveryDeadlineMs;
     expect(manager.checkDeadlines(owner)).toEqual([]);
     expect(manager.counters).toEqual({
-      ownedRecords: 0,
-      ownedWireBytes: 0,
+      ownedRecords: 1,
+      ownedWireBytes: 88,
       pendingSources: 0,
-      sources: 1,
+      sources: 2,
     });
   });
 
@@ -651,6 +687,70 @@ describe("RecoverySourceManager", () => {
     expect(manager.counters).toMatchObject({ ownedRecords: 0, ownedWireBytes: 0, sources: 0 });
   });
 
+  it("retains every accepted old generation identity across monotonic replacements", async () => {
+    const { manager } = createHarness();
+    const owner = {};
+    const generationOne = prepareFor(1, "1");
+    const generationTwo = prepareFor(1, "2");
+    const generationThree = prepareFor(1, "3");
+
+    expectPrepared(await manager.prepare(owner, generationOne, () => true));
+    expectPrepared(await manager.prepare(owner, generationTwo, () => true));
+    expectPrepared(await manager.prepare(owner, generationThree, () => true));
+
+    expect(manager.isRetiredIdentity(owner, routing(generationOne))).toBe(true);
+    expect(manager.isRetiredIdentity(owner, routing(generationTwo))).toBe(true);
+    expect(manager.isRetiredIdentity(owner, routing(generationThree))).toBe(false);
+    expect(manager.isRetiredIdentity({}, routing(generationOne))).toBe(false);
+    expect(
+      manager.isRetiredIdentity(owner, {
+        ...routing(generationOne),
+        connectionId: "connection-source-divergent",
+      }),
+    ).toBe(false);
+    expect(
+      manager.received(owner, {
+        type: "recovery-source-received",
+        ...routing(generationOne),
+        lane: "recovery",
+        contiguousDeliveryOrdinal: "1",
+        cumulativeEncodedBytes: "88",
+      }),
+    ).toEqual({ status: "invalid", reason: "unknown-source" });
+    expect(
+      manager.reset(owner, {
+        type: "recovery-source-reset",
+        ...routing(generationOne),
+        reason: "generation-reset",
+      }),
+    ).toBe(false);
+    expect(manager.isRetiredIdentity(owner, routing(generationOne))).toBe(true);
+    expect(manager.counters).toMatchObject({ ownedRecords: 1, ownedWireBytes: 88, sources: 1 });
+  });
+
+  it("bounds retired generation history without evicting exact identities or the current source", async () => {
+    const { manager } = createHarness();
+    const owner = {};
+    for (let generation = 1; generation <= 16; generation += 1) {
+      expectPrepared(
+        await manager.prepare(owner, prepareFor(1, generation.toString()), () => true),
+      );
+    }
+
+    await expect(manager.prepare(owner, prepareFor(1, "17"), () => true)).resolves.toMatchObject({
+      status: "rejected",
+      rejection: { reason: "capacity-exceeded" },
+    });
+    expect(manager.isRetiredIdentity(owner, routing(prepareFor(1, "1")))).toBe(true);
+    expect(manager.isRetiredIdentity(owner, routing(prepareFor(1, "15")))).toBe(true);
+    expect(manager.isRetiredIdentity(owner, routing(prepareFor(1, "16")))).toBe(false);
+    expectPrepared(await manager.prepare(owner, prepareFor(1, "16"), () => true));
+    expect(manager.counters).toMatchObject({ ownedRecords: 1, ownedWireBytes: 88, sources: 1 });
+
+    expect(manager.resetOwner(owner)).toBe(1);
+    expect(manager.counters).toMatchObject({ ownedRecords: 0, ownedWireBytes: 0, sources: 0 });
+  });
+
   it("tombstones an exact reset that arrives before its prepare without weakening identity", async () => {
     const { manager } = createHarness({ maxSources: 1 });
     const owner = {};
@@ -731,7 +831,7 @@ describe("RecoverySourceManager", () => {
         { maxRecords: 1, maxWireBytes: 88 },
         () => {},
       ),
-    ).toEqual({ records: 1, wireBytes: 88 });
+    ).toEqual({ status: "complete", records: 1, wireBytes: 88 });
     expect(
       manager.received(owners[0]!, {
         type: "recovery-source-received",
@@ -781,7 +881,7 @@ describe("RecoverySourceManager", () => {
         { maxRecords: 1, maxWireBytes: 88 },
         () => {},
       ),
-    ).toEqual({ records: 1, wireBytes: 88 });
+    ).toEqual({ status: "complete", records: 1, wireBytes: 88 });
   });
 
   it("fences a pending actor prepare by opaque owner before any late commit can publish", async () => {
@@ -860,6 +960,14 @@ describe("RecoverySourceManager", () => {
         reason: "no-progress-deadline",
       },
     ]);
+    expect(manager.isRetiredIdentity(ownerA, routing(prepareA))).toBe(true);
+    expect(manager.isRetiredIdentity(ownerB, routing(prepareA))).toBe(false);
+    expect(
+      manager.isRetiredIdentity(ownerA, {
+        ...routing(prepareA),
+        deliveryGeneration: "2",
+      }),
+    ).toBe(false);
     expect(manager.checkDeadlines(ownerA)).toEqual([]);
     expect(manager.counters).toEqual({
       ownedRecords: 1,
@@ -880,6 +988,62 @@ describe("RecoverySourceManager", () => {
       pendingSources: 0,
       sources: 2,
     });
+  });
+
+  it("retires only an expired source while another source on the same pair continues", async () => {
+    const { clock, manager } = createHarness({
+      noProgressDeadlineMs: 10,
+      recoveryDeadlineMs: 100,
+    });
+    const owner = {};
+    const expiredPrepare = prepareFor(1);
+    const livePrepare = prepareFor(2);
+    const expiredResult = await manager.prepare(owner, expiredPrepare, () => true);
+    const liveResult = await manager.prepare(owner, livePrepare, () => true);
+    expectPrepared(expiredResult);
+    expectPrepared(liveResult);
+    for (const [prepare, result] of [
+      [expiredPrepare, expiredResult],
+      [livePrepare, liveResult],
+    ] as const) {
+      expect(
+        manager.startReady(owner, {
+          type: "recovery-start-ready",
+          ...routing(prepare),
+          committedThrough: result.committedThrough,
+          cumulativeGrantedEncodedBytes: "88",
+        }),
+      ).toBe(true);
+    }
+
+    clock.now = 5;
+    expect(
+      manager.drainGranted(
+        owner,
+        routing(livePrepare),
+        { maxRecords: 1, maxWireBytes: 88 },
+        () => {},
+      ),
+    ).toEqual({ status: "complete", records: 1, wireBytes: 88 });
+    clock.now = 10;
+    expect(manager.checkDeadlines(owner)).toEqual([
+      {
+        ownerToken: owner,
+        identity: routing(expiredPrepare),
+        reason: "no-progress-deadline",
+      },
+    ]);
+    expect(manager.isRetiredIdentity(owner, routing(expiredPrepare))).toBe(true);
+    expect(manager.isRetiredIdentity(owner, routing(livePrepare))).toBe(false);
+    expect(
+      manager.received(owner, {
+        type: "recovery-source-received",
+        ...routing(livePrepare),
+        lane: "recovery",
+        contiguousDeliveryOrdinal: "1",
+        cumulativeEncodedBytes: "88",
+      }),
+    ).toMatchObject({ status: "closed", duplicate: false });
   });
 
   it("expires pending, stalled, and absolute recovery lifetimes and disposes idempotently", async () => {
@@ -1003,7 +1167,7 @@ describe("RecoverySourceManager", () => {
         { maxRecords: 1, maxWireBytes: 88 },
         () => {},
       ),
-    ).toEqual({ records: 1, wireBytes: 88 });
+    ).toEqual({ status: "complete", records: 1, wireBytes: 88 });
     absolute.clock.now = 20;
     expect(absolute.manager.checkDeadlines(absoluteOwner)).toEqual([
       {

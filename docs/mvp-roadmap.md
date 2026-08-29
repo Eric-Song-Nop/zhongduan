@@ -6,10 +6,12 @@
 > 具体工作分别见[高性能远程终端 Snapshot 恢复实施计划](high-performance-snapshot-recovery-plan.md)与
 > [输入稳定性与高 RTT 交互实施计划](input-stability-plan.md)。
 >
-> Recovery v3 当前新增的 P2.5a stacked candidate 只交付 Cloud v9 no-payload delivery ledger、
-> enqueue/begin/send/confirm ordering 与 hibernation 后的 delivery-owner fence；runtime 仍是 per-lane
-> stop-and-wait，默认 production kill switch/Host/Browser offer 仍选择 v2。扩大 lane window 属于后续 slice；
-> session aggregate、ephemeral shared ring 与 multi-client DRR 属于 P2.5c。这不改写下方历史 MVP stack，
+> Recovery v3 当前新增的 P2.5a stacked candidate 交付 Cloud v9 no-payload delivery ledger、
+> enqueue/begin/send/confirm ordering 与 hibernation 后的 delivery-owner fence；P2.5b 在现有
+> `2 MiB / 1024 records` cap/grant 内交付 Host recovery source multi-outstanding、connection-local
+> DRR、shared data backpressure yield 与 per-source deadline isolation。live lane 仍是 stop-and-wait，
+> Cloud session aggregate、ephemeral shared ring、writer/live reservation 与多 client/lane DRR 属于
+> P2.5c。默认 production kill switch/Host/Browser offer 仍选择 v2。这不改写下方历史 MVP stack，
 > 也不修改 WTerm/Ghostty；真实 API 缺口仍须先在 `Eric-Song-Nop` 对应 fork 走独立 PR，再更新 Zhongduan
 > 固定 submodule。
 

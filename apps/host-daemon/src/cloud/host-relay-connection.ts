@@ -21,6 +21,10 @@ import {
   type RecoverySourceManager,
   type RecoverySourceOwnerToken,
 } from "./recovery-source-manager";
+import {
+  HOST_RECOVERY_DATA_HIGH_WATER_BYTES,
+  RecoverySourceScheduler,
+} from "./recovery-source-scheduler";
 import type { SnapshotCheckpointManager } from "./snapshot-checkpoint-manager";
 
 export const HOST_READY_TIMEOUT_MS = 10_000;
@@ -33,7 +37,6 @@ export const HOST_CONTROL_QUEUE_LIMITS = {
 } as const;
 const MAX_CONTROL_MESSAGE_CHARS = 6 * 1024 * 1024 + 4_096;
 const MAX_CONTROL_BUFFERED_BYTES = 1024 * 1024;
-const HOST_RECOVERY_DRAIN_MAX_WIRE_BYTES = 512 * 1024;
 const textEncoder = new TextEncoder();
 const HOST_RECOVERY_V3_CAPABILITIES = [
   RelayCapability.capabilityNegotiationV1,
@@ -64,6 +67,7 @@ export class HostRelayConnection {
   readonly #readyTimeoutMs: number;
   readonly #recoveryDeadlineTickMs: number;
   readonly #recoveryOwnerToken: RecoverySourceOwnerToken = {};
+  readonly #recoveryScheduler: RecoverySourceScheduler;
   readonly #recoverySourceManager: RecoverySourceManager;
   readonly #recoveryV3Enabled: boolean;
   readonly #readyPromise: Promise<void>;
@@ -107,6 +111,14 @@ export class HostRelayConnection {
       throw new RangeError("recovery deadline tick must be a positive integer");
     }
     this.#recoverySourceManager = options.recoverySourceManager;
+    this.#recoveryScheduler = new RecoverySourceScheduler({
+      bufferedAmount: () => this.#pair.data.bufferedAmount,
+      dataHighWaterBytes: HOST_RECOVERY_DATA_HIGH_WATER_BYTES,
+      manager: this.#recoverySourceManager,
+      onFailure: (reason) => this.#close(1011, reason),
+      ownerToken: this.#recoveryOwnerToken,
+      sendData: (encoded) => this.#sendRecoveryData(encoded),
+    });
     const negotiated = new Set(options.pair.connection.negotiatedCapabilities ?? []);
     this.#recoveryV3Enabled = HOST_RECOVERY_V3_CAPABILITIES.every((capability) =>
       negotiated.has(capability),
@@ -323,48 +335,54 @@ export class HostRelayConnection {
         this.#sendRecoveryControl(result.rejection);
         return;
       }
+      if (result.status === "unavailable" && result.reason === "deadline") return;
       throw new Error(`Recovery source prepare ${result.status}: ${result.reason}`);
     }
     if (frame.type === "recovery-start-ready") {
       if (!this.#recoverySourceManager.startReady(this.#recoveryOwnerToken, frame)) {
+        if (this.#isRetiredRecoveryIdentity(frame)) return;
         throw new Error("invalid Recovery source start-ready identity");
       }
-      this.#drainRecovery(frame);
+      this.#recoveryScheduler.notify(frame);
       return;
     }
     if (frame.type === "recovery-source-grant") {
       if (!this.#recoverySourceManager.grant(this.#recoveryOwnerToken, frame)) {
+        if (this.#isRetiredRecoveryIdentity(frame)) return;
         throw new Error("invalid Recovery source grant identity");
       }
-      this.#drainRecovery(frame);
+      this.#recoveryScheduler.notify(frame);
       return;
     }
     if (frame.type === "recovery-source-received") {
       const result = this.#recoverySourceManager.received(this.#recoveryOwnerToken, frame);
       if (result.status === "invalid") {
+        if (this.#isRetiredRecoveryIdentity(frame)) return;
         throw new Error(`invalid Recovery source receipt: ${result.reason}`);
       }
-      if (result.status === "closed") this.#sendRecoveryControl(result.closed);
-      if (result.status === "partial" && result.advanced) this.#drainRecovery(frame);
+      if (result.status === "closed") {
+        this.#recoveryScheduler.forget(frame);
+        this.#sendRecoveryControl(result.closed);
+      }
+      if (result.status === "partial" && result.advanced) {
+        this.#recoveryScheduler.notify(frame);
+      }
       return;
     }
     if (!this.#recoverySourceManager.reset(this.#recoveryOwnerToken, frame)) {
+      if (this.#isRetiredRecoveryIdentity(frame)) return;
       throw new Error("invalid Recovery source reset identity");
     }
+    this.#recoveryScheduler.forget(frame);
   }
 
-  #drainRecovery(identity: RecoveryV3HostRoutingIdentity): void {
-    this.#recoverySourceManager.drainGranted(
-      this.#recoveryOwnerToken,
-      {
-        recoveryId: identity.recoveryId,
-        connectionId: identity.connectionId,
-        streamId: identity.streamId,
-        deliveryGeneration: identity.deliveryGeneration,
-      },
-      { maxRecords: 1, maxWireBytes: HOST_RECOVERY_DRAIN_MAX_WIRE_BYTES },
-      (encoded) => this.#sendRecoveryData(encoded),
-    );
+  #isRetiredRecoveryIdentity(identity: RecoveryV3HostRoutingIdentity): boolean {
+    return this.#recoverySourceManager.isRetiredIdentity(this.#recoveryOwnerToken, {
+      recoveryId: identity.recoveryId,
+      connectionId: identity.connectionId,
+      streamId: identity.streamId,
+      deliveryGeneration: identity.deliveryGeneration,
+    });
   }
 
   #sendRecoveryControl(frame: RecoveryV3HostToCloudControlFrame): void {
@@ -378,13 +396,9 @@ export class HostRelayConnection {
       this.#recoveryDeadlineTimer = undefined;
       if (this.#closed) return;
       try {
-        const expiration = this.#recoverySourceManager.checkDeadlines(this.#recoveryOwnerToken)[0];
-        if (expiration !== undefined) {
-          this.#close(
-            1012,
-            `Recovery source ${expiration.identity.recoveryId} ${expiration.reason}`,
-          );
-          return;
+        const expirations = this.#recoverySourceManager.checkDeadlines(this.#recoveryOwnerToken);
+        for (const expiration of expirations) {
+          this.#recoveryScheduler.forget(expiration.identity);
         }
       } catch (error) {
         this.#close(
@@ -468,9 +482,6 @@ export class HostRelayConnection {
     if (this.#closed || this.#pair.data.readyState !== WebSocket.OPEN) {
       throw new Error("Host data WebSocket is not open");
     }
-    if (frame.byteLength > HOST_CANONICAL_QUEUE_LIMITS.maxBytes - this.#pair.data.bufferedAmount) {
-      throw new Error("Host data WebSocket buffer exceeded");
-    }
     if (!(frame.buffer instanceof ArrayBuffer)) {
       throw new Error("Host data frame must use an owned ArrayBuffer");
     }
@@ -505,6 +516,7 @@ export class HostRelayConnection {
     if (this.#recoveryDeadlineTimer !== undefined) clearTimeout(this.#recoveryDeadlineTimer);
     this.#recoveryDeadlineTimer = undefined;
     this.#unlisten();
+    this.#recoveryScheduler.dispose();
     this.#recoverySourceManager.resetOwner(this.#recoveryOwnerToken);
     this.#scheduler.dispose(reason);
     this.#rejectReady(new Error(reason));
