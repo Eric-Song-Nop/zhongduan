@@ -13,9 +13,12 @@ import { EventJournal } from "../journal";
 import type { PtyProcess } from "../pty-process";
 import { TerminalSession } from "../session";
 import type { SemanticMouse } from "../terminal-authority";
-import type { SnapshotPublisherLike } from "./delivery-scheduler";
 import { HostRelayConnection, HOST_CONTROL_QUEUE_LIMITS } from "./host-relay-connection";
 import type { HostSocketPair } from "./paired-websocket";
+import {
+  SnapshotCheckpointManager,
+  type SnapshotPublisherLike,
+} from "./snapshot-checkpoint-manager";
 
 class FakeWebSocket extends EventTarget {
   static readonly CONNECTING = 0;
@@ -131,6 +134,11 @@ function createHarness(
       },
     }),
   };
+  const snapshotCheckpointManager = new SnapshotCheckpointManager({
+    publisher: snapshotPublisher,
+    session,
+    sessionId: "session_AAAAAAAAA",
+  });
   const relay = new HostRelayConnection({
     pair,
     ...(options.heartbeatIntervalMs === undefined
@@ -141,7 +149,7 @@ function createHarness(
       : { heartbeatTimeoutMs: options.heartbeatTimeoutMs }),
     ...(options.readyTimeoutMs === undefined ? {} : { readyTimeoutMs: options.readyTimeoutMs }),
     session,
-    snapshotPublisher,
+    snapshotCheckpointManager,
   });
   return { control, data, pair, pty, relay, session };
 }

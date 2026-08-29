@@ -7,14 +7,10 @@ import {
 } from "@zhongduan/protocol";
 
 import type { ReplayCursor, TerminalSession } from "../session";
-import {
-  HOST_CANONICAL_QUEUE_LIMITS,
-  HostDeliveryScheduler,
-  type SnapshotPublisherLike,
-} from "./delivery-scheduler";
+import { HOST_CANONICAL_QUEUE_LIMITS, HostDeliveryScheduler } from "./delivery-scheduler";
 import { dispatchForwardedInput, type ForwardedInput } from "./input-dispatcher";
 import type { HostSocketPair } from "./paired-websocket";
-import type { SnapshotCheckpointCache } from "./snapshot-checkpoint-cache";
+import type { SnapshotCheckpointManager } from "./snapshot-checkpoint-manager";
 
 export const HOST_READY_TIMEOUT_MS = 10_000;
 export const HOST_HEARTBEAT_INTERVAL_MS = 15_000;
@@ -34,8 +30,7 @@ export interface HostRelayConnectionOptions {
   pair: HostSocketPair;
   readyTimeoutMs?: number;
   session: TerminalSession;
-  snapshotCheckpointCache?: SnapshotCheckpointCache;
-  snapshotPublisher: SnapshotPublisherLike;
+  snapshotCheckpointManager: SnapshotCheckpointManager;
 }
 
 export class HostRelayConnection {
@@ -100,10 +95,7 @@ export class HostRelayConnection {
       sendControl: (frame) => this.#sendControl(frame),
       sendData: (frame) => this.#sendData(frame),
       session: this.#session,
-      ...(options.snapshotCheckpointCache === undefined
-        ? {}
-        : { snapshotCheckpointCache: options.snapshotCheckpointCache }),
-      snapshotPublisher: options.snapshotPublisher,
+      snapshotCheckpointManager: options.snapshotCheckpointManager,
     });
   }
 

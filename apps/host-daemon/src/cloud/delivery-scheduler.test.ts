@@ -21,13 +21,17 @@ import {
   SNAPSHOT_RECOVERY_MAX_QUIET_WAIT_MS,
   SNAPSHOT_RECOVERY_QUIET_MS,
   WARM_REPLAY_MAX_FRAMES,
-  type SnapshotPublisherLike,
 } from "./delivery-scheduler";
 import {
   SnapshotCleanupConfirmedError,
   SnapshotUnavailableError,
   type PublishedSnapshot,
 } from "./snapshot-publisher";
+import {
+  SNAPSHOT_CHECKPOINT_FRESHNESS_MS,
+  SnapshotCheckpointManager,
+  type SnapshotPublisherLike,
+} from "./snapshot-checkpoint-manager";
 
 const encoder = new TextEncoder();
 
@@ -81,6 +85,7 @@ function createHarness(
   authority: FakeTerminalAuthority = new FakeTerminalAuthority(),
   sessionMonotonicNow?: () => number,
   yieldIo: () => Promise<void> = () => Promise.resolve(),
+  checkpointMonotonicNow?: () => number,
 ): Harness {
   const pty = new ManualPty();
   const session = new TerminalSession({
@@ -94,6 +99,12 @@ function createHarness(
   const data: Uint8Array[] = [];
   const closeReasons: string[] = [];
   let barrierResponder: ((encoded: Uint8Array) => void) | undefined;
+  const snapshotCheckpointManager = new SnapshotCheckpointManager({
+    ...(checkpointMonotonicNow === undefined ? {} : { monotonicNow: checkpointMonotonicNow }),
+    publisher: snapshotPublisher,
+    session,
+    sessionId: "session_AAAAAAAAAAAA",
+  });
   const scheduler = new HostDeliveryScheduler({
     closePair: (reason) => closeReasons.push(reason),
     sendControl: (frame) => controls.push(frame),
@@ -105,7 +116,7 @@ function createHarness(
       }
     },
     session,
-    snapshotPublisher,
+    snapshotCheckpointManager,
     yieldIo,
   });
   scheduler.prepareHostReady();
@@ -741,6 +752,84 @@ describe("HostDeliveryScheduler", () => {
       ).size,
     ).toBe(1);
     expect(frames.filter((frame) => frame.kind === DataFrameKind.ReplayCommit)).toHaveLength(16);
+    expect(harness.closeReasons).toEqual([]);
+  });
+
+  it("reuses the same idle checkpoint after its age freshness threshold", async () => {
+    let checkpointNow = 0;
+    const authority = new FakeTerminalAuthority();
+    const encodeSnapshot = vi.spyOn(authority, "encodeSnapshot");
+    const publish = vi.fn(async (snapshot: SnapshotCapture) => publishedSnapshot(snapshot, "A"));
+    const harness = createHarness(
+      { publish },
+      authority,
+      undefined,
+      () => Promise.resolve(),
+      () => checkpointNow,
+    );
+    activate(harness);
+    harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
+
+    attach(harness, { connectionId: "connection_AAAAAAAAA", streamId: 1 });
+    await settle();
+    checkpointNow += SNAPSHOT_CHECKPOINT_FRESHNESS_MS + 1;
+    attach(harness, { connectionId: "connection_BBBBBBBBB", streamId: 2 });
+    await settle();
+
+    const snapshotIds = harness.data
+      .map(decodeDataFrame)
+      .filter((frame) => frame.kind === DataFrameKind.DeliveryBarrier)
+      .map((frame) => decodeDeliveryBarrierPayload(frame.payload))
+      .flatMap((payload) => (payload.mode === "snapshot" ? [payload.snapshotId] : []));
+    expect(snapshotIds).toEqual([`snapshot_${"A".repeat(16)}`, `snapshot_${"A".repeat(16)}`]);
+    expect(encodeSnapshot).toHaveBeenCalledOnce();
+    expect(publish).toHaveBeenCalledOnce();
+    expect(harness.closeReasons).toEqual([]);
+  });
+
+  it("keeps an age-stale checkpoint behind the existing static tail limit", async () => {
+    vi.useFakeTimers();
+    let checkpointNow = 0;
+    let publishCalls = 0;
+    const authority = new FakeTerminalAuthority();
+    const encodeSnapshot = vi.spyOn(authority, "encodeSnapshot");
+    const publish = vi.fn(async (snapshot: SnapshotCapture) => {
+      publishCalls += 1;
+      return publishedSnapshot(snapshot, publishCalls === 1 ? "A" : "B");
+    });
+    const harness = createHarness(
+      { publish },
+      authority,
+      undefined,
+      () => Promise.resolve(),
+      () => checkpointNow,
+    );
+    activate(harness);
+    harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
+
+    attach(harness, { connectionId: "connection_AAAAAAAAA", streamId: 1 });
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+    expect(publish).toHaveBeenCalledOnce();
+
+    checkpointNow += SNAPSHOT_CHECKPOINT_FRESHNESS_MS + 1;
+    for (let index = 0; index < WARM_REPLAY_MAX_FRAMES + 1; index += 1) {
+      harness.pty.emit(Uint8Array.of(index & 0xff));
+    }
+    attach(harness, { connectionId: "connection_BBBBBBBBB", streamId: 2 });
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+
+    expect(publish).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_RECOVERY_QUIET_MS);
+    for (let turn = 0; turn < 64; turn += 1) await Promise.resolve();
+
+    const snapshotIds = harness.data
+      .map(decodeDataFrame)
+      .filter((frame) => frame.kind === DataFrameKind.DeliveryBarrier)
+      .map((frame) => decodeDeliveryBarrierPayload(frame.payload))
+      .flatMap((payload) => (payload.mode === "snapshot" ? [payload.snapshotId] : []));
+    expect(snapshotIds).toEqual([`snapshot_${"A".repeat(16)}`, `snapshot_${"B".repeat(16)}`]);
+    expect(encodeSnapshot).toHaveBeenCalledTimes(2);
+    expect(publish).toHaveBeenCalledTimes(2);
     expect(harness.closeReasons).toEqual([]);
   });
 

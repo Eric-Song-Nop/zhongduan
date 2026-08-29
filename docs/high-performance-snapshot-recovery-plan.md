@@ -306,6 +306,16 @@ needsNewerCut     合并后的刷新压力和最低 cut 需求
 ledger 到达 cleanup-safe terminal state，或已转交给独立有界 cleanup owner 后，才能释放本地 body 并允许
 新 ID。迟到 abort/delete 也不得命中 replacement。
 
+Phase 1 按可直接验收的 ownership gate 分层实现。P1.1 只把现有 publisher 和一个 immutable
+`latestValid` checkpoint 收归 `HostCloudRelay` 生命周期内的 manager，并把 30 秒阈值改成只读
+`ageFresh` 分类。它不把 `refreshInFlight`、waiter、capture 或 recovery generation controller 从 scheduler
+移入 manager；这些 ownership 变化必须在后续 sub-gate 中连同新的取消语义和直接测试一起落地。
+
+P1.1 的 `latestValid` 表示 publisher 已确认、metadata 与固定 session/engine/epoch/cut identity 自洽。它不表示
+Cloud blob 此刻可取得，也不表示 checkpoint 对某个目标 `H` usable。相同 identity 的幂等结果不续 freshness；
+迟到的旧 cut 或同 cut 不同 identity 不能覆盖 latest。只有 exact-identity invalidation 清空 latest 后，才允许在
+未变化的 authority cut 安装新 snapshot identity。
+
 ### valid、usable 与 fresh 是三个概念
 
 | 属性     | 含义                                                                        | 过期/失败动作                         |
@@ -314,8 +324,10 @@ ledger 到达 cleanup-safe terminal state，或已转交给独立有界 cleanup 
 | `usable` | 针对目标 `H`，blob 可取得且 journal 精确覆盖 `(R,H]`，bytes/frames 在预算内 | 换更近 cut、reset 或报告 unavailable  |
 | `fresh`  | age、tail cost、dirty state 达到策略目标，值得后台刷新                      | 触发 refresh，不删除仍 usable 的 body |
 
-当前 cache 的 30 秒 TTL 在 TARGET 中只作为 freshness/refresh 信号。Idle session 状态未变化时，一个超过
-30 秒但 valid 且 tail 为空的 checkpoint 仍然 usable，不能仅按 wall clock 删除。
+P1.1 起，原 cache 的 30 秒 TTL 只产生 `ageFresh=false`，不再按年龄删除或隐藏 checkpoint，也不会因读取而
+续期。Idle session 状态未变化时，一个超过 30 秒但 identity-valid 且 tail 为空的 checkpoint 仍可由 CURRENT
+静态 tail gate 使用。`ageFresh` 不是完整 `fresh`：tail cost、dirty state 与后台 refresh policy 仍由后续
+sub-gate 实现。
 
 ### Serviceability 必须动态测量
 
@@ -501,11 +513,22 @@ Phase 1 只能从通过上述契约和完整 CI 的 exact Phase 0 revision 开�
 
 ### Phase 1：Checkpoint manager 与动态 serviceability
 
-- 抽取 session-owned `SnapshotCheckpointManager`；
-- 实现 valid/usable/fresh、动态 range bytes/frames/gap 计算；
-- pending body 只在仍 serviceable 或 bounded cursor-ahead 时 resume，否则 abandon/supersede；
-- 多 waiter single-flight，共享 build，30 秒只触发 freshness refresh；
-- 保留 v2 delivery，不同时修改 recovery ordering。
+- **P1.1：latest-valid ownership 与 age freshness**。每个 HostCloudRelay/TerminalSession 构造一个
+  `SnapshotCheckpointManager`，跨 relay connection 复用现有 publisher 和 immutable latest；30 秒只改变
+  `ageFresh`，不删除 checkpoint。Scheduler 仍用现有 journal replay、frame/byte 上限决定当前 delivery，且
+  capture/quiet/backoff/generation cancellation 与 v2 ordering 不变。
+- **P1.2：动态 serviceability facts**。在 materialize replay 前计算实际 range bytes/frames/gap，并区分
+  identity-valid、针对 `H` usable 和 refresh policy；仍不改变 v2 delivery ordering。
+- **P1.3：pending body serviceability**。pending body 只在仍 serviceable 或 bounded cursor-ahead 时 resume，
+  否则按 cleanup-safe ownership abandon/supersede；失败不能 starvation、storm 或泄漏 immutable body。
+- **P1.4：manager-owned refresh single-flight**。把 `refreshInFlight`、合并后的更新压力和 waiter ownership 移入
+  manager；单个 waiter supersede 不取消仍有价值的公共 build，connection replacement 可以接续同一 session
+  refresh。此步必须显式更新当前 generation-supersede 的 capture/publish 契约。
+
+P1.1 的直接 gate 是：manager 在 30 秒边界后仍返回同一 latest 且 `ageFresh=false`；两个无 mutation 的 cold
+attach 相隔超过 30 秒仍使用同一 `snapshotId`，authority encode 和 publish 总计各一次。现有 16 attach
+单 build 只是回归保护，不作为本层新增进展。旧 checkpoint 的 tail gap/静态超预算仍必须 invalidate 并 recapture。
+P1.1 单独通过不表示 Phase 1 完成；下列总 gate 仍需 P1.2–P1.4 的直接证据。
 
 Gate：16 个 attach 只 build 一次；90–120 秒 upload/retry 不会发布出生即不可服务的 checkpoint；idle
 checkpoint 不因 TTL 被错误删除；无 pending body starvation/storm/leak。

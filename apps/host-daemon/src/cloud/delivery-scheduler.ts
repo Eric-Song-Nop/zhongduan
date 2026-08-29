@@ -18,7 +18,7 @@ import {
   type DeliveryBarrierResult,
 } from "./delivery-barrier-waiter";
 import { DeliveryRecoveryQueue, recoveryKey, type AttachRequest } from "./delivery-recovery-queue";
-import { SnapshotCheckpointCache, type SnapshotCheckpoint } from "./snapshot-checkpoint-cache";
+import { SnapshotCheckpointManager, type SnapshotCheckpoint } from "./snapshot-checkpoint-manager";
 import {
   RetryableSnapshotPublishError,
   SnapshotCleanupConfirmedError,
@@ -56,6 +56,11 @@ interface ColdPreparation {
   status: "publishing" | "ready";
 }
 
+interface PreparedCheckpoint {
+  capture?: SnapshotCapture;
+  published: PublishedSnapshot;
+}
+
 export interface HostDeliverySchedulerOptions {
   bufferedAmount?: () => number;
   closePair: (reason: string) => void;
@@ -63,14 +68,8 @@ export interface HostDeliverySchedulerOptions {
   sendControl: (frame: HostControlFrame) => void;
   sendData: (frame: Uint8Array) => void;
   session: TerminalSession;
-  snapshotCheckpointCache?: SnapshotCheckpointCache;
-  snapshotPublisher: SnapshotPublisherLike;
+  snapshotCheckpointManager: SnapshotCheckpointManager;
   yieldIo?: () => Promise<void>;
-}
-
-export interface SnapshotPublisherLike {
-  publish(snapshot: SnapshotCapture, signal?: AbortSignal): Promise<PublishedSnapshot>;
-  resumePending?(signal?: AbortSignal): Promise<PublishedSnapshot> | undefined;
 }
 
 export class HostDeliveryScheduler {
@@ -83,8 +82,7 @@ export class HostDeliveryScheduler {
   readonly #sendControl: (frame: HostControlFrame) => void;
   readonly #sendDataFrame: (frame: Uint8Array) => void;
   readonly #session: TerminalSession;
-  readonly #snapshotCheckpointCache: SnapshotCheckpointCache;
-  readonly #snapshotPublisher: SnapshotPublisherLike;
+  readonly #snapshotCheckpointManager: SnapshotCheckpointManager;
   readonly #yieldIo: () => Promise<void>;
   readonly #coldPreparations = new Map<string, ColdPreparation>();
   readonly #recoveryQueue: DeliveryRecoveryQueue;
@@ -106,9 +104,7 @@ export class HostDeliveryScheduler {
     this.#sendControl = options.sendControl;
     this.#sendDataFrame = options.sendData;
     this.#session = options.session;
-    this.#snapshotCheckpointCache =
-      options.snapshotCheckpointCache ?? new SnapshotCheckpointCache();
-    this.#snapshotPublisher = options.snapshotPublisher;
+    this.#snapshotCheckpointManager = options.snapshotCheckpointManager;
     this.#yieldIo = options.yieldIo ?? (() => new Promise((resolve) => setImmediate(resolve)));
     this.#recoveryQueue = new DeliveryRecoveryQueue({
       maxQuietWaitMs: SNAPSHOT_RECOVERY_MAX_QUIET_WAIT_MS,
@@ -278,7 +274,7 @@ export class HostDeliveryScheduler {
     }
     const preparation = this.#coldPreparations.get(key);
     if (preparation?.status === "ready") return true;
-    if (this.#snapshotCheckpointCache.current() !== undefined) return true;
+    if (this.#snapshotCheckpointManager.latestValid() !== undefined) return true;
     if (preparation?.status === "publishing" || this.#coldBuildInFlight !== undefined) return false;
     return this.#coldCaptureReadyAt(request) <= this.#monotonicNow();
   }
@@ -299,7 +295,7 @@ export class HostDeliveryScheduler {
       }
       const preparation = this.#coldPreparations.get(key);
       if (preparation?.status === "ready") earliest = 0;
-      if (this.#snapshotCheckpointCache.current() !== undefined) earliest = 0;
+      if (this.#snapshotCheckpointManager.latestValid() !== undefined) earliest = 0;
       if (preparation?.status === "publishing" || this.#coldBuildInFlight !== undefined) return;
       earliest = Math.min(earliest, this.#coldCaptureReadyAt(request));
     });
@@ -363,7 +359,7 @@ export class HostDeliveryScheduler {
       active.mode = "cold";
       this.#recoveryQueue.markCold(request);
       let preparation = this.#coldPreparations.get(key);
-      const recentCheckpoint = this.#snapshotCheckpointCache.current();
+      const recentCheckpoint = this.#snapshotCheckpointManager.latestValid()?.checkpoint;
       if (preparation === undefined && recentCheckpoint !== undefined) {
         preparation = {
           checkpoint: recentCheckpoint,
@@ -442,7 +438,7 @@ export class HostDeliveryScheduler {
     this.#coldBuildInFlight = preparation;
     this.#coldPreparations.set(key, preparation);
     void this.#prepareCold(preparation).then(
-      (checkpoint) => {
+      (prepared) => {
         if (this.#coldBuildInFlight === preparation) this.#coldBuildInFlight = undefined;
         if (
           this.#failed ||
@@ -452,40 +448,52 @@ export class HostDeliveryScheduler {
           this.#schedulePendingRecoveries();
           return;
         }
-        preparation.checkpoint = this.#snapshotCheckpointCache.install(checkpoint);
+        try {
+          preparation.checkpoint = this.#snapshotCheckpointManager.install(
+            prepared.published,
+            prepared.capture,
+          );
+        } catch (error) {
+          this.#handleColdPreparationFailure(preparation, key, error);
+          return;
+        }
         preparation.status = "ready";
         this.#coldCaptureNotBefore = undefined;
         this.#coldCaptureQuietDeadline = undefined;
         this.#recoveryQueue.requeue(request);
         this.#schedulePendingRecoveries();
       },
-      (error: unknown) => {
-        if (this.#coldBuildInFlight === preparation) this.#coldBuildInFlight = undefined;
-        const isCurrent = this.#coldPreparations.get(key) === preparation;
-        if (isCurrent) this.#coldPreparations.delete(key);
-        if (this.#failed || preparation.controller.signal.aborted || !isCurrent) {
-          this.#schedulePendingRecoveries();
-          return;
-        }
-        if (isRetryableColdRecoveryError(error)) {
-          this.#recoveryQueue.requeue(request);
-          const retryDelay = this.#recoveryQueue.deferAfterFailure(
-            request,
-            snapshotRetryAfter(error),
-          );
-          this.#deferColdCaptures(retryDelay);
-          this.#schedulePendingRecoveries();
-          return;
-        }
-        this.#failPair(error instanceof Error ? error.message : "snapshot preparation failed");
-      },
+      (error: unknown) => this.#handleColdPreparationFailure(preparation, key, error),
     );
   }
 
-  async #prepareCold(preparation: ColdPreparation): Promise<SnapshotCheckpoint> {
+  #handleColdPreparationFailure(preparation: ColdPreparation, key: string, error: unknown): void {
+    if (this.#coldBuildInFlight === preparation) this.#coldBuildInFlight = undefined;
+    const isCurrent = this.#coldPreparations.get(key) === preparation;
+    if (isCurrent) this.#coldPreparations.delete(key);
+    if (this.#failed || preparation.controller.signal.aborted || !isCurrent) {
+      this.#schedulePendingRecoveries();
+      return;
+    }
+    if (isRetryableColdRecoveryError(error)) {
+      this.#recoveryQueue.requeue(preparation.request);
+      const retryDelay = this.#recoveryQueue.deferAfterFailure(
+        preparation.request,
+        snapshotRetryAfter(error),
+      );
+      this.#deferColdCaptures(retryDelay);
+      this.#schedulePendingRecoveries();
+      return;
+    }
+    this.#failPair(error instanceof Error ? error.message : "snapshot preparation failed");
+  }
+
+  async #prepareCold(preparation: ColdPreparation): Promise<PreparedCheckpoint> {
     const resumed = this.#resumePendingSnapshot(preparation);
     if (resumed !== undefined) {
-      return checkpointFromPublished(await resumed, this.#session);
+      const published = await resumed;
+      preparation.controller.signal.throwIfAborted();
+      return { published };
     }
     const snapshot = await this.#captureSnapshot(preparation);
     preparation.controller.signal.throwIfAborted();
@@ -494,8 +502,7 @@ export class HostDeliveryScheduler {
     }
     const published = await this.#publishSnapshot(snapshot, preparation);
     preparation.controller.signal.throwIfAborted();
-    assertPublishedSnapshotMatchesCapture(published, snapshot);
-    return checkpointFromPublished(published, this.#session);
+    return { capture: snapshot, published };
   }
 
   #resumePendingSnapshot(preparation: ColdPreparation): Promise<PublishedSnapshot> | undefined {
@@ -511,7 +518,7 @@ export class HostDeliveryScheduler {
     ]);
     let operation: Promise<PublishedSnapshot> | undefined;
     try {
-      operation = this.#snapshotPublisher.resumePending?.(signal);
+      operation = this.#snapshotCheckpointManager.resumePending(signal);
     } catch (error) {
       clearTimeout(timeout);
       throw error;
@@ -556,7 +563,7 @@ export class HostDeliveryScheduler {
       this.#connectionAbort.signal,
     ]);
     try {
-      return await raceAbort(this.#snapshotPublisher.publish(snapshot, signal), signal);
+      return await raceAbort(this.#snapshotCheckpointManager.publish(snapshot, signal), signal);
     } finally {
       clearTimeout(timeout);
     }
@@ -773,7 +780,7 @@ export class HostDeliveryScheduler {
   }
 
   #invalidateCheckpoint(checkpoint: SnapshotCheckpoint): void {
-    this.#snapshotCheckpointCache.invalidate(checkpoint);
+    this.#snapshotCheckpointManager.invalidate(checkpoint);
     this.#deferColdCaptures(SNAPSHOT_RECOVERY_QUIET_MS);
   }
 
@@ -830,41 +837,6 @@ function sameCursor(left: ReplayCursor, right: ReplayCursor): boolean {
     left.lastEventSeq === right.lastEventSeq &&
     left.nextPtyOffset === right.nextPtyOffset
   );
-}
-
-function assertPublishedSnapshotMatchesCapture(
-  published: PublishedSnapshot,
-  snapshot: SnapshotCapture,
-): void {
-  if (
-    published.metadata.engineId !== snapshot.engineId ||
-    BigInt(published.metadata.sessionEpoch) !== snapshot.sessionEpoch ||
-    BigInt(published.metadata.cutEventSeq) !== snapshot.cutEventSeq ||
-    BigInt(published.metadata.nextPtyOffset) !== snapshot.nextPtyOffset
-  ) {
-    throw new Error("published snapshot metadata does not match its authority cut");
-  }
-}
-
-function checkpointFromPublished(
-  published: PublishedSnapshot,
-  session: TerminalSession,
-): SnapshotCheckpoint {
-  if (
-    published.metadata.engineId !== session.engineId ||
-    BigInt(published.metadata.sessionEpoch) !== session.sessionEpoch
-  ) {
-    throw new Error("pending snapshot metadata does not match the terminal authority");
-  }
-  return {
-    base: {
-      sessionEpoch: BigInt(published.metadata.sessionEpoch),
-      lastEventSeq: BigInt(published.metadata.cutEventSeq),
-      nextPtyOffset: BigInt(published.metadata.nextPtyOffset),
-    },
-    engineId: published.metadata.engineId,
-    published: { metadata: { ...published.metadata } },
-  };
 }
 
 function raceAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {

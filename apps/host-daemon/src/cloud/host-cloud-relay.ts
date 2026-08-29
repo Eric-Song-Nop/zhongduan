@@ -4,7 +4,6 @@ import {
   CapabilityRenewalTimeoutError,
 } from "./capability-manager";
 import { CloudApiError } from "./cloud-api";
-import type { SnapshotPublisherLike } from "./delivery-scheduler";
 import { HostRelayConnection } from "./host-relay-connection";
 import {
   openHostSocketPair,
@@ -16,7 +15,10 @@ import {
   type HostCapabilityProvider,
   type SnapshotUploadApi,
 } from "./snapshot-publisher";
-import { SnapshotCheckpointCache } from "./snapshot-checkpoint-cache";
+import {
+  SnapshotCheckpointManager,
+  type SnapshotPublisherLike,
+} from "./snapshot-checkpoint-manager";
 
 export type HostCloudApi = HostConnectionApi & SnapshotUploadApi;
 
@@ -45,8 +47,7 @@ export class HostCloudRelay {
   readonly #reconnectDelayMs: number;
   readonly #session: TerminalSession;
   readonly #sessionId: string;
-  readonly #snapshotCheckpointCache = new SnapshotCheckpointCache();
-  readonly #snapshotPublisher: SnapshotPublisherLike;
+  readonly #snapshotCheckpointManager: SnapshotCheckpointManager;
   readonly #stableConnectionMs: number;
   readonly #stopController = new AbortController();
   readonly #webSocketFactory: RelayWebSocketFactory | undefined;
@@ -79,13 +80,19 @@ export class HostCloudRelay {
     this.#monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
     this.#session = options.session;
     this.#sessionId = options.sessionId;
-    this.#snapshotPublisher =
+    const snapshotPublisher =
       options.snapshotPublisher ??
       new SnapshotPublisher({
         api: options.api,
         capabilities: options.capabilities,
         sessionId: options.sessionId,
       });
+    this.#snapshotCheckpointManager = new SnapshotCheckpointManager({
+      monotonicNow: this.#monotonicNow,
+      publisher: snapshotPublisher,
+      session: this.#session,
+      sessionId: this.#sessionId,
+    });
     this.#stableConnectionMs = options.stableConnectionMs ?? 30_000;
     if (!Number.isInteger(this.#stableConnectionMs) || this.#stableConnectionMs <= 0) {
       throw new RangeError("stableConnectionMs must be a positive integer");
@@ -143,8 +150,7 @@ export class HostCloudRelay {
         const connection = new HostRelayConnection({
           pair,
           session: this.#session,
-          snapshotCheckpointCache: this.#snapshotCheckpointCache,
-          snapshotPublisher: this.#snapshotPublisher,
+          snapshotCheckpointManager: this.#snapshotCheckpointManager,
         });
         this.#connection = connection;
         await connection.start();
