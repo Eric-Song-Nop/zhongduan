@@ -39,6 +39,8 @@ export type RecoveryAttemptState =
 
 export type RecoveryLane = "live" | "recovery";
 
+export type RecoveryDeliveryRecordState = "queued" | "sending" | "sent";
+
 export type RecoveryOutboxKind =
   | "recovery-prepare"
   | "recovery-start"
@@ -89,6 +91,30 @@ export interface RecoveryDeliveryLaneRow {
   updated_at: number;
 }
 
+export interface RecoveryDeliveryRecordRow {
+  authority_cursor_after_json: string;
+  cumulative_encoded_bytes: string;
+  delivery_ordinal: string;
+  encoded_bytes: number;
+  lane: RecoveryLane;
+  recovery_id: string;
+  state: RecoveryDeliveryRecordState;
+}
+
+export interface RecoveryDeliveryRecordIdentity {
+  authorityCursorAfter: AuthorityCursor;
+  cumulativeEncodedBytes: string;
+  deliveryOrdinal: string;
+  encodedBytes: number;
+  lane: RecoveryLane;
+  recoveryId: string;
+}
+
+export interface RecoveryDeliveryUsage {
+  encodedBytes: number;
+  records: number;
+}
+
 export interface RecoveryControlOutboxRow {
   created_at: number;
   destination: "browser" | "host";
@@ -100,6 +126,8 @@ export interface RecoveryControlOutboxRow {
 
 export interface RelayRecoveryStoreLimits {
   maxAttempts: number;
+  maxDeliveryEncodedBytes: number;
+  maxDeliveryRecords: number;
   maxOutboxEntries: number;
 }
 
@@ -130,6 +158,7 @@ export type RecoveryStoreRejectReason =
   | "client-missing"
   | "client-v2"
   | "deadline-expired"
+  | "delivery-capacity"
   | "generation-owned"
   | "head-mismatch"
   | "identity-mismatch"
@@ -145,8 +174,18 @@ export type RecoveryStoreResult =
   | { changed: boolean; ok: true }
   | { ok: false; reason: RecoveryStoreRejectReason };
 
+export type RecoveryDeliveryEnqueueResult =
+  | {
+      changed: true;
+      ok: true;
+      record: RecoveryDeliveryRecordIdentity;
+    }
+  | { ok: false; reason: RecoveryStoreRejectReason };
+
 const ok = (changed: boolean): RecoveryStoreResult => ({ changed, ok: true });
-const rejected = (reason: RecoveryStoreRejectReason): RecoveryStoreResult => ({
+const rejected = (
+  reason: RecoveryStoreRejectReason,
+): { ok: false; reason: RecoveryStoreRejectReason } => ({
   ok: false,
   reason,
 });
@@ -203,6 +242,10 @@ export class RelayRecoveryStore {
   ) {
     if (
       !isPositiveSafeInteger(limits.maxAttempts) ||
+      limits.maxAttempts === Number.MAX_SAFE_INTEGER ||
+      !isPositiveSafeInteger(limits.maxDeliveryEncodedBytes) ||
+      !isPositiveSafeInteger(limits.maxDeliveryRecords) ||
+      limits.maxDeliveryRecords === Number.MAX_SAFE_INTEGER ||
       !isPositiveSafeInteger(limits.maxOutboxEntries)
     ) {
       throw new RangeError("invalid recovery store limits");
@@ -272,6 +315,89 @@ export class RelayRecoveryStore {
         recoveryId,
       )
       .toArray() as unknown as RecoveryDeliveryLaneRow[];
+  }
+
+  deliveryRecords(recoveryId: string): RecoveryDeliveryRecordRow[] {
+    const rows = this.sql
+      .exec(
+        `SELECT * FROM recovery_delivery_record
+         WHERE recovery_id = ?
+         ORDER BY lane, length(delivery_ordinal), delivery_ordinal
+         LIMIT ?`,
+        recoveryId,
+        this.limits.maxDeliveryRecords + 1,
+      )
+      .toArray() as unknown as RecoveryDeliveryRecordRow[];
+    if (rows.length > this.limits.maxDeliveryRecords) {
+      throw new Error("recovery delivery record capacity exceeded");
+    }
+    return rows;
+  }
+
+  deliveryRecordsAwaitingReceipt(recoveryId: string): RecoveryDeliveryRecordRow[] {
+    const rows = this.sql
+      .exec(
+        `SELECT * FROM recovery_delivery_record
+         WHERE recovery_id = ? AND state = 'sent'
+         ORDER BY lane, length(delivery_ordinal), delivery_ordinal
+         LIMIT ?`,
+        recoveryId,
+        this.limits.maxDeliveryRecords + 1,
+      )
+      .toArray() as unknown as RecoveryDeliveryRecordRow[];
+    if (rows.length > this.limits.maxDeliveryRecords) {
+      throw new Error("recovery delivery record capacity exceeded");
+    }
+    return rows;
+  }
+
+  deliveryRecoveryIdsRequiringReset(): string[] {
+    const rows = this.sql
+      .exec(
+        `SELECT DISTINCT recovery_id FROM recovery_delivery_record
+           WHERE state IN ('queued', 'sending')
+           ORDER BY recovery_id
+           LIMIT ?`,
+        this.limits.maxAttempts + 1,
+      )
+      .toArray() as unknown as { recovery_id: string }[];
+    if (rows.length > this.limits.maxAttempts) {
+      throw new Error("recovery delivery reset candidate capacity exceeded");
+    }
+    return rows.map((row) => row.recovery_id);
+  }
+
+  deliveryUsage(recoveryId: string): RecoveryDeliveryUsage {
+    const records = this.deliveryRecords(recoveryId);
+    let encodedBytes = 0;
+    for (const record of records) {
+      if (!isPositiveSafeInteger(record.encoded_bytes)) {
+        throw new Error("invalid durable recovery delivery size");
+      }
+      encodedBytes += record.encoded_bytes;
+      if (
+        !Number.isSafeInteger(encodedBytes) ||
+        encodedBytes > this.limits.maxDeliveryEncodedBytes
+      ) {
+        throw new Error("recovery delivery encoded-byte capacity exceeded");
+      }
+    }
+    return { encodedBytes, records: records.length };
+  }
+
+  recoveryGrantReservation(recoveryId: string): string {
+    const attempt = this.attempt(recoveryId);
+    if (attempt === undefined) throw new Error("missing recovery attempt");
+    if (attempt.state === "complete" || attempt.state === "resetting") return "0";
+    if (attempt.source_closed_json !== null) return "0";
+    const lane = this.#lane(recoveryId, "recovery");
+    const received =
+      lane === undefined
+        ? 0n
+        : BigInt(DecimalU64Schema.parse(lane.received_cumulative_encoded_bytes));
+    const granted = BigInt(DecimalU64Schema.parse(attempt.granted_cumulative_encoded_bytes));
+    if (received > granted) throw new Error("recovery received bytes exceed durable grant");
+    return (granted - received).toString();
   }
 
   outbox(limit = this.limits.maxOutboxEntries): RecoveryControlOutboxRow[] {
@@ -541,18 +667,20 @@ export class RelayRecoveryStore {
   }
 
   /**
-   * Records one newly validated envelope without retaining its bytes or hash.
-   * A retry at an already-recorded ordinal cannot be proven byte-identical, so
-   * it deliberately fails closed as invalid progress.
+   * Admits one validated envelope into the bounded scalar ledger without
+   * retaining its payload or hash. The returned identity is an in-memory CAS
+   * token for the caller's queue -> send -> confirm sequence.
    */
-  recordValidatedLaneSend(
+  enqueueValidatedLaneDelivery(
     recoveryId: string,
     encoded: ArrayBuffer | Uint8Array,
     now: number,
-  ): RecoveryStoreResult {
+  ): RecoveryDeliveryEnqueueResult {
     const envelope = decodeDeliveryEnvelopeV3(encoded);
     const frame = decodeDataFrame(envelope.payload);
     this.#validateTime(now);
+    const encodedBytes = encoded.byteLength;
+    if (!isPositiveSafeInteger(encodedBytes)) return rejected("invalid-progress");
     const attempt = this.attempt(recoveryId);
     if (attempt === undefined) return rejected("missing-attempt");
     const ownership = this.#validateAttemptGeneration(
@@ -576,30 +704,29 @@ export class RelayRecoveryStore {
     }
     const lane = this.#lane(recoveryId, envelope.lane);
     if (lane === undefined) return rejected("state-conflict");
-    // P2.4 deliberately permits one outstanding envelope per lane. Only the
-    // latest sent/received scalar pair is durable, so a second outstanding
-    // send would make an intermediate receipt impossible to authenticate.
-    if (
-      lane.sent_delivery_ordinal !== lane.received_delivery_ordinal ||
-      lane.sent_cumulative_encoded_bytes !== lane.received_cumulative_encoded_bytes
-    ) {
-      return rejected("invalid-progress");
-    }
+    const obligations = this.#validatedDeliveryObligations(lane);
+    if (obligations === undefined) return rejected("invalid-progress");
+    const tail = obligations.at(-1);
+    const previousOrdinal = tail?.delivery_ordinal ?? lane.sent_delivery_ordinal;
+    const previousCumulativeBytes =
+      tail?.cumulative_encoded_bytes ?? lane.sent_cumulative_encoded_bytes;
+    const previousAuthorityJson =
+      tail?.authority_cursor_after_json ?? lane.sent_authority_cursor_json;
     let nextLane: DeliveryLaneCursor;
     let nextAuthority: AuthorityCursor;
     try {
       nextLane = advanceDeliveryLaneCursor(
         {
-          cumulativeEncodedBytes: BigInt(lane.sent_cumulative_encoded_bytes),
+          cumulativeEncodedBytes: BigInt(previousCumulativeBytes),
           deliveryGeneration: BigInt(attempt.delivery_generation),
-          deliveryOrdinal: BigInt(lane.sent_delivery_ordinal),
+          deliveryOrdinal: BigInt(previousOrdinal),
           lane: lane.lane,
           streamId: attempt.stream_id,
         },
         envelope,
       );
       nextAuthority = this.#advanceSentAuthority(
-        parseCursor(lane.sent_authority_cursor_json),
+        parseCursor(previousAuthorityJson),
         envelope.lane,
         frame,
       );
@@ -607,6 +734,12 @@ export class RelayRecoveryStore {
       return rejected("invalid-progress");
     }
     if (!this.#validSentAuthority(attempt, envelope.lane, nextAuthority)) {
+      return rejected("invalid-progress");
+    }
+    if (
+      nextLane.cumulativeEncodedBytes - BigInt(previousCumulativeBytes) !==
+      BigInt(encodedBytes)
+    ) {
       return rejected("invalid-progress");
     }
     const isDone = frame.kind === DataFrameKind.ReplayCommit;
@@ -618,17 +751,28 @@ export class RelayRecoveryStore {
     ) {
       return rejected("invalid-progress");
     }
+    if (!this.#hasDeliveryCapacity(recoveryId, encodedBytes)) {
+      return rejected("delivery-capacity");
+    }
+    const identity: RecoveryDeliveryRecordIdentity = {
+      authorityCursorAfter: nextAuthority,
+      cumulativeEncodedBytes: nextLane.cumulativeEncodedBytes.toString(),
+      deliveryOrdinal: nextLane.deliveryOrdinal.toString(),
+      encodedBytes,
+      lane: envelope.lane,
+      recoveryId,
+    };
     this.sql.exec(
-      `UPDATE recovery_delivery_lane
-       SET sent_delivery_ordinal = ?, sent_cumulative_encoded_bytes = ?,
-           sent_authority_cursor_json = ?, updated_at = ?
-       WHERE recovery_id = ? AND lane = ?`,
-      nextLane.deliveryOrdinal.toString(),
-      nextLane.cumulativeEncodedBytes.toString(),
-      canonicalJson(nextAuthority),
-      now,
+      `INSERT INTO recovery_delivery_record
+        (recovery_id, lane, delivery_ordinal, cumulative_encoded_bytes,
+         encoded_bytes, authority_cursor_after_json, state)
+       VALUES (?, ?, ?, ?, ?, ?, 'queued')`,
       recoveryId,
       envelope.lane,
+      identity.deliveryOrdinal,
+      identity.cumulativeEncodedBytes,
+      encodedBytes,
+      canonicalJson(nextAuthority),
     );
     if (isDone) {
       this.sql.exec(
@@ -642,6 +786,138 @@ export class RelayRecoveryStore {
         now,
         recoveryId,
       );
+    }
+    return { changed: true, ok: true, record: identity };
+  }
+
+  beginLaneDeliverySend(
+    identityInput: RecoveryDeliveryRecordIdentity,
+    now: number,
+  ): RecoveryStoreResult {
+    const identity = this.#parseDeliveryIdentity(identityInput);
+    this.#validateTime(now);
+    const attempt = this.attempt(identity.recoveryId);
+    if (attempt === undefined) return rejected("missing-attempt");
+    const ownership = this.#validateAttemptGeneration(attempt, attempt.delivery_generation);
+    if (ownership !== undefined) return rejected(ownership);
+    if (!this.#canLaneProgress(attempt, identity.lane)) return rejected("state-conflict");
+    if (attempt.state !== "complete" && this.#deadlineExpired(attempt, now)) {
+      return rejected("deadline-expired");
+    }
+    const lane = this.#lane(identity.recoveryId, identity.lane);
+    if (lane === undefined) return rejected("state-conflict");
+    const obligations = this.#validatedDeliveryObligations(lane);
+    if (obligations === undefined) return rejected("invalid-progress");
+    const record = obligations.find(
+      (candidate) => candidate.delivery_ordinal === identity.deliveryOrdinal,
+    );
+    if (record === undefined || !this.#sameDeliveryRecord(record, identity)) {
+      return rejected("invalid-progress");
+    }
+    if (record.state !== "queued") return rejected("state-conflict");
+    const existingSending = this.sql
+      .exec(
+        `SELECT recovery_id FROM recovery_delivery_record
+         WHERE recovery_id = ? AND state = 'sending' LIMIT 1`,
+        identity.recoveryId,
+      )
+      .toArray()[0];
+    if (existingSending !== undefined) return rejected("state-conflict");
+    const sentOrdinal = BigInt(lane.sent_delivery_ordinal);
+    const candidateOrdinal = BigInt(record.delivery_ordinal);
+    if (candidateOrdinal !== sentOrdinal + 1n) return rejected("state-conflict");
+    const previousCumulative = BigInt(lane.sent_cumulative_encoded_bytes);
+    if (
+      BigInt(record.cumulative_encoded_bytes) !==
+      previousCumulative + BigInt(record.encoded_bytes)
+    ) {
+      return rejected("invalid-progress");
+    }
+    const updated = this.sql.exec(
+      `UPDATE recovery_delivery_record SET state = 'sending'
+       WHERE recovery_id = ? AND lane = ? AND delivery_ordinal = ?
+         AND cumulative_encoded_bytes = ? AND encoded_bytes = ?
+         AND authority_cursor_after_json = ? AND state = 'queued'
+       RETURNING recovery_id`,
+      identity.recoveryId,
+      identity.lane,
+      identity.deliveryOrdinal,
+      identity.cumulativeEncodedBytes,
+      identity.encodedBytes,
+      canonicalJson(identity.authorityCursorAfter),
+    );
+    if (updated.toArray().length !== 1) return rejected("state-conflict");
+    return ok(true);
+  }
+
+  confirmLaneDeliverySend(
+    identityInput: RecoveryDeliveryRecordIdentity,
+    now: number,
+  ): RecoveryStoreResult {
+    const identity = this.#parseDeliveryIdentity(identityInput);
+    this.#validateTime(now);
+    const attempt = this.attempt(identity.recoveryId);
+    if (attempt === undefined) return rejected("missing-attempt");
+    const ownership = this.#validateAttemptGeneration(attempt, attempt.delivery_generation);
+    if (ownership !== undefined) return rejected(ownership);
+    if (!this.#canLaneProgress(attempt, identity.lane)) return rejected("state-conflict");
+    const lane = this.#lane(identity.recoveryId, identity.lane);
+    if (lane === undefined) return rejected("state-conflict");
+    const obligations = this.#validatedDeliveryObligations(lane);
+    if (obligations === undefined) return rejected("invalid-progress");
+    const record = obligations.find(
+      (candidate) => candidate.delivery_ordinal === identity.deliveryOrdinal,
+    );
+    if (record === undefined || !this.#sameDeliveryRecord(record, identity)) {
+      return rejected("invalid-progress");
+    }
+    if (record.state === "sent") return ok(false);
+    if (record.state !== "sending") return rejected("state-conflict");
+    const sentOrdinal = BigInt(lane.sent_delivery_ordinal);
+    if (BigInt(record.delivery_ordinal) !== sentOrdinal + 1n) {
+      return rejected("state-conflict");
+    }
+    if (
+      BigInt(record.cumulative_encoded_bytes) !==
+      BigInt(lane.sent_cumulative_encoded_bytes) + BigInt(record.encoded_bytes)
+    ) {
+      return rejected("invalid-progress");
+    }
+    const updated = this.sql.exec(
+      `UPDATE recovery_delivery_record SET state = 'sent'
+       WHERE recovery_id = ? AND lane = ? AND delivery_ordinal = ?
+         AND cumulative_encoded_bytes = ? AND encoded_bytes = ?
+         AND authority_cursor_after_json = ? AND state = 'sending'
+       RETURNING recovery_id`,
+      identity.recoveryId,
+      identity.lane,
+      identity.deliveryOrdinal,
+      identity.cumulativeEncodedBytes,
+      identity.encodedBytes,
+      canonicalJson(identity.authorityCursorAfter),
+    );
+    if (updated.toArray().length !== 1) return rejected("state-conflict");
+    const laneUpdated = this.sql.exec(
+      `UPDATE recovery_delivery_lane
+       SET sent_delivery_ordinal = ?, sent_cumulative_encoded_bytes = ?,
+           sent_authority_cursor_json = ?, updated_at = ?
+       WHERE recovery_id = ? AND lane = ?
+         AND sent_delivery_ordinal = ?
+         AND sent_cumulative_encoded_bytes = ?
+         AND sent_authority_cursor_json = ?
+       RETURNING recovery_id`,
+      identity.deliveryOrdinal,
+      identity.cumulativeEncodedBytes,
+      canonicalJson(identity.authorityCursorAfter),
+      now,
+      identity.recoveryId,
+      identity.lane,
+      lane.sent_delivery_ordinal,
+      lane.sent_cumulative_encoded_bytes,
+      lane.sent_authority_cursor_json,
+    );
+    if (laneUpdated.toArray().length !== 1) {
+      throw new Error("durable recovery lane disappeared during send confirmation");
     }
     return ok(true);
   }
@@ -673,10 +949,17 @@ export class RelayRecoveryStore {
     if (attempt.state !== "complete" && this.#deadlineExpired(attempt, now)) {
       return rejected("deadline-expired");
     }
-    if (
-      receipt.contiguousDeliveryOrdinal !== lane.sent_delivery_ordinal ||
-      receipt.cumulativeEncodedBytes !== lane.sent_cumulative_encoded_bytes
-    ) {
+    const obligations = this.#validatedDeliveryObligations(lane);
+    if (obligations === undefined) return rejected("invalid-progress");
+    const target = obligations.find(
+      (record) =>
+        record.delivery_ordinal === receipt.contiguousDeliveryOrdinal &&
+        record.cumulative_encoded_bytes === receipt.cumulativeEncodedBytes,
+    );
+    if (target === undefined || target.state !== "sent") return rejected("invalid-progress");
+    const targetOrdinal = BigInt(target.delivery_ordinal);
+    const prefix = obligations.filter((record) => BigInt(record.delivery_ordinal) <= targetOrdinal);
+    if (prefix.length === 0 || prefix.some((record) => record.state !== "sent")) {
       return rejected("invalid-progress");
     }
     if (
@@ -685,17 +968,46 @@ export class RelayRecoveryStore {
     ) {
       return rejected("outbox-capacity");
     }
-    this.sql.exec(
+    const laneUpdated = this.sql.exec(
       `UPDATE recovery_delivery_lane
        SET received_delivery_ordinal = ?, received_cumulative_encoded_bytes = ?,
-           received_authority_cursor_json = sent_authority_cursor_json, updated_at = ?
-       WHERE recovery_id = ? AND lane = ?`,
+           received_authority_cursor_json = ?, updated_at = ?
+       WHERE recovery_id = ? AND lane = ?
+         AND received_delivery_ordinal = ?
+         AND received_cumulative_encoded_bytes = ?
+         AND received_authority_cursor_json = ?
+       RETURNING recovery_id`,
       receipt.contiguousDeliveryOrdinal,
       receipt.cumulativeEncodedBytes,
+      target.authority_cursor_after_json,
       now,
       progress.recoveryId,
       receipt.lane,
+      lane.received_delivery_ordinal,
+      lane.received_cumulative_encoded_bytes,
+      lane.received_authority_cursor_json,
     );
+    if (laneUpdated.toArray().length !== 1) {
+      throw new Error("durable recovery receipt lane CAS failed");
+    }
+    for (const record of prefix) {
+      const deleted = this.sql.exec(
+        `DELETE FROM recovery_delivery_record
+         WHERE recovery_id = ? AND lane = ? AND delivery_ordinal = ?
+           AND cumulative_encoded_bytes = ? AND encoded_bytes = ?
+           AND authority_cursor_after_json = ? AND state = 'sent'
+         RETURNING recovery_id`,
+        record.recovery_id,
+        record.lane,
+        record.delivery_ordinal,
+        record.cumulative_encoded_bytes,
+        record.encoded_bytes,
+        record.authority_cursor_after_json,
+      );
+      if (deleted.toArray().length !== 1) {
+        throw new Error("durable recovery receipt prefix CAS failed");
+      }
+    }
     this.#touchProgress(attempt, now);
     if (receipt.lane === "recovery") {
       const routed = RecoveryV3HostSourceReceivedSchema.parse({
@@ -956,6 +1268,46 @@ export class RelayRecoveryStore {
     return removed;
   }
 
+  /**
+   * Fences a delivery generation that retained payload-free queued/sending
+   * obligations across a crash or hibernation boundary. A complete attempt has
+   * no live Host recovery source, so it becomes a local terminal tombstone
+   * without emitting a post-closure Host reset.
+   */
+  resetUnsafeDeliveryOutcome(recoveryId: string, now: number): RecoveryStoreResult {
+    this.#validateTime(now);
+    const attempt = this.attempt(recoveryId);
+    if (attempt === undefined) return rejected("missing-attempt");
+    if (attempt.state === "resetting") {
+      return attempt.reset_reason === "ack-outcome-uncertain"
+        ? ok(false)
+        : rejected("immutable-conflict");
+    }
+    const unsafe = this.sql
+      .exec(
+        `SELECT recovery_id FROM recovery_delivery_record
+         WHERE recovery_id = ? AND state IN ('queued', 'sending') LIMIT 1`,
+        recoveryId,
+      )
+      .toArray()[0];
+    if (unsafe === undefined) return rejected("state-conflict");
+    return this.#fenceDeliveryOwner(attempt, "ack-outcome-uncertain", now);
+  }
+
+  /** Caller has already proven that the exact Browser receiver pair is gone. */
+  resetUndeliverableDeliveryOwner(recoveryId: string, now: number): RecoveryStoreResult {
+    this.#validateTime(now);
+    const attempt = this.attempt(recoveryId);
+    if (attempt === undefined) return rejected("missing-attempt");
+    if (attempt.state === "resetting") {
+      return attempt.reset_reason === "generation-reset"
+        ? ok(false)
+        : rejected("immutable-conflict");
+    }
+    if (attempt.state === "preparing") return rejected("state-conflict");
+    return this.#fenceDeliveryOwner(attempt, "generation-reset", now);
+  }
+
   reset(
     recoveryId: string,
     reasonInput: RecoveryV3HostSourceReset["reason"],
@@ -1103,6 +1455,27 @@ export class RelayRecoveryStore {
     }
   }
 
+  #fenceDeliveryOwner(
+    attempt: RecoveryAttemptRow,
+    reason: "ack-outcome-uncertain" | "generation-reset",
+    now: number,
+  ): RecoveryStoreResult {
+    if (attempt.state !== "complete") return this.reset(attempt.recovery_id, reason, now);
+    const updated = this.sql.exec(
+      `UPDATE recovery_attempt
+       SET state = 'resetting', reset_reason = ?, updated_at = ?
+       WHERE recovery_id = ? AND state = 'complete'
+       RETURNING recovery_id`,
+      reason,
+      now,
+      attempt.recovery_id,
+    );
+    if (updated.toArray().length !== 1) return rejected("state-conflict");
+    this.sql.exec("DELETE FROM recovery_control_outbox WHERE recovery_id = ?", attempt.recovery_id);
+    this.sql.exec("DELETE FROM recovery_delivery_lane WHERE recovery_id = ?", attempt.recovery_id);
+    return ok(true);
+  }
+
   #requireResetOutboxCapacity(rows: readonly { recovery_id: string }[]): void {
     if (rows.length === 0) return;
     const count = this.sql.exec("SELECT COUNT(*) AS value FROM recovery_control_outbox").one() as {
@@ -1208,8 +1581,8 @@ export class RelayRecoveryStore {
     const ordinalDelta = BigInt(nextOrdinal) - BigInt(previousOrdinal);
     const byteDelta = BigInt(nextBytes) - BigInt(previousBytes);
     // Only the current received scalar is an authenticated idempotent retry.
-    // No receipt history or payload hash is durable, so lower, mixed, and
-    // unknown intermediate pairs must all fail closed.
+    // Every advancing pair is authenticated separately against the exact
+    // durable sent record and its complete sent prefix.
     if (ordinalDelta <= 0n || byteDelta <= 0n) return "invalid";
     return "advance";
   }
@@ -1258,6 +1631,164 @@ export class RelayRecoveryStore {
         lane,
       )
       .toArray()[0] as RecoveryDeliveryLaneRow | undefined;
+  }
+
+  #parseDeliveryIdentity(identity: RecoveryDeliveryRecordIdentity): RecoveryDeliveryRecordIdentity {
+    if (
+      typeof identity.recoveryId !== "string" ||
+      identity.recoveryId.length < 16 ||
+      identity.recoveryId.length > 128
+    ) {
+      throw new RangeError("invalid recovery delivery identity");
+    }
+    if (identity.lane !== "live" && identity.lane !== "recovery") {
+      throw new RangeError("invalid recovery delivery lane");
+    }
+    if (!isPositiveSafeInteger(identity.encodedBytes)) {
+      throw new RangeError("invalid recovery delivery size");
+    }
+    return {
+      authorityCursorAfter: AuthorityCursorSchema.parse(identity.authorityCursorAfter),
+      cumulativeEncodedBytes: PositiveDecimalU64Schema.parse(identity.cumulativeEncodedBytes),
+      deliveryOrdinal: PositiveDecimalU64Schema.parse(identity.deliveryOrdinal),
+      encodedBytes: identity.encodedBytes,
+      lane: identity.lane,
+      recoveryId: identity.recoveryId,
+    };
+  }
+
+  #sameDeliveryRecord(
+    row: RecoveryDeliveryRecordRow,
+    identity: RecoveryDeliveryRecordIdentity,
+  ): boolean {
+    return (
+      row.recovery_id === identity.recoveryId &&
+      row.lane === identity.lane &&
+      row.delivery_ordinal === identity.deliveryOrdinal &&
+      row.cumulative_encoded_bytes === identity.cumulativeEncodedBytes &&
+      row.encoded_bytes === identity.encodedBytes &&
+      row.authority_cursor_after_json === canonicalJson(identity.authorityCursorAfter)
+    );
+  }
+
+  #validatedDeliveryObligations(
+    lane: RecoveryDeliveryLaneRow,
+  ): RecoveryDeliveryRecordRow[] | undefined {
+    try {
+      this.deliveryUsage(lane.recovery_id);
+    } catch {
+      return undefined;
+    }
+    let receivedOrdinal: bigint;
+    let receivedBytes: bigint;
+    let receivedAuthority: AuthorityCursor;
+    let sentAuthority: AuthorityCursor;
+    try {
+      receivedOrdinal = BigInt(DecimalU64Schema.parse(lane.received_delivery_ordinal));
+      receivedBytes = BigInt(DecimalU64Schema.parse(lane.received_cumulative_encoded_bytes));
+      receivedAuthority = parseCursor(lane.received_authority_cursor_json);
+      sentAuthority = parseCursor(lane.sent_authority_cursor_json);
+      if (
+        DecimalU64Schema.parse(lane.sent_delivery_ordinal) !== lane.sent_delivery_ordinal ||
+        DecimalU64Schema.parse(lane.sent_cumulative_encoded_bytes) !==
+          lane.sent_cumulative_encoded_bytes ||
+        canonicalJson(receivedAuthority) !== lane.received_authority_cursor_json ||
+        canonicalJson(sentAuthority) !== lane.sent_authority_cursor_json
+      ) {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+    const rows = this.sql
+      .exec(
+        `SELECT * FROM recovery_delivery_record
+         WHERE recovery_id = ? AND lane = ?
+         ORDER BY length(delivery_ordinal), delivery_ordinal
+         LIMIT ?`,
+        lane.recovery_id,
+        lane.lane,
+        this.limits.maxDeliveryRecords + 1,
+      )
+      .toArray() as unknown as RecoveryDeliveryRecordRow[];
+    if (rows.length > this.limits.maxDeliveryRecords) return undefined;
+
+    let previousOrdinal = receivedOrdinal;
+    let previousBytes = receivedBytes;
+    let previousAuthority = receivedAuthority;
+    let previousPhase = -1;
+    let encodedBytes = 0;
+    let lastSent: RecoveryDeliveryRecordRow | undefined;
+    const phase: Record<RecoveryDeliveryRecordState, number> = {
+      sent: 0,
+      sending: 1,
+      queued: 2,
+    };
+    for (const row of rows) {
+      try {
+        const ordinal = BigInt(PositiveDecimalU64Schema.parse(row.delivery_ordinal));
+        const cumulative = BigInt(PositiveDecimalU64Schema.parse(row.cumulative_encoded_bytes));
+        if (
+          row.recovery_id !== lane.recovery_id ||
+          row.lane !== lane.lane ||
+          !isPositiveSafeInteger(row.encoded_bytes) ||
+          ordinal !== previousOrdinal + 1n ||
+          cumulative !== previousBytes + BigInt(row.encoded_bytes)
+        ) {
+          return undefined;
+        }
+        const authority = parseCursor(row.authority_cursor_after_json);
+        if (
+          canonicalJson(authority) !== row.authority_cursor_after_json ||
+          !cursorAtOrAfter(authority, previousAuthority)
+        ) {
+          return undefined;
+        }
+        const currentPhase = phase[row.state];
+        if (currentPhase === undefined || currentPhase < previousPhase) return undefined;
+        previousPhase = currentPhase;
+        if (row.state === "sent") lastSent = row;
+        encodedBytes += row.encoded_bytes;
+        if (
+          !Number.isSafeInteger(encodedBytes) ||
+          encodedBytes > this.limits.maxDeliveryEncodedBytes
+        ) {
+          return undefined;
+        }
+        previousOrdinal = ordinal;
+        previousBytes = cumulative;
+        previousAuthority = authority;
+      } catch {
+        return undefined;
+      }
+    }
+
+    const expectedSentOrdinal = lastSent?.delivery_ordinal ?? lane.received_delivery_ordinal;
+    const expectedSentBytes =
+      lastSent?.cumulative_encoded_bytes ?? lane.received_cumulative_encoded_bytes;
+    const expectedSentAuthority =
+      lastSent?.authority_cursor_after_json ?? lane.received_authority_cursor_json;
+    if (
+      lane.sent_delivery_ordinal !== expectedSentOrdinal ||
+      lane.sent_cumulative_encoded_bytes !== expectedSentBytes ||
+      lane.sent_authority_cursor_json !== expectedSentAuthority
+    ) {
+      return undefined;
+    }
+    return rows;
+  }
+
+  #hasDeliveryCapacity(recoveryId: string, additionalEncodedBytes: number): boolean {
+    let usage: RecoveryDeliveryUsage;
+    try {
+      usage = this.deliveryUsage(recoveryId);
+    } catch {
+      return false;
+    }
+    return (
+      usage.records < this.limits.maxDeliveryRecords &&
+      usage.encodedBytes + additionalEncodedBytes <= this.limits.maxDeliveryEncodedBytes
+    );
   }
 
   #canProgress(attempt: RecoveryAttemptRow): boolean {

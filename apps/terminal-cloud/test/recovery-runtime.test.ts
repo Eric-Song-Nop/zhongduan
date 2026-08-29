@@ -159,6 +159,26 @@ function nextText(socket: WebSocket): Promise<string> {
   });
 }
 
+function nextTexts(socket: WebSocket, count: number): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    const messages: string[] = [];
+    const onMessage = (event: MessageEvent) => {
+      if (typeof event.data !== "string") {
+        socket.removeEventListener("message", onMessage);
+        reject(new Error("expected text WebSocket messages"));
+        return;
+      }
+      messages.push(event.data);
+      if (messages.length === count) {
+        socket.removeEventListener("message", onMessage);
+        resolve(messages);
+      }
+    };
+    socket.addEventListener("message", onMessage);
+    socket.addEventListener("error", () => reject(new Error("WebSocket failed")), { once: true });
+  });
+}
+
 function nextBinary(socket: WebSocket): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
     socket.addEventListener(
@@ -884,6 +904,8 @@ describe("Recovery v3 Durable Object runtime", () => {
       const now = Date.now();
       const store = new RelayRecoveryStore(state.storage.sql, new RelayStore(state.storage.sql), {
         maxAttempts: 16,
+        maxDeliveryEncodedBytes: 2 * 1024 * 1024,
+        maxDeliveryRecords: 1_024,
         maxOutboxEntries: 112,
       });
       let result: ReturnType<RelayRecoveryStore["beginPreparing"]> | undefined;
@@ -1299,6 +1321,287 @@ describe("Recovery v3 Durable Object runtime", () => {
     expect(capped).toEqual({ outboxCount: 1, progressed: true, reachableRows: 1 });
   });
 
+  it("fences queued and sending delivery owners when hibernation loses their payloads", async () => {
+    const session = await createSession();
+    const host = await openReadyHost(session);
+    await publishSnapshot(session, "snapshot_recovery_runtime_0013");
+    const queued = await openRecoveryBrowser(session, host);
+    const sending = await openRecoveryBrowser(session, host);
+    await installRecovery(host, queued);
+    await installRecovery(host, sending);
+
+    const seeded = await runInDurableObject(sessionStub(session.sessionId), (instance, state) => {
+      const recoveries = Reflect.get(instance, "recoveries");
+      if (!(recoveries instanceof RelayRecoveryStore)) {
+        throw new Error("runtime recovery store is missing");
+      }
+      const states: string[] = [];
+      state.storage.transactionSync(() => {
+        for (const [browser, begin] of [
+          [queued, false],
+          [sending, true],
+        ] as const) {
+          const enqueued = recoveries.enqueueValidatedLaneDelivery(
+            browser.prepare.recoveryId,
+            recoveryDone(browser),
+            Date.now(),
+          );
+          if (!enqueued.ok) throw new Error(`failed to seed delivery: ${enqueued.reason}`);
+          if (begin) {
+            const begun = recoveries.beginLaneDeliverySend(enqueued.record, Date.now());
+            if (!begun.ok) throw new Error(`failed to begin delivery: ${begun.reason}`);
+          }
+          states.push(
+            state.storage.sql
+              .exec<{ state: string }>(
+                "SELECT state FROM recovery_delivery_record WHERE recovery_id = ?",
+                browser.prepare.recoveryId,
+              )
+              .one().state,
+          );
+        }
+      });
+      return states;
+    });
+    expect(seeded).toEqual(["queued", "sending"]);
+
+    const queuedControlClosed = nextClose(queued.control);
+    const queuedDataClosed = nextClose(queued.data);
+    const sendingControlClosed = nextClose(sending.control);
+    const sendingDataClosed = nextClose(sending.data);
+    const resetMessages = nextTexts(host.control, 2);
+    await evictDurableObject(sessionStub(session.sessionId), { webSockets: "hibernate" });
+    await runInDurableObject(sessionStub(session.sessionId), () => undefined);
+
+    await Promise.all([
+      expect(queuedControlClosed).resolves.toMatchObject({ code: 4400 }),
+      expect(queuedDataClosed).resolves.toMatchObject({ code: 4400 }),
+      expect(sendingControlClosed).resolves.toMatchObject({ code: 4400 }),
+      expect(sendingDataClosed).resolves.toMatchObject({ code: 4400 }),
+    ]);
+    const resets = (await resetMessages)
+      .map((message) => decodeRelayToHostControlFrame(message, "v3"))
+      .map((frame) => {
+        if (frame.type !== "recovery-source-reset") throw new Error("expected source reset");
+        return { reason: frame.reason, recoveryId: frame.recoveryId };
+      })
+      .sort((left, right) => left.recoveryId.localeCompare(right.recoveryId));
+    expect(resets).toEqual(
+      [queued.prepare.recoveryId, sending.prepare.recoveryId]
+        .sort((left, right) => left.localeCompare(right))
+        .map((recoveryId) => ({ reason: "ack-outcome-uncertain", recoveryId })),
+    );
+    const durable = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => ({
+        records: state.storage.sql
+          .exec<{ value: number }>("SELECT COUNT(*) AS value FROM recovery_delivery_record")
+          .one().value,
+        states: state.storage.sql
+          .exec<{ reset_reason: string; state: string }>(
+            `SELECT state, reset_reason FROM recovery_attempt
+             WHERE recovery_id IN (?, ?) ORDER BY recovery_id`,
+            queued.prepare.recoveryId,
+            sending.prepare.recoveryId,
+          )
+          .toArray(),
+      }),
+    );
+    expect(durable).toEqual({
+      records: 0,
+      states: [
+        { reset_reason: "ack-outcome-uncertain", state: "resetting" },
+        { reset_reason: "ack-outcome-uncertain", state: "resetting" },
+      ],
+    });
+    expect(host.control.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("keeps a sent delivery across hibernation only for the exact Browser pair", async () => {
+    const session = await createSession();
+    const host = await openReadyHost(session);
+    await publishSnapshot(session, "snapshot_recovery_runtime_0014");
+    const browser = await openRecoveryBrowser(session, host);
+    await installRecovery(host, browser);
+
+    let binaryMessages = 0;
+    browser.data.addEventListener("message", (event) => {
+      if (typeof event.data !== "string") binaryMessages += 1;
+    });
+    const recoveryMessage = nextBinary(browser.data);
+    host.data.send(recoveryDone(browser));
+    const delivered = decodeDeliveryEnvelopeV3(await recoveryMessage);
+    expect(binaryMessages).toBe(1);
+    const beforeWake = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) =>
+        state.storage.sql
+          .exec<{ state: string }>(
+            "SELECT state FROM recovery_delivery_record WHERE recovery_id = ?",
+            browser.prepare.recoveryId,
+          )
+          .one().state,
+    );
+    expect(beforeWake).toBe("sent");
+
+    await evictDurableObject(sessionStub(session.sessionId), { webSockets: "hibernate" });
+    await runInDurableObject(sessionStub(session.sessionId), () => undefined);
+    expect(binaryMessages).toBe(1);
+    const sourceReceivedMessage = nextText(host.control);
+    browser.control.send(
+      JSON.stringify({
+        type: "delivery-received",
+        deliveryGeneration: browser.connection.deliveryGeneration,
+        lane: "recovery",
+        contiguousDeliveryOrdinal: "1",
+        cumulativeEncodedBytes: delivered.cumulativeEncodedBytes.toString(),
+      }),
+    );
+    expect(decodeRelayToHostControlFrame(await sourceReceivedMessage, "v3")).toMatchObject({
+      type: "recovery-source-received",
+      recoveryId: browser.prepare.recoveryId,
+    });
+    const durable = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => ({
+        records: state.storage.sql
+          .exec<{ value: number }>(
+            "SELECT COUNT(*) AS value FROM recovery_delivery_record WHERE recovery_id = ?",
+            browser.prepare.recoveryId,
+          )
+          .one().value,
+        received: state.storage.sql
+          .exec<{ received_delivery_ordinal: string }>(
+            `SELECT received_delivery_ordinal FROM recovery_delivery_lane
+             WHERE recovery_id = ? AND lane = 'recovery'`,
+            browser.prepare.recoveryId,
+          )
+          .one().received_delivery_ordinal,
+      }),
+    );
+    expect(durable).toEqual({ received: "1", records: 0 });
+    expect(binaryMessages).toBe(1);
+    expect(browser.control.readyState).toBe(WebSocket.OPEN);
+    expect(browser.data.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("fences a sent owner when its exact Browser pair is missing after hibernation", async () => {
+    const session = await createSession();
+    const host = await openReadyHost(session);
+    await publishSnapshot(session, "snapshot_recovery_runtime_0016");
+    const browser = await openRecoveryBrowser(session, host);
+    await installRecovery(host, browser);
+
+    const recoveryMessage = nextBinary(browser.data);
+    host.data.send(recoveryDone(browser));
+    await recoveryMessage;
+    await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      for (const socket of state.getWebSockets(`client:${browser.connection.clientId}`)) {
+        const attachment = SocketAttachmentV3Schema.parse(socket.deserializeAttachment());
+        if (attachment.channel === "data") {
+          socket.serializeAttachment(
+            SocketAttachmentV3Schema.parse({ ...attachment, recoveryLookupKey: null }),
+          );
+        }
+      }
+    });
+
+    const controlClosed = nextClose(browser.control);
+    const dataClosed = nextClose(browser.data);
+    const resetMessage = nextText(host.control);
+    await evictDurableObject(sessionStub(session.sessionId), { webSockets: "hibernate" });
+    await runInDurableObject(sessionStub(session.sessionId), () => undefined);
+    await expect(controlClosed).resolves.toMatchObject({ code: 4400 });
+    await expect(dataClosed).resolves.toMatchObject({ code: 4400 });
+    expect(decodeRelayToHostControlFrame(await resetMessage, "v3")).toMatchObject({
+      type: "recovery-source-reset",
+      recoveryId: browser.prepare.recoveryId,
+      reason: "generation-reset",
+    });
+    const durable = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => ({
+        attempt: state.storage.sql
+          .exec<{ reset_reason: string; state: string }>(
+            "SELECT state, reset_reason FROM recovery_attempt WHERE recovery_id = ?",
+            browser.prepare.recoveryId,
+          )
+          .one(),
+        records: state.storage.sql
+          .exec<{ value: number }>(
+            "SELECT COUNT(*) AS value FROM recovery_delivery_record WHERE recovery_id = ?",
+            browser.prepare.recoveryId,
+          )
+          .one().value,
+      }),
+    );
+    expect(durable).toEqual({
+      attempt: { reset_reason: "generation-reset", state: "resetting" },
+      records: 0,
+    });
+    expect(host.control.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("locally fences a complete owner with a missing cold Browser pair and sends no Host reset", async () => {
+    const session = await createSession();
+    const host = await openReadyHost(session);
+    await publishSnapshot(session, "snapshot_recovery_runtime_0015");
+    const browser = await openRecoveryBrowser(session, host, "writer");
+    await completeRecoveryAdoptedBeforeClose(host, browser);
+    await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      for (const socket of state.getWebSockets(`client:${browser.connection.clientId}`)) {
+        const attachment = SocketAttachmentV3Schema.parse(socket.deserializeAttachment());
+        if (attachment.channel === "control") {
+          socket.serializeAttachment(
+            SocketAttachmentV3Schema.parse({ ...attachment, channel: "data" }),
+          );
+        }
+      }
+    });
+
+    let hostResetCount = 0;
+    host.control.addEventListener("message", (event) => {
+      if (
+        typeof event.data === "string" &&
+        decodeRelayToHostControlFrame(event.data, "v3").type === "recovery-source-reset"
+      ) {
+        hostResetCount += 1;
+      }
+    });
+    const controlClosed = nextClose(browser.control);
+    const dataClosed = nextClose(browser.data);
+    await evictDurableObject(sessionStub(session.sessionId), { webSockets: "hibernate" });
+    const durable = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => ({
+        attempt: state.storage.sql
+          .exec<{ reset_reason: string; state: string }>(
+            "SELECT state, reset_reason FROM recovery_attempt WHERE recovery_id = ?",
+            browser.prepare.recoveryId,
+          )
+          .one(),
+        leaseExpiresAt: state.storage.sql
+          .exec<{ expires_at: number }>("SELECT expires_at FROM writer_lease WHERE singleton = 1")
+          .one().expires_at,
+        outbox: state.storage.sql
+          .exec<{ value: number }>(
+            "SELECT COUNT(*) AS value FROM recovery_control_outbox WHERE recovery_id = ?",
+            browser.prepare.recoveryId,
+          )
+          .one().value,
+      }),
+    );
+    await expect(controlClosed).resolves.toMatchObject({ code: 4400 });
+    await expect(dataClosed).resolves.toMatchObject({ code: 4400 });
+    expect(durable).toEqual({
+      attempt: { reset_reason: "generation-reset", state: "resetting" },
+      leaseExpiresAt: 0,
+      outbox: 0,
+    });
+    expect(hostResetCount).toBe(0);
+    expect(host.control.readyState).toBe(WebSocket.OPEN);
+  });
+
   it("isolates only the affected generation on ordinal replay and uncertain data send", async () => {
     const session = await createSession();
     const host = await openReadyHost(session);
@@ -1416,7 +1719,7 @@ describe("Recovery v3 Durable Object runtime", () => {
       (BigInt(completed.connection.deliveryGeneration) + 1n).toString(),
     );
     expect(next.prepare.connectionId).toBe(next.connection.connectionId);
-  });
+  }, 10_000);
 
   it("sends zero pending v3 outbox frames once the kill switch is closed", async () => {
     const session = await createSession();

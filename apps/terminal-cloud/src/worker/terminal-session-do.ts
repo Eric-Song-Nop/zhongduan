@@ -65,6 +65,7 @@ import {
   RelayRecoveryStore,
   type RecoveryAttemptRow,
   type RecoveryControlOutboxRow,
+  type RecoveryDeliveryRecordIdentity,
 } from "./relay-recovery-store";
 import {
   readSocketAttachment as readAttachment,
@@ -140,6 +141,7 @@ type RecoveryDataSendPlan = {
   attempt: RecoveryAttemptRow;
   browserData: WebSocket;
   encoded: Uint8Array;
+  record: RecoveryDeliveryRecordIdentity;
 };
 
 type RecoveryBrowserSockets = {
@@ -189,14 +191,17 @@ const MAX_BROWSER_CONNECTIONS = 16;
 const MAX_PENDING_CONNECTION_SETS = MAX_BROWSER_CONNECTIONS + 1;
 const MAX_RECOVERY_ATTEMPTS = MAX_BROWSER_CONNECTIONS;
 const MAX_RECOVERY_OUTBOX_ENTRIES = MAX_RECOVERY_ATTEMPTS * 7;
+const MAX_RECOVERY_DELIVERY_RECORDS = 1_024;
+const MAX_RECOVERY_DELIVERY_ENCODED_BYTES = 2 * 1024 * 1024;
 const MAX_CONTROL_MESSAGE_CHARS = 6 * 1024 * 1024 + 4_096;
 const MAX_HOST_DATA_BYTES = DATA_HEADER_BYTES + 16 * 1024;
 const MAX_HOST_RECOVERY_DATA_BYTES = DELIVERY_ENVELOPE_V3_HEADER_BYTES + MAX_HOST_DATA_BYTES;
 const RECOVERY_HARD_DEADLINE_MS = 60_000;
 const RECOVERY_NO_PROGRESS_TIMEOUT_MS = 15_000;
-// P2.4 is deliberately stop-and-wait per lane. This fixed grant covers the
-// Host's current retained aggregate hard cap; P2.5 owns dynamic lane credit.
-const RECOVERY_INITIAL_CUMULATIVE_GRANT = (2 * 1024 * 1024).toString();
+// P2.5a keeps the P2.4 runtime stop-and-wait policy while making its scalar
+// delivery ownership durable. Later scheduler slices may spend this bounded
+// ledger as a wider window without changing the storage cap.
+const RECOVERY_INITIAL_CUMULATIVE_GRANT = MAX_RECOVERY_DELIVERY_ENCODED_BYTES.toString();
 const RECOVERY_OUTBOX_DRAIN_BATCH = 16;
 const SOCKET_REPLACED = 4001;
 const SLOW_CLIENT = 4008;
@@ -301,6 +306,8 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     migrateRelayStore(ctx, this.sql);
     this.recoveries = new RelayRecoveryStore(this.sql, this.store, {
       maxAttempts: MAX_RECOVERY_ATTEMPTS,
+      maxDeliveryEncodedBytes: MAX_RECOVERY_DELIVERY_ENCODED_BYTES,
+      maxDeliveryRecords: MAX_RECOVERY_DELIVERY_RECORDS,
       maxOutboxEntries: MAX_RECOVERY_OUTBOX_ENTRIES,
     });
     this.snapshots = new SnapshotStore(ctx, this.sql, this.store, MAX_BROWSER_CONNECTIONS);
@@ -338,6 +345,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     void this.ctx.blockConcurrencyWhile(async () => {
       await this.alarmMux.initialize();
+      this.reconcileRecoveryDeliveryOwnersAfterWake();
       await this.snapshotUploads.initialize();
       await this.recoveryMaintenance.initialize();
       if (this.recoveryV3Enabled) this.scheduleRecoveryOutboxDrain();
@@ -2022,16 +2030,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.failCurrentHost(hostAttachment, "Recovery v3 prepare rejection identity mismatch");
       return;
     }
-    const now = Date.now();
-    this.ctx.storage.transactionSync(() => {
-      this.recoveries.reset(
-        attempt.recovery_id,
-        frame.reason === "client-gone" ? "pair-fenced" : "generation-reset",
-        now,
-      );
-    });
-    this.isolateRecoveryAttempt(attempt, "Recovery v3 source rejected");
-    this.afterRecoveryTransition();
+    this.resetAndIsolateRecovery(
+      attempt,
+      frame.reason === "client-gone" ? "pair-fenced" : "generation-reset",
+      "Recovery v3 source rejected",
+    );
   }
 
   private handleRecoverySourceClosed(
@@ -2061,8 +2064,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       }
     });
     if (result === undefined || !result.ok) {
-      this.isolateRecoveryAttempt(attempt, "invalid Recovery v3 source closure");
-      this.afterRecoveryTransition();
+      this.resetAndIsolateRecovery(
+        attempt,
+        "generation-reset",
+        "invalid Recovery v3 source closure",
+      );
       return;
     }
     this.afterRecoveryTransition();
@@ -2165,11 +2171,10 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       }
     });
     if (result === undefined || !result.ok) {
-      this.isolateRecoveryAttempt(attempt, "Recovery v3 start fence rejected");
+      this.resetAndIsolateRecovery(attempt, "generation-reset", "Recovery v3 start fence rejected");
       if (result?.reason === "head-mismatch" || result?.reason === "identity-mismatch") {
         this.failCurrentHost(hostAttachment, "Recovery v3 start fence conflicts with authority");
       }
-      this.afterRecoveryTransition();
       return;
     }
     this.afterRecoveryTransition();
@@ -2206,19 +2211,35 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
 
     const now = Date.now();
-    let result: ReturnType<RelayRecoveryStore["recordValidatedLaneSend"]> | undefined;
+    let record: RecoveryDeliveryRecordIdentity | undefined;
     this.ctx.storage.transactionSync(() => {
-      result = this.recoveries.recordValidatedLaneSend(attempt.recovery_id, encoded, now);
-      if (result !== undefined && !result.ok && attempt.state !== "complete") {
-        this.recoveries.reset(attempt.recovery_id, "generation-reset", now);
+      const enqueued = this.recoveries.enqueueValidatedLaneDelivery(
+        attempt.recovery_id,
+        encoded,
+        now,
+      );
+      if (!enqueued.ok) {
+        this.recoveries.resetUndeliverableDeliveryOwner(attempt.recovery_id, now);
+        return;
       }
+      const begun = this.recoveries.beginLaneDeliverySend(enqueued.record, now);
+      if (!begun.ok) {
+        this.recoveries.resetUnsafeDeliveryOutcome(attempt.recovery_id, now);
+        return;
+      }
+      record = enqueued.record;
     });
-    if (result === undefined || !result.ok) {
+    if (record === undefined) {
       this.isolateRecoveryAttempt(attempt, "invalid or repeated Recovery v3 envelope");
       this.afterRecoveryTransition();
       return;
     }
-    this.sendRecoveryEnvelopeToBrowser({ attempt, browserData: browser.data, encoded });
+    this.sendRecoveryEnvelopeToBrowser({
+      attempt,
+      browserData: browser.data,
+      encoded,
+      record,
+    });
   }
 
   private async handleHostData(
@@ -2466,7 +2487,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
           live.sent_delivery_ordinal !== live.received_delivery_ordinal ||
           live.sent_cumulative_encoded_bytes !== live.received_cumulative_encoded_bytes
         ) {
-          this.recoveries.reset(attempt.recovery_id, "generation-reset", now);
+          this.recoveries.resetUndeliverableDeliveryOwner(attempt.recovery_id, now);
           isolated.push(attempt);
           continue;
         }
@@ -2486,21 +2507,32 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
             payload: canonical,
           });
         } catch {
-          this.recoveries.reset(attempt.recovery_id, "generation-reset", now);
+          this.recoveries.resetUndeliverableDeliveryOwner(attempt.recovery_id, now);
           isolated.push(attempt);
           continue;
         }
-        const recorded = this.recoveries.recordValidatedLaneSend(
+        const enqueued = this.recoveries.enqueueValidatedLaneDelivery(
           attempt.recovery_id,
           envelope,
           now,
         );
-        if (!recorded.ok || !recorded.changed) {
-          this.recoveries.reset(attempt.recovery_id, "generation-reset", now);
+        if (!enqueued.ok) {
+          this.recoveries.resetUndeliverableDeliveryOwner(attempt.recovery_id, now);
           isolated.push(attempt);
           continue;
         }
-        plans.push({ attempt, browserData: browser.data, encoded: envelope });
+        const begun = this.recoveries.beginLaneDeliverySend(enqueued.record, now);
+        if (!begun.ok) {
+          this.recoveries.resetUnsafeDeliveryOutcome(attempt.recovery_id, now);
+          isolated.push(attempt);
+          continue;
+        }
+        plans.push({
+          attempt,
+          browserData: browser.data,
+          encoded: envelope,
+          record: enqueued.record,
+        });
       }
     });
     if (!committed) return undefined;
@@ -2807,9 +2839,8 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   private sendRecoveryEnvelopeToBrowser(plan: RecoveryDataSendPlan): void {
     const browser = this.recoveryBrowserSockets(plan.attempt);
     if (browser?.data !== plan.browserData || plan.browserData.readyState !== WebSocket.OPEN) {
-      this.resetAndIsolateRecovery(
+      this.fenceUncertainRecoveryDelivery(
         plan.attempt,
-        "generation-reset",
         "Recovery v3 data socket changed before delivery",
       );
       return;
@@ -2817,12 +2848,93 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     try {
       plan.browserData.send(plan.encoded);
     } catch {
-      this.resetAndIsolateRecovery(
+      this.fenceUncertainRecoveryDelivery(
         plan.attempt,
-        "ack-outcome-uncertain",
         "Recovery v3 data send outcome is uncertain",
       );
+      return;
     }
+
+    let confirmed: ReturnType<RelayRecoveryStore["confirmLaneDeliverySend"]> | undefined;
+    try {
+      this.ctx.storage.transactionSync(() => {
+        confirmed = this.recoveries.confirmLaneDeliverySend(plan.record, Date.now());
+      });
+    } catch {
+      this.fenceUncertainRecoveryDelivery(
+        plan.attempt,
+        "Recovery v3 data send confirmation failed",
+      );
+      return;
+    }
+    if (confirmed === undefined || !confirmed.ok || !confirmed.changed) {
+      this.fenceUncertainRecoveryDelivery(
+        plan.attempt,
+        "Recovery v3 data send confirmation is uncertain",
+      );
+    }
+  }
+
+  private fenceUncertainRecoveryDelivery(attempt: RecoveryAttemptRow, closeReason: string): void {
+    this.ctx.storage.transactionSync(() => {
+      this.recoveries.resetUnsafeDeliveryOutcome(attempt.recovery_id, Date.now());
+    });
+    this.isolateRecoveryAttempt(attempt, closeReason);
+    this.afterRecoveryTransition();
+  }
+
+  private reconcileRecoveryDeliveryOwnersAfterWake(): void {
+    const attempts = this.sql
+      .exec(
+        `SELECT * FROM recovery_attempt
+         WHERE state IN ('preparing', 'installed', 'assembling', 'complete', 'resetting')
+         ORDER BY created_at, recovery_id LIMIT ?`,
+        MAX_RECOVERY_ATTEMPTS + 1,
+      )
+      .toArray() as unknown as RecoveryAttemptRow[];
+    if (attempts.length > MAX_RECOVERY_ATTEMPTS) {
+      throw new Error("durable Recovery v3 attempt bound exceeded during wake reconciliation");
+    }
+
+    const isolate = new Map<string, RecoveryAttemptRow>();
+    const unsafe = new Set(this.recoveries.deliveryRecoveryIdsRequiringReset());
+    const undeliverable = new Set<string>();
+    for (const attempt of attempts) {
+      if (attempt.state === "resetting") {
+        isolate.set(attempt.recovery_id, attempt);
+        continue;
+      }
+      if (unsafe.has(attempt.recovery_id)) continue;
+      if (
+        (attempt.state === "installed" ||
+          attempt.state === "assembling" ||
+          attempt.state === "complete") &&
+        this.recoveryBrowserSockets(attempt) === undefined
+      ) {
+        undeliverable.add(attempt.recovery_id);
+      }
+    }
+
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      for (const recoveryId of unsafe) {
+        const attempt = this.recoveries.attempt(recoveryId);
+        if (attempt === undefined) continue;
+        this.recoveries.resetUnsafeDeliveryOutcome(recoveryId, now);
+        isolate.set(recoveryId, attempt);
+      }
+      for (const recoveryId of undeliverable) {
+        const attempt = this.recoveries.attempt(recoveryId);
+        if (attempt === undefined) continue;
+        this.recoveries.resetUndeliverableDeliveryOwner(recoveryId, now);
+        isolate.set(recoveryId, attempt);
+      }
+    });
+
+    for (const attempt of isolate.values()) {
+      this.isolateRecoveryAttempt(attempt, "Recovery v3 delivery owner fenced after wake");
+    }
+    if (isolate.size > 0) this.snapshotUploads.scheduleMaintenance();
   }
 
   private resetAndIsolateRecovery(
@@ -2831,10 +2943,14 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     closeReason: string,
   ): void {
     const current = this.recoveries.attempt(attempt.recovery_id);
-    if (current !== undefined && current.state !== "complete" && current.state !== "resetting") {
+    if (current !== undefined && current.state !== "resetting") {
       const now = Date.now();
       this.ctx.storage.transactionSync(() => {
-        this.recoveries.reset(attempt.recovery_id, reason, now);
+        if (current.state === "complete") {
+          this.recoveries.resetUndeliverableDeliveryOwner(attempt.recovery_id, now);
+        } else {
+          this.recoveries.reset(attempt.recovery_id, reason, now);
+        }
       });
     }
     this.isolateRecoveryAttempt(attempt, closeReason);
@@ -2873,20 +2989,37 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   }
 
   private isolateRecoveryAttempt(attempt: RecoveryAttemptRow, reason: string): void {
-    const control = this.ctx.getWebSockets(`client:${attempt.client_id}`).find((socket) => {
-      const attachment = readAttachment(socket);
-      return (
-        attachment?.peer === "browser" &&
-        attachment.channel === "control" &&
-        attachment.connectionId === attempt.connection_id &&
-        attachment.deliveryGeneration === attempt.delivery_generation
+    const exactSockets = this.ctx
+      .getWebSockets(`client:${attempt.client_id}`)
+      .map((socket) => ({ attachment: readAttachment(socket), socket }))
+      .filter(
+        (candidate): candidate is { attachment: SocketAttachment; socket: WebSocket } =>
+          candidate.attachment?.peer === "browser" &&
+          candidate.attachment.clientId === attempt.client_id &&
+          candidate.attachment.connectionId === attempt.connection_id &&
+          candidate.attachment.streamId === attempt.stream_id &&
+          candidate.attachment.deliveryGeneration === attempt.delivery_generation,
       );
-    });
-    const controlAttachment = control === undefined ? undefined : readAttachment(control);
+    const control = exactSockets.find(({ attachment }) => attachment.channel === "control");
+    const connectionWitness = control ?? exactSockets[0];
     this.ctx.storage.transactionSync(() => {
-      if (controlAttachment !== undefined) {
-        this.releaseWriterLease(attempt.client_id, controlAttachment.leaseFence);
-        this.connections.closeConnectionSet(controlAttachment.connectionSetId);
+      if (control !== undefined) {
+        this.releaseWriterLease(attempt.client_id, control.attachment.leaseFence);
+      } else {
+        const client = this.clientById(attempt.client_id);
+        const lease = this.writerLease();
+        if (
+          client?.recovery_strategy === "v3" &&
+          client.role === "writer" &&
+          client.stream_id === attempt.stream_id &&
+          client.delivery_generation === attempt.delivery_generation &&
+          lease?.client_id === attempt.client_id
+        ) {
+          this.releaseWriterLease(attempt.client_id, lease.fence);
+        }
+      }
+      if (connectionWitness !== undefined) {
+        this.connections.closeConnectionSet(connectionWitness.attachment.connectionSetId);
       }
     });
     this.closeSockets(
@@ -2894,6 +3027,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         attachment.peer === "browser" &&
         attachment.clientId === attempt.client_id &&
         attachment.connectionId === attempt.connection_id &&
+        attachment.streamId === attempt.stream_id &&
         attachment.deliveryGeneration === attempt.delivery_generation,
       undefined,
       4400,
@@ -3064,8 +3198,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     } catch {
       if (attempt.state === "complete") {
         this.acknowledgeRecoveryOutbox(entry);
-        this.isolateRecoveryAttempt(attempt, "Recovery v3 Browser control send failed");
-        this.afterRecoveryTransition();
+        this.resetAndIsolateRecovery(
+          attempt,
+          "ack-outcome-uncertain",
+          "Recovery v3 Browser control send failed",
+        );
       } else {
         this.resetAndIsolateRecovery(
           attempt,
@@ -3109,9 +3246,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const now = Date.now();
     this.ctx.storage.transactionSync(() => {
       for (const attempt of attempts) {
-        // A complete attempt has no valid transition back to resetting. Its
-        // owner is still fenced by closing the exact socket generation below.
-        if (attempt.state !== "complete") {
+        if (attempt.state === "complete") {
+          this.recoveries.resetUndeliverableDeliveryOwner(attempt.recovery_id, now);
+        } else {
           this.recoveries.reset(attempt.recovery_id, "generation-reset", now);
         }
       }
