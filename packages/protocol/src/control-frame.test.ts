@@ -399,14 +399,43 @@ describe("control frame validation", () => {
         reason: "generation-fenced",
       }),
     ).toMatchObject({ reason: "generation-fenced" });
-    expect(
-      RelayToHostControlFrameSchema.parse({
+    const validRejected = [
+      {
+        ...commonAcknowledgement,
+        mode: "warm",
+        status: "rejected",
+        reason: "missing-live-seed",
+        retryScope: "same-generation",
+      },
+      {
+        ...commonAcknowledgement,
+        mode: "warm",
+        status: "rejected",
+        reason: "browser-control-send-failed",
+        retryScope: "drop-client",
+      },
+      {
         ...acknowledgement,
         status: "rejected",
         reason: "snapshot-missing",
         retryScope: "refresh-checkpoint",
-      }),
-    ).toMatchObject({ reason: "snapshot-missing", retryScope: "refresh-checkpoint" });
+      },
+      {
+        ...acknowledgement,
+        status: "rejected",
+        reason: "snapshot-metadata-mismatch",
+        retryScope: "refresh-checkpoint",
+      },
+      {
+        ...acknowledgement,
+        status: "rejected",
+        reason: "browser-control-send-failed",
+        retryScope: "drop-client",
+      },
+    ];
+    for (const rejected of validRejected) {
+      expect(RelayToHostControlFrameSchema.parse(rejected)).toEqual(rejected);
+    }
     expect(() =>
       RelayToHostControlFrameSchema.parse({
         ...acknowledgement,
@@ -422,6 +451,35 @@ describe("control frame validation", () => {
         retryScope: "drop-client",
       }),
     ).toThrow();
+    for (const rejected of [
+      {
+        ...commonAcknowledgement,
+        mode: "warm",
+        status: "rejected",
+        reason: "snapshot-missing",
+        retryScope: "refresh-checkpoint",
+      },
+      {
+        ...acknowledgement,
+        status: "rejected",
+        reason: "missing-live-seed",
+        retryScope: "same-generation",
+      },
+      {
+        ...acknowledgement,
+        status: "rejected",
+        reason: "cloud-head-behind-cut",
+        retryScope: "same-generation",
+      },
+      {
+        ...acknowledgement,
+        status: "rejected",
+        reason: "snapshot-missing",
+        retryScope: "reset-generation",
+      },
+    ]) {
+      expect(() => RelayToHostControlFrameSchema.parse(rejected)).toThrow();
+    }
     expect(() =>
       RelayToHostControlFrameSchema.parse({
         ...acknowledgement,

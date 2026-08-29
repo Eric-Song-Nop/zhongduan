@@ -221,6 +221,109 @@ class ManualTimers {
   }
 }
 
+async function openRecoveryUnderWatchdog(
+  timers: ManualTimers,
+  mode: "cold-pending" | "warm-start",
+): Promise<{
+  control: FakeSocket;
+  data: FakeSocket;
+  session: TerminalSession;
+}> {
+  const response = {
+    connectionSetId: "connection_set_warm_watchdog",
+    connectionId: "connection_warm_watchdog",
+    clientId: "browser_warm_watchdog",
+    streamId: 7,
+    deliveryGeneration: mode === "warm-start" ? "2" : "1",
+    expiresAt: timers.now + 30_000,
+    controlTicket: "control_ticket_warm_watchdog",
+    dataTicket: "data_ticket_warm_watchdog",
+  };
+  const fetch = vi.fn(
+    async () =>
+      new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+  );
+  const capabilities = new CapabilityManager({
+    bootstrap: {
+      capability: "opaque",
+      expiresAt: Math.floor(timers.now / 1_000) + 1_000,
+      issuedAt: Math.floor(timers.now / 1_000),
+      role: "observer",
+      sessionId: SESSION_ID,
+    },
+    fetch,
+    setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+    clearTimer: vi.fn(),
+  });
+  const sockets: FakeSocket[] = [];
+  const session = new TerminalSession({
+    capabilities,
+    engineId: ENGINE_ID,
+    host: {
+      engineId: ENGINE_ID,
+      active: new VisibleSink(),
+      restore: vi.fn<ReplicaHost["restore"]>(),
+      adopt: vi.fn(),
+    },
+    input: new InputDispatcher({
+      getObservedEventSeq: () => null,
+      inputEpoch: "input_epoch_warm_watchdog",
+    }),
+    ...(mode === "warm-start"
+      ? {
+          initialCursor: {
+            sessionEpoch: 1n,
+            deliveryGeneration: 1n,
+            lastEventSeq: 10n,
+            nextPtyOffset: 20n,
+          },
+        }
+      : {}),
+    sessionId: SESSION_ID,
+    snapshots: { load: vi.fn() },
+    fetch,
+    createWebSocket: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    },
+    makeWebSocketUrl: (path) => path,
+    now: () => timers.now,
+    random: () => 0,
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  });
+
+  session.start();
+  await waitForSockets(sockets, 1);
+  const control = sockets[0]!;
+  control.open();
+  await waitForSockets(sockets, 2);
+  const data = sockets[1]!;
+  data.open();
+  await vi.waitFor(() => {
+    expect(controlFrames(control).some((frame) => frame.type === "attach")).toBe(true);
+  });
+  if (mode === "cold-pending") return { control, data, session };
+  control.message(
+    JSON.stringify({
+      type: "replay-start",
+      sessionEpoch: "1",
+      streamId: 7,
+      deliveryGeneration: "2",
+      baseEventSeq: "10",
+      basePtyOffset: "20",
+      commitEventSeq: "10",
+      commitPtyOffset: "20",
+    }),
+  );
+  expect(session.snapshot).toMatchObject({ deliveryState: "replaying", phase: "restoring" });
+  return { control, data, session };
+}
+
 describe("TerminalSession delivery activation", () => {
   it("buffers data before replay-start and invalidates the old data callback before replacement", async () => {
     const sink = new VisibleSink();
@@ -667,77 +770,10 @@ describe("TerminalSession delivery activation", () => {
     },
   );
 
-  it("allows the maximum concurrent cold service window, then fences a lost attach", async () => {
+  it("fences an attach that never receives a recovery start", async () => {
     const timers = new ManualTimers();
     timers.now = 2_000_000_000_000;
-    const response = {
-      connectionSetId: "connection_set_attach_timeout",
-      connectionId: "connection_attach_timeout",
-      clientId: "browser_attach_timeout",
-      streamId: 7,
-      deliveryGeneration: "1",
-      expiresAt: timers.now + 30_000,
-      controlTicket: "control_ticket_attach_timeout",
-      dataTicket: "data_ticket_attach_timeout",
-    };
-    const fetch = vi.fn(
-      async () =>
-        new Response(JSON.stringify(response), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        }),
-    );
-    const capabilities = new CapabilityManager({
-      bootstrap: {
-        capability: "opaque",
-        expiresAt: Math.floor(timers.now / 1_000) + 1_000,
-        issuedAt: Math.floor(timers.now / 1_000),
-        role: "observer",
-        sessionId: SESSION_ID,
-      },
-      fetch,
-      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
-      clearTimer: vi.fn(),
-    });
-    const sockets: FakeSocket[] = [];
-    const session = new TerminalSession({
-      capabilities,
-      engineId: ENGINE_ID,
-      host: {
-        engineId: ENGINE_ID,
-        active: new VisibleSink(),
-        restore: vi.fn<ReplicaHost["restore"]>(),
-        adopt: vi.fn(),
-      },
-      input: new InputDispatcher({
-        getObservedEventSeq: () => null,
-        inputEpoch: "input_epoch_attach_timeout",
-      }),
-      sessionId: SESSION_ID,
-      snapshots: { load: vi.fn() },
-      fetch,
-      createWebSocket: () => {
-        const socket = new FakeSocket();
-        sockets.push(socket);
-        return socket as unknown as WebSocket;
-      },
-      makeWebSocketUrl: (path) => path,
-      now: () => timers.now,
-      random: () => 0,
-      setTimer: timers.setTimer,
-      clearTimer: timers.clearTimer,
-    });
-
-    session.start();
-    await waitForSockets(sockets, 1);
-    const control = sockets[0]!;
-    control.open();
-    await waitForSockets(sockets, 2);
-    const data = sockets[1]!;
-    data.open();
-    await vi.waitFor(() => {
-      expect(controlFrames(control).some((frame) => frame.type === "attach")).toBe(true);
-    });
+    const { control, data, session } = await openRecoveryUnderWatchdog(timers, "cold-pending");
 
     await timers.advanceBy(ATTACH_START_TIMEOUT_MS - 1);
     expect(control.readyState).toBe(1);
@@ -747,6 +783,38 @@ describe("TerminalSession delivery activation", () => {
     expect(control.readyState).toBe(3);
     expect(data.readyState).toBe(3);
     expect(session.snapshot).toMatchObject({ lastError: "connection", phase: "reconnecting" });
+    session.close();
+  });
+
+  it("keeps the attach watchdog through replay-start and fences a missing ReplayCommit", async () => {
+    const timers = new ManualTimers();
+    timers.now = 2_000_000_000_000;
+    const { control, data, session } = await openRecoveryUnderWatchdog(timers, "warm-start");
+
+    await timers.advanceBy(ATTACH_START_TIMEOUT_MS - 1);
+    expect(control.readyState).toBe(1);
+    expect(data.readyState).toBe(1);
+    await timers.advanceBy(1);
+
+    expect(control.readyState).toBe(3);
+    expect(data.readyState).toBe(3);
+    expect(session.snapshot).toMatchObject({ lastError: "connection", phase: "reconnecting" });
+    session.close();
+  });
+
+  it("cancels the attach watchdog only after the matching ReplayCommit makes warm replay live", async () => {
+    const timers = new ManualTimers();
+    timers.now = 2_000_000_000_000;
+    const { control, data, session } = await openRecoveryUnderWatchdog(timers, "warm-start");
+
+    await timers.advanceBy(ATTACH_START_TIMEOUT_MS - 1);
+    data.message(dataFrame(2n, 10n, 20n, [], DataFrameKind.ReplayCommit));
+    expect(session.snapshot).toMatchObject({ deliveryState: "live", phase: "live" });
+
+    await timers.advanceBy(ATTACH_START_TIMEOUT_MS + 1);
+    expect(control.readyState).toBe(1);
+    expect(data.readyState).toBe(1);
+    expect(session.snapshot).toMatchObject({ lastError: null, phase: "live" });
     session.close();
   });
 

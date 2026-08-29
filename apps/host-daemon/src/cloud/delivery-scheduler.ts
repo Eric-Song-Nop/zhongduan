@@ -350,7 +350,7 @@ export class HostDeliveryScheduler {
             return;
           }
           const retryScope = deliveryBarrierRetryScope(result);
-          if (retryScope === "drop-client" || retryScope === "reset-generation") {
+          if (retryScope === "drop-client") {
             this.#recoveryQueue.complete(request);
             return;
           }
@@ -392,7 +392,7 @@ export class HostDeliveryScheduler {
         return;
       }
       const retryScope = deliveryBarrierRetryScope(result);
-      if (retryScope === "drop-client" || retryScope === "reset-generation") {
+      if (retryScope === "drop-client") {
         this.#recoveryQueue.complete(request);
         this.#discardColdPreparation(request);
         return;
@@ -797,7 +797,7 @@ export class HostDeliveryScheduler {
 
 function deliveryBarrierRetryScope(
   result: DeliveryBarrierResult,
-): "same-generation" | "refresh-checkpoint" | "reset-generation" | "drop-client" {
+): "same-generation" | "refresh-checkpoint" | "drop-client" {
   if (result.status !== "rejected") {
     throw new Error("delivery barrier retry scope requires a rejected result");
   }

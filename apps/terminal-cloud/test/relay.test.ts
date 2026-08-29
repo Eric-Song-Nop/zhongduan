@@ -2205,6 +2205,26 @@ describe("live Durable Object relay", () => {
     expect((await host.data.inbox.nextClose()).code).toBe(4400);
   });
 
+  it("rejects a missing finalized snapshot without failing the Host", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const snapshotId = "snapshot_missing_barrier1";
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser, null);
+
+    host.data.socket.send(deliveryBarrier(browser, "snapshot", 0n, 0n, snapshotId));
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "delivery-barrier-result",
+      status: "rejected",
+      snapshotId,
+      reason: "snapshot-missing",
+      retryScope: "refresh-checkpoint",
+    });
+    expect(browser.control.inbox.pendingMessageCount).toBe(0);
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
   it("rejects mismatched finalized snapshot metadata without failing the Host", async () => {
     const session = await createSession();
     const host = await openHost(session);

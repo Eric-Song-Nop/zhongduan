@@ -41,6 +41,14 @@ export default defineConfig({
         ],
         cache: false,
       },
+      "verify-phase0": {
+        command: [
+          "vp test --run packages/protocol/src/control-frame.test.ts packages/protocol/src/cloud-api.test.ts apps/host-daemon/src/cloud/delivery-recovery-queue.test.ts apps/host-daemon/src/cloud/delivery-barrier-waiter.test.ts apps/host-daemon/src/cloud/delivery-scheduler.test.ts",
+          "pnpm --dir apps/terminal-cloud exec vp test --config vitest.worker.config.ts --run test/relay.test.ts test/runtime.test.ts",
+          "pnpm --dir apps/terminal-cloud exec vp test --config vitest.browser.config.ts --run src/browser/terminal-session.test.ts",
+        ],
+        cache: false,
+      },
       "verify-clean-host": {
         command: "node scripts/verify-clean-host-build.mjs",
         cache: false,
@@ -51,10 +59,6 @@ export default defineConfig({
       },
       "verify-clean-browser": {
         command: "node scripts/verify-clean-browser-build.mjs",
-        cache: false,
-      },
-      "verify-browser-e2e": {
-        command: "python scripts/verify-browser-e2e.py",
         cache: false,
       },
     },

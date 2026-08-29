@@ -193,13 +193,14 @@ pnpm --filter "@zhongduan/terminal-cloud" run dev -- --host "127.0.0.1" --port "
 另一个终端构建 Host，并将相同 bootstrap token 放入权限为 `0600` 的文件，然后使用
 `http://127.0.0.1:5173` 作为 `--url` 启动 Host。
 
-浏览器连接与输入 smoke test 需要 Python Playwright 和 Chromium。脚本会自行创建并删除
-`apps/terminal-cloud/.dev.vars`，因此运行前必须停止本地 dev server，并临时移走已有的
-`.dev.vars`：
+CURRENT recovery 的开发验收范围、状态机测试与局限见
+[Phase 0 验收契约](phase-0-acceptance-contract.md)。可复现的本地状态机诊断报告使用：
 
 ```bash
-pnpm exec vp run verify-browser-e2e
+pnpm exec vp run verify-phase0
 ```
+
+本地部署步骤和该报告都不提供 E2E、性能或生产行为证明。
 
 ## 8. 运维边界
 
