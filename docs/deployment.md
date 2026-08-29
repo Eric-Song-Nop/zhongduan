@@ -121,6 +121,16 @@ upload 与 R2 object 已验证、但 committed head 尚未追上 snapshot cut �
 不会猜测或释放，因此顺序错误不会破坏数据，但会让 bounded cursor-ahead 暂时退化为旧行为。该 HTTP 错误
 分类不改变 terminal WebSocket wire、SQLite schema 或 snapshot body。
 
+Recovery v3 的 capability/wire schema 采用 Cloud-first 滚动顺序。P2.0 Cloud 对 negotiation-aware request
+只确认已实现的 v2 能力；未提供 bootstrap token 的旧 Host/Browser 仍收到旧 connection-set response shape。
+新 Host/Browser 连接旧 Cloud 时看不到 `negotiatedCapabilities`，必须完整使用 v2。Durable Object 的 additive
+schema migration 把既有 session 固定为 authority data v2，并把既有 generation strategy 默认设为 v2。
+在 Browser assembler、Host source owner、Cloud durable state、receipt/closure 与 fairness gate 全部通过前，
+生产 endpoint 不得 advertise v3 token，Cloud kill switch 必须保持关闭，也不得单独移除 v2 pause/barrier/pin。
+若回滚到不认识 negotiation token 的旧 DO 代码，已经用新 attachment 建立的 socket 会 fail closed，运维上应预期
+这些连接重连；additive SQLite facts 与 authority log 不因此回退或丢失。不要把“已有连接不断开”当作该回滚
+路径的保证。
+
 部署前可用以下命令只验证生成的 Worker、Assets、DO 和 R2 binding，不上传：
 
 ```bash

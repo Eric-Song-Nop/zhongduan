@@ -141,7 +141,7 @@ async function createConnectionSet(
     method: "POST",
     headers: {
       "content-type": "application/json",
-      ...(claims.role === "host" && selectedCapabilities.length > 0
+      ...(selectedCapabilities.length > 0
         ? { [RELAY_CAPABILITIES_HEADER]: selectedCapabilities.join(",") }
         : {}),
     },

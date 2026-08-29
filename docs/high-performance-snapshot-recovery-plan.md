@@ -1,6 +1,7 @@
 # 高性能远程终端 Snapshot 与 Recovery v3 实施计划
 
-> 状态：Phase 0/1 为 CURRENT stacked candidate；Phase 2–5 为 TARGET
+> 状态：Phase 0/1 为 CURRENT stacked candidate；Phase 2 的 wire/capability 层为 stacked candidate，
+> Recovery v3 runtime 仍为 TARGET；Phase 3–5 为 TARGET
 >
 > 决策日期：2026-08-28
 >
@@ -54,9 +55,10 @@ continuation 属于 cut 之前的状态，恢复后不能作为新的 PTY output
 terminal mutation，不消耗 `eventSeq`，不进入 journal/snapshot tail，也不广播给 observer。输入验证使用
 writer-only、live-only、可丢失的 causal certificate；详细定义归输入计划和三平面总纲所有。
 
-并发 live/recovery 使同一个 mutation 可能重复到达。第一版按 canonical 字段逐项比较
-`{sessionEpoch, eventSeq, kind, ptyOffset, semantic flags, payload}`；完全相同才可去重，不同则 fail
-closed。Mutation hash chain 可以作为后续诊断和快速校验优化，但不是 Recovery v3 的正确性前置条件。
+Recovery lane 只覆盖 `(R,H]`，live lane 只覆盖 `[H+1,...)`；同一个 `eventSeq` 出现在两个 lane 表示
+start/floor 已经错误，必须 reset。仅同 lane、同 delivery ordinal 的 retry 可以按 canonical 字段逐项比较
+`{sessionEpoch, eventSeq, kind, ptyOffset, semantic flags, payload}`；完全相同才幂等，不同则 fail closed。
+Mutation hash chain 可以作为后续诊断和快速校验优化，但不是 Recovery v3 的正确性前置条件。
 
 ### Snapshot 覆盖范围
 
@@ -110,7 +112,8 @@ ordering 条件要由 Recovery v3 整体替换，不能逐个关闭。
 
 ## TARGET：Recovery v3 并发 gap-fill
 
-Recovery v3 对 warm 和 cold 使用同一套协议，只改变 base 的来源：
+Recovery v3 对 warm 和 cold 使用同一套协议，只改变 base 的来源。精确 binary/control shape 与滚动
+协商见 [Recovery v3 Wire Contract](recovery-v3-wire.md)：
 
 ```text
 warm: existing replica@R + gap-fill(R,H]
@@ -132,9 +135,10 @@ cold: snapshot@R         + gap-fill(R,H]
    之后、任何 `H+1` 之前；它是 delivery marker，不消耗 `eventSeq`、不进 journal；
 3. Cloud 从同一 Host data stream 收到 fence 时要求 committed head 恰好等于 `H`；在处理下一条 Host data
    message 前，原子把客户端置为 `assembling`、固定 start metadata，并安装
-   `liveFloor = successor(H)` 的 delivery obligation；
-4. Cloud 向 Browser 发 `RecoveryStart` 并向 Host ACK 可以发送 prepared gap；此后 `H+1...` 持续 fanout
-   给该客户端和所有 synced 客户端，Browser 允许在 start 前有界缓存同 generation live frame；
+   `liveFloor = MutationBoundary{H.eventSeq+1,H.nextPtyOffset}` 的 delivery obligation；
+4. Cloud 向 Browser 发 `RecoveryStart`，并向 Host ACK 初始 bounded recovery grant；Host 只在累计 grant
+   范围内发送 prepared gap；此后 `H+1...` 持续 fanout 给该客户端和所有 synced 客户端，Browser 允许在
+   start 前有界缓存同 generation live frame；
 5. 任一 prepare、head、generation 或 source-retention 校验失败都 reset/replan，不发送截断 tail。
 
 这个短临界点只排序一个 marker，不等待 Browser、snapshot download 或 recovery RTT，也不冻结 `H` 之后的
@@ -156,9 +160,9 @@ RecoveryStart {
   deliveryGeneration,
   engineId,
   base: AuthorityCursor R,
-  snapshotId?,
+  source: { kind: warm } | { kind: snapshot, complete immutable manifest },
   committedThrough: AuthorityCursor H,
-  liveFloor: successor(H)
+  liveFloor: MutationBoundary(H)
 }
 
 RecoveryDone {
@@ -176,12 +180,15 @@ RecoveryAdopted {
 RecoverySourceClosed {
   recoveryId,
   deliveryGeneration,
-  throughRecoveryOrdinal
+  throughRecoveryOrdinal,
+  throughRecoveryCumulativeEncodedBytes
 }
 ```
 
-`RecoveryStart` 一旦可见，同 generation 的 `{recoveryId, engineId, base R, snapshotId}` 不可更换；
-rebase 必须增加 generation。`H` 之后的 head 可以持续前进。
+`RecoveryStart` 一旦可见，同 generation 的
+`{recoveryId, engineId, base R, source, committedThrough H, liveFloor}` 不可更换；cold source 包含
+session/snapshot id、engine/epoch/cut、compression、长度、checksum、与两个 id 精确绑定的 download path
+和 restore-through；rebase 必须增加 generation。`H` 之后的 head 可以持续前进。
 
 ### Browser RecoveryAssembler
 
@@ -191,7 +198,7 @@ rebase 必须增加 generation。`H` 之后的 head 可以持续前进。
 base R
 nextExpected = R + 1
 framesByEventSeq = bounded map
-appliedIdentityByEventSeq = bounded overlap cache
+appliedIdentityByEventSeq = bounded same-lane late-retry cache
 recoveryDoneThrough = optional H
 bufferedBytes / bufferedFrames / oldestBufferedAt
 targetCore = existing active replica@R（warm）或 detached snapshot replica@R（cold）
@@ -201,8 +208,9 @@ targetCore = existing active replica@R（warm）或 detached snapshot replica@R�
 
 1. recovery lane 只接受 `(R,H]`，live lane 从 `liveFloor` 开始；start 到达前的同 generation frame
    可以进入有界 pre-start buffer；
-2. 任一 lane 到达的 mutation 先验证 epoch、cursor、offset 和 exact duplicate identity；已经 apply 并从
-   reorder map 删除的 overlap 仍与 `appliedIdentityByEventSeq` 中的完整 canonical fields/payload 比较；
+2. 任一 lane 到达的 mutation 先验证 epoch、cursor、offset 和 exact identity；跨 lane 同 eventSeq 立即
+   fail closed；已经 apply 并从 reorder map 删除的同 lane late retry 仍与
+   `appliedIdentityByEventSeq` 中的完整 canonical fields/payload 比较；
 3. 只有 `nextExpected` 存在时才 apply，并循环推进连续前缀；较新 frame 留在 map 中；warm 可在 active
    replica 上逐个展示这些连续前缀，cold 只更新 detached candidate；
 4. cold snapshot 尚未下载/restore 完成时只拥有并缓存 bounded copy，不推进 candidate cursor；
@@ -214,10 +222,11 @@ targetCore = existing active replica@R（warm）或 detached snapshot replica@R�
    ownership 不确定都 reset 该客户端，不影响 authority 和其他客户端。Cold conflict 直接 discard candidate；
    warm conflict 必须把 active replica 标记为 non-current/tainted，下一 generation 强制 cold rebase，不能复用。
 
-Applied identity cache 计入 per-generation bytes/frames；只保留可能被 recovery/live overlap 或 late retry
-命中的区间。Browser 发出 `DeliveryReceived` 后仍须保留 cache；只有收到 Host/source 在实际处理 receipt 后
-返回的 matching `RecoverySourceClosed`，且本地 ordinal 已达到 `throughRecoveryOrdinal`，才可释放。Closure
-丢失时幂等请求/重发，最终走有界 deadline/reset；不能为了完整比较保留无界 session history。
+Applied identity cache 计入 per-generation bytes/frames；只保留仍可能被同 lane late retry 命中的区间。
+Browser 发出 `DeliveryReceived` 后仍须保留 recovery identity cache；只有收到 Host/source 在实际处理
+receipt 后返回的 matching `RecoverySourceClosed`，且本地 recovery lane cursor 同时覆盖
+`throughRecoveryOrdinal` 与 `throughRecoveryCumulativeEncodedBytes`，才可释放。Closure 丢失时幂等
+请求/重发，最终走有界 deadline/reset；不能为了完整比较保留无界 session history。
 
 live `H+1...` 可能先于 `RecoveryStart`、snapshot 或 recovery frame 到达，也可能在 adopt 前已经连续
 apply 到 `K > H`；这不改变 adoption 条件。Assembler 始终采用同一 log 的连续前缀，不能因“画面看起来
@@ -249,7 +258,7 @@ DeliveryReceived {
   deliveryGeneration,
   lane,
   contiguousDeliveryOrdinal,
-  receivedBytes
+  cumulativeEncodedBytes
 }
 
 ReplicaApplied {
@@ -258,16 +267,18 @@ ReplicaApplied {
 }
 ```
 
-`DeliveryReceived` 只在 payload 已复制进有界 assembler 后发送，用于释放对应 logical lane 的 transport
-credit；ordinal/bytes 必须单调且不超过已发送值。`ReplicaApplied` 表示 Ghostty 已连续 apply 的
+`DeliveryReceived` 只在完整 v3 envelope 已校验、payload 已复制进有界 assembler 后发送，用于释放对应
+logical lane 的 transport credit；ordinal/cumulative bytes 必须单调且精确匹配已发送 lane cursor。
+`ReplicaApplied` 表示 Ghostty 已连续 apply 的
 authority cursor，用于正确性、进度和 adoption。两者不能互相推导。
 
 ### 逻辑 lane、物理连接与公平性
 
 第一版建立 `control-input`、`live-data`、`recovery-data` 三个逻辑 lane，并为 live/control 保留 credit 和
-scheduler priority；snapshot blob 继续走 HTTP。先允许 live/recovery 复用当前 data WebSocket，通过有界
-quantum 调度。只有指标证明 recovery 的 TCP/WebSocket HOL 仍显著推高 live latency，才升级为第三条物理
-WebSocket 或未来 QUIC/WebTransport stream。三条物理 WebSocket 不是正确性前置条件。
+scheduler priority；snapshot blob 继续走 HTTP。Cloud→Browser 的 live/recovery 先复用同一 v3 data
+WebSocket，每条 record 由 generation-scoped envelope 显式标记 lane、ordinal 和 cumulative encoded bytes，
+并通过有界 quantum 调度。只有以后经批准的环境方法证明 TCP/WebSocket HOL 仍显著，才讨论第三条物理
+WebSocket 或未来 QUIC/WebTransport stream；这不是当前正确性前置条件，也不是本阶段性能 gate。
 
 Recovery scheduler 必须有 session 级并发上限、每客户端 bytes/frames credit、deadline 和
 deficit/round-robin quantum。16 个客户端可以共享同一个 immutable checkpoint/build；慢客户端耗尽自身
@@ -560,8 +571,8 @@ Phase 1 stacked candidate 的最终行为是：
 
 ### 后续需要的测试
 
-- Durable Object v4→v5 ticket/capability 数据迁移 fixture，以及 Cloud-first rolling deployment 的
-  production-like staging 验证；
+- Cloud-first rolling/rollback 的 production-like staging 验证；v5→v6 authority-version/strategy direct
+  migration fixture 已由 P2.0 保留；
 - DO hibernation、R2 HEAD/PUT/delete、response loss、Host crash/restart 和 generic uncertain reconciliation 的
   fault injection；
 - 真实 snapshot restore/adopt、parser continuation 与 exact tail-continuity oracle；
@@ -573,15 +584,22 @@ Phase 1 stacked candidate 的最终行为是：
 - 完成 protocol capability negotiation：authority data version 固定到 session epoch，recovery strategy 在
   新 delivery generation 选择三方兼容交集；同 generation 不混用 v2/v3 ordering；
 - 实现 committed-through-H start fence、live floor、`RecoveryStart/Done/Adopted/SourceClosed`；
-- 实现 Browser bounded assembler、exact duplicate、gap/deadline/reset；
+- 实现 Browser bounded assembler、同 lane exact retry、跨 lane conflict、gap/deadline/reset；
 - 分离 `DeliveryReceived` credit 与 `ReplicaApplied`；
 - 建立 live/recovery logical lane 和有界公平调度；
-- 端到端 gate 通过后，一次性删除 v3 路径的 global pause、fixed-commit barrier 和 pin；保留有序
+- 完整 negotiated state-machine gate 通过后，一次性删除 v3 路径的 global pause、fixed-commit barrier 和
+  pin；保留有序
   `RecoveryStartFence`，v2 fallback 不变。
 
 Gate：snapshot 下载/restore 时 `(R,H]` 与 `H+1...` 任意交错仍只采用连续前缀；
 ACK/Done/Adopted/SourceClosed 丢失可恢复；一个慢客户端不阻塞 authority、writer 或其他客户端；full
-snapshot 路径通过 model/fuzz/E2E。
+snapshot 路径通过独立 reference model/property、owner-level deterministic fault integration 与真实 Ghostty
+snapshot/continuation equivalence。浏览器端到端只保留 capability downgrade 和 wiring smoke，并明确不作为
+lane interleaving、ownership、terminal state 或性能证明。
+
+Phase 2 预计不需要修改 WTerm/Ghostty。若实现暴露真实 API 缺口，必须先在 `Eric-Song-Nop` 的对应 fork
+创建正式 PR、完成 review/验证，再由 Zhongduan 的独立 stacked PR 更新固定 submodule 指针；不得直接修改
+vendor、指向 upstream 或 pin 未审 commit。
 
 ### Phase 3：严格有界 immutable cut
 
@@ -622,8 +640,9 @@ Gate：持续 50–100 ms output、从不 quiet 时 cut 仍有界前进，且 in
 - 随机选择 `R/H/K`，验证 `snapshot@R + continuous log(R,K]` 与 uninterrupted authority 的可见
   screen、cursor、modes、offset 和后续 parser 行为一致；
 - 覆盖 UTF-8、CSI/OSC/DCS continuation、primary/alternate、resize/reflow、sync output 和 scrollback；
-- live/recovery 任意乱序、重复、Done-before-frame、Start-after-live、Adopted/ACK/SourceClosed loss；
-- duplicate payload 一致时幂等，不一致、gap、错误 epoch/engine/generation/offset 一律 fail closed；
+- live/recovery 任意乱序、同 lane retry、Done-before-frame、Start-after-live、Adopted/ACK/SourceClosed loss；
+- 同 lane、同 ordinal duplicate 逐字节一致时幂等；跨 lane 同 eventSeq、divergent duplicate、gap、错误
+  epoch/engine/generation/offset 一律 fail closed；
 - v2 pause/barrier 和 v3 gap-fill 分别模型测试，不允许半 v2/半 v3 状态。
 
 ### 生命周期、容量与多客户端
@@ -631,10 +650,13 @@ Gate：持续 50–100 ms output、从不 quiet 时 cut 仍有界前进，且 in
 - single-flight、16 waiters/observers、supersede、relay reconnect、DO hibernation、cursor-ahead；
 - encode/compress/upload 失败、response loss、R2 404/checksum mismatch、pending body 失去 serviceability；
 - Browser download/restore timeout、assembler cap、generation bump、candidate/history abort、dispose once；
-- recovery credit exhaustion、fair scheduling、慢 observer 隔离和 writer/live reservation；
-- 30 分钟 soak 验证 Host RSS/CPU、Browser heap/WASM、R2 rows/bytes 和 ownership 无持续增长。
+- recovery credit exhaustion、fair scheduling、慢 observer 隔离和 writer/live reservation。
 
-### 性能与 SLO
+### 后置的性能、soak 与 SLO
+
+本节只记录未来可能需要的环境验证，不是当前 Phase 2 实现或完成 gate。只有 workload、link profile、环境
+隔离、warm-up、样本量和统计方法另行批准后，才实施 30 分钟 soak、性能回归或 SLO；当前不编写这些测试，
+也不从 correctness suite 推断性能。
 
 核心指标包括：
 
@@ -645,7 +667,7 @@ Gate：持续 50–100 ms output、从不 quiet 时 cut 仍有界前进，且 in
 - `input_ack_ms - measured_transport_rtt_ms`、Cloud/Host local queue、Ctrl-C 到 PTY write；
 - time-to-first-visible、time-to-current、fresh attach 与 same-page resync 分布。
 
-初始 gate：
+未来候选 gate：
 
 - 支持 envelope 内 cold recovery 成功率至少 99.9%，无错误 adoption、tail hole 或跨 generation 拼接；
 - input ACK 上限写成 `measured path RTT + local processing budget`；Cloud/Host 本地 processing 单独满足
@@ -681,7 +703,8 @@ branch，不能放宽 recovery invariant。因此不宣称全面超过 Mosh；�
 
 - Phase 0–4 依赖顺序通过并默认启用，v2 fallback 有明确退役条件；
 - README/总纲、wire protocol、input 与本计划使用同一 invariant、cursor 和 CURRENT/TARGET 术语；
-- model、fuzz、E2E、故障注入、多客户端公平性和 soak gate 全部通过；
-- dashboard 能把恢复慢定位到 cut、encode、publish、download、gap-fill、assembler、apply 或 network；
+- Phase 2 以独立 reference model/property、owner fault tests、真实 snapshot continuation fixture 与最小 wiring
+  smoke 收口；wiring smoke 不证明状态机、terminal state 或性能；
+- 性能、soak、production dashboard 与 SLO 保持后置，只有验证方法另行批准后才成为对应后续阶段的 gate；
 - rollback 只影响新 generation，已开始 attempt 完成或明确 reset，不跨 generation 拼接；
 - 同环境 Mosh/SSH 基准只陈述观测结果，不用架构推断宣称“全面超过”。

@@ -47,9 +47,9 @@ class FakeWebSocket extends EventTarget {
   }
 }
 
-function api(): HostConnectionApi {
+function api(connectionSet: ConnectionSetResponse = connection): HostConnectionApi {
   return {
-    createConnectionSet: async () => connection,
+    createConnectionSet: async () => connectionSet,
     webSocketUrl: (_sessionId, channel, ticket) =>
       `wss://cloud.example/${channel}?ticket=${ticket}`,
   };
@@ -88,11 +88,37 @@ describe("openHostSocketPair", () => {
     sockets[1]!.open();
 
     const pair = await opening;
+    expect(pair.connection).toEqual(connection);
+    expect(pair.connection).not.toHaveProperty("negotiatedCapabilities");
     expect(pair.control).toBe(sockets[0]);
     expect(pair.data).toBe(sockets[1]);
     expect(sockets[1]!.binaryType).toBe("arraybuffer");
     pair.close(1000, "done");
     expect(sockets.every((socket) => socket.readyState === FakeWebSocket.CLOSED)).toBe(true);
+  });
+
+  it("preserves a confirmed capability selection with the opened pair", async () => {
+    const negotiatedConnection: ConnectionSetResponse = {
+      ...connection,
+      negotiatedCapabilities: ["capability-negotiation-v1", "authority-data-v2"],
+    };
+    const opening = openHostSocketPair({
+      api: api(negotiatedConnection),
+      capability: "host-cap",
+      sessionId: "session_AAAAAAAAA",
+      webSocketFactory(url) {
+        const socket = new FakeWebSocket(url);
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+    });
+
+    const pair = await opening;
+    expect(pair.connection.negotiatedCapabilities).toEqual([
+      "capability-negotiation-v1",
+      "authority-data-v2",
+    ]);
+    pair.close();
   });
 
   it("times out a black-holed pair and closes the partial control socket", async () => {

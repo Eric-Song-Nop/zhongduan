@@ -413,8 +413,14 @@ async function openBrowser(
   session: CreatedSession,
   capability: string,
   clientId?: string,
+  relayCapabilities: string[] = [],
 ): Promise<BrowserEndpoint> {
-  const connection = await createConnectionSet(session.sessionId, capability, clientId);
+  const connection = await createConnectionSet(
+    session.sessionId,
+    capability,
+    clientId,
+    relayCapabilities,
+  );
   const control = await upgrade(session.sessionId, "control", connection.controlTicket);
   const data = await upgrade(session.sessionId, "data", connection.dataTicket);
   return { connection, control, data };
@@ -2600,7 +2606,10 @@ describe("live Durable Object relay", () => {
   it("resets browser delivery when an open data socket receives an error event", async () => {
     const session = await createSession();
     const host = await openHost(session);
-    const browser = await openBrowser(session, session.observerCapability);
+    const browser = await openBrowser(session, session.observerCapability, undefined, [
+      RelayCapability.capabilityNegotiationV1,
+      RelayCapability.authorityDataV2,
+    ]);
     await attachBrowser(session, host, browser);
 
     await runInDurableObject(sessionStub(session.sessionId), async (instance, state) => {
@@ -2627,7 +2636,53 @@ describe("live Durable Object relay", () => {
     });
     expect(browser.control.socket.readyState).toBe(WebSocket.OPEN);
 
+    const replacementState = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const ticket = state.storage.sql
+          .exec(
+            `SELECT relay_capabilities_json FROM connection_ticket
+             WHERE peer = 'browser' AND channel = 'data' AND client_id = ?`,
+            browser.connection.clientId,
+          )
+          .one() as { relay_capabilities_json: string };
+        return {
+          capabilities: ticket.relay_capabilities_json,
+          client: state.storage.sql
+            .exec(
+              `SELECT delivery_generation, recovery_strategy FROM client_delivery
+               WHERE client_id = ?`,
+              browser.connection.clientId,
+            )
+            .one(),
+        };
+      },
+    );
+    expect(JSON.parse(replacementState.capabilities)).toEqual([
+      RelayCapability.capabilityNegotiationV1,
+      RelayCapability.authorityDataV2,
+    ]);
+    expect(replacementState.client).toEqual({
+      delivery_generation: "2",
+      recovery_strategy: "v2",
+    });
+
     const replacementData = await upgrade(session.sessionId, "data", resync.dataTicket);
+    const replacementAttachment = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) => {
+        const dataSocket = state
+          .getWebSockets(`client:${browser.connection.clientId}`)
+          .find((socket) => {
+            return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+          });
+        return dataSocket?.deserializeAttachment() as { relayCapabilities?: string[] };
+      },
+    );
+    expect(replacementAttachment.relayCapabilities).toEqual([
+      RelayCapability.capabilityNegotiationV1,
+      RelayCapability.authorityDataV2,
+    ]);
     const replacement = { ...browser, data: replacementData };
     const request = await reattachBrowser(session, host, replacement, "2");
     expect(request).toMatchObject({
