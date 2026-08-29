@@ -3,6 +3,9 @@
   "name": "zhongduan-terminal-cloud",
   "main": "./src/worker/index.ts",
   "compatibility_date": "2026-08-27",
+  "vars": {
+    "RECOVERY_V3_ENABLED": "false",
+  },
   "assets": {
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",

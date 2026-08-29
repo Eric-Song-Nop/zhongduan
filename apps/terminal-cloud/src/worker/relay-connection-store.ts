@@ -1,4 +1,4 @@
-import { MAX_U64 } from "@zhongduan/protocol";
+import { MAX_U64, type RecoveryStrategy } from "@zhongduan/protocol";
 import type { CapabilityRole } from "./auth";
 import { RelayStore, type ClientRow, type TicketRow } from "./relay-store";
 
@@ -12,6 +12,8 @@ export interface ConnectionSetReservation {
   now: number;
   peer: "host" | "browser";
   principalIdHash: string | undefined;
+  recoveryHostFence: string | null;
+  recoveryStrategy: RecoveryStrategy;
   relayCapabilitiesJson: string;
   role: CapabilityRole;
   subject: string;
@@ -32,7 +34,12 @@ export interface BrowserDeliveryReplacement {
 }
 
 export type ConnectionSetReservationResult =
-  | { client: ClientRow | undefined; deliveryGeneration: string; ok: true }
+  | {
+      client: ClientRow | undefined;
+      deliveryGeneration: string;
+      ok: true;
+      recoveryStrategy: RecoveryStrategy;
+    }
   | {
       ok: false;
       reason: "client-owner-mismatch" | "too-many-clients" | "too-many-pending-connections";
@@ -64,6 +71,12 @@ export class RelayConnectionStore {
   ) {}
 
   reserveConnectionSet(input: ConnectionSetReservation): ConnectionSetReservationResult {
+    if (
+      (input.recoveryStrategy === "v3") !== (input.recoveryHostFence !== null) ||
+      (input.peer === "host" && input.recoveryStrategy !== "v2")
+    ) {
+      throw new Error("invalid recovery strategy reservation witness");
+    }
     let result: ConnectionSetReservationResult | undefined;
     let recoveriesFenced = false;
     this.state.storage.transactionSync(() => {
@@ -128,9 +141,9 @@ export class RelayConnectionStore {
         this.sql.exec(
           `INSERT INTO connection_ticket
             (ticket_digest, connection_set_id, connection_id, peer, channel,
-             client_id, subject, role, stream_id, delivery_generation, expires_at,
-             relay_capabilities_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             client_id, subject, role, stream_id, delivery_generation, host_fence,
+             expires_at, relay_capabilities_json, recovery_strategy)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           ticketDigest,
           input.connectionSetId,
           input.connectionId,
@@ -141,18 +154,29 @@ export class RelayConnectionStore {
           input.role,
           streamId,
           deliveryGeneration,
+          input.recoveryHostFence,
           input.expiresAt,
           input.relayCapabilitiesJson,
+          input.recoveryStrategy,
         );
       }
-      result = { client, deliveryGeneration, ok: true };
+      result = {
+        client,
+        deliveryGeneration,
+        ok: true,
+        recoveryStrategy: input.recoveryStrategy,
+      };
     });
     if (recoveriesFenced) this.onRecoveriesFenced();
     if (result === undefined) throw new Error("connection reservation did not resolve");
     return result;
   }
 
-  claimBrowserControl(ticket: TicketRow): TicketRow | undefined {
+  claimBrowserControl(
+    ticket: TicketRow,
+    currentReadyHostFence?: string,
+    recoveryV3Enabled = false,
+  ): TicketRow | undefined {
     if (ticket.client_id === null || ticket.channel !== "control") return undefined;
     let claimed: TicketRow | undefined;
     let recoveriesFenced = false;
@@ -160,6 +184,14 @@ export class RelayConnectionStore {
       const now = Date.now();
       this.#cleanupExpired(now);
       const currentTicket = this.store.ticket(ticket.ticket_digest);
+      const pairedDataTickets = this.sql
+        .exec(
+          `SELECT * FROM connection_ticket
+           WHERE connection_set_id = ? AND channel = 'data'`,
+          ticket.connection_set_id,
+        )
+        .toArray() as unknown as TicketRow[];
+      const pairedDataTicket = pairedDataTickets[0];
       const client = this.store.clientById(ticket.client_id!);
       const clientCount = this.sql.exec("SELECT COUNT(*) AS value FROM client_delivery").one() as {
         value: number;
@@ -171,13 +203,38 @@ export class RelayConnectionStore {
         client === undefined ||
         currentTicket.ticket_digest !== ticket.ticket_digest ||
         currentTicket.channel !== "control" ||
+        currentTicket.peer !== "browser" ||
         currentTicket.client_id !== ticket.client_id ||
         currentTicket.role !== ticket.role ||
         currentTicket.stream_id !== ticket.stream_id ||
         currentTicket.delivery_generation !== ticket.delivery_generation ||
+        currentTicket.recovery_strategy !== ticket.recovery_strategy ||
+        currentTicket.host_fence !== ticket.host_fence ||
+        currentTicket.relay_capabilities_json !== ticket.relay_capabilities_json ||
+        pairedDataTickets.length !== 1 ||
+        pairedDataTicket === undefined ||
+        pairedDataTicket.peer !== currentTicket.peer ||
+        pairedDataTicket.client_id !== currentTicket.client_id ||
+        pairedDataTicket.connection_id !== currentTicket.connection_id ||
+        pairedDataTicket.subject !== currentTicket.subject ||
+        pairedDataTicket.role !== currentTicket.role ||
+        pairedDataTicket.stream_id !== currentTicket.stream_id ||
+        pairedDataTicket.delivery_generation !== currentTicket.delivery_generation ||
+        pairedDataTicket.recovery_strategy !== currentTicket.recovery_strategy ||
+        pairedDataTicket.host_fence !== currentTicket.host_fence ||
+        pairedDataTicket.relay_capabilities_json !== currentTicket.relay_capabilities_json ||
         client.role !== currentTicket.role ||
         client.stream_id !== currentTicket.stream_id ||
         clientCount.value > this.maxBrowserClients
+      ) {
+        return;
+      }
+      if (
+        currentTicket.recovery_strategy === "v3"
+          ? !recoveryV3Enabled ||
+            currentTicket.host_fence === null ||
+            currentReadyHostFence !== currentTicket.host_fence
+          : currentTicket.host_fence !== null
       ) {
         return;
       }
@@ -191,10 +248,11 @@ export class RelayConnectionStore {
       this.sql.exec(
         `UPDATE client_delivery
          SET delivery_generation = ?, registered_at = COALESCE(registered_at, ?),
-             reservation_expires_at = NULL, updated_at = ?
+             reservation_expires_at = NULL, recovery_strategy = ?, updated_at = ?
          WHERE client_id = ? AND delivery_generation = ? AND ${registrationPredicate}`,
         currentTicket.delivery_generation,
         now,
+        currentTicket.recovery_strategy,
         now,
         ticket.client_id,
         client.delivery_generation,
@@ -202,7 +260,8 @@ export class RelayConnectionStore {
       const activatedClient = this.store.clientById(ticket.client_id!);
       if (
         activatedClient?.registered_at !== null &&
-        activatedClient?.delivery_generation === currentTicket.delivery_generation
+        activatedClient?.delivery_generation === currentTicket.delivery_generation &&
+        activatedClient?.recovery_strategy === currentTicket.recovery_strategy
       ) {
         this.recoveries.fenceClientGeneration(
           activatedClient.client_id,
@@ -313,7 +372,8 @@ export class RelayConnectionStore {
         client === undefined ||
         client.delivery_generation !== input.currentGeneration ||
         client.stream_id !== input.streamId ||
-        client.role !== input.role
+        client.role !== input.role ||
+        client.recovery_strategy !== "v2"
       ) {
         return;
       }
@@ -333,9 +393,9 @@ export class RelayConnectionStore {
       this.sql.exec(
         `INSERT INTO connection_ticket
           (ticket_digest, connection_set_id, connection_id, peer, channel,
-           client_id, subject, role, stream_id, delivery_generation, expires_at,
-           relay_capabilities_json)
-         VALUES (?, ?, ?, 'browser', 'data', ?, ?, ?, ?, ?, ?, ?)`,
+           client_id, subject, role, stream_id, delivery_generation, host_fence,
+           expires_at, relay_capabilities_json, recovery_strategy)
+         VALUES (?, ?, ?, 'browser', 'data', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         input.ticketDigest,
         input.connectionSetId,
         input.connectionId,
@@ -344,8 +404,10 @@ export class RelayConnectionStore {
         input.role,
         input.streamId,
         input.nextGeneration,
+        null,
         input.expiresAt,
         input.relayCapabilitiesJson,
+        "v2",
       );
       this.recoveries.fenceClientGeneration(input.clientId, input.nextGeneration, now);
       recoveriesFenced = true;

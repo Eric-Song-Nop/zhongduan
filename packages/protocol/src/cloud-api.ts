@@ -8,6 +8,7 @@ export {
   RELAY_CAPABILITIES_HEADER,
   RelayCapability,
   RelayCapabilitySchema,
+  RecoveryStrategySchema,
   confirmedRelayCapabilities,
   selectRecoveryStrategy,
   selectRelayCapabilities,
@@ -57,6 +58,8 @@ export const ConnectionSetResponseSchema = z.strictObject({
   expiresAt: z.number().int().positive(),
   controlTicket: CloudResourceIdSchema,
   dataTicket: CloudResourceIdSchema,
+  // Absence is the rolling-compatible v2 strategy. Only activated v3 reservations opt in.
+  recoveryStrategy: z.literal("v3").optional(),
   // Decode-only rolling shim for Durable Objects that still echo the selected intersection.
   selectedCapabilities: relayCapabilities.optional(),
   // Emitted only after the caller offers capability-negotiation-v1.

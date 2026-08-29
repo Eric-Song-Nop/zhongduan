@@ -6,7 +6,8 @@ import { EventJournal } from "../journal";
 import type { PtyProcess } from "../pty-process";
 import { TerminalSession } from "../session";
 import { CloudApiError } from "./cloud-api";
-import { HostCloudRelay, type HostCloudApi } from "./host-cloud-relay";
+import { HOST_RECOVERY_SOURCE_LIMITS, HostCloudRelay, type HostCloudApi } from "./host-cloud-relay";
+import { RecoverySourceManager } from "./recovery-source-manager";
 
 class ManualPty implements PtyProcess {
   readonly pid = 42;
@@ -147,6 +148,78 @@ afterEach(() => {
 });
 
 describe("HostCloudRelay", () => {
+  it("reuses one 16-source recovery owner across pair reconnects and disposes it last", async () => {
+    expect(HOST_RECOVERY_SOURCE_LIMITS.maxSources).toBe(16);
+    const pty = new ManualPty();
+    const session = new TerminalSession({
+      authority: new FakeTerminalAuthority(),
+      journal: new EventJournal(),
+      pty,
+      sessionEpoch: 7n,
+    });
+    const recoverySourceManager = new RecoverySourceManager({
+      limits: {
+        maxCanonicalBytesPerSource: 256 * 1024,
+        maxCanonicalFramesPerSource: 512,
+        maxOwnedRecords: 1_024,
+        maxOwnedWireBytes: 2 * 1024 * 1024,
+        maxSources: 16,
+        noProgressDeadlineMs: 15_000,
+        recoveryDeadlineMs: 60_000,
+      },
+      monotonicNow: () => Date.now(),
+      session,
+    });
+    const resetOwner = vi.spyOn(recoverySourceManager, "resetOwner");
+    const disposeRecovery = vi.spyOn(recoverySourceManager, "dispose");
+    const disposeSnapshotPublisher = vi.fn();
+    let connectionNumber = 0;
+    const relay = new HostCloudRelay({
+      api: {
+        createConnectionSet: async () => {
+          connectionNumber += 1;
+          return connectionSet(connectionNumber);
+        },
+        uploadSnapshot: async (metadata) => ({ created: true, snapshot: metadata }),
+        webSocketUrl: (_sessionId, channel, ticket) =>
+          `wss://cloud.example/${channel}?ticket=${ticket}`,
+      },
+      capabilities: {
+        current: async () => "host-capability",
+        recoverRejected: async () => "host-capability-recovered",
+      },
+      maxReconnectDelayMs: 800,
+      monotonicNow: () => Date.now(),
+      random: () => 0.5,
+      reconnectDelayMs: 100,
+      recoverySourceManager,
+      session,
+      sessionId: "session_AAAAAAAAA",
+      snapshotPublisher: {
+        dispose: disposeSnapshotPublisher,
+        publish: async () => Promise.reject(new Error("unused")),
+      },
+      stableConnectionMs: 1_000,
+      webSocketFactory: (url) => new ShortLivedWebSocket(url, true) as unknown as WebSocket,
+    });
+
+    const firstReady = relay.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await firstReady;
+    await vi.advanceTimersByTimeAsync(105);
+    expect(connectionNumber).toBe(2);
+    expect(resetOwner).toHaveBeenCalledTimes(2);
+    expect(resetOwner.mock.calls[0]?.[0]).not.toBe(resetOwner.mock.calls[1]?.[0]);
+
+    await relay.stop();
+    expect(disposeSnapshotPublisher).toHaveBeenCalledOnce();
+    expect(disposeRecovery).toHaveBeenCalledOnce();
+    expect(disposeSnapshotPublisher.mock.invocationCallOrder[0]).toBeLessThan(
+      disposeRecovery.mock.invocationCallOrder[0]!,
+    );
+    session.dispose();
+  });
+
   it("keeps a shell writable while permanent Cloud 4xx responses remain degraded", async () => {
     const capabilityAttempts: number[] = [];
     const disposeSnapshotPublisher = vi.fn();

@@ -74,6 +74,29 @@ export interface RecoverySourceDrainResult {
   readonly wireBytes: number;
 }
 
+export type RecoverySourceReceivedResult =
+  | {
+      readonly status: "partial";
+      readonly advanced: boolean;
+      readonly contiguousDeliveryOrdinal: string;
+      readonly cumulativeEncodedBytes: string;
+    }
+  | {
+      readonly status: "closed";
+      readonly closed: RecoveryV3HostSourceClosed;
+      readonly duplicate: boolean;
+    }
+  | {
+      readonly status: "invalid";
+      readonly reason: "unknown-source" | "beyond-sent" | "cumulative-mismatch";
+    };
+
+export interface RecoverySourceDeadlineExpiration {
+  readonly ownerToken: RecoverySourceOwnerToken;
+  readonly identity: RecoveryV3HostRoutingIdentity;
+  readonly reason: "prepare-deadline" | "no-progress-deadline" | "recovery-deadline";
+}
+
 export interface RecoverySourceManagerCounters {
   readonly ownedRecords: number;
   readonly ownedWireBytes: number;
@@ -129,7 +152,7 @@ interface RecoverySource {
 }
 
 interface RecoveryGenerationTombstone {
-  readonly deliveryGeneration: bigint;
+  readonly identity: RecoveryV3HostRoutingIdentity;
   readonly ownerToken: RecoverySourceOwnerToken;
 }
 
@@ -218,7 +241,7 @@ export class RecoverySourceManager {
     const replacesTombstone =
       replacedTombstone !== null &&
       replacedTombstone.ownerToken === ownerToken &&
-      BigInt(prepare.deliveryGeneration) > replacedTombstone.deliveryGeneration;
+      BigInt(prepare.deliveryGeneration) > BigInt(replacedTombstone.identity.deliveryGeneration);
     if (
       this.#pendingByStream.size +
         this.#sourcesByStream.size +
@@ -344,7 +367,11 @@ export class RecoverySourceManager {
     let sentRecords = 0;
     let sentWireBytes = 0;
     while (sentRecords < maxRecords) {
-      const record = source.records[source.nextSendIndex];
+      const hasOutstanding = source.sentDeliveryOrdinal > source.lastReceivedOrdinal;
+      const recordIndex = hasOutstanding
+        ? Number(source.sentDeliveryOrdinal - 1n)
+        : source.nextSendIndex;
+      const record = source.records[recordIndex];
       if (record === undefined) break;
       if (record.cumulativeEncodedBytes > source.cumulativeGrantedEncodedBytes) break;
       if (record.bytes.byteLength > maxWireBytes - sentWireBytes) break;
@@ -356,12 +383,15 @@ export class RecoverySourceManager {
       ) {
         break;
       }
-      source.nextSendIndex += 1;
-      source.sentDeliveryOrdinal = record.deliveryOrdinal;
-      source.sentCumulativeEncodedBytes = record.cumulativeEncodedBytes;
-      source.lastProgressAtMs = Math.max(source.lastProgressAtMs, this.#lastNowMs);
+      if (!hasOutstanding) {
+        source.nextSendIndex += 1;
+        source.sentDeliveryOrdinal = record.deliveryOrdinal;
+        source.sentCumulativeEncodedBytes = record.cumulativeEncodedBytes;
+        source.lastProgressAtMs = Math.max(source.lastProgressAtMs, this.#lastNowMs);
+      }
       sentRecords += 1;
       sentWireBytes += record.bytes.byteLength;
+      break;
     }
     return { records: sentRecords, wireBytes: sentWireBytes };
   }
@@ -369,20 +399,20 @@ export class RecoverySourceManager {
   received(
     ownerToken: RecoverySourceOwnerToken,
     input: RecoveryV3HostSourceReceived,
-  ): RecoveryV3HostSourceClosed | null {
+  ): RecoverySourceReceivedResult {
     assertOwnerToken(ownerToken);
     const received = RecoveryV3HostSourceReceivedSchema.parse(input);
     const nowMs = this.#recordNow();
     const source = this.#sourceFor(ownerToken, received);
-    if (source === null) return null;
+    if (source === null) return { status: "invalid", reason: "unknown-source" };
 
     const deliveryOrdinal = BigInt(received.contiguousDeliveryOrdinal);
     const cumulativeEncodedBytes = BigInt(received.cumulativeEncodedBytes);
     if (source.closed !== null) {
       return deliveryOrdinal === source.finalDeliveryOrdinal &&
         cumulativeEncodedBytes === source.finalCumulativeEncodedBytes
-        ? source.closed
-        : null;
+        ? { status: "closed", closed: source.closed, duplicate: true }
+        : { status: "invalid", reason: "cumulative-mismatch" };
     }
     const records = source.records;
     if (
@@ -391,17 +421,25 @@ export class RecoverySourceManager {
       deliveryOrdinal <= 0n ||
       deliveryOrdinal > BigInt(records.length)
     ) {
-      return null;
+      return { status: "invalid", reason: "beyond-sent" };
     }
     const record = records[Number(deliveryOrdinal - 1n)];
     if (record === undefined || record.cumulativeEncodedBytes !== cumulativeEncodedBytes) {
-      return null;
+      return { status: "invalid", reason: "cumulative-mismatch" };
     }
-    if (deliveryOrdinal > source.lastReceivedOrdinal) {
+    const advanced = deliveryOrdinal > source.lastReceivedOrdinal;
+    if (advanced) {
       source.lastReceivedOrdinal = deliveryOrdinal;
       source.lastProgressAtMs = nowMs;
     }
-    if (deliveryOrdinal !== source.finalDeliveryOrdinal) return null;
+    if (deliveryOrdinal !== source.finalDeliveryOrdinal) {
+      return {
+        status: "partial",
+        advanced,
+        contiguousDeliveryOrdinal: received.contiguousDeliveryOrdinal,
+        cumulativeEncodedBytes: received.cumulativeEncodedBytes,
+      };
+    }
 
     source.closed = Object.freeze(
       RecoveryV3HostSourceClosedSchema.parse({
@@ -412,7 +450,7 @@ export class RecoverySourceManager {
       }),
     );
     this.#releaseRecords(source);
-    return source.closed;
+    return { status: "closed", closed: source.closed, duplicate: false };
   }
 
   reset(ownerToken: RecoverySourceOwnerToken, input: RecoveryV3HostSourceReset): boolean {
@@ -420,7 +458,14 @@ export class RecoverySourceManager {
     const reset = RecoveryV3HostSourceResetSchema.parse(input);
     this.#recordNow();
     const source = this.#sourceFor(ownerToken, reset);
-    if (source === null) return false;
+    if (source === null) {
+      const tombstone = this.#tombstonesByStream.get(reset.streamId);
+      return (
+        tombstone !== undefined &&
+        tombstone.ownerToken === ownerToken &&
+        sameRouting(tombstone.identity, reset)
+      );
+    }
     this.#retireSource(source);
     return true;
   }
@@ -448,23 +493,38 @@ export class RecoverySourceManager {
     return reset;
   }
 
-  checkDeadlines(): number {
+  checkDeadlines(ownerToken: RecoverySourceOwnerToken): RecoverySourceDeadlineExpiration[] {
+    assertOwnerToken(ownerToken);
     const nowMs = this.#recordNow();
-    let expired = 0;
+    const expired: RecoverySourceDeadlineExpiration[] = [];
     for (const pending of this.#pendingByStream.values()) {
+      if (pending.ownerToken !== ownerToken) continue;
       if (nowMs - pending.startedAtMs < this.#limits.recoveryDeadlineMs) continue;
+      expired.push({
+        ownerToken: pending.ownerToken,
+        identity: routingIdentity(pending.prepare),
+        reason: "prepare-deadline",
+      });
       this.#cancelPending(pending, { status: "unavailable", reason: "deadline" }, true);
-      expired += 1;
     }
     for (const source of this.#sourcesByStream.values()) {
+      if (source.ownerToken !== ownerToken) continue;
+      if (source.closed !== null) continue;
       if (
         nowMs - source.startedAtMs < this.#limits.recoveryDeadlineMs &&
         nowMs - source.lastProgressAtMs < this.#limits.noProgressDeadlineMs
       ) {
         continue;
       }
+      expired.push({
+        ownerToken: source.ownerToken,
+        identity: routingIdentity(source.prepare),
+        reason:
+          nowMs - source.startedAtMs >= this.#limits.recoveryDeadlineMs
+            ? "recovery-deadline"
+            : "no-progress-deadline",
+      });
       this.#retireSource(source);
-      expired += 1;
     }
     return expired;
   }
@@ -524,7 +584,7 @@ export class RecoverySourceManager {
     if (tombstone.ownerToken !== ownerToken) {
       return Promise.resolve(this.#rejected(prepare, "client-gone"));
     }
-    if (generation <= tombstone.deliveryGeneration) {
+    if (generation <= BigInt(tombstone.identity.deliveryGeneration)) {
       return Promise.resolve(this.#rejected(prepare, "generation-fenced"));
     }
     return null;
@@ -622,10 +682,10 @@ export class RecoverySourceManager {
       this.#pendingByStream.delete(pending.prepare.streamId);
     }
     if (result.status !== "prepared" && pending.replacedTombstone !== null) {
-      this.#installTombstone(pending.replacedTombstone.ownerToken, {
-        ...routingIdentity(pending.prepare),
-        deliveryGeneration: pending.replacedTombstone.deliveryGeneration.toString(),
-      });
+      this.#installTombstone(
+        pending.replacedTombstone.ownerToken,
+        pending.replacedTombstone.identity,
+      );
     }
     pending.resolve(result);
   }
@@ -687,9 +747,12 @@ export class RecoverySourceManager {
     if (
       existing === undefined ||
       existing.ownerToken !== ownerToken ||
-      deliveryGeneration > existing.deliveryGeneration
+      deliveryGeneration > BigInt(existing.identity.deliveryGeneration)
     ) {
-      this.#tombstonesByStream.set(identity.streamId, { deliveryGeneration, ownerToken });
+      this.#tombstonesByStream.set(identity.streamId, {
+        identity: Object.freeze(routingIdentity(identity)),
+        ownerToken,
+      });
     }
   }
 

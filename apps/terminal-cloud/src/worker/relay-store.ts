@@ -1,3 +1,4 @@
+import type { RecoveryStrategy } from "@zhongduan/protocol";
 import type { CapabilityRole } from "./auth";
 import type { RelayChannel } from "./relay-socket";
 
@@ -9,6 +10,7 @@ export interface TicketRow {
   delivery_generation: string;
   expires_at: number;
   host_fence: string | null;
+  recovery_strategy: RecoveryStrategy;
   relay_capabilities_json: string;
   peer: "host" | "browser";
   role: CapabilityRole;
@@ -42,7 +44,7 @@ export interface ClientRow {
   principal_id_hash: string;
   registered_at: number | null;
   reservation_expires_at: number | null;
-  recovery_strategy: "v2" | "v3";
+  recovery_strategy: RecoveryStrategy;
   role: "writer" | "observer";
   stream_id: number;
 }
@@ -407,6 +409,28 @@ export function migrateRelayStore(state: DurableObjectState, sql: SqlStorage): v
         ) STRICT
       `);
       state.storage.kv.put("schema-version", 7);
+    });
+    version = 7;
+  }
+
+  if (version < 8) {
+    state.storage.transactionSync(() => {
+      const hasTicketRecoveryStrategy = sql
+        .exec("PRAGMA table_info(connection_ticket)")
+        .toArray()
+        .some((column) => column.name === "recovery_strategy");
+      if (!hasTicketRecoveryStrategy) {
+        sql.exec(
+          `ALTER TABLE connection_ticket
+           ADD COLUMN recovery_strategy TEXT NOT NULL DEFAULT 'v2'
+           CHECK (recovery_strategy IN ('v2', 'v3'))`,
+        );
+      }
+      sql.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS connection_ticket_set_channel
+         ON connection_ticket(connection_set_id, channel)`,
+      );
+      state.storage.kv.put("schema-version", 8);
     });
   }
 }

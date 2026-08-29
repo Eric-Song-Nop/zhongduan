@@ -9,6 +9,7 @@ import {
 import { env, exports as workerExports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
+import { SocketAttachmentV3Schema } from "../src/worker/relay-socket";
 
 interface CreatedSession {
   hostCapability: string;
@@ -25,6 +26,7 @@ interface ConnectionSet {
   dataTicket: string;
   deliveryGeneration: string;
   negotiatedCapabilities?: string[];
+  recoveryStrategy?: "v3";
   streamId: number;
 }
 
@@ -32,6 +34,21 @@ const origin = "https://terminal.example.test";
 let sessionCounter = 0;
 const testSockets = new Set<WebSocket>();
 const testSocketSessions = new Set<string>();
+const recoveryV3HostCapabilities = [
+  RelayCapability.capabilityNegotiationV1,
+  RelayCapability.authorityDataV2,
+  RelayCapability.wireEndpointV3,
+  RelayCapability.recoveryV3GapFillV1,
+] as const;
+const recoveryV3BrowserCapabilities = [
+  RelayCapability.capabilityNegotiationV1,
+  RelayCapability.authorityDataV2,
+  RelayCapability.wireEndpointV3,
+  RelayCapability.deliveryEnvelopeV3,
+  RelayCapability.deliveryReceiveCreditV1,
+  RelayCapability.authorityApplyProgressV1,
+  RelayCapability.recoveryV3GapFillV1,
+] as const;
 
 function nextSessionId(): string {
   sessionCounter += 1;
@@ -126,6 +143,60 @@ function nextClose(socket: WebSocket): Promise<CloseEvent> {
 async function drainSession(sessionId: string): Promise<void> {
   const stub = env.TERMINAL_SESSIONS.get(env.TERMINAL_SESSIONS.idFromName(`v1:${sessionId}`));
   await runInDurableObject(stub, () => undefined);
+}
+
+async function openReadyHost(
+  session: CreatedSession,
+): Promise<{ connection: ConnectionSet; control: WebSocket; data: WebSocket }> {
+  const connection = await createConnectionSet(
+    session.sessionId,
+    session.hostCapability,
+    undefined,
+    [...recoveryV3HostCapabilities],
+  );
+  const control = await upgrade(session.sessionId, "control", connection.controlTicket);
+  const data = await upgrade(session.sessionId, "data", connection.dataTicket);
+  expect(control.response.status).toBe(101);
+  expect(data.response.status).toBe(101);
+  if (control.socket === undefined || data.socket === undefined) {
+    throw new Error("host upgrade did not return both WebSockets");
+  }
+  const acknowledgement = nextMessage(control.socket);
+  control.socket.send(
+    JSON.stringify({
+      type: "host-ready",
+      engineId: "ghostty:test+snapshot-v1+wterm:test",
+      sessionEpoch: "7",
+      headEventSeq: "0",
+      nextPtyOffset: "0",
+    }),
+  );
+  await expect(acknowledgement).resolves.toContain('"type":"host-ready-ack"');
+  return { connection, control: control.socket, data: data.socket };
+}
+
+async function publishStrategySnapshot(session: CreatedSession, snapshotId: string): Promise<void> {
+  const stub = env.TERMINAL_SESSIONS.get(
+    env.TERMINAL_SESSIONS.idFromName(`v1:${session.sessionId}`),
+  );
+  await runInDurableObject(stub, (_instance, state) => {
+    state.storage.sql.exec(
+      `INSERT INTO snapshot
+        (snapshot_id, session_epoch, cut_event_seq, next_pty_offset, engine_id,
+         object_key, r2_version, etag, sha256, compressed_length,
+         uncompressed_length, compression, state, created_at)
+       VALUES (?, '7', '0', '0', 'ghostty:test+snapshot-v1+wterm:test',
+               ?, 'r2-version', 'etag', ?, 1, '1', 'none', 'servable', ?)`,
+      snapshotId,
+      `sessions/${session.sessionId}/snapshots/${snapshotId}`,
+      "0".repeat(64),
+      Date.now(),
+    );
+    state.storage.sql.exec(
+      "UPDATE session_state SET latest_snapshot_id = ? WHERE singleton = 1",
+      snapshotId,
+    );
+  });
 }
 
 afterEach(async () => {
@@ -275,6 +346,272 @@ describe("cloud relay runtime", () => {
     data.socket?.close(1000, "test complete");
   });
 
+  it("freezes a v3 strategy and ready-Host witness across reservation, claim, and data pairing", async () => {
+    const session = await createSession();
+    const stub = env.TERMINAL_SESSIONS.get(
+      env.TERMINAL_SESSIONS.idFromName(`v1:${session.sessionId}`),
+    );
+    await runInDurableObject(stub, (instance) => {
+      expect(Reflect.get(instance, "recoveryV3Enabled")).toBe(true);
+    });
+    const missingPrerequisites = await createConnectionSet(
+      session.sessionId,
+      session.observerCapability,
+      undefined,
+      [...recoveryV3BrowserCapabilities],
+    );
+    expect(missingPrerequisites.recoveryStrategy).toBeUndefined();
+
+    const firstHost = await openReadyHost(session);
+    const snapshotId = "snapshot_runtime_strategy_0001";
+    await publishStrategySnapshot(session, snapshotId);
+
+    const stale = await createConnectionSet(
+      session.sessionId,
+      session.observerCapability,
+      undefined,
+      [...recoveryV3BrowserCapabilities],
+    );
+    expect(stale.recoveryStrategy).toBe("v3");
+    const reserved = await runInDurableObject(stub, (_instance, state) => ({
+      client: state.storage.sql
+        .exec(
+          "SELECT recovery_strategy, registered_at FROM client_delivery WHERE client_id = ?",
+          stale.clientId,
+        )
+        .one(),
+      tickets: state.storage.sql
+        .exec(
+          `SELECT channel, recovery_strategy, host_fence FROM connection_ticket
+           WHERE connection_set_id = ? ORDER BY channel`,
+          stale.connectionSetId,
+        )
+        .toArray(),
+    }));
+    expect(reserved.client).toEqual({ recovery_strategy: "v2", registered_at: null });
+    expect(reserved.tickets).toEqual([
+      { channel: "control", recovery_strategy: "v3", host_fence: "1" },
+      { channel: "data", recovery_strategy: "v3", host_fence: "1" },
+    ]);
+
+    const secondHost = await openReadyHost(session);
+    const staleClaim = await upgrade(session.sessionId, "control", stale.controlTicket);
+    expect(staleClaim.response.status).toBe(409);
+    await staleClaim.response.body?.cancel();
+
+    const current = await createConnectionSet(
+      session.sessionId,
+      session.observerCapability,
+      stale.clientId ?? undefined,
+      [...recoveryV3BrowserCapabilities],
+    );
+    expect(current.recoveryStrategy).toBe("v3");
+    const control = await upgrade(session.sessionId, "control", current.controlTicket);
+    expect(control.response.status).toBe(101);
+    const activated = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql
+        .exec(
+          "SELECT delivery_generation, recovery_strategy FROM client_delivery WHERE client_id = ?",
+          current.clientId,
+        )
+        .one(),
+    );
+    expect(activated).toEqual({
+      delivery_generation: current.deliveryGeneration,
+      recovery_strategy: "v3",
+    });
+
+    const originalDataCapabilities = await runInDurableObject(stub, (_instance, state) => {
+      const ticket = state.storage.sql
+        .exec<{ relay_capabilities_json: string }>(
+          `SELECT relay_capabilities_json FROM connection_ticket
+           WHERE connection_set_id = ? AND channel = 'data'`,
+          current.connectionSetId,
+        )
+        .one();
+      state.storage.sql.exec(
+        `UPDATE connection_ticket SET relay_capabilities_json = '[]'
+         WHERE connection_set_id = ? AND channel = 'data'`,
+        current.connectionSetId,
+      );
+      return ticket.relay_capabilities_json;
+    });
+    const mismatchedData = await upgrade(session.sessionId, "data", current.dataTicket);
+    expect(mismatchedData.response.status).toBe(409);
+    await mismatchedData.response.body?.cancel();
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        `UPDATE connection_ticket SET relay_capabilities_json = ?
+         WHERE connection_set_id = ? AND channel = 'data'`,
+        originalDataCapabilities,
+        current.connectionSetId,
+      );
+    });
+
+    const thirdHost = await openReadyHost(session);
+    const staleData = await upgrade(session.sessionId, "data", current.dataTicket);
+    expect(staleData.response.status).toBe(409);
+    await staleData.response.body?.cancel();
+    const unchanged = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql
+        .exec(
+          "SELECT delivery_generation, recovery_strategy FROM client_delivery WHERE client_id = ?",
+          current.clientId,
+        )
+        .one(),
+    );
+    expect(unchanged).toEqual(activated);
+
+    const continued = await createConnectionSet(
+      session.sessionId,
+      session.observerCapability,
+      current.clientId ?? undefined,
+      [...recoveryV3BrowserCapabilities],
+    );
+    expect(continued).toMatchObject({
+      recoveryStrategy: "v3",
+      deliveryGeneration: (BigInt(current.deliveryGeneration) + 1n).toString(),
+    });
+    const continuedControl = await upgrade(session.sessionId, "control", continued.controlTicket);
+    const continuedData = await upgrade(session.sessionId, "data", continued.dataTicket);
+    expect(continuedControl.response.status).toBe(101);
+    expect(continuedData.response.status).toBe(101);
+    const attachments = await runInDurableObject(stub, (_instance, state) =>
+      state
+        .getWebSockets(`client:${continued.clientId}`)
+        .map((socket) => socket.deserializeAttachment()),
+    );
+    expect(attachments).toHaveLength(2);
+    expect(attachments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ version: 2, channel: "control", hostFence: "3" }),
+        expect.objectContaining({ version: 2, channel: "data", hostFence: "3" }),
+      ]),
+    );
+    expect(attachments.every((attachment) => !("recoveryStrategy" in attachment))).toBe(true);
+
+    firstHost.control.close(1000, "test complete");
+    firstHost.data.close(1000, "test complete");
+    secondHost.control.close(1000, "test complete");
+    secondHost.data.close(1000, "test complete");
+    thirdHost.control.close(1000, "test complete");
+    thirdHost.data.close(1000, "test complete");
+    control.socket?.close(1000, "test complete");
+    continuedControl.socket?.close(1000, "test complete");
+    continuedData.socket?.close(1000, "test complete");
+  });
+
+  it("rejects an already-issued v3 ticket after the kill switch closes without changing v2 ownership", async () => {
+    const session = await createSession();
+    const stub = env.TERMINAL_SESSIONS.get(
+      env.TERMINAL_SESSIONS.idFromName(`v1:${session.sessionId}`),
+    );
+    await runInDurableObject(stub, (instance) => {
+      expect(Reflect.get(instance, "recoveryV3Enabled")).toBe(true);
+    });
+    const host = await openReadyHost(session);
+    await publishStrategySnapshot(session, "snapshot_runtime_kill_000001");
+
+    const baseline = await createConnectionSet(session.sessionId, session.observerCapability);
+    const baselineControl = await upgrade(session.sessionId, "control", baseline.controlTicket);
+    expect(baselineControl.response.status).toBe(101);
+    const candidate = await createConnectionSet(
+      session.sessionId,
+      session.observerCapability,
+      baseline.clientId ?? undefined,
+      [...recoveryV3BrowserCapabilities],
+    );
+    expect(candidate).toMatchObject({ deliveryGeneration: "2", recoveryStrategy: "v3" });
+
+    await runInDurableObject(stub, (instance) => {
+      Reflect.set(instance, "recoveryV3Enabled", false);
+    });
+    const rejected = await upgrade(session.sessionId, "control", candidate.controlTicket);
+    expect(rejected.response.status).toBe(409);
+    await rejected.response.body?.cancel();
+    const durable = await runInDurableObject(stub, (_instance, state) => ({
+      client: state.storage.sql
+        .exec(
+          `SELECT delivery_generation, recovery_strategy FROM client_delivery
+           WHERE client_id = ?`,
+          baseline.clientId,
+        )
+        .one(),
+      candidateTickets: state.storage.sql
+        .exec<{ value: number }>(
+          "SELECT COUNT(*) AS value FROM connection_ticket WHERE connection_set_id = ?",
+          candidate.connectionSetId,
+        )
+        .one().value,
+    }));
+    expect(durable).toEqual({
+      candidateTickets: 0,
+      client: { delivery_generation: "1", recovery_strategy: "v2" },
+    });
+
+    host.control.close(1000, "test complete");
+    host.data.close(1000, "test complete");
+    baselineControl.socket?.close(1000, "test complete");
+  });
+
+  it("rejects a v3 data ticket when the kill switch closes after control claim", async () => {
+    const session = await createSession();
+    const stub = env.TERMINAL_SESSIONS.get(
+      env.TERMINAL_SESSIONS.idFromName(`v1:${session.sessionId}`),
+    );
+    await runInDurableObject(stub, (instance) => {
+      expect(Reflect.get(instance, "recoveryV3Enabled")).toBe(true);
+    });
+    const host = await openReadyHost(session);
+    await publishStrategySnapshot(session, "snapshot_runtime_data_kill_0001");
+    const candidate = await createConnectionSet(
+      session.sessionId,
+      session.observerCapability,
+      undefined,
+      [...recoveryV3BrowserCapabilities],
+    );
+    expect(candidate).toMatchObject({ deliveryGeneration: "1", recoveryStrategy: "v3" });
+
+    const control = await upgrade(session.sessionId, "control", candidate.controlTicket);
+    expect(control.response.status).toBe(101);
+    await runInDurableObject(stub, (instance) => {
+      Reflect.set(instance, "recoveryV3Enabled", false);
+    });
+    const rejectedData = await upgrade(session.sessionId, "data", candidate.dataTicket);
+    expect(rejectedData.response.status).toBe(409);
+    await rejectedData.response.body?.cancel();
+
+    const durable = await runInDurableObject(stub, (_instance, state) => ({
+      client: state.storage.sql
+        .exec(
+          `SELECT delivery_generation, recovery_strategy FROM client_delivery
+           WHERE client_id = ?`,
+          candidate.clientId,
+        )
+        .one(),
+      remainingTicketChannels: state.storage.sql
+        .exec<{ channel: string }>(
+          "SELECT channel FROM connection_ticket WHERE connection_set_id = ? ORDER BY channel",
+          candidate.connectionSetId,
+        )
+        .toArray()
+        .map(({ channel }) => channel),
+      socketChannels: state
+        .getWebSockets(`client:${candidate.clientId}`)
+        .map((socket) => socket.deserializeAttachment() as { channel: string })
+        .map(({ channel }) => channel),
+    }));
+    expect(durable).toEqual({
+      client: { delivery_generation: "1", recovery_strategy: "v3" },
+      remainingTicketChannels: ["data"],
+      socketChannels: ["control"],
+    });
+
+    host.control.close(1000, "test complete");
+    host.data.close(1000, "test complete");
+    control.socket?.close(1000, "test complete");
+  });
+
   // This is a production-v2 rejection gate, not Recovery v3 runtime coverage.
   it("keeps Recovery v3 control candidates unreachable through production v2 sockets", async () => {
     const session = await createSession();
@@ -345,6 +682,90 @@ describe("cloud relay runtime", () => {
       attemptCount: 0,
       browser: { recovery_strategy: "v2" },
       outboxCount: 0,
+    });
+  });
+
+  it("fails closed before v2 dispatch on a hibernated v3 attachment", async () => {
+    const session = await createSession();
+    const browser = await createConnectionSet(session.sessionId, session.observerCapability);
+    const control = await upgrade(session.sessionId, "control", browser.controlTicket);
+    expect(control.response.status).toBe(101);
+    if (control.socket === undefined) throw new Error("browser control socket missing");
+    const stub = env.TERMINAL_SESSIONS.get(
+      env.TERMINAL_SESSIONS.idFromName(`v1:${session.sessionId}`),
+    );
+    await runInDurableObject(stub, (_instance, state) => {
+      const server = state.getWebSockets(`client:${browser.clientId}`).find((socket) => {
+        return (socket.deserializeAttachment() as { channel?: string }).channel === "control";
+      });
+      if (server === undefined) throw new Error("server control socket missing");
+      const current = server.deserializeAttachment() as {
+        channel: "control";
+        clientId: string;
+        connectionId: string;
+        connectionSetId: string;
+        deliveryGeneration: string;
+        peer: "browser";
+        role: "observer";
+        streamId: number;
+        subject: string;
+      };
+      server.serializeAttachment(
+        SocketAttachmentV3Schema.parse({
+          version: 3,
+          peer: current.peer,
+          channel: current.channel,
+          connectionSetId: current.connectionSetId,
+          connectionId: current.connectionId,
+          subject: current.subject,
+          clientId: current.clientId,
+          role: current.role,
+          streamId: current.streamId,
+          deliveryGeneration: current.deliveryGeneration,
+          hostFence: null,
+          leaseFence: null,
+          relayCapabilities: [...recoveryV3BrowserCapabilities],
+          recoveryStrategy: "v3",
+          recoveryLookupKey: null,
+        }),
+      );
+      state.storage.sql.exec(
+        "UPDATE client_delivery SET recovery_strategy = 'v3' WHERE client_id = ?",
+        browser.clientId,
+      );
+    });
+    await evictDurableObject(stub, { webSockets: "hibernate" });
+
+    const v2Frame = {
+      type: "writer-lease-renew",
+      writerLease: "lease_runtime_hibernated_0001",
+    } as const;
+    expect(ClientControlFrameSchema.safeParse(v2Frame).success).toBe(true);
+    expect(RecoveryV3ClientControlFrameSchema.safeParse(v2Frame).success).toBe(false);
+    const closed = nextClose(control.socket);
+    control.socket.send(JSON.stringify(v2Frame));
+    await expect(closed).resolves.toMatchObject({
+      code: 4400,
+      reason: "recovery v3 runtime unavailable",
+    });
+    const durable = await runInDurableObject(stub, (_instance, state) => ({
+      attempts: state.storage.sql
+        .exec<{ value: number }>("SELECT COUNT(*) AS value FROM recovery_attempt")
+        .one().value,
+      client: state.storage.sql
+        .exec<{ recovery_strategy: string }>(
+          "SELECT recovery_strategy FROM client_delivery WHERE client_id = ?",
+          browser.clientId,
+        )
+        .one(),
+      outbox: state.storage.sql
+        .exec<{ value: number }>("SELECT COUNT(*) AS value FROM recovery_control_outbox")
+        .one().value,
+    }));
+    expect(durable).toEqual({
+      attempts: 0,
+      client: { recovery_strategy: "v3" },
+      outbox: 0,
     });
   });
 
