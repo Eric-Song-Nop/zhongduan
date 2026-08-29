@@ -457,16 +457,47 @@ export class RecoverySourceManager {
     assertOwnerToken(ownerToken);
     const reset = RecoveryV3HostSourceResetSchema.parse(input);
     this.#recordNow();
+    if (this.#disposed || this.#staleOwners.has(ownerToken)) return false;
+
     const source = this.#sourceFor(ownerToken, reset);
-    if (source === null) {
-      const tombstone = this.#tombstonesByStream.get(reset.streamId);
-      return (
-        tombstone !== undefined &&
-        tombstone.ownerToken === ownerToken &&
-        sameRouting(tombstone.identity, reset)
-      );
+    if (source !== null) {
+      this.#retireSource(source);
+      return true;
     }
-    this.#retireSource(source);
+    // An occupied stream with a different routing identity is not an
+    // "unknown" source. Never let a stale or forged reset retire/fence the
+    // current generation implicitly.
+    if (this.#sourcesByStream.has(reset.streamId)) return false;
+
+    const pending = this.#pendingByStream.get(reset.streamId);
+    if (pending !== undefined) {
+      if (pending.ownerToken !== ownerToken || !sameRouting(pending.prepare, reset)) return false;
+      this.#cancelPending(pending, this.#rejected(pending.prepare, "generation-fenced"), true);
+      return true;
+    }
+
+    const tombstone = this.#tombstonesByStream.get(reset.streamId);
+    if (tombstone !== undefined) {
+      if (tombstone.ownerToken !== ownerToken) return false;
+      if (sameRouting(tombstone.identity, reset)) return true;
+      if (BigInt(reset.deliveryGeneration) <= BigInt(tombstone.identity.deliveryGeneration)) {
+        return false;
+      }
+      this.#installTombstone(ownerToken, reset);
+      return true;
+    }
+
+    // Cloud may durably replace an unsent recovery-prepare outbox entry with
+    // recovery-source-reset. The current authenticated pair must accept that
+    // reset even though it has never observed the source. Retaining the exact
+    // generation identity prevents a late prepare from resurrecting it.
+    if (
+      this.#pendingByStream.size + this.#sourcesByStream.size + this.#tombstonesByStream.size >=
+      this.#limits.maxSources
+    ) {
+      return false;
+    }
+    this.#installTombstone(ownerToken, reset);
     return true;
   }
 
