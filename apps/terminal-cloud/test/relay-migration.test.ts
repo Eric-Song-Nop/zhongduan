@@ -163,7 +163,7 @@ describe("relay capability migration", () => {
     expect(migrated).toMatchObject({
       client: { recovery_strategy: "v2" },
       session: { authority_data_version: 2 },
-      version: 6,
+      version: 7,
     });
     expect(migrated.columns.client).toContain("recovery_strategy");
     expect(migrated.columns.session).toContain("authority_data_version");

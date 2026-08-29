@@ -8,6 +8,8 @@ import {
   bucketWithOverrides,
   createSession,
   engineId,
+  forceNextSessionAlarmDue,
+  forceSessionAlarmDue,
   getSnapshot,
   sessionStub,
   uploadSnapshot,
@@ -167,7 +169,7 @@ describe("snapshot retention migration", () => {
       backlog: 1,
       currentUploads: 0,
       snapshots: LEGACY_SNAPSHOT_ROWS,
-      version: 6,
+      version: 7,
     });
     expect(migrated.alarm).not.toBeNull();
     expect(migrated.indexes).toEqual([
@@ -222,6 +224,7 @@ describe("snapshot retention migration", () => {
       migrationPins.clear();
       migrationPins.add(`snapshot_legacy_00000${alarm % 2 === 0 ? "2" : "3"}`);
       touchedKeys.clear();
+      await forceNextSessionAlarmDue(session.sessionId);
       expect(await runDurableObjectAlarm(sessionStub(session.sessionId))).toBe(true);
       const scan = await settleInstanceMaintenance(session.sessionId, (durable) =>
         durable.storage.sql
@@ -251,6 +254,7 @@ describe("snapshot retention migration", () => {
       releaseMaintenance = resolve;
     });
     touchedKeys.clear();
+    await forceNextSessionAlarmDue(session.sessionId);
     const alarmDispatch = runDurableObjectAlarm(sessionStub(session.sessionId));
     await within(maintenanceBlocked, "bounded maintenance batch did not reach R2");
     const blockedDuringAlarm = await Promise.all(
@@ -283,6 +287,7 @@ describe("snapshot retention migration", () => {
         let previousBacklog = 1;
         let previousSnapshotCount = LEGACY_SNAPSHOT_ROWS;
         let state: typeof finalState;
+        await forceSessionAlarmDue(instance);
         for (let alarm = 0; alarm < 100; alarm += 1) {
           touchedKeys.clear();
           await durable.storage.deleteAlarm();
@@ -478,7 +483,7 @@ describe("snapshot retention migration", () => {
 
   it("re-arms cold maintenance after an initial alarm persistence failure", async () => {
     const session = await createSession();
-    await runInDurableObject(sessionStub(session.sessionId), async (_instance, durable) => {
+    await runInDurableObject(sessionStub(session.sessionId), async (instance, durable) => {
       const sql = durable.storage.sql;
       sql.exec(
         `UPDATE session_state
@@ -487,19 +492,17 @@ describe("snapshot retention migration", () => {
       );
       await durable.storage.deleteAlarm();
       const snapshots = new SnapshotStore(durable, sql, new RelayStore(sql), 16);
-      const failingState = {
-        storage: {
-          async getAlarm(): Promise<number | null> {
-            throw new Error("injected cold alarm failure");
-          },
-        },
-        waitUntil(): void {},
-      } as unknown as DurableObjectState;
       const first = new SnapshotUploadCoordinator(
-        failingState,
+        durable,
         env.SNAPSHOTS,
         snapshots,
         () => new Set(),
+        {
+          async clear(): Promise<void> {},
+          async schedule(): Promise<void> {
+            throw new Error("injected cold alarm failure");
+          },
+        },
       );
       await expect(first.initialize()).rejects.toThrow("injected cold alarm failure");
       expect(await durable.storage.getAlarm()).toBeNull();
@@ -509,6 +512,10 @@ describe("snapshot retention migration", () => {
         env.SNAPSHOTS,
         snapshots,
         () => new Set(),
+        Reflect.get(Reflect.get(instance, "snapshotUploads") as object, "alarmScheduler") as {
+          clear(): Promise<void>;
+          schedule(timestamp: number): Promise<void>;
+        },
       );
       await rebuilt.initialize();
       expect(await durable.storage.getAlarm()).not.toBeNull();

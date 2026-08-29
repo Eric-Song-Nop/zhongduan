@@ -13,7 +13,11 @@ import {
 import { env, exports as workerExports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { installMiniflareMultipartEtagShim, storedSnapshotKey } from "./snapshot-test-helpers";
+import {
+  forceSessionAlarmDue,
+  installMiniflareMultipartEtagShim,
+  storedSnapshotKey,
+} from "./snapshot-test-helpers";
 
 interface CreatedSession {
   hostCapability: string;
@@ -1955,6 +1959,7 @@ describe("live Durable Object relay", () => {
       reason: "data-disconnected",
     });
     await runInDurableObject(sessionStub(session.sessionId), async (instance) => {
+      await forceSessionAlarmDue(instance);
       await instance.alarm();
     });
     const released = await runInDurableObject(

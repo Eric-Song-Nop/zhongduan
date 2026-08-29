@@ -1,8 +1,8 @@
 # 高性能远程终端 Snapshot 与 Recovery v3 实施计划
 
-> 状态：Phase 0/1 为 CURRENT stacked candidate；Phase 2 的 wire/capability、pure Browser
-> RecoveryAssembler 与 pure Host PreparedGap/source owner 为 stacked candidate，但生产 Recovery v3 runtime
-> 仍不可达；Phase 3–5 为 TARGET
+> 状态：Phase 0/1 为 CURRENT stacked candidate；Phase 2 的 P2.0–P2.3（wire/capability、pure Browser
+> RecoveryAssembler、pure Host PreparedGap/source owner 与 Cloud durable scalar owner）为 stacked
+> candidates，但生产 Recovery v3 runtime 仍不可达；Phase 3–5 为 TARGET
 >
 > 决策日期：2026-08-28
 >
@@ -268,6 +268,47 @@ P2.2 stacked candidate 只冻结 Host 内尚未接 production relay 的 bounded 
 这些 primitives 未加入当前 Host control union、`HostRelayConnection` 或 delivery scheduler，Cloud 也尚未消费
 start fence，因此 production v3 仍不可达。P2.2 证明的是 cut/order/ownership 边界，不是 transport fairness、
 hibernation、跨进程 closure 或性能。
+
+### Cloud durable scalar owner、hibernation attachment 与 shared alarm
+
+P2.3 stacked candidate 建立 Cloud 侧 hibernation-safe 的 durable scalar truth，但不接通 production v3
+control/data path：
+
+- schema v7 在同一 migration transaction 中新增 STRICT `recovery_attempt`、`recovery_delivery_lane` 与
+  `recovery_control_outbox`。attempt 保存 immutable prepare/start identity、base/committed/live floor、grant、
+  Done、replica-applied、adopted/source-closed、deadline 与 reset state；每个 logical lane 分别保存 sent/received
+  ordinal、cumulative encoded bytes 与对应 authority cursor；bounded outbox 只保存待发 control intent；
+- `RelayRecoveryStore` 是同步、caller-owned transaction participant。prepare-before-outbox、exact start-fence
+  install、lane receipt、apply、adopt、source-closed、completion 与 reset 都先成为 SQL scalar fact；outbox capacity
+  不足时整个 caller transaction fail closed，而不是留下半个 generation transition；
+- V2/V3 hibernation attachment 使用 strict versioned shape。V2 继续完整保存 legacy delivery state，并在内存中
+  normalize 为 `recoveryStrategy=v2`、空 recovery lookup；V3 只保存 connection identity、capability、
+  `recoveryStrategy=v3` 与可选 Browser recovery lookup key，Host lookup 必须为空，legacy delivery fields 不写入
+  V3 attachment；未知 version/field/identity fail closed；
+- Browser generation replacement/activation、Host fence 更新和 inactive client removal 在各自已有的
+  `transactionSync` 内同步 fence 旧 recovery attempt。若 reset outbox 无容量，connection/generation/client
+  mutation 与 recovery fence 一起回滚；事务完成后才请求 recovery alarm 与 snapshot cleanup，不在 SQL
+  transaction 内做 socket、R2 或其他外部 I/O；
+- cold attempt 引用的 snapshot id 与现有 V2 socket pin 做 union，作为 snapshot retention 的 durable pin；
+  reset/complete 后不再把该 attempt 当 active pin。冷启动从 SQL 重建 deadline 与 pin，不依赖内存 attachment
+  delivery state；
+- `DurableAlarmMux` 是 `TerminalSessionDO` 唯一的 platform alarm writer。Snapshot 与 recovery 各自持久化
+  component due fact，mux 总是设置两者最早 deadline；dispatch 前把 due 变成 durable active fact，handler 在
+  transaction 外执行，成功后重算。stale early delivery 不执行 future handler；首次 initialize 用持久化
+  `initialized` marker 一次性接管 pre-mux snapshot alarm，之后 empty state 的残留 alarm 不会再次被接管；
+- handler failure 从 handler **完成时钟** 后安排 bounded retry，不从已过期 claim time 重排；recovery
+  maintenance 若处理后仍只剩 past deadline，也安排短的 future retry，避免成功但无进展时 hot-loop。alarm
+  at-least-once retry、eviction 后 active fact 重建以及 snapshot/recovery deadline 不互相覆盖均由同一 owner
+  收口。
+
+Cloud 刻意不持久化 delivery mutation envelope payload，也不持久化其 hash；SQL/outbox 中的 JSON 是 bounded
+control identity/intent，不是 mutation holdback。因而 Cloud 看到已记录 ordinal 的 envelope retry 时，无法仅凭
+scalar cursor 证明它与先前 bytes 完全一致，必须 fail closed 并由后续 runtime owner reset/replan，不能把“相同
+ordinal”当幂等。逐字节 retry 证明仍由持有 exact copy/hash 的 Host source 与 Browser assembler 完成。
+
+P2.3 仍不 drain `recovery_control_outbox`，也没有把 prepare/start/envelope/receipt/apply/adopt/source-closed
+绑定到当前 socket identity；生产 socket 仍只写 V2 attachment，endpoint 也不 advertise v3。因此这些 Cloud
+facts 目前只能由 direct owner tests 构造，production Recovery v3 仍不可达。
 
 ### Holdback 放在 Browser，而不是 Cloud durable payload
 
@@ -602,6 +643,13 @@ Phase 1 stacked candidate 的最终行为是：
   `H / fence(H) / H+1` 顺序、R=H 的 Done-only envelope、per-source/session cap、grant/send retry、actual Done
   receipt closure、generation tombstone、16-source aggregate bound、deadline/reset/dispose；既有 v2 scheduler
   regression 继续独立证明 pause/barrier/pin fallback 未改变。
+- P2.3 Cloud owner tests 保留 `relay-recovery-store.test.ts`、`relay-connection-recovery.test.ts`、
+  `relay-socket.test.ts`、`relay-recovery-maintenance.test.ts` 与 `durable-alarm-mux.test.ts`：它们检查 v6→v7
+  strict migration 与 V2 default、prepare/install/outbox 原子性、独立 lane sent/received、receipt/apply/adopt/
+  source-closed/completion scalar、deadline/pin/fence、outbox capacity rollback、V2/V3 attachment strict roundtrip、
+  eviction 后 deadline 重建，以及 shared earliest alarm、one-time initialized marker、stale early delivery、
+  active fact 与 completion-clock bounded retry。既有 snapshot tests 继续检查 snapshot alarm 语义与 recovery
+  component 不互相覆盖。
 
 这些测试的证据来自明确状态、identity、frame ordering、资源 owner 和本地 Worker storage/R2 oracle。测试总数、
 绿色 CI、timeout 数值或 clean build 本身不证明这些状态。
@@ -616,24 +664,27 @@ Phase 1 stacked candidate 的最终行为是：
 - 本地 cleanup slot 只约束运行中的 Host；进程崩溃后 generic `uncertain` upload 的 durable reconciliation 仍未
   完成；
 - P2.1 assembler 没有接入 Browser `TerminalSession`/v2 `SessionCoordinator`；P2.2 Host primitives 没有接入
-  relay connection/control union/scheduler；当前仍没有 HTTP snapshot、WTerm restore/adopt、WebSocket control、
-  长期 live owner或 Cloud generation/credit/closure wiring；
-  production capability 不 advertise v3 token，所以该路径当前不可达；
+  relay connection/control union/scheduler；P2.3 只有 Cloud SQL scalar、versioned attachment shape、fence hook、
+  cold pin 与 alarm maintenance，没有 production prepare/start/envelope/progress handler，也不 drain/bind control
+  outbox。当前仍没有 HTTP snapshot、WTerm restore/adopt、长期 live owner；production attachment 仍为 V2，
+  capability 不 advertise v3 token，所以该路径当前不可达；
+- Cloud scalar store 不保存 mutation payload/hash，因此不能证明同 ordinal replay byte-identical；当前正确行为是
+  fail closed，尚未验证 P2.4 runtime reset/replan 的跨 owner 收敛；
 - pure target tests 不证明真实 WTerm/Ghostty 的 parser continuation、atomic adopt 或 terminal state
   equivalence，也不证明跨进程 ownership、multi-client fairness、load/soak、性能/SLO、production dashboard
   或真实滚动发布。
 
 ### 后续需要的测试
 
-- Cloud-first rolling/rollback 的 production-like staging 验证；v5→v6 authority-version/strategy direct
-  migration fixture 已由 P2.0 保留；
-- DO hibernation、R2 HEAD/PUT/delete、response loss、Host crash/restart 和 generic uncertain reconciliation 的
-  fault injection；
+- Cloud-first rolling/rollback 的 production-like staging 验证；v5→v6 authority-version/strategy 与 v6→v7
+  recovery scalar direct migration fixtures 已保留；
+- 真实 Cloudflare alarm retry/eviction、DO hibernation、R2 HEAD/PUT/delete、response loss、Host crash/restart 和
+  generic uncertain reconciliation 的 fault injection；
 - Browser wiring owner 接入 HTTP snapshot、真实 WTerm restore/adopt 与长期 live handoff，并用 parser
   continuation 和 exact tail-continuity oracle 验证 pure target seam；
-- Cloud owner 建立 start-fence durable install、lane cursor/credit、apply/closure 与 generation cleanup；随后把
-  Host primitives 接入 relay socket，并做跨 owner duplicate/gap/reset/adopt/closure fault integration 和
-  multi-client aggregate/fair scheduling；
+- P2.4 把已有 Cloud scalar owner/outbox 接入 current socket identity、Host source 与 Browser assembler，实际
+  drain/ACK control outbox，并做 duplicate/gap/same-ordinal-reset/adopt/closure/crash fault integration；
+- P2.5 建立 bounded lane credit、multi-client aggregate、writer/live reservation 与公平 scheduling；
 - 在完整三方 wiring 上扩展独立 reference model/property/fuzz，并验证 rolling capability downgrade/rollback；
 - 性能验证只在 workload、link profile、环境隔离、warm-up、样本量和统计方法另行批准后实施。
 
@@ -642,11 +693,14 @@ Phase 1 stacked candidate 的最终行为是：
 - P2.0 已冻结 protocol capability negotiation、v2 authority identity、v3 delivery envelope 与 generation
   strategy 的 v2 default；P2.1 已冻结不可达的 pure Browser bounded assembler、同 lane exact retry、跨 lane
   conflict、gap/deadline/reset 与 receipt/apply/adopt progress；P2.2 已冻结不可达的 Host committed-through-H
-  actor cut、ordered start fence、PreparedGap envelope source 与 release-once closure；
-- 后续 Cloud owner 实现 durable assembling state、live/recovery lane cursor、receipt credit、apply/closure 与
-  hibernation-safe cleanup；再把三方 runtime 接通并实现有界公平调度；
-- 后续 Browser wiring owner 才把 pure assembler 接入 `TerminalSession`、HTTP snapshot、WTerm
-  restore/adopt、socket progress/retry 和 completion 后的长期 live；
+  actor cut、ordered start fence、PreparedGap envelope source 与 release-once closure；P2.3 已冻结不可达的 Cloud
+  v7 SQL scalar truth、V2/V3 attachment、same-transaction fence、cold pin union、bounded control outbox 与 shared
+  earliest alarm owner；
+- P2.4 才把 Cloud outbox、Host source、Browser assembler、`TerminalSession`、HTTP snapshot、WTerm
+  restore/adopt、socket progress/retry 和 completion 后长期 live 接通；Cloud 不保存 mutation payload/hash，无法
+  证明的 same-ordinal retry 必须 reset/replan；
+- P2.5 才实现 per-lane credit、session aggregate、writer/live reservation 与多 client 有界公平调度；性能、
+  load/soak、dashboard 与 SLO 继续后置，不作为 P2.3–P2.5 correctness 的替代证据；
 - 完整 negotiated state-machine gate 通过后，一次性删除 v3 路径的 global pause、fixed-commit barrier 和
   pin；保留有序
   `RecoveryStartFence`，v2 fallback 不变。
