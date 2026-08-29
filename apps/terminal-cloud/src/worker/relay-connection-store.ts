@@ -24,6 +24,7 @@ export interface BrowserDeliveryReplacement {
   currentGeneration: string;
   expiresAt: number;
   nextGeneration: string;
+  relayCapabilitiesJson: string;
   role: CapabilityRole;
   streamId: number;
   subject: string;
@@ -295,8 +296,9 @@ export class RelayConnectionStore {
       this.sql.exec(
         `INSERT INTO connection_ticket
           (ticket_digest, connection_set_id, connection_id, peer, channel,
-           client_id, subject, role, stream_id, delivery_generation, expires_at)
-         VALUES (?, ?, ?, 'browser', 'data', ?, ?, ?, ?, ?, ?)`,
+           client_id, subject, role, stream_id, delivery_generation, expires_at,
+           relay_capabilities_json)
+         VALUES (?, ?, ?, 'browser', 'data', ?, ?, ?, ?, ?, ?, ?)`,
         input.ticketDigest,
         input.connectionSetId,
         input.connectionId,
@@ -306,6 +308,7 @@ export class RelayConnectionStore {
         input.streamId,
         input.nextGeneration,
         input.expiresAt,
+        input.relayCapabilitiesJson,
       );
       replaced = true;
     });

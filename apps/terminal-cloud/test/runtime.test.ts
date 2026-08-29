@@ -1,3 +1,4 @@
+import { RELAY_CAPABILITIES_HEADER, RelayCapability } from "@zhongduan/protocol";
 import { env, exports as workerExports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +16,7 @@ interface ConnectionSet {
   controlTicket: string;
   dataTicket: string;
   deliveryGeneration: string;
+  negotiatedCapabilities?: string[];
   streamId: number;
 }
 
@@ -52,8 +54,9 @@ async function createConnectionSet(
   sessionId: string,
   capability: string,
   clientId?: string,
+  relayCapabilities: string[] = [],
 ): Promise<ConnectionSet> {
-  const response = await requestConnectionSet(sessionId, capability, clientId);
+  const response = await requestConnectionSet(sessionId, capability, clientId, relayCapabilities);
   expect(response.status).toBe(200);
   return response.json<ConnectionSet>();
 }
@@ -62,6 +65,7 @@ async function requestConnectionSet(
   sessionId: string,
   capability: string,
   clientId?: string,
+  relayCapabilities: string[] = [],
 ): Promise<Response> {
   return workerExports.default.fetch(
     new Request(`${origin}/api/v1/sessions/${sessionId}/connection-sets`, {
@@ -69,6 +73,9 @@ async function requestConnectionSet(
       headers: {
         authorization: `Bearer ${capability}`,
         "content-type": "application/json",
+        ...(relayCapabilities.length === 0
+          ? {}
+          : { [RELAY_CAPABILITIES_HEADER]: relayCapabilities.join(",") }),
       },
       body: JSON.stringify(clientId === undefined ? {} : { clientId }),
     }),
@@ -176,6 +183,104 @@ describe("cloud relay runtime", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.not.toHaveProperty("selectedCapabilities");
+  });
+
+  it("confirms and persists only the supported Browser negotiation without enabling v3", async () => {
+    const session = await createSession();
+    const connection = await createConnectionSet(
+      session.sessionId,
+      session.writerCapability,
+      undefined,
+      [
+        RelayCapability.capabilityNegotiationV1,
+        RelayCapability.authorityDataV2,
+        RelayCapability.deliveryBarrierOutcomeV1,
+        RelayCapability.recoveryV3GapFillV1,
+      ],
+    );
+    expect(connection.negotiatedCapabilities).toEqual([
+      RelayCapability.capabilityNegotiationV1,
+      RelayCapability.authorityDataV2,
+    ]);
+
+    const stub = env.TERMINAL_SESSIONS.get(
+      env.TERMINAL_SESSIONS.idFromName(`v1:${session.sessionId}`),
+    );
+    const durable = await runInDurableObject(stub, (_instance, state) => ({
+      client: state.storage.sql
+        .exec(
+          `SELECT recovery_strategy FROM client_delivery
+           WHERE client_id = ?`,
+          connection.clientId,
+        )
+        .one(),
+      session: state.storage.sql
+        .exec("SELECT authority_data_version FROM session_state WHERE singleton = 1")
+        .one(),
+      tickets: state.storage.sql
+        .exec(
+          `SELECT channel, relay_capabilities_json FROM connection_ticket
+           WHERE connection_set_id = ? ORDER BY channel`,
+          connection.connectionSetId,
+        )
+        .toArray(),
+    }));
+    expect(durable).toEqual({
+      client: { recovery_strategy: "v2" },
+      session: { authority_data_version: 2 },
+      tickets: [
+        {
+          channel: "control",
+          relay_capabilities_json: JSON.stringify(connection.negotiatedCapabilities),
+        },
+        {
+          channel: "data",
+          relay_capabilities_json: JSON.stringify(connection.negotiatedCapabilities),
+        },
+      ],
+    });
+
+    const control = await upgrade(session.sessionId, "control", connection.controlTicket);
+    const data = await upgrade(session.sessionId, "data", connection.dataTicket);
+    expect(control.response.status).toBe(101);
+    expect(data.response.status).toBe(101);
+    await evictDurableObject(stub, { webSockets: "hibernate" });
+    const attachments = await runInDurableObject(stub, (_instance, state) =>
+      state
+        .getWebSockets(`client:${connection.clientId}`)
+        .map((socket) => socket.deserializeAttachment() as { relayCapabilities?: string[] }),
+    );
+    expect(attachments).toHaveLength(2);
+    expect(
+      attachments.every(
+        ({ relayCapabilities }) =>
+          JSON.stringify(relayCapabilities) === JSON.stringify(connection.negotiatedCapabilities),
+      ),
+    ).toBe(true);
+    control.socket?.close(1000, "test complete");
+    data.socket?.close(1000, "test complete");
+  });
+
+  it("keeps the exact legacy response keys when the negotiation bootstrap is absent", async () => {
+    const session = await createSession();
+    const response = await requestConnectionSet(
+      session.sessionId,
+      session.observerCapability,
+      undefined,
+      [RelayCapability.authorityDataV2],
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json<Record<string, unknown>>();
+    expect(Object.keys(body).sort()).toEqual([
+      "clientId",
+      "connectionId",
+      "connectionSetId",
+      "controlTicket",
+      "dataTicket",
+      "deliveryGeneration",
+      "expiresAt",
+      "streamId",
+    ]);
   });
 
   it("authenticates session and connection-set creation", async () => {

@@ -3,6 +3,8 @@ import {
   CloudResourceIdSchema,
   ConnectionSetRequestSchema,
   ConnectionSetResponseSchema,
+  RELAY_CAPABILITIES_HEADER,
+  RelayCapability,
   ServerControlFrameSchema,
   decodeDataFrame,
   type BrowserCapabilityRole,
@@ -39,6 +41,10 @@ const SNAPSHOT_RETRY_MAX_MS = 30_000;
 // A legal 1 MiB input can expand to six bytes per byte when JSON escapes control characters.
 const MAX_CONTROL_FRAME_BYTES = 6 * 1024 * 1024 + 4_096;
 const MAX_CONTROL_QUEUE_BYTES = MAX_CONTROL_FRAME_BYTES;
+const BROWSER_RELAY_CAPABILITIES = [
+  RelayCapability.capabilityNegotiationV1,
+  RelayCapability.authorityDataV2,
+] as const;
 const textEncoder = new TextEncoder();
 
 type SessionPhase =
@@ -342,6 +348,7 @@ export class TerminalSession {
           headers: {
             ...this.#capabilities.authorizationHeaders(),
             "Content-Type": "application/json",
+            [RELAY_CAPABILITIES_HEADER]: BROWSER_RELAY_CAPABILITIES.join(","),
           },
           body: JSON.stringify(request),
           signal: requestSignal,

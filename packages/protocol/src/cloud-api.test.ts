@@ -9,6 +9,7 @@ import {
   HostCapabilityReclaimRequestSchema,
   CreateSessionRequestSchema,
   RelayCapability,
+  confirmedRelayCapabilities,
   selectRelayCapabilities,
 } from "./cloud-api";
 
@@ -34,22 +35,27 @@ describe("Cloud HTTP contracts", () => {
     expect(() =>
       ConnectionSetRequestSchema.parse({ clientId: "client_id_AAAAAAAAAAA", role: "host" }),
     ).toThrow();
-    expect(
-      ConnectionSetResponseSchema.parse({
-        connectionSetId: "connection_set_AAAAA",
-        connectionId: "connection_id_AAAAAA",
-        clientId: "client_id_AAAAAAAAAAA",
-        streamId: 3,
-        deliveryGeneration: "2",
-        expiresAt: 1_800_000_000_000,
-        controlTicket: "control_ticket_AAAAAA",
-        dataTicket: "data_ticket_AAAAAAAAA",
-        selectedCapabilities: [RelayCapability.deliveryBarrierOutcomeV1],
-      }),
-    ).toMatchObject({
+    const selectedOnly = ConnectionSetResponseSchema.parse({
+      connectionSetId: "connection_set_AAAAA",
+      connectionId: "connection_id_AAAAAA",
+      clientId: "client_id_AAAAAAAAAAA",
+      streamId: 3,
+      deliveryGeneration: "2",
+      expiresAt: 1_800_000_000_000,
+      controlTicket: "control_ticket_AAAAAA",
+      dataTicket: "data_ticket_AAAAAAAAA",
+      selectedCapabilities: [RelayCapability.deliveryBarrierOutcomeV1],
+    });
+    expect(selectedOnly).toMatchObject({
       deliveryGeneration: "2",
       selectedCapabilities: [RelayCapability.deliveryBarrierOutcomeV1],
     });
+    expect(
+      confirmedRelayCapabilities(selectedOnly, [
+        RelayCapability.capabilityNegotiationV1,
+        RelayCapability.deliveryBarrierOutcomeV1,
+      ]),
+    ).toEqual([]);
     expect(
       ConnectionSetResponseSchema.parse({
         connectionSetId: "connection_set_AAAAA",
@@ -62,6 +68,49 @@ describe("Cloud HTTP contracts", () => {
         dataTicket: "data_ticket_AAAAAAAAA",
       }),
     ).not.toHaveProperty("selectedCapabilities");
+  });
+
+  it("decodes raw negotiated lists but confirms only an offered bootstrap handshake", () => {
+    const common = {
+      connectionSetId: "connection_set_AAAAA",
+      connectionId: "connection_id_AAAAAA",
+      clientId: null,
+      streamId: 0,
+      deliveryGeneration: "0",
+      expiresAt: 1_800_000_000_000,
+      controlTicket: "control_ticket_AAAAAA",
+      dataTicket: "data_ticket_AAAAAAAAA",
+    };
+    const confirmed = ConnectionSetResponseSchema.parse({
+      ...common,
+      negotiatedCapabilities: [
+        RelayCapability.capabilityNegotiationV1,
+        RelayCapability.authorityDataV2,
+      ],
+    });
+    expect(confirmed).toMatchObject({
+      negotiatedCapabilities: [
+        RelayCapability.capabilityNegotiationV1,
+        RelayCapability.authorityDataV2,
+      ],
+    });
+    expect(
+      confirmedRelayCapabilities(confirmed, [
+        RelayCapability.capabilityNegotiationV1,
+        RelayCapability.authorityDataV2,
+      ]),
+    ).toEqual(confirmed.negotiatedCapabilities);
+
+    const missingBootstrap = ConnectionSetResponseSchema.parse({
+      ...common,
+      negotiatedCapabilities: [RelayCapability.authorityDataV2],
+    });
+    expect(
+      confirmedRelayCapabilities(missingBootstrap, [
+        RelayCapability.capabilityNegotiationV1,
+        RelayCapability.authorityDataV2,
+      ]),
+    ).toEqual([]);
   });
 
   it("keeps capability roles and reclaim identity strict", () => {

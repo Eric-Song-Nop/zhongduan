@@ -2,37 +2,29 @@ import { z } from "zod";
 
 import { DecimalU64Schema, PositiveDecimalU64Schema } from "./scalars";
 import { SnapshotMetadataSchema } from "./snapshot";
+import { RelayCapabilitySchema } from "./wire-capabilities";
+
+export {
+  RELAY_CAPABILITIES_HEADER,
+  RelayCapability,
+  RelayCapabilitySchema,
+  confirmedRelayCapabilities,
+  selectRecoveryStrategy,
+  selectRelayCapabilities,
+  type RecoveryStrategy,
+} from "./wire-capabilities";
 
 export const CloudResourceIdSchema = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/);
 export const CapabilityRoleSchema = z.enum(["host", "writer", "observer"]);
 export const BrowserCapabilityRoleSchema = z.enum(["writer", "observer"]);
 const engineId = z.string().min(1).max(512);
 const capability = z.string().min(1).max(4_096);
-
-export const RELAY_CAPABILITIES_HEADER = "x-zhongduan-relay-capabilities";
-export const RelayCapability = {
-  deliveryBarrierOutcomeV1: "delivery-barrier-outcome-v1",
-} as const;
-export const RelayCapabilitySchema = z.enum([RelayCapability.deliveryBarrierOutcomeV1]);
-export type RelayCapability = z.infer<typeof RelayCapabilitySchema>;
-
-const MAX_RELAY_CAPABILITIES_HEADER_CHARS = 1_024;
-const MAX_RELAY_CAPABILITIES = 16;
-const relayCapabilityToken = /^[a-z0-9][a-z0-9-]{0,63}$/u;
-
-export function selectRelayCapabilities(header: string | null): RelayCapability[] | undefined {
-  if (header === null || header === "") return [];
-  if (header.length > MAX_RELAY_CAPABILITIES_HEADER_CHARS) return undefined;
-  const requested = header.split(",").map((entry) => entry.trim());
-  if (
-    requested.length > MAX_RELAY_CAPABILITIES ||
-    requested.some((entry) => !relayCapabilityToken.test(entry))
-  ) {
-    return undefined;
-  }
-  const requestedSet = new Set(requested);
-  return Object.values(RelayCapability).filter((capability) => requestedSet.has(capability));
-}
+const relayCapabilities = z
+  .array(RelayCapabilitySchema)
+  .max(16)
+  .refine((capabilities) => new Set(capabilities).size === capabilities.length, {
+    message: "relay capabilities must be unique",
+  });
 
 export const CreateSessionRequestSchema = z.strictObject({
   sessionId: CloudResourceIdSchema,
@@ -66,7 +58,9 @@ export const ConnectionSetResponseSchema = z.strictObject({
   controlTicket: CloudResourceIdSchema,
   dataTicket: CloudResourceIdSchema,
   // Decode-only rolling shim for Durable Objects that still echo the selected intersection.
-  selectedCapabilities: z.array(RelayCapabilitySchema).max(16).optional(),
+  selectedCapabilities: relayCapabilities.optional(),
+  // Emitted only after the caller offers capability-negotiation-v1.
+  negotiatedCapabilities: relayCapabilities.optional(),
 });
 
 export const CapabilityMintRequestSchema = z.strictObject({

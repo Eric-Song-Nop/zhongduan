@@ -135,7 +135,7 @@ DeliveryCursor {
   deliveryGeneration,
   lane,
   deliveryOrdinal,
-  receivedBytes   // 该 lane 已安全进入 Browser 有界 buffer 的累计 transport bytes
+  cumulativeEncodedBytes // 该 lane 已安全进入 Browser 有界 buffer 的累计 encoded bytes
 }
 ```
 
@@ -255,9 +255,13 @@ RecoveryStart {
   deliveryGeneration,
   engineId,
   base: AuthorityCursor R,
-  snapshotId?,
+  source: { kind: warm } | { kind: snapshot, complete immutable manifest },
   committedThrough: AuthorityCursor H,
-  liveFloor: successor(H)
+  liveFloor: MutationBoundary {
+    sessionEpoch: H.sessionEpoch,
+    nextEventSeq: H.eventSeq + 1,
+    nextPtyOffset: H.nextPtyOffset
+  }
 }
 ```
 
@@ -272,13 +276,15 @@ Host data message 并向 Browser 发送 `RecoveryStart`。若未来把 live/reco
 开始的 live lane，不存在无人负责的窗口。准备失败、Cloud head 不等于 H、generation 已失效或 source 无法
 保留到发送完成，都只能 reset/replan，不能发送截断 gap-fill。
 
-`liveFloor` 是该 generation 中 live lane 必须开始覆盖的第一条 mutation，通常是 `H+1`。它不是固定全局
-head；authority 可以立即继续提交 `H+1,H+2,...`。Cloud 不必长期保存第二份 per-client payload holdback，
+`liveFloor` 是该 generation 中 live lane 必须开始覆盖的第一条 mutation boundary，通常是 `H+1`。它不是
+一个尚未存在的 authority cursor，也不是固定全局 head；authority 可以立即继续提交
+`H+1,H+2,...`。Cloud 不必长期保存第二份 per-client payload holdback，
 但必须保证这些 mutation 经有界 delivery lane 到达 Browser assembler；承诺无法履行时只能 reset generation。
 
-`{deliveryGeneration, base R, snapshotId, committedThrough H, liveFloor}` 一旦对 Browser 可见就不可原地
-更换。需要新 snapshot 或更近 base 时增加 generation，丢弃旧 candidate。两个 lane 因 retry 产生相同
-mutation 时允许一致 duplicate；任何 divergent duplicate 都 fail closed。
+`{deliveryGeneration, base R, source, committedThrough H, liveFloor}` 一旦对 Browser 可见就不可原地
+更换。需要新 snapshot 或更近 base 时增加 generation，丢弃旧 candidate。Recovery lane 只覆盖 `(R,H]`，
+live lane 只覆盖 `[H+1,...)`；同一 canonical eventSeq 出现在两个 lane 表示错误 floor，必须 fail closed。
+同 lane、同 delivery ordinal 的 retry 只有 envelope 与 canonical mutation 逐字节一致时才是幂等 duplicate。
 
 ### 并发 gap-fill
 
@@ -289,8 +295,9 @@ live lane:      H+1, H+2, H+3, ...
 Browser bounded RecoveryAssembler -----+--> continuous apply
 ```
 
-Browser 可以并行下载/restore snapshot、接收 gap-fill 和接收 live mutation。Assembler 按 `eventSeq` 去重、
-检查 `ptyOffset`，只把从 `nextExpected` 开始的连续 mutation apply 到 recovery target：warm 使用已存在且
+Browser 可以并行下载/restore snapshot、接收 gap-fill 和接收 live mutation。Assembler 按 `eventSeq`
+组装连续前缀，仅对同 lane、同 ordinal 的逐字节一致 retry 幂等；跨 lane 同 eventSeq 立即 fail closed。它检查
+`ptyOffset`，只把从 `nextExpected` 开始的连续 mutation apply 到 recovery target：warm 使用已存在且
 cursor 精确等于 R 的 active replica，cold 使用从 snapshot@R 创建的 detached candidate。它必须同时限制：
 
 - 每客户端和每 generation 的 bytes、frames 与最大 age；
@@ -298,12 +305,12 @@ cursor 精确等于 R 的 active replica，cold 使用从 snapshot@R 创建的 d
 - 单 frame/payload 上限、gap 数量、duplicate 检查成本和 apply work slice；
 - snapshot download、restore、recovery lane 和 live lane 的 deadline。
 
-Frame 从 reorder map 被 apply 后，assembler 仍须在可能产生 overlap/late retry 的窗口内保留有界的完整
-canonical identity。Browser 发送 receipt 不证明 source 已收到；只有它收到匹配的
-`RecoverySourceClosed`，且本地 contiguous delivery ordinal 已达到 certificate 声明的位置，才能释放该
-overlap cache。Late duplicate 也必须逐字段/逐 payload 比较；divergent duplicate 会 taint target。Cold 直接
-discard candidate；warm active core 必须标记 non-current/tainted，并从新 generation 的 cold base 恢复，
-绝不能把已污染 cursor 当作 warm base。
+Frame 从 reorder map 被 apply 后，assembler 仍须在可能产生同 lane late retry 的窗口内保留有界的完整
+canonical identity；跨 lane 同 eventSeq 直接 fail closed，不进入 duplicate 比较。Browser 发送 receipt 不证明 source 已收到；只有它收到匹配的
+`RecoverySourceClosed`，且本地 recovery lane cursor 的 contiguous delivery ordinal 与 cumulative encoded
+bytes 同时覆盖 certificate 声明的位置，才能释放该 late-retry cache。同 lane late duplicate 必须逐字段/逐
+payload 比较；divergent duplicate 会 taint target。Cold 直接 discard candidate；warm active core 必须标记
+non-current/tainted，并从新 generation 的 cold base 恢复，绝不能把已污染 cursor 当作 warm base。
 
 超过任一上限、source 无法履行 `(R,H]`、live lane 从 floor 出现不可修复 gap，或 duplicate 不一致时，
 在上述 taint 规则下 reset 该客户端并提升 generation。不能无限扩大 reorder/identity map，也不能让慢
@@ -338,15 +345,17 @@ RecoveryAdopted {
 RecoverySourceClosed {
   recoveryId,
   deliveryGeneration,
-  throughRecoveryOrdinal
+  throughRecoveryOrdinal,
+  throughRecoveryCumulativeEncodedBytes
 }
 ```
 
 资源按 ownership 分层释放：Host/source 只有实际收到覆盖 recovery lane `RecoveryDone` 的
 `DeliveryReceived` 后，才能原子记录 source closed、release-once `PreparedGap` payload/lease，并通过 Cloud
-幂等发送 `RecoverySourceClosed`。Browser 收到 closure 且本地 ordinal 达标后才释放 applied identity cache。
-Cloud 的 generation/start bookkeeping 保留到 matching closure 与 `RecoveryAdopted` 都成立，之后才把客户端
-视为 synced。任一 ACK/closure 丢失只会延长有界 retention 或触发 deadline/reset，不能提前释放比较证据。
+幂等发送 `RecoverySourceClosed`。Browser 收到 closure，且本地 recovery lane cursor 同时覆盖 certificate
+声明的 ordinal 与 cumulative encoded bytes 后，才释放 applied identity cache。Cloud 的 generation/start
+bookkeeping 保留到 matching closure 与 `RecoveryAdopted` 都成立，之后才把客户端视为 synced。任一
+ACK/closure 丢失只会延长有界 retention 或触发 deadline/reset，不能提前释放比较证据。
 提前到达的 `H+1...` 可以已在 recovery target 上连续 apply，或仍留在有界 assembler 中继续 apply；两种情况
 都不能丢失或重复执行 effect。
 
@@ -366,6 +375,12 @@ Browser 只有成功保留 frame 所需内存后才发送 `DeliveryReceived`；�
 或 reset。Cloud 不能用 `DeliveryReceived` 推断 terminal cursor，Host 也不能用 `ReplicaApplied` 代替
 per-lane transport credit。这种分离允许 gap-fill 与 live lane 乱序到达，又不让一个旧 gap 永久锁死
 network window。
+
+Cloud 到 Browser 的每条 v3 delivery 使用 generation-scoped envelope，显式携带 logical lane、从 1 开始的
+delivery ordinal，以及该 lane 的 cumulative encoded bytes。Envelope payload 是完整、未改写的 canonical
+data-v2 frame；delivery metadata 不进入 authority log。`RecoveryDone` 是 recovery lane 的最后一个 record，
+占用稳定 ordinal，因此 Host source 的 release certificate 可以由 receipt 精确覆盖，而不是根据 authority
+cursor 猜测 transport ownership。
 
 ### CURRENT pause 的移除条件
 
@@ -403,6 +418,11 @@ observer 或整个 session 强绑到同一升级节奏：
   protocol；同一 generation 内不可热切换；
 - writer sideband 在新的 writer control connection 上协商，只发给当前 writer；observer 无需支持；
 - context/input-region capability 还必须由具体 application integration 显式 opt in。
+
+Recovery v3 另外要求显式 negotiation confirmation。Client 在 bounded capability header 中包含
+`capability-negotiation-v1`；只有 Cloud 返回同 token 的 `negotiatedCapabilities` 才算确认。缺字段、缺 bootstrap
+token、未知旧 Cloud，或仅看到历史 `selectedCapabilities`，都必须完整回退 v2。Production endpoint 只能
+advertise 已实现的 owner capability；schema 先行不等于 runtime 可用。
 
 Capability family 至少需要覆盖以下依赖关系（最终 wire 名称可在实现时版本化）：
 

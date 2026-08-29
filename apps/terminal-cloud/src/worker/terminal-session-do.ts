@@ -76,6 +76,14 @@ const CreateConnectionSetSchema = z.strictObject({
   clientId: identifier.optional(),
 });
 const RelayCapabilitiesSchema = z.array(RelayCapabilitySchema).max(16);
+const BROWSER_RELAY_CAPABILITIES = [
+  RelayCapability.capabilityNegotiationV1,
+  RelayCapability.authorityDataV2,
+] as const;
+const HOST_RELAY_CAPABILITIES = [
+  ...BROWSER_RELAY_CAPABILITIES,
+  RelayCapability.deliveryBarrierOutcomeV1,
+] as const;
 
 interface AcquiredLease {
   fence: string;
@@ -168,6 +176,17 @@ function hasUnadvancedDeliveryCursor(attachment: SocketAttachment): boolean {
       attachment.firstPtyOffset === attachment.ackedPtyOffset &&
       attachment.firstPtyOffset === attachment.sentPtyOffset);
   return eventCursorUnchanged && ptyCursorUnchanged;
+}
+
+function selectEnabledRelayCapabilities(
+  header: string | null,
+  peer: "browser" | "host",
+): RelayCapability[] | undefined {
+  const selected = selectRelayCapabilities(header);
+  if (selected === undefined) return undefined;
+  const requested = new Set(selected);
+  const enabled = peer === "host" ? HOST_RELAY_CAPABILITIES : BROWSER_RELAY_CAPABILITIES;
+  return enabled.filter((capability) => requested.has(capability));
 }
 
 export class TerminalSessionDO extends DurableObject<CloudEnv> {
@@ -525,11 +544,14 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const dataTicket = randomId(32);
     const requestedClientId = peer === "browser" ? (parsed.data.clientId ?? randomId()) : null;
     const selectedCapabilitiesHeader = request.headers.get(RELAY_CAPABILITIES_HEADER);
-    const selectedCapabilitiesResult = selectRelayCapabilities(selectedCapabilitiesHeader);
+    const selectedCapabilitiesResult = selectEnabledRelayCapabilities(
+      selectedCapabilitiesHeader,
+      peer,
+    );
     if (selectedCapabilitiesResult === undefined) {
       return json({ error: "invalid-connection-set" }, 400);
     }
-    const selectedCapabilities = parsed.data.role === "host" ? selectedCapabilitiesResult : [];
+    const selectedCapabilities = selectedCapabilitiesResult;
     const [controlDigest, dataDigest, principalIdHash] = await Promise.all([
       sha256Hex(controlTicket),
       sha256Hex(dataTicket),
@@ -569,6 +591,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         expiresAt,
         controlTicket,
         dataTicket,
+        ...(selectedCapabilities.includes(RelayCapability.capabilityNegotiationV1)
+          ? { negotiatedCapabilities: selectedCapabilities }
+          : {}),
       }),
     );
   }
@@ -1706,6 +1731,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         currentGeneration: client.delivery_generation,
         expiresAt,
         nextGeneration,
+        relayCapabilitiesJson: JSON.stringify(currentControlAttachment.relayCapabilities),
         role: currentControlAttachment.role,
         streamId: currentClient.stream_id,
         subject: currentControlAttachment.subject,

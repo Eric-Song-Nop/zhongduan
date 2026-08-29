@@ -8,6 +8,7 @@ import {
   SnapshotHeader,
   SnapshotMetadataSchema,
   SnapshotUploadResponseSchema,
+  confirmedRelayCapabilities,
   type CapabilityResponse,
   type ConnectionSetRequest,
   type ConnectionSetResponse,
@@ -19,6 +20,12 @@ import {
 interface Schema<T> {
   parse(input: unknown): T;
 }
+
+const HOST_RELAY_CAPABILITIES = [
+  RelayCapability.capabilityNegotiationV1,
+  RelayCapability.authorityDataV2,
+  RelayCapability.deliveryBarrierOutcomeV1,
+] as const;
 
 export type CloudFetch = typeof fetch;
 
@@ -90,22 +97,26 @@ export class CloudApiClient {
     return created;
   }
 
-  createConnectionSet(
+  async createConnectionSet(
     sessionId: string,
     capability: string,
     request: ConnectionSetRequest = {},
     signal?: AbortSignal,
   ): Promise<ConnectionSetResponse> {
-    return this.#postJson(
+    const connection = await this.#postJson(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/connection-sets`,
       capability,
       request,
       ConnectionSetResponseSchema,
       signal,
       {
-        [RELAY_CAPABILITIES_HEADER]: RelayCapability.deliveryBarrierOutcomeV1,
+        [RELAY_CAPABILITIES_HEADER]: HOST_RELAY_CAPABILITIES.join(","),
       },
     );
+    const confirmed = confirmedRelayCapabilities(connection, HOST_RELAY_CAPABILITIES);
+    if (confirmed.length === 0) delete connection.negotiatedCapabilities;
+    else connection.negotiatedCapabilities = confirmed;
+    return connection;
   }
 
   refreshCapability(

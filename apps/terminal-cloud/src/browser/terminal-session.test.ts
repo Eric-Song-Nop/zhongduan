@@ -229,6 +229,7 @@ async function openRecoveryUnderWatchdog(
 ): Promise<{
   control: FakeSocket;
   data: FakeSocket;
+  request: RequestInit;
   session: TerminalSession;
 }> {
   const response = {
@@ -241,13 +242,14 @@ async function openRecoveryUnderWatchdog(
     controlTicket: "control_ticket_warm_watchdog",
     dataTicket: "data_ticket_warm_watchdog",
   };
-  const fetch = vi.fn(
-    async () =>
-      new Response(JSON.stringify(response), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-  );
+  let request: RequestInit | undefined;
+  const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    request = init;
+    return new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
   const capabilities = new CapabilityManager({
     bootstrap: {
       capability: "opaque",
@@ -309,7 +311,8 @@ async function openRecoveryUnderWatchdog(
   await vi.waitFor(() => {
     expect(controlFrames(control).some((frame) => frame.type === "attach")).toBe(true);
   });
-  if (mode === "cold-pending") return { control, data, session };
+  if (request === undefined) throw new Error("connection-set request was not captured");
+  if (mode === "cold-pending") return { control, data, request, session };
   control.message(
     JSON.stringify({
       type: "replay-start",
@@ -323,8 +326,21 @@ async function openRecoveryUnderWatchdog(
     }),
   );
   expect(session.snapshot).toMatchObject({ deliveryState: "replaying", phase: "restoring" });
-  return { control, data, session };
+  return { control, data, request, session };
 }
+
+describe("TerminalSession capability negotiation", () => {
+  it("advertises only implemented Browser capabilities and accepts an old Cloud omission", async () => {
+    const timers = new ManualTimers();
+    timers.now = 2_000_000_000_000;
+    const { request, session } = await openRecoveryUnderWatchdog(timers, "cold-pending");
+
+    expect(new Headers(request.headers).get("x-zhongduan-relay-capabilities")).toBe(
+      "capability-negotiation-v1,authority-data-v2",
+    );
+    session.close();
+  });
+});
 
 describe("TerminalSession delivery activation", () => {
   it("buffers data before replay-start and invalidates the old data callback before replacement", async () => {

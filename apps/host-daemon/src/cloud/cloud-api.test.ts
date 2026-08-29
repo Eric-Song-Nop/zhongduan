@@ -29,6 +29,17 @@ const metadata: SnapshotMetadata = {
   sha256: "a".repeat(64),
 };
 
+const hostConnection = {
+  connectionSetId: "connection_set_host01",
+  connectionId: "connection_id_host001",
+  clientId: null,
+  streamId: 0,
+  deliveryGeneration: "0",
+  expiresAt: 2_000,
+  controlTicket: "control_ticket_host01",
+  dataTicket: "data_ticket_host0001",
+};
+
 describe("CloudApiClient", () => {
   it("creates a session with exact bootstrap identity and strict response parsing", async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
@@ -68,17 +79,14 @@ describe("CloudApiClient", () => {
     });
   });
 
-  it("advertises relay capabilities and decodes the rolling response echo", async () => {
+  it("advertises only the implemented Host capabilities and decodes a confirmed selection", async () => {
     const response = {
-      connectionSetId: "connection_set_host01",
-      connectionId: "connection_id_host001",
-      clientId: null,
-      streamId: 0,
-      deliveryGeneration: "0",
-      expiresAt: 2_000,
-      controlTicket: "control_ticket_host01",
-      dataTicket: "data_ticket_host0001",
-      selectedCapabilities: [RelayCapability.deliveryBarrierOutcomeV1],
+      ...hostConnection,
+      negotiatedCapabilities: [
+        RelayCapability.capabilityNegotiationV1,
+        RelayCapability.authorityDataV2,
+        RelayCapability.deliveryBarrierOutcomeV1,
+      ],
     };
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
       jsonResponse(response),
@@ -93,8 +101,41 @@ describe("CloudApiClient", () => {
     const [, init] = fetchMock.mock.calls[0]!;
     expect(JSON.parse(init?.body as string)).toEqual({});
     expect(new Headers(init?.headers).get(RELAY_CAPABILITIES_HEADER)).toBe(
-      RelayCapability.deliveryBarrierOutcomeV1,
+      "capability-negotiation-v1,authority-data-v2,delivery-barrier-outcome-v1",
     );
+  });
+
+  it("keeps negotiation unconfirmed when an old Cloud omits the response field", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      jsonResponse(hostConnection),
+    );
+    const api = new CloudApiClient("https://cloud.example", {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(api.createConnectionSet("session_AAAAAAAAA", "host-cap")).resolves.toEqual(
+      hostConnection,
+    );
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(new Headers(init?.headers).get(RELAY_CAPABILITIES_HEADER)).toBe(
+      "capability-negotiation-v1,authority-data-v2,delivery-barrier-outcome-v1",
+    );
+  });
+
+  it("does not confirm a selection that omits the negotiation bootstrap", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      jsonResponse({
+        ...hostConnection,
+        negotiatedCapabilities: [RelayCapability.authorityDataV2],
+      }),
+    );
+    const api = new CloudApiClient("https://cloud.example", {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(
+      api.createConnectionSet("session_AAAAAAAAA", "host-cap"),
+    ).resolves.not.toHaveProperty("negotiatedCapabilities");
   });
 
   it("uploads the immutable snapshot body with the complete metadata contract", async () => {

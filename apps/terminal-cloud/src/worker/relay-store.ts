@@ -18,6 +18,7 @@ export interface TicketRow {
 }
 
 export interface SessionRow {
+  authority_data_version: 2;
   engine_id: string;
   head_event_seq: string;
   host_fence: string;
@@ -41,6 +42,7 @@ export interface ClientRow {
   principal_id_hash: string;
   registered_at: number | null;
   reservation_expires_at: number | null;
+  recovery_strategy: "v2" | "v3";
   role: "writer" | "observer";
   stream_id: number;
 }
@@ -244,6 +246,35 @@ export function migrateRelayStore(state: DurableObjectState, sql: SqlStorage): v
         );
       }
       state.storage.kv.put("schema-version", 5);
+    });
+    version = 5;
+  }
+
+  if (version < 6) {
+    state.storage.transactionSync(() => {
+      const hasAuthorityDataVersion = sql
+        .exec("PRAGMA table_info(session_state)")
+        .toArray()
+        .some((column) => column.name === "authority_data_version");
+      if (!hasAuthorityDataVersion) {
+        sql.exec(
+          `ALTER TABLE session_state
+           ADD COLUMN authority_data_version INTEGER NOT NULL DEFAULT 2
+           CHECK (authority_data_version = 2)`,
+        );
+      }
+      const hasRecoveryStrategy = sql
+        .exec("PRAGMA table_info(client_delivery)")
+        .toArray()
+        .some((column) => column.name === "recovery_strategy");
+      if (!hasRecoveryStrategy) {
+        sql.exec(
+          `ALTER TABLE client_delivery
+           ADD COLUMN recovery_strategy TEXT NOT NULL DEFAULT 'v2'
+           CHECK (recovery_strategy IN ('v2', 'v3'))`,
+        );
+      }
+      state.storage.kv.put("schema-version", 6);
     });
   }
 }
