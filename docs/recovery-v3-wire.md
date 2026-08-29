@@ -1,7 +1,8 @@
 # Recovery v3 Wire Contract
 
-> 状态：P2.0 wire/capability 与 P2.1 pure Browser RecoveryAssembler 为 stacked candidate；所有生产
-> generation 仍选择 protocol v2，Recovery v3 runtime 仍不可达
+> 状态：P2.0 wire/capability、P2.1 pure Browser RecoveryAssembler 与 P2.2 pure Host
+> PreparedGap/source owner 为 stacked candidate；所有生产 generation 仍选择 protocol v2，Recovery v3
+> runtime 仍不可达
 >
 > 适用范围：Host authority data、Cloud delivery、Browser recovery 与滚动协商
 
@@ -183,18 +184,34 @@ receipt/apply/adopt/completion progress；它自己不做网络、HTTP 或真实
   标为 tainted；零 effect 的 start/admission conflict 保留可复用 base。所有 gap/no-progress deadline只由显式
   monotonic tick 推进。
 
+P2.2 只保留 Host 内尚未接 production control union 或 relay connection 的 source primitives：
+
+- `TerminalSession` 在一个 actor turn 内固定 `H`，对 `(R,H]` 先做 exact journal range/cap 检查，再拥有
+  materialized frame copy，并同步执行 fence commit；callback 拒绝或抛错只返回 unavailable，不改变 authority；
+- `CanonicalPublisher` 把 strict `RecoveryStartFence(H)` 当作 ordered marker 排在 `H` 与 `H+1` 之间。marker
+  占有界 queue budget，但不进入 journal、不推进 canonical cursor，也不暂停 publisher；
+- session-scoped `RecoverySourceManager` 在 actor commit 内预编码唯一 retained recovery envelope copy，并以
+  `RecoveryDone(H)` 作为最后 record。只有 matching start-ready/grant 才允许 bounded drain；send throw 不推进
+  cursor，重试仍发送逐字节一致的 retained record；
+- 只有覆盖实际已发送 Done ordinal/cumulative bytes 的 receipt 才 release-once payload，并产生稳定
+  `RecoverySourceClosed`。reset、deadline 与 generation replacement 立即释放 payload，同时保留有界
+  owner+stream generation tombstone，阻止同代迟到 prepare 复活；
+- per-source canonical cap、session-owned envelope cap、source-count cap、no-progress/absolute deadline 和
+  owner-token fence 均由 caller 显式配置或驱动；这一层不拥有 socket、timer、Cloud state 或公平调度。
+
 ### 当前不可达与后置 owner
 
-P2.1 没有接入 `TerminalSession` 或 v2 `SessionCoordinator`，也没有 endpoint advertise v3 capability；因此
-production attach、warm resync 和 cold recovery 都不能到达 pure assembler。它不包含：
+P2.1 assembler 没有接入 Browser `TerminalSession` 或 v2 `SessionCoordinator`，P2.2 Host primitives 也没有
+接入 `HostRelayConnection`、production control union 或 delivery scheduler；endpoint 仍不 advertise v3
+capability。因此 production attach、warm resync 和 cold recovery 都不能到达这些 primitives。当前不包含：
 
 - HTTP snapshot download、WTerm restore/adopt 或真实 terminal handoff；
-- Host PreparedGap/start-fence source owner、Cloud generation/lane scheduling、receipt credit、apply progress、
-  closure transport 与 cleanup wiring；
+- Cloud generation/lane durable state、receipt credit、apply progress、closure transport 与 cleanup wiring；
+- Host source primitive 到实际 relay control/data socket 的接线和多 source 公平调度；
 - WebSocket send/retry timer、generation replan，或 completion 后长期消费 live mutation 的 owner。
 
-滚动实现顺序保持 capability-first：先保留 P2.0 的显式 downgrade；再接 Host source owner 与 Cloud
-generation/credit/closure owner；最后接 Browser `TerminalSession`、真实 target handoff 和长期 live。完整三方
+滚动实现顺序保持 capability-first：P2.0 保留显式 downgrade，P2.1/P2.2 先冻结两端 pure owner；接下来建立
+Cloud generation/credit/closure durable owner，再接 Host/Browser runtime、真实 target handoff 和长期 live。完整三方
 negotiated state machine、owner fault tests、真实 snapshot continuation oracle 与 rolling downgrade/rollback gate
 全部通过后，才允许对**新的** delivery generation 一次性选择 v3，并同时切换掉该 v3 path 的 global pause、
 fixed-commit barrier 和 pin。不能提前单独关闭其中任何一项；v2 generation 与 v2 fallback 保持原 invariant。
@@ -218,11 +235,17 @@ release-once。短 lane merge 由保持各 lane 顺序的 exhaustive cases 覆�
 cursor/assembler helper 的独立 reference reducer；当前不引入随机 generator 或 `fast-check`，也不把 case
 数量当作 correctness 证据。
 
+P2.2 owner tests 覆盖 actor 内固定 `(R,H]`、真实 `TerminalSession -> CanonicalPublisher` 的
+`H / fence(H) / H+1` 出队顺序、R=H 时唯一 Done record 的 literal 40-byte envelope/cumulative bytes、cap 与
+cap+1、grant boundary、send throw 后 byte-identical retry、伪造/提前 receipt 不释放、exact Done closure retry、
+generation tombstone、16-source aggregate bound、deadline、reset 与 dispose。既有 v2 delivery scheduler regression
+仍单独证明 pause/barrier/pin fallback 未改变；这些测试不声称已证明 socket fairness 或 Cloud hibernation。
+
 这些证据只证明 pure wire/assembler contract 和显式 downgrade，不等价于 production-like 网络、真实
 WTerm/Ghostty state 或跨进程 owner。后续需要 owner-level deterministic fault integration、真实
 snapshot/parser-continuation/exact-tail oracle 和 Cloud-first/rollback staging。性能、load/soak、SLO 与 dashboard
 仍后置；当前 correctness gate 不编写或推断性能验证。
 
-P2.1 不修改 WTerm/Ghostty。若 Browser wiring 暴露真实 API 缺口，必须先在 `Eric-Song-Nop` 对应 fork 建立
+P2.0-P2.2 不修改 WTerm/Ghostty。若后续 wiring 暴露真实 API 缺口，必须先在 `Eric-Song-Nop` 对应 fork 建立
 正式 PR 并完成 review/验证，再由 Zhongduan 的独立 stacked PR 更新固定 submodule；不得直接改 vendor、指向
 upstream 或 pin 未审 commit。

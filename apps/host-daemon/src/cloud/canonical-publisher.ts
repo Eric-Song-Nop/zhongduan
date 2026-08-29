@@ -1,4 +1,9 @@
-import { DATA_HEADER_BYTES, DataFrameKind, decodeDataFrame } from "@zhongduan/protocol";
+import {
+  DATA_HEADER_BYTES,
+  DataFrameKind,
+  decodeDataFrame,
+  decodeRecoveryStartFence,
+} from "@zhongduan/protocol";
 
 import type { ReplayCursor, TerminalSession } from "../session";
 
@@ -11,10 +16,19 @@ const PUMP_YIELD_BYTES = 256 * 1024;
 const PUMP_YIELD_FRAMES = 64;
 const MAX_CANONICAL_FRAME_BYTES = DATA_HEADER_BYTES + 16 * 1024;
 
-interface QueuedCanonicalFrame {
+interface QueuedCanonicalMutation {
+  type: "mutation";
   bytes: Uint8Array;
   cursor: ReplayCursor;
 }
+
+interface QueuedOrderedMarker {
+  type: "ordered-marker";
+  bytes: Uint8Array;
+  cursor: ReplayCursor;
+}
+
+type QueuedCanonicalItem = QueuedCanonicalMutation | QueuedOrderedMarker;
 
 export interface CanonicalPublisherOptions {
   canInterruptRecovery: () => boolean;
@@ -31,7 +45,7 @@ export class CanonicalPublisher {
   readonly #onFailure: (reason: string) => void;
   readonly #onIngress: () => void;
   readonly #onRecoveryPressure: () => void;
-  readonly #queue: QueuedCanonicalFrame[] = [];
+  readonly #queue: QueuedCanonicalItem[] = [];
   readonly #sendData: (frame: Uint8Array) => void;
   readonly #session: TerminalSession;
   readonly #yieldIo: () => Promise<void>;
@@ -77,6 +91,35 @@ export class CanonicalPublisher {
     this.#schedulePump();
   }
 
+  tryEnqueueRecoveryStartFence(encoded: Uint8Array): boolean {
+    if (this.#stopped || this.#lastQueuedCursor === undefined) return false;
+
+    let cursor: ReplayCursor;
+    try {
+      const fence = decodeRecoveryStartFence(encoded);
+      cursor = {
+        sessionEpoch: BigInt(fence.committedThrough.sessionEpoch),
+        lastEventSeq: BigInt(fence.committedThrough.eventSeq),
+        nextPtyOffset: BigInt(fence.committedThrough.nextPtyOffset),
+      };
+    } catch {
+      return false;
+    }
+    if (!sameCursor(cursor, this.#lastQueuedCursor)) return false;
+    if (
+      this.#queue.length + 1 > HOST_CANONICAL_QUEUE_LIMITS.maxFrames ||
+      this.#queueBytes + encoded.byteLength > HOST_CANONICAL_QUEUE_LIMITS.maxBytes
+    ) {
+      return false;
+    }
+
+    const bytes = encoded.slice();
+    this.#queue.push({ type: "ordered-marker", bytes, cursor });
+    this.#queueBytes += bytes.byteLength;
+    this.#schedulePump();
+    return true;
+  }
+
   async pause(): Promise<void> {
     this.#paused = true;
     await this.#pumpPromise;
@@ -97,7 +140,7 @@ export class CanonicalPublisher {
       this.#queue.shift();
       this.#queueBytes -= queued.bytes.byteLength;
       this.#sendData(queued.bytes);
-      this.#lastSentCursor = queued.cursor;
+      if (queued.type === "mutation") this.#lastSentCursor = queued.cursor;
       bytesSinceYield += queued.bytes.byteLength;
       framesSinceYield += 1;
       if (bytesSinceYield >= PUMP_YIELD_BYTES || framesSinceYield >= PUMP_YIELD_FRAMES) {
@@ -156,7 +199,7 @@ export class CanonicalPublisher {
     }
     const cursor = cursorAfter(frame);
     const bytes = encoded.slice();
-    this.#queue.push({ bytes, cursor });
+    this.#queue.push({ type: "mutation", bytes, cursor });
     this.#queueBytes += bytes.byteLength;
     this.#lastQueuedCursor = cursor;
     this.#onIngress();
@@ -196,7 +239,7 @@ export class CanonicalPublisher {
       if (queued === undefined) return;
       this.#queueBytes -= queued.bytes.byteLength;
       this.#sendData(queued.bytes);
-      this.#lastSentCursor = queued.cursor;
+      if (queued.type === "mutation") this.#lastSentCursor = queued.cursor;
       if (this.#queue.length === 0) this.#lastQueuedCursor = queued.cursor;
       bytesSinceYield += queued.bytes.byteLength;
       framesSinceYield += 1;
