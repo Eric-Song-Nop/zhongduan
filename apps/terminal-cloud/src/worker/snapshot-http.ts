@@ -18,6 +18,7 @@ const UploadErrorSchema = z.strictObject({
     "invalid-snapshot-metadata",
     "snapshot-checksum-mismatch",
     "snapshot-conflict",
+    "snapshot-cursor-ahead",
     "snapshot-reservation-failed",
     "snapshot-unavailable",
     "snapshot-upload-failed",

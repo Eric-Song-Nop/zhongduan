@@ -25,6 +25,7 @@ import {
 } from "./delivery-scheduler";
 import {
   SnapshotCleanupConfirmedError,
+  SnapshotPendingSupersededError,
   SnapshotUnavailableError,
   type PublishedSnapshot,
 } from "./snapshot-publisher";
@@ -78,6 +79,7 @@ interface Harness {
   pty: ManualPty;
   scheduler: HostDeliveryScheduler;
   session: TerminalSession;
+  snapshotCheckpointManager: SnapshotCheckpointManager;
   setBarrierResponder(responder: (encoded: Uint8Array) => void): void;
 }
 
@@ -128,6 +130,7 @@ function createHarness(
     pty,
     scheduler,
     session,
+    snapshotCheckpointManager,
     setBarrierResponder(responder) {
       barrierResponder = responder;
     },
@@ -1195,24 +1198,36 @@ describe("HostDeliveryScheduler", () => {
     expect(harness.controls).toEqual([]);
   });
 
-  it("discards an over-budget R-to-C tail and recaptures once after trailing quiet", async () => {
+  it("rechecks a published pending body before install and recaptures after trailing quiet", async () => {
     vi.useFakeTimers();
     let publishCalls = 0;
     const firstStarted = deferred<SnapshotCapture>();
-    const firstUpload = deferred<PublishedSnapshot>();
+    const firstUpload = deferred<void>();
     const publisher: SnapshotPublisherLike = {
-      publish(snapshot) {
+      publish(snapshot, _signal, admit) {
         publishCalls += 1;
-        if (publishCalls !== 1) return Promise.resolve(publishedSnapshot(snapshot, "Q"));
+        if (publishCalls !== 1) {
+          const published = publishedSnapshot(snapshot, "Q");
+          return admit?.(published.metadata) === true
+            ? Promise.resolve(published)
+            : Promise.reject(new SnapshotPendingSupersededError());
+        }
         firstStarted.resolve(snapshot);
-        return firstUpload.promise;
+        const published = publishedSnapshot(snapshot, "P");
+        return firstUpload.promise.then(() => {
+          if (admit?.(published.metadata) !== true) {
+            throw new SnapshotPendingSupersededError();
+          }
+          return published;
+        });
       },
     };
     const harness = createHarness(publisher);
+    const install = vi.spyOn(harness.snapshotCheckpointManager, "install");
     activate(harness);
     harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
     attach(harness);
-    const firstSnapshot = await firstStarted.promise;
+    await firstStarted.promise;
 
     for (let index = 0; index < WARM_REPLAY_MAX_FRAMES + 1; index += 1) {
       harness.pty.emit(Uint8Array.of(index & 0xff));
@@ -1224,10 +1239,11 @@ describe("HostDeliveryScheduler", () => {
         "\u0003",
       ),
     ).resolves.toMatchObject({ status: "written" });
-    firstUpload.resolve(publishedSnapshot(firstSnapshot, "P"));
+    firstUpload.resolve();
     for (let index = 0; index < 8; index += 1) await Promise.resolve();
 
     expect(publishCalls).toBe(1);
+    expect(install).not.toHaveBeenCalled();
     expect(harness.closeReasons).toEqual([]);
     expect(harness.controls).toEqual([]);
     expect(harness.pty.writes).toContainEqual(Uint8Array.of(0x03));
@@ -1239,6 +1255,10 @@ describe("HostDeliveryScheduler", () => {
     await Promise.resolve();
 
     expect(publishCalls).toBe(2);
+    expect(install).toHaveBeenCalledOnce();
+    expect(install.mock.calls[0]?.[0]).toMatchObject({
+      metadata: { snapshotId: `snapshot_${"Q".repeat(16)}` },
+    });
     expect(harness.closeReasons).toEqual([]);
     expect(
       harness.data

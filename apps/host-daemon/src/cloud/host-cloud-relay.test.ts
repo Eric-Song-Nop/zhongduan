@@ -149,6 +149,7 @@ afterEach(() => {
 describe("HostCloudRelay", () => {
   it("keeps a shell writable while permanent Cloud 4xx responses remain degraded", async () => {
     const capabilityAttempts: number[] = [];
+    const disposeSnapshotPublisher = vi.fn();
     const pty = new ManualPty();
     const session = new TerminalSession({
       authority: new FakeTerminalAuthority(),
@@ -177,7 +178,10 @@ describe("HostCloudRelay", () => {
       reconnectDelayMs: 10,
       session,
       sessionId: "session_AAAAAAAAA",
-      snapshotPublisher: { publish: async () => Promise.reject(new Error("unused")) },
+      snapshotPublisher: {
+        dispose: disposeSnapshotPublisher,
+        publish: async () => Promise.reject(new Error("unused")),
+      },
       stableConnectionMs: 1_000,
     });
 
@@ -196,6 +200,9 @@ describe("HostCloudRelay", () => {
     expect(session.sessionEpoch).toBe(7n);
     await relay.stop();
     await stoppedBeforeReady;
+    await relay.stop();
+    expect(disposeSnapshotPublisher).toHaveBeenCalledOnce();
+    expect(disposeSnapshotPublisher.mock.calls[0]?.[0]).toMatchObject({ name: "AbortError" });
     session.dispose();
   });
 

@@ -115,6 +115,12 @@ pnpm exec vp run build-browser
 pnpm --filter "@zhongduan/terminal-cloud" exec wrangler deploy
 ```
 
+引入 `snapshot-cursor-ahead` 的 Phase 1 P1.3 版本必须先部署 Cloud，再滚动 Host。新 Cloud 只在 exact
+completed upload 与 R2 object 已验证、但 committed head 尚未追上 snapshot cut 时返回该错误；旧 Host 会把
+它保守地当作可重试失败。新 Host 在旧 Cloud 上仍把 generic `snapshot-conflict` 保留为结果不确定的 immutable
+body，不会猜测或释放，因此顺序错误不会破坏数据，但会让 bounded cursor-ahead 暂时退化为旧行为。该 HTTP
+错误分类不改变 terminal WebSocket wire、SQLite schema 或 snapshot body。
+
 部署前可用以下命令只验证生成的 Worker、Assets、DO 和 R2 binding，不上传：
 
 ```bash

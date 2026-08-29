@@ -1321,6 +1321,7 @@ describe("snapshot multipart retention", () => {
       cutEventSeq: "1",
     });
     expect(cursorAhead.status).toBe(409);
+    expect(await cursorAhead.json()).toEqual({ error: "snapshot-cursor-ahead" });
     expect({ createCalls, partCalls }).toEqual({ createCalls: 1, partCalls: 1 });
     const cursorAheadKey = await storedSnapshotKey(session.sessionId, cursorAheadId);
     expect(await env.SNAPSHOTS.head(cursorAheadKey)).not.toBeNull();
@@ -1365,6 +1366,7 @@ describe("snapshot multipart retention", () => {
     for (const [snapshotId, overrides] of invalidSnapshots) {
       const response = await uploadSnapshot(session, snapshotId, session.hostCapability, overrides);
       expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({ error: "snapshot-conflict" });
       expect(await env.SNAPSHOTS.head(snapshotObjectKey(session.sessionId, snapshotId))).toBeNull();
       const pointer = await getSnapshot(session, snapshotId);
       expect(pointer.status).toBe(404);

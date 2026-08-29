@@ -545,8 +545,24 @@ P1.2 的直接 gate 是：mixed output/resize range 返回精确 scalar facts �
 materialize。Materialized frame count/encoded bytes 与 plan 不一致时 fail closed，不能发送 barrier、截断 tail
 或 commit。Warm policy、pending serviceability 与完整 `usable` 不在本层声明内。
 
-Gate：16 个 attach 只 build 一次；90–120 秒 upload/retry 不会发布出生即不可服务的 checkpoint；idle
-checkpoint 不因 TTL 被错误删除；无 pending body starvation/storm/leak。
+P1.3 的直接 gate 是：build 后首次 PUT 前、每次 retry/resume 前以及 exact upload success 安装前，重新以
+最新 `H=session.cursor` 检查 P1.2 的 Host-local range、现有 256 KiB credit 和 512-frame 上限；失去 eligibility
+的 body 立即不再作为 recovery candidate。尚未 PUT 的 local body 可 exact-CAS 释放；结果不确定的 PUT 必须
+转入同一 session 最多一个 local cleanup owner，并继续使用同一 ID/body 做 reconciliation；只有 exact success、
+checksum cleanup-confirmed，或 Cloud 明确接管的 completed object 才能释放。Active/build 与 cleanup 合计最多
+保留两个 immutable body，cleanup 满时不得构造第三个。
+
+Cloud 只在 exact completed row 和 R2 object 已验证、且唯一失败是 committed head 尚未追上 cut 时返回
+`409 snapshot-cursor-ahead`。该 identity 从第一次收到此精确结果起最多等待 120 秒；attach、relay reconnect、
+caller timeout、backoff 和后续相同响应都不能续期。generic `snapshot-conflict`、transport/5xx 和 unknown 结果
+不能冒充 cursor-ahead，也不能直接释放 body。部署顺序必须 Cloud-first：旧 Host 会保守重试新错误码；新 Host
+连接旧 Cloud 时仍保守保留 generic 409，因此在 rolling 窗口中只会暂时退化为旧行为，不牺牲 immutable retry。
+本层不改变 Cloud generic `uncertain` 的 alarm/GC 语义；Host 进程退出后该类 reservation 的 durable cleanup
+仍是后续 gate，不能由运行期的单个 local cleanup slot 推导。
+
+Gate：16 个 attach 只 build 一次；90–120 秒 upload/retry 中失去 serviceability 的 checkpoint 不会被 Host
+安装或交付（已经发出的 PUT 仍可能在 Cloud 完成）；idle checkpoint 不因 TTL 被错误删除；运行中的 Host
+不会出现 pending body starvation/storm 或无界 retained-body 增长。
 
 ### Phase 2：Recovery v3，继续使用 full snapshot
 
