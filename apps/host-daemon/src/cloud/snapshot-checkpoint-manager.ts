@@ -7,9 +7,9 @@ import {
   type SnapshotPendingAdmission as PublisherPendingAdmission,
 } from "./snapshot-publisher";
 
-export const SNAPSHOT_CHECKPOINT_FRESHNESS_MS = 30_000;
-export const SNAPSHOT_ENCODE_BUDGET_MS = 5_000;
-export const SNAPSHOT_PUBLISH_TIMEOUT_MS = 120_000;
+const SNAPSHOT_ENCODE_BUDGET_MS = 5_000;
+const SNAPSHOT_CHECKPOINT_FRESHNESS_MS = 30_000;
+const SNAPSHOT_PUBLISH_TIMEOUT_MS = 120_000;
 
 export class SnapshotEncodeBudgetError extends Error {
   constructor() {
@@ -20,13 +20,7 @@ export class SnapshotEncodeBudgetError extends Error {
 
 export interface SnapshotCheckpoint {
   readonly base: ReplayCursor;
-  readonly engineId: string;
   readonly published: PublishedSnapshot;
-}
-
-export interface SnapshotCheckpointState {
-  readonly ageFresh: boolean;
-  readonly checkpoint: SnapshotCheckpoint;
 }
 
 export type SnapshotCheckpointAdmission = (base: Readonly<ReplayCursor>) => boolean;
@@ -56,7 +50,6 @@ type SnapshotManagerSession = Pick<
 >;
 
 export interface SnapshotCheckpointManagerOptions {
-  freshnessMs?: number;
   monotonicNow?: () => number;
   publisher: SnapshotPublisherLike;
   session: SnapshotManagerSession;
@@ -84,7 +77,6 @@ interface RefreshFlight {
 
 export class SnapshotCheckpointManager {
   readonly #engineId: string;
-  readonly #freshnessMs: number;
   readonly #monotonicNow: () => number;
   readonly #publisher: SnapshotPublisherLike;
   readonly #session: SnapshotManagerSession;
@@ -95,16 +87,11 @@ export class SnapshotCheckpointManager {
   #disposedReason: Error | undefined;
   #highWater: SnapshotCheckpoint | undefined;
   #latestValid: InstalledCheckpoint | undefined;
-  #needsNewerCut: Readonly<ReplayCursor> | undefined;
   #refreshInFlight: RefreshFlight | undefined;
   #replacementMinimumCut: Readonly<ReplayCursor> | undefined;
 
   constructor(options: SnapshotCheckpointManagerOptions) {
     this.#engineId = options.session.engineId;
-    this.#freshnessMs = options.freshnessMs ?? SNAPSHOT_CHECKPOINT_FRESHNESS_MS;
-    if (!Number.isInteger(this.#freshnessMs) || this.#freshnessMs <= 0) {
-      throw new RangeError("snapshot checkpoint freshness must be a positive integer");
-    }
     this.#monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
     this.#publisher = options.publisher;
     this.#session = options.session;
@@ -112,14 +99,16 @@ export class SnapshotCheckpointManager {
     this.#sessionId = options.sessionId;
   }
 
-  latestValid(): SnapshotCheckpointState | undefined {
+  latestValid(): SnapshotCheckpoint | undefined {
     if (this.#disposedReason !== undefined) return undefined;
-    const latest = this.#latestValid;
-    if (latest === undefined) return undefined;
-    return Object.freeze({
-      ageFresh: this.#monotonicNow() - latest.installedAt < this.#freshnessMs,
-      checkpoint: latest.checkpoint,
-    });
+    return this.#latestValid?.checkpoint;
+  }
+
+  isAgeFresh(checkpoint: SnapshotCheckpoint): boolean {
+    if (this.#disposedReason !== undefined || this.#latestValid?.checkpoint !== checkpoint) {
+      return false;
+    }
+    return this.#monotonicNow() - this.#latestValid.installedAt < SNAPSHOT_CHECKPOINT_FRESHNESS_MS;
   }
 
   refresh(request: SnapshotRefreshRequest): Promise<SnapshotCheckpoint> {
@@ -158,7 +147,6 @@ export class SnapshotCheckpointManager {
         onAbort!();
         return;
       }
-      this.#recomputeNeedsNewerCut();
       this.#startRefreshIfNeeded();
     });
   }
@@ -171,7 +159,6 @@ export class SnapshotCheckpointManager {
         : this.#validatedRegisteredMinimum(replacementMinimumCut);
     this.#latestValid = undefined;
     if (validatedMinimum !== undefined) this.#mergeReplacementMinimum(validatedMinimum);
-    this.#recomputeNeedsNewerCut();
   }
 
   dispose(reason: unknown = new Error("snapshot checkpoint manager disposed")): void {
@@ -182,7 +169,6 @@ export class SnapshotCheckpointManager {
         : new Error("snapshot checkpoint manager disposed", { cause: reason });
     this.#latestValid = undefined;
     this.#highWater = undefined;
-    this.#needsNewerCut = undefined;
     this.#replacementMinimumCut = undefined;
     const flight = this.#refreshInFlight;
     this.#refreshInFlight = undefined;
@@ -236,7 +222,6 @@ export class SnapshotCheckpointManager {
     } catch (error) {
       if (error instanceof SnapshotPendingSupersededError) {
         this.#mergeReplacementMinimum(this.#validatedRegisteredMinimum(this.#session.cursor));
-        this.#recomputeNeedsNewerCut();
       }
       throw error;
     }
@@ -319,9 +304,9 @@ export class SnapshotCheckpointManager {
     ) {
       this.#replacementMinimumCut = undefined;
     }
-    this.#recomputeNeedsNewerCut();
+    const requiredMinimumCut = this.#requiredMinimumCut();
     const needsFollowUp =
-      checkpoint === undefined || !this.#cursorSatisfies(checkpoint.base, this.#needsNewerCut);
+      checkpoint === undefined || !this.#cursorSatisfies(checkpoint.base, requiredMinimumCut);
     if (checkpoint !== undefined) {
       for (const waiter of this.#waiters) {
         if (this.#cursorSatisfies(checkpoint.base, waiter.minimumCut)) {
@@ -329,7 +314,6 @@ export class SnapshotCheckpointManager {
         }
       }
     }
-    this.#recomputeNeedsNewerCut();
     if (needsFollowUp) this.#startRefreshIfNeeded();
   }
 
@@ -338,7 +322,6 @@ export class SnapshotCheckpointManager {
     this.#refreshInFlight = undefined;
     if (this.#disposedReason !== undefined) return;
     this.#rejectAllWaiters(error);
-    this.#recomputeNeedsNewerCut();
   }
 
   #resolveWaiter(waiter: RefreshWaiter, checkpoint: SnapshotCheckpoint): void {
@@ -355,19 +338,18 @@ export class SnapshotCheckpointManager {
       waiter.signal?.removeEventListener("abort", waiter.onAbort);
     }
     waiter.reject(error);
-    this.#recomputeNeedsNewerCut();
   }
 
   #rejectAllWaiters(error: unknown): void {
     for (const waiter of this.#waiters) this.#rejectWaiter(waiter, error);
   }
 
-  #recomputeNeedsNewerCut(): void {
+  #requiredMinimumCut(): Readonly<ReplayCursor> | undefined {
     let maximum = this.#replacementMinimumCut;
     for (const waiter of this.#waiters) {
       if (waiter.minimumCut !== undefined) maximum = maxCursor(maximum, waiter.minimumCut);
     }
-    this.#needsNewerCut = maximum;
+    return maximum;
   }
 
   #mergeReplacementMinimum(minimumCut: Readonly<ReplayCursor>): void {
@@ -400,12 +382,10 @@ export class SnapshotCheckpointManager {
     const ownedMetadata = Object.freeze({ ...metadata });
     const checkpoint = Object.freeze({
       base,
-      engineId: metadata.engineId,
       published: Object.freeze({ metadata: ownedMetadata }),
     });
-    const installedAt = this.#monotonicNow();
     this.#highWater = checkpoint;
-    this.#latestValid = Object.freeze({ checkpoint, installedAt });
+    this.#latestValid = Object.freeze({ checkpoint, installedAt: this.#monotonicNow() });
     return checkpoint;
   }
 

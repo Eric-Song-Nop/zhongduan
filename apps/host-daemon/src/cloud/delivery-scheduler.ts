@@ -1,7 +1,6 @@
 import {
   DataFrameFlag,
   DataFrameKind,
-  MAX_DELIVERY_OUTSTANDING_BYTES,
   decodeDataFrame,
   deliveryOutstandingBytes,
   encodeDataFrame,
@@ -30,17 +29,12 @@ import {
   SnapshotUnavailableError,
 } from "./snapshot-publisher";
 
-export { HOST_CANONICAL_QUEUE_LIMITS } from "./canonical-publisher";
-export {
-  SNAPSHOT_ENCODE_BUDGET_MS,
-  SNAPSHOT_PUBLISH_TIMEOUT_MS,
-} from "./snapshot-checkpoint-manager";
-export const WARM_REPLAY_MAX_OUTSTANDING_BYTES = 256 * 1024;
-export const WARM_REPLAY_MAX_FRAMES = 512;
-export const DELIVERY_BARRIER_TIMEOUT_MS = 5_000;
-export const SNAPSHOT_RECOVERY_QUIET_MS = 250;
-export const SNAPSHOT_RECOVERY_MAX_RETRY_MS = 5_000;
-export const SNAPSHOT_RECOVERY_MAX_QUIET_WAIT_MS = 5_000;
+const WARM_REPLAY_MAX_OUTSTANDING_BYTES = 256 * 1024;
+const WARM_REPLAY_MAX_FRAMES = 512;
+const DELIVERY_BARRIER_TIMEOUT_MS = 5_000;
+const SNAPSHOT_RECOVERY_QUIET_MS = 250;
+const SNAPSHOT_RECOVERY_MAX_RETRY_MS = 5_000;
+const SNAPSHOT_RECOVERY_MAX_QUIET_WAIT_MS = 5_000;
 
 const PUMP_YIELD_BYTES = 256 * 1024;
 const PUMP_YIELD_FRAMES = 64;
@@ -55,12 +49,19 @@ interface ActiveRecovery {
   request: AttachRequest;
 }
 
-interface ColdPreparation {
-  checkpoint?: SnapshotCheckpoint;
+interface RefreshingColdPreparation {
   controller: AbortController;
   request: AttachRequest;
-  status: "refreshing" | "ready";
+  status: "refreshing";
 }
+
+interface ReadyColdPreparation {
+  checkpoint: SnapshotCheckpoint;
+  request: AttachRequest;
+  status: "ready";
+}
+
+type ColdPreparation = RefreshingColdPreparation | ReadyColdPreparation;
 
 export interface HostDeliverySchedulerOptions {
   bufferedAmount?: () => number;
@@ -178,7 +179,7 @@ export class HostDeliveryScheduler {
     this.#connectionAbort.abort(new Error(reason));
     this.#activeRecovery?.controller.abort(new Error(reason));
     for (const preparation of this.#coldPreparations.values()) {
-      preparation.controller.abort(new Error(reason));
+      if (preparation.status === "refreshing") preparation.controller.abort(new Error(reason));
     }
     this.#coldPreparations.clear();
     this.#recoveryQueue.clear();
@@ -203,7 +204,7 @@ export class HostDeliveryScheduler {
   #abortColdPreparations(keys: string[], reason: string): void {
     for (const key of keys) {
       const preparation = this.#coldPreparations.get(key);
-      preparation?.controller.abort(new Error(reason));
+      if (preparation?.status === "refreshing") preparation.controller.abort(new Error(reason));
       this.#coldPreparations.delete(key);
     }
   }
@@ -211,7 +212,9 @@ export class HostDeliveryScheduler {
   #discardColdPreparation(request: AttachRequest): void {
     const key = recoveryKey(request);
     const preparation = this.#coldPreparations.get(key);
-    preparation?.controller.abort(new Error("cold preparation was discarded"));
+    if (preparation?.status === "refreshing") {
+      preparation.controller.abort(new Error("cold preparation was discarded"));
+    }
     this.#coldPreparations.delete(key);
   }
 
@@ -337,8 +340,7 @@ export class HostDeliveryScheduler {
             { eventSeq: base.lastEventSeq, nextPtyOffset: base.nextPtyOffset },
             { eventSeq: commit.lastEventSeq, nextPtyOffset: commit.nextPtyOffset },
           ) <= BigInt(WARM_REPLAY_MAX_OUTSTANDING_BYTES) &&
-          replay.frames.length <= WARM_REPLAY_MAX_FRAMES &&
-          WARM_REPLAY_MAX_OUTSTANDING_BYTES <= MAX_DELIVERY_OUTSTANDING_BYTES
+          replay.frames.length <= WARM_REPLAY_MAX_FRAMES
         ) {
           active.mode = "warm";
           const result = await this.#deliverWarm(request, base, commit, replay.frames, active);
@@ -360,11 +362,10 @@ export class HostDeliveryScheduler {
       active.mode = "cold";
       this.#recoveryQueue.markCold(request);
       let preparation = this.#coldPreparations.get(key);
-      const recentCheckpoint = this.#snapshotCheckpointManager.latestValid()?.checkpoint;
+      const recentCheckpoint = this.#snapshotCheckpointManager.latestValid();
       if (preparation === undefined && recentCheckpoint !== undefined) {
         preparation = {
           checkpoint: recentCheckpoint,
-          controller: new AbortController(),
           request,
           status: "ready",
         };
@@ -392,9 +393,7 @@ export class HostDeliveryScheduler {
         return;
       }
       if (retryScope === "refresh-checkpoint") {
-        if (preparation.checkpoint !== undefined) {
-          this.#invalidateCheckpoint(preparation.checkpoint, preparation.checkpoint.base);
-        }
+        this.#invalidateCheckpoint(preparation.checkpoint, preparation.checkpoint.base);
         this.#discardColdPreparation(request);
       }
       this.#recoveryQueue.requeue(request);
@@ -428,7 +427,7 @@ export class HostDeliveryScheduler {
       this.#recoveryQueue.requeue(request);
       return;
     }
-    const preparation: ColdPreparation = {
+    const preparation: RefreshingColdPreparation = {
       controller: new AbortController(),
       request,
       status: "refreshing",
@@ -449,14 +448,17 @@ export class HostDeliveryScheduler {
             this.#schedulePendingRecoveries();
             return;
           }
-          if (this.#snapshotCheckpointManager.latestValid()?.checkpoint !== checkpoint) {
+          if (this.#snapshotCheckpointManager.latestValid() !== checkpoint) {
             this.#coldPreparations.delete(key);
             this.#recoveryQueue.requeue(request);
             this.#schedulePendingRecoveries();
             return;
           }
-          preparation.checkpoint = checkpoint;
-          preparation.status = "ready";
+          this.#coldPreparations.set(key, {
+            checkpoint,
+            request,
+            status: "ready",
+          });
           this.#coldCaptureNotBefore = undefined;
           this.#coldCaptureQuietDeadline = undefined;
           this.#recoveryQueue.requeue(request);
@@ -466,7 +468,11 @@ export class HostDeliveryScheduler {
       );
   }
 
-  #handleColdPreparationFailure(preparation: ColdPreparation, key: string, error: unknown): void {
+  #handleColdPreparationFailure(
+    preparation: RefreshingColdPreparation,
+    key: string,
+    error: unknown,
+  ): void {
     const isCurrent = this.#coldPreparations.get(key) === preparation;
     if (isCurrent) this.#coldPreparations.delete(key);
     if (this.#failed || preparation.controller.signal.aborted || !isCurrent) {
@@ -535,15 +541,12 @@ export class HostDeliveryScheduler {
 
   async #deliverPreparedCold(
     request: AttachRequest,
-    preparation: ColdPreparation,
+    preparation: ReadyColdPreparation,
     active: ActiveRecovery,
   ): Promise<DeliveryBarrierResult> {
     const checkpoint = preparation.checkpoint;
-    if (checkpoint === undefined) {
-      throw new Error("prepared snapshot is incomplete");
-    }
     if (
-      checkpoint.engineId !== this.#session.engineId ||
+      checkpoint.published.metadata.engineId !== this.#session.engineId ||
       checkpoint.base.sessionEpoch !== this.#session.sessionEpoch
     ) {
       throw new Error("published checkpoint does not match the terminal authority");
@@ -561,12 +564,7 @@ export class HostDeliveryScheduler {
       throw new ColdTailUnavailableError();
     }
     const replay = replayPlan.materialize();
-    if (
-      replay.status !== "ok" ||
-      replay.frames.length !== replayPlan.exactFrames ||
-      replay.frames.reduce((total, frame) => total + frame.byteLength, 0) !==
-        replayPlan.exactEncodedBytes
-    ) {
+    if (replay.status !== "ok") {
       this.#invalidateCheckpoint(checkpoint, commit);
       throw new ColdTailUnavailableError();
     }
@@ -677,10 +675,7 @@ export class HostDeliveryScheduler {
     );
   }
 
-  #sendReplayUnavailable(
-    connectionId: string,
-    reason: "journal-gap" | "engine-mismatch" | "epoch-changed",
-  ): void {
+  #sendReplayUnavailable(connectionId: string, reason: "engine-mismatch" | "epoch-changed"): void {
     this.#sendControl({ type: "replay-unavailable", connectionId, reason });
   }
 
@@ -717,8 +712,7 @@ export class HostDeliveryScheduler {
   #invalidateCheckpoint(checkpoint: SnapshotCheckpoint, replacementMinimumCut: ReplayCursor): void {
     this.#snapshotCheckpointManager.invalidate(checkpoint, replacementMinimumCut);
     for (const [key, preparation] of this.#coldPreparations) {
-      if (preparation.checkpoint !== checkpoint) continue;
-      preparation.controller.abort(new Error("snapshot checkpoint was invalidated"));
+      if (preparation.status !== "ready" || preparation.checkpoint !== checkpoint) continue;
       this.#coldPreparations.delete(key);
       this.#recoveryQueue.requeue(preparation.request);
     }

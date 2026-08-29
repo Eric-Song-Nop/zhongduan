@@ -37,7 +37,7 @@ interface PendingBarrier {
   readonly signal: AbortSignal;
 }
 
-export interface DeliveryBarrierWaiterOptions {
+interface DeliveryBarrierWaiterOptions {
   sendData: (frame: Uint8Array) => void;
   sessionEpoch: () => bigint;
 }

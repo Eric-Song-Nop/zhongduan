@@ -4,13 +4,12 @@ Phase 0 只收口 CURRENT protocol v2 的 recovery 活性。它不实现 TARGET 
 分支存在或笼统的 E2E 标签代替具体状态转换证据。
 
 本契约按 revision 判定：只有该 revision 同时包含实现和下列验收测试，且测试通过，才能称为 Phase 0
-candidate complete；只有进入 `main` 后才能称为主线完成。每个 Phase 0 PR 必须在正文中写明它翻转的
-sub-gate、翻转前后的状态、直接观察该状态的测试以及测试局限。只增加基础设施而不翻转 sub-gate 的 PR
-不能声称完成度前进。
+candidate complete；只有进入 `main` 后才能称为主线完成。当前 stacked candidate 已满足 P0.1–P0.4，
+但不能仅凭分支、测试数量或绿色 CI 推导主线状态或更大的产品完成度。
 
-## 本轮保留的执行教训
+## 测试与验收原则
 
-- 先冻结顶层 gate，再开始实现；每个 PR 必须让一个预先定义的 gate 从 fail 变为 pass。
+- 先冻结顶层 gate，再开始实现；实现必须让预先定义的可观察状态从 fail 变为 pass。
 - 测试名称和结论必须等于 oracle 直接观察到的事实。ACK、socket send、DOM mutation、RAF、timeout 或
   最终 `live` 不能替代它们没有观察到的 app effect、paint、性能或中间 recovery 状态。
 - supporting infrastructure、测试数量和绿色 CI 本身不代表阶段进度；stack review 必须重新检查顶层 gate，
@@ -60,20 +59,22 @@ sub-gate、翻转前后的状态、直接观察该状态的测试以及测试局
 未知 future capability 被忽略，协商结果跨 Durable Object hibernation 保留。新旧组件 skew 不能改变上述
 correctness 行为。
 
-## 可复现诊断报告
+## 可复现回归入口
 
-Phase 0 的本地诊断报告入口是：
+Phase 0 gate owner 的本地回归入口是：
 
 ```bash
 pnpm exec vp run verify-phase0
 ```
 
-该任务固定运行下列 gate owner 的直接测试：protocol/capability、Host barrier waiter/recovery
-queue/scheduler、Cloud relay/runtime，以及 Browser TerminalSession。测试 runner 输出的用例名、明确状态断言和
-pass/fail 结果构成 revision 对应的可复现报告；它不依赖生产 telemetry、外部 dashboard 或网络服务。
+该任务运行 protocol/capability、Host barrier waiter/recovery queue/scheduler、Cloud relay/runtime，以及
+Browser TerminalSession 的完整 owner suite。因为这些文件也包含 Phase 1 和其他回归测试，它是 broad
+gate-owner regression suite，不是只含 Phase 0 用例的独立报告。Phase 0 的证据是下一节列出的具体状态断言；
+aggregate test count 和其他用例通过都不能替代这些 oracle。该任务不依赖生产 telemetry、外部 dashboard 或
+网络服务。
 
-该报告只回答 P0.1–P0.4 的 correctness 问题。它没有 latency 数值，不区分纯 network RTT，不观察通用 app
-effect 或 pixel paint，也不能被用于性能、SLO 或 production rollout 结论。
+其中列出的 Phase 0 断言只回答 P0.1–P0.4 的 correctness 问题。它们没有 latency 数值，不区分纯 network
+RTT，不观察通用 app effect 或 pixel paint，也不能被用于性能、SLO 或 production rollout 结论。
 
 ## 当前验收证据
 
@@ -115,6 +116,7 @@ effect 或 pixel paint，也不能被用于性能、SLO 或 production rollout �
 后续阶段需要分别设计，而不是扩张 Phase 0 的 correctness tests：
 
 - Recovery v3 的 state model、property/fuzz、generation/retry/reset/adopt 和 snapshot tail-continuity oracle；
+- Durable Object v4→v5 ticket/capability 数据的真实迁移 fixture；
 - 两条链路的 fault injection，以及 production-like staging 对 DO/R2 与滚动发布的验证；
 - 多客户端、writer transfer、output flood、load/soak 和资源有界性；
 - 能区分 Cloud、Host、PTY 与受支持 workload effect 的运维查询或 dashboard；

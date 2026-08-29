@@ -2,9 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { ReplayCursor, SnapshotCapture } from "../session";
 import {
-  SNAPSHOT_CHECKPOINT_FRESHNESS_MS,
-  SNAPSHOT_ENCODE_BUDGET_MS,
-  SNAPSHOT_PUBLISH_TIMEOUT_MS,
   SnapshotCheckpointManager,
   SnapshotEncodeBudgetError,
   type SnapshotCheckpointManagerOptions,
@@ -14,6 +11,10 @@ import { SnapshotPendingSupersededError, type PublishedSnapshot } from "./snapsh
 
 const ENGINE_ID = "ghostty:test+snapshot-v1+wterm:test";
 const SESSION_ID = "session_AAAAAAAAAAAA";
+// Freeze the authority budgets independently from the manager implementation.
+const SNAPSHOT_CHECKPOINT_FRESHNESS_MS = 30_000;
+const SNAPSHOT_ENCODE_BUDGET_MS = 5_000;
+const SNAPSHOT_PUBLISH_TIMEOUT_MS = 120_000;
 const SNAPSHOT_IDS = [
   "snapshot_AAAAAAAAAAAAAAAA",
   "snapshot_BBBBBBBBBBBBBBBB",
@@ -125,20 +126,27 @@ function refresh(
 }
 
 describe("SnapshotCheckpointManager", () => {
-  it("keeps latestValid after its age threshold and reuses it without renewing freshness", async () => {
+  it("classifies only the current checkpoint by age without expiring or renewing it", async () => {
     let now = 100;
     const snapshot = capture();
     const publish = vi.fn(async () => published(snapshot));
     const checkpointManager = manager({ publish }, { monotonicNow: () => now });
 
     const checkpoint = await refresh(checkpointManager);
-    expect(checkpointManager.latestValid()).toEqual({ ageFresh: true, checkpoint });
+    expect(checkpointManager.latestValid()).toBe(checkpoint);
+    expect(checkpointManager.isAgeFresh(checkpoint)).toBe(true);
 
-    now += SNAPSHOT_CHECKPOINT_FRESHNESS_MS;
-    expect(checkpointManager.latestValid()).toEqual({ ageFresh: false, checkpoint });
+    now += SNAPSHOT_CHECKPOINT_FRESHNESS_MS - 1;
+    expect(checkpointManager.isAgeFresh(checkpoint)).toBe(true);
+    now += 1;
+    expect(checkpointManager.isAgeFresh(checkpoint)).toBe(false);
     await expect(refresh(checkpointManager)).resolves.toBe(checkpoint);
-    expect(checkpointManager.latestValid()).toEqual({ ageFresh: false, checkpoint });
+    expect(checkpointManager.latestValid()).toBe(checkpoint);
+    expect(checkpointManager.isAgeFresh(checkpoint)).toBe(false);
     expect(publish).toHaveBeenCalledOnce();
+
+    checkpointManager.invalidate(checkpoint);
+    expect(checkpointManager.isAgeFresh(checkpoint)).toBe(false);
   });
 
   it("keeps the cut high-water while allowing an exact invalidation replacement", async () => {
@@ -159,14 +167,14 @@ describe("SnapshotCheckpointManager", () => {
     expect(Object.isFrozen(second.published.metadata)).toBe(true);
 
     checkpointManager.invalidate(first, cursor(secondSnapshot));
-    expect(checkpointManager.latestValid()?.checkpoint).toBe(second);
+    expect(checkpointManager.latestValid()).toBe(second);
     checkpointManager.invalidate(second, cursor(secondSnapshot));
     expect(checkpointManager.latestValid()).toBeUndefined();
 
     const replacement = await refresh(checkpointManager);
     expect(replacement).not.toBe(second);
     expect(replacement.base).toEqual(cursor(secondSnapshot));
-    expect(checkpointManager.latestValid()?.checkpoint).toBe(replacement);
+    expect(checkpointManager.latestValid()).toBe(replacement);
   });
 
   it("fences immutable identity changes returned by a resumed pending upload", async () => {
@@ -188,7 +196,7 @@ describe("SnapshotCheckpointManager", () => {
     await expect(refresh(checkpointManager, { minimumCut: cursor(laterSnapshot) })).rejects.toThrow(
       "snapshot checkpoint immutable identity changed",
     );
-    expect(checkpointManager.latestValid()?.checkpoint).toBe(first);
+    expect(checkpointManager.latestValid()).toBe(first);
   });
 
   it("rejects a late regressed cut and a different identity at the same high-water", async () => {
@@ -214,7 +222,7 @@ describe("SnapshotCheckpointManager", () => {
     await expect(
       refresh(checkpointManager, { minimumCut: cursor(currentSnapshot) }),
     ).rejects.toThrow("snapshot checkpoint identity changed without advancing its cut");
-    expect(checkpointManager.latestValid()?.checkpoint).toBe(installed);
+    expect(checkpointManager.latestValid()).toBe(installed);
   });
 
   it("fences an invalidated identity but permits a new identity at the same cut", async () => {
@@ -328,7 +336,7 @@ describe("SnapshotCheckpointManager", () => {
     expect(checkpoint.base).toEqual(cursor(snapshot));
     expect(controlled.captureSnapshot).toHaveBeenCalledOnce();
     expect(publish).toHaveBeenCalledOnce();
-    expect(checkpointManager.latestValid()?.checkpoint).toBe(checkpoint);
+    expect(checkpointManager.latestValid()).toBe(checkpoint);
   });
 
   it("installs the first cut for an older waiter and performs exactly one newer-cut follow-up", async () => {
@@ -355,7 +363,7 @@ describe("SnapshotCheckpointManager", () => {
     await expect(newer).resolves.toMatchObject({ base: cursor(newerSnapshot) });
     expect(controlled.captureSnapshot).toHaveBeenCalledTimes(2);
     expect(publish).toHaveBeenCalledTimes(2);
-    expect(checkpointManager.latestValid()?.checkpoint.base).toEqual(cursor(newerSnapshot));
+    expect(checkpointManager.latestValid()?.base).toEqual(cursor(newerSnapshot));
   });
 
   it("does not start a newer-cut follow-up after the last live waiter aborts", async () => {
@@ -380,7 +388,7 @@ describe("SnapshotCheckpointManager", () => {
     await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce());
 
     expect(controlled.captureSnapshot).toHaveBeenCalledOnce();
-    expect(checkpointManager.latestValid()?.checkpoint.base).toEqual(cursor(firstSnapshot));
+    expect(checkpointManager.latestValid()?.base).toEqual(cursor(firstSnapshot));
   });
 
   it("keeps a global invalidation floor hidden until a follow-up reaches it", async () => {
@@ -411,7 +419,7 @@ describe("SnapshotCheckpointManager", () => {
     await expect(replacement).resolves.toMatchObject({ base: cursor(newerSnapshot) });
     expect(publish).toHaveBeenCalledTimes(3);
     expect(admissions).toEqual([true, false, true]);
-    expect(checkpointManager.latestValid()?.checkpoint.base).toEqual(cursor(newerSnapshot));
+    expect(checkpointManager.latestValid()?.base).toEqual(cursor(newerSnapshot));
   });
 
   it("ignores a stale checkpoint invalidation and its replacement floor", async () => {
@@ -431,7 +439,7 @@ describe("SnapshotCheckpointManager", () => {
 
     checkpointManager.invalidate(first, cursor(futureSnapshot));
 
-    expect(checkpointManager.latestValid()?.checkpoint).toBe(second);
+    expect(checkpointManager.latestValid()).toBe(second);
     await expect(refresh(checkpointManager)).resolves.toBe(second);
     expect(publish).toHaveBeenCalledTimes(2);
   });
@@ -477,7 +485,7 @@ describe("SnapshotCheckpointManager", () => {
     await expect(refresh(checkpointManager)).resolves.toMatchObject({
       base: cursor(newerSnapshot),
     });
-    expect(checkpointManager.latestValid()?.checkpoint.base).toEqual(cursor(newerSnapshot));
+    expect(checkpointManager.latestValid()?.base).toEqual(cursor(newerSnapshot));
   });
 
   it("enforces both the measured encode budget and the manager-owned encode deadline", async () => {

@@ -26,7 +26,7 @@ describe("Cloud HTTP contracts", () => {
     ).toThrow();
   });
 
-  it("validates a generation-fenced connection-set response", () => {
+  it("decodes connection-set responses with or without the rolling capability echo", () => {
     expect(ConnectionSetRequestSchema.parse({ clientId: "client_id_AAAAAAAAAAA" })).toEqual({
       clientId: "client_id_AAAAAAAAAAA",
     });

@@ -69,7 +69,7 @@ const VerifySessionIdentitySchema = HostCapabilityReclaimRequestSchema.extend({
   sessionId: identifier,
 });
 
-export const CreateConnectionSetSchema = z.strictObject({
+const CreateConnectionSetSchema = z.strictObject({
   sessionId: identifier,
   subject: identifier,
   role: z.enum(["host", "writer", "observer"]),
@@ -569,7 +569,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         expiresAt,
         controlTicket,
         dataTicket,
-        ...(selectedCapabilities.length === 0 ? {} : { selectedCapabilities }),
       }),
     );
   }

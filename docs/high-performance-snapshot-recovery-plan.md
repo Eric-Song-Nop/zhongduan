@@ -1,6 +1,6 @@
 # 高性能远程终端 Snapshot 与 Recovery v3 实施计划
 
-> 状态：根据 PR review 重写，等待分阶段实施
+> 状态：Phase 0/1 为 CURRENT stacked candidate；Phase 2–5 为 TARGET
 >
 > 决策日期：2026-08-28
 >
@@ -288,79 +288,76 @@ recovery 可以作为 rollout 起点，但不能继续依赖全局 pause 来串�
 
 ## SnapshotCheckpointManager
 
-Snapshot 构建归 session-owned manager，而不是单个 attach request。Manager 至少持有：
+CURRENT snapshot refresh 归 session-owned manager，而不是单个 attach request 或 relay connection。
+Manager 持有：
 
 ```text
-latestValid       最近一个通过完整性和 lineage 校验的 immutable checkpoint
-refreshInFlight   至多一个 capture/compress/publish pipeline
-pendingBody       至多一个可幂等重试、也可被 supersede 的 immutable body
-needsNewerCut     合并后的刷新压力和最低 cut 需求
+latestValid           最近一个通过完整性和 lineage 校验的 immutable checkpoint
+installedAt           当前 checkpoint 的 age-only freshness 起点
+refreshInFlight       至多一个 capture/compress/publish pipeline
+waiters               当前等待 checkpoint 的 attach requests
+replacementMinimumCut exact invalidation 或 pending supersede 合并出的最低 cut
 ```
 
-多个 waiter 共享 build；单个 request 被 supersede 只移除 waiter，不取消仍有价值的公共 build。Manager 只
-安装同 engine、同 epoch、cut 单调前进的 checkpoint，并确保 dispose、epoch change 和 failure 恰好释放
-一次资源。
+`latestValid` 一直保留到 validated forward replacement、exact checkpoint invalidation 或 manager dispose；
+时间流逝和读取都不会删除、隐藏或更新它。Manager 只安装同 session、同 engine、同 epoch、cut 单调不回退的
+checkpoint。相同 immutable
+identity 的迟到结果必须完全一致；旧 cut、同 cut 的未授权 replacement 和已 invalidated identity 都不能重新
+安装。Exact invalidation 可以提供 inclusive replacement floor，并清除所有 scheduler preparation 中指向该
+checkpoint 的引用。
+
+每个需要 refresh、无法直接复用 latest 的 cold attach 注册一个 waiter；多个 waiter 共享同一 capture →
+compress/publish → install flight。Waiter signal 只拥有该 waiter；generation supersede 或 relay connection
+关闭不会取消公共 flight。只有 manager
+dispose 或 manager-owned capture/publish deadline 可以终止公共 flight 并 fence 迟到 completion。若已有 flight
+在 `R` 完成，而 live waiter 要求最低 `H>R`，`R` 仍可满足允许它的旧 waiter，manager 合并压力并至多启动
+一个 follow-up。所有 waiter 已离开时，当前 flight 可以安装有用 checkpoint，但不能无 owner 地启动
+follow-up。
 
 `snapshotId` 与 body 仍是 immutable identity：结果不确定的 upload retry 必须继续使用同 ID、同 bytes，
 不能以新 body 覆盖。所谓 supersede 只表示 planner 不再把旧 cut 分配给新 recovery；旧 upload 只有在 Cloud
 ledger 到达 cleanup-safe terminal state，或已转交给独立有界 cleanup owner 后，才能释放本地 body 并允许
 新 ID。迟到 abort/delete 也不得命中 replacement。
 
-Phase 1 按可直接验收的 ownership gate 分层实现。P1.1 只把现有 publisher 和一个 immutable
-`latestValid` checkpoint 收归 `HostCloudRelay` 生命周期内的 manager，并把 30 秒阈值改成只读
-`ageFresh` 分类。它不把 `refreshInFlight`、waiter、capture 或 recovery generation controller 从 scheduler
-移入 manager；这些 ownership 变化必须在后续 sub-gate 中连同新的取消语义和直接测试一起落地。
+CURRENT manager 的 `latestValid` 只表示 publisher 已确认、metadata 与固定 session/engine/epoch/cut identity
+自洽。`isAgeFresh(checkpoint)` 只对 exact current identity 给出 30 秒 age classification；读取或复用不会续期，
+`false` 也不会删除或隐藏 checkpoint。它不表示 Cloud blob 此刻可取得，也不表示 checkpoint 对某个目标 `H`
+可服务。结合 tail cost、dirty state 或 attach pressure 的 background refresh policy 尚未实现；未来策略只能触发
+refresh，不能让仍可服务的 checkpoint 因时间流逝自动失效。
 
-P1.1 的 `latestValid` 表示 publisher 已确认、metadata 与固定 session/engine/epoch/cut identity 自洽。它不表示
-Cloud blob 此刻可取得，也不表示 checkpoint 对某个目标 `H` usable。相同 identity 的幂等结果不续 freshness；
-迟到的旧 cut 或同 cut 不同 identity 不能覆盖 latest。只有 exact-identity invalidation 清空 latest 后，才允许在
-未变化的 authority cut 安装新 snapshot identity。
+### CURRENT serviceability 动态检查
 
-### valid、usable 与 fresh 是三个概念
-
-| 属性     | 含义                                                                        | 过期/失败动作                         |
-| -------- | --------------------------------------------------------------------------- | ------------------------------------- |
-| `valid`  | schema、checksum、engine、epoch、cut 和 immutable body 自洽                 | 标记损坏，不得再采用                  |
-| `usable` | 针对目标 `H`，blob 可取得且 journal 精确覆盖 `(R,H]`，bytes/frames 在预算内 | 换更近 cut、reset 或报告 unavailable  |
-| `fresh`  | age、tail cost、dirty state 达到策略目标，值得后台刷新                      | 触发 refresh，不删除仍 usable 的 body |
-
-P1.1 起，原 cache 的 30 秒 TTL 只产生 `ageFresh=false`，不再按年龄删除或隐藏 checkpoint，也不会因读取而
-续期。Idle session 状态未变化时，一个超过 30 秒但 identity-valid 且 tail 为空的 checkpoint 仍可由 CURRENT
-静态 tail gate 使用。`ageFresh` 不是完整 `fresh`：tail cost、dirty state 与后台 refresh policy 仍由后续
-sub-gate 实现。
-
-### Serviceability 必须动态测量
-
-每次 resume pending upload、安装 checkpoint、选择 `RecoveryStart`、retry 和 rebase 前，都对实际目标
-`H` 调用等价于下面的 range measure：
+CURRENT Host 对 canonical pause 后固定的 `{R,H}` 先规划 journal range，再决定是否复制 frames：
 
 ```text
-measure(R,H) -> {
-  status: ok | cursor-ahead | gap | blob-unavailable,
-  exactTailBytes,
-  exactTailFrames,
-  oldestRequiredMutationAge,
-  estimatedDeliveryMs
+planReplayThrough(R,H) -> {
+  status: ok | gap,
+  exactEncodedBytes,
+  exactFrames,
+  materializeSameRevision()
 }
 ```
 
-P1.2 只关闭其中 Host 当前内存 journal 的 `gap`、`exactTailFrames` 和 `exactEncodedBytes` 事实，以及
-CURRENT cold path 的 tail-envelope eligibility。它不会把 `cursor-ahead`、blob availability、mutation age、
-estimated delivery、Browser budget 或 refresh policy 伪装成已经实现的 `usable`。Range plan 在 canonical pause
-后固定同一个 `{R,H}`，先返回 scalar facts；只有现有 256 KiB credit / 512 frame gate 通过后才 materialize，且
-materialize 必须来自同一个 journal revision。`exactEncodedBytes` 是 stored frame 长度之和；现有 256 KiB
-准入仍使用 `payload bytes + 64 bytes/event`，两者不能混称或借此修改策略。
+只有 range 无 gap、同 revision materialization 保持相同 facts，且现有 256 KiB delivery credit / 512-frame
+envelope 通过时，CURRENT cold path 才可发送 barrier、directed tail 和 commit。`exactEncodedBytes` 是 stored
+canonical frame 长度之和；256 KiB 准入仍按 PTY payload bytes 加每 event 64 bytes 计算，两者不能混称。
+Gap、预算溢出、revision change 或 materialized facts mismatch 都会 exact-invalidate checkpoint，且在 recapture
+前不得发送 barrier、截断 tail 或 commit。
 
-只有 `status=ok` 且 bytes、frames、age、delivery/browser budgets 全部满足时才 usable。不能把
-serviceability 简化成 capture timestamp 加固定 `serviceableUntil`：output byte rate、frame rate、journal
-segment retention 和 Cloud head 都会动态变化。
+Pending body 在 build 后、每次 PUT/retry/resume 前以及 exact upload success 安装前，都以最新
+`H=session.cursor` 重做上述 Host-local 检查。失去 serviceability 的 body 不会被 Host 安装或交付；已经发出的
+PUT 仍可能在 Cloud 完成。每个 session 最多保留一个 active/build body 加一个 ambiguity-cleanup body；cleanup
+slot 被占用时不得构造第三个 immutable body。
 
 `cursor-ahead` 表示 snapshot cut 已在 Host 产生，但 Cloud committed head 尚未到达该 cut；可以有界等待
-Cloud 追上并重试同一 body。`gap`，或任一 budget check 失败，会派生 planner reason
-`tail-unavailable`，表示 `(R,H]` 已缺失或超预算，等待通常只会更坏；planner 必须停止给新 recovery
-分配这个 body，并在满足上一节 cleanup-safe ownership 后
-abandon/supersede，允许更新 cut，而不是让 publisher 永远优先 resume 旧 body。
-若实现 journal pin，pin 也必须有独立 bytes/frames/age hard cap，超限后 abandon。
+Cloud 追上并重试同一 body。Cloud 只有在 completed row 与 R2 object 已精确验证、唯一失败是 committed head
+落后于 cut 时，才返回 `snapshot-cursor-ahead`。该 identity 的 120 秒 deadline 不因 attach、reconnect、caller
+timeout、backoff 或相同响应续期。Generic conflict、transport/5xx 和 unknown 结果继续 fail closed，不能冒充
+cursor-ahead 或释放 immutable body。
+
+这些检查仍不构成完整 `usable` policy：CURRENT 没有证明 blob 对任意 Browser 可取得，也没有 mutation age、
+estimated delivery、Browser restore/apply budget 或 freshness planner。若未来实现 journal pin，pin 同样必须有
+独立 bytes/frames/age hard cap。
 
 ## Capture pause 与 rolling snapshot 前置条件
 
@@ -431,16 +428,16 @@ lambda_frames * T_restore < B_browser_live_frames
 
 这些值属于不同层，不能合并成一个 tail budget：
 
-| 层级/用途                        | CURRENT 值                                                               |
-| -------------------------------- | ------------------------------------------------------------------------ |
-| Journal segment / retention      | 256 KiB 或 250 ms；60 s / 8 MiB                                          |
-| Host warm/cold tail admission    | 256 KiB / 512 frames                                                     |
-| Relay delivery outstanding       | 512 KiB                                                                  |
-| Host v2 paused canonical queue   | 8 MiB / 1024 frames                                                      |
-| Browser recovery tail            | 2 MiB / 1024 frames；5 s snapshot load + restore deadline                |
-| Checkpoint cache / build cadence | 30 s TTL；1 s minimum build interval                                     |
-| Snapshot blob                    | 32 MiB compressed / 128 MiB uncompressed                                 |
-| Cloud retention                  | 32 snapshot/upload rows；4 reservations；latest + active pins + 2 recent |
+| 层级/用途                      | CURRENT 值                                                               |
+| ------------------------------ | ------------------------------------------------------------------------ |
+| Journal segment / retention    | 256 KiB 或 250 ms；60 s / 8 MiB                                          |
+| Host warm/cold tail admission  | 256 KiB / 512 frames                                                     |
+| Relay delivery outstanding     | 512 KiB                                                                  |
+| Host v2 paused canonical queue | 8 MiB / 1024 frames                                                      |
+| Browser recovery tail          | 2 MiB / 1024 frames；5 s snapshot load + restore deadline                |
+| Checkpoint age / build cadence | 30 s age classification；1 s minimum build interval                      |
+| Snapshot blob                  | 32 MiB compressed / 128 MiB uncompressed                                 |
+| Cloud retention                | 32 snapshot/upload rows；4 reservations；latest + active pins + 2 recent |
 
 迁移初期不顺手放宽这些值。Recovery v3 要新增 per-lane receipt credit、assembler gap span、per-generation
 deadline 和 session aggregate cap；阈值先 shadow 观测再调整。
@@ -462,9 +459,10 @@ UI 必须分别统计。
 
 ## 错误分类与 retry taxonomy
 
-CURRENT 的非-ready barrier 结果缺少足够的 reason/scope：scheduler resume 后返回，上层仍会无条件
-complete request 并丢弃 per-request preparation，可能让 Browser 永久停在 catching-up。它不等于所有路径
-都会 invalidate 共享 checkpoint。v2 修复和 v3 `RecoveryStart` 都使用带原因和作用域的结果：
+CURRENT v2 已使用带原因和作用域的 closed barrier outcome；只有协商了
+`delivery-barrier-outcome-v1` 的 Host 收到 enriched shape，旧 Host 继续收到 legacy status。Scheduler 对每个
+non-ready outcome 都有明确 owner 和收敛动作，不会把 rejection 当作成功完成。TARGET v3 的
+`RecoveryStart` 必须保留同样的 producer/owner 约束：
 
 ```text
 Start/BarrierResult =
@@ -500,86 +498,75 @@ CURRENT barrier rejection 不提供无 owner 的 `reset-generation` 占位符。
 只有协议状态机明确证明 marker/start 未产生不确定结果时，才允许 same-generation retry。否则 fence
 generation，避免跨 attempt 拼接。
 
-## 实施阶段与依赖
+## 当前阶段状态与依赖
 
-### Phase 0：修 CURRENT recovery 活性
+### Phase 0：CURRENT recovery 活性
 
-Phase 0 的规范范围、直接测试证据与局限见 [Phase 0 验收契约](phase-0-acceptance-contract.md)。本阶段只收口
-CURRENT protocol v2 的 recovery 活性：
+Phase 0 stacked candidate 已满足 [Phase 0 验收契约](phase-0-acceptance-contract.md)的 P0.1–P0.4：v2
+pause/barrier/pinned commit invariant 保持不变；enriched non-ready outcome 有 closed producer/owner 集；warm
+rejection、checkpoint refresh 和 isolated-client drop 都会收敛；attach-start 与 warm-completion watchdog 防止
+Browser 永久停在 catching-up。它尚未合入 `main`，因此不能称为主线完成。
 
-- 保留 v2 pause/barrier/pinned commit correctness invariant；
-- 落地 `reason + retryScope`，修复 non-ready 被错误 complete 的 Browser freeze；
-- 增加 attach-start 与 warm-completion watchdog；明确 retry/drop，generation reset 只由已有显式 owner 发起；
-- 用 scheduler、queue、Browser session、Cloud relay 和 protocol 的状态机测试直接验证每个声明的转换。
+### Phase 1：CURRENT checkpoint ownership 与 Host-local serviceability
 
-Gate：验收契约的四个 required gate 全部通过。性能、production dashboard、纯 network 分解和通用
-application effect 验证后置，不阻止 Phase 0 收口，也不得由本阶段的 timeout 或状态机测试代替。
+Phase 1 stacked candidate 的最终行为是：
 
-Phase 1 只能从通过上述契约和完整 CI 的 exact Phase 0 revision 开始；它可以作为 stacked PR 的 parent，
-但在 Phase 0 合入 `main` 前不能把主线状态写成已完成。
+- session-owned manager 跨 attach 和 relay connection 复用一个 immutable latest checkpoint；它保留到
+  validated forward replacement、exact invalidation 或 dispose；30 秒 age classification 不驱逐或续期它；
+- canonical pause 后先规划固定 `{R,H}` 的 gap、encoded bytes 与 frame count，通过现有 envelope 后才从同一
+  journal revision materialize；
+- pending body 在 publish/install 生命周期的每个可变边界重查最新 Host-local serviceability，运行中的 Host
+  最多持有一个 active/build body 和一个 cleanup body；
+- exact `snapshot-cursor-ahead` 使用不续期的 identity deadline，generic ambiguity 继续 fail closed；
+- 多个 waiter 共享 manager-owned refresh flight，单 waiter 或旧 connection 离开不取消公共工作；inclusive
+  minimum cut 压力至多合并出一个有 live owner 的 follow-up。
 
-### Phase 1：Checkpoint manager 与动态 serviceability
+这些能力和完整 CI 已在同一 stacked revision 上通过；在 parent stack 合入 `main` 前仍不能称为主线 Phase 1
+完成。
 
-- **P1.1：latest-valid ownership 与 age freshness**。每个 HostCloudRelay/TerminalSession 构造一个
-  `SnapshotCheckpointManager`，跨 relay connection 复用现有 publisher 和 immutable latest；30 秒只改变
-  `ageFresh`，不删除 checkpoint。Scheduler 仍用现有 journal replay、frame/byte 上限决定当前 delivery，且
-  capture/quiet/backoff/generation cancellation 与 v2 ordering 不变。
-- **P1.2：Host journal range facts 与 CURRENT cold-tail admission**。在 materialize replay 前，对 canonical
-  pause 后固定的 `{R,H}` 计算实际 encoded bytes、frames 和 gap；超出现有 credit/frame envelope 时不复制旧
-  tail，仍走 exact-checkpoint invalidation 与 quiet 后 recapture。它只证明 Host-local eligibility，不证明
-  Cloud blob、Browser budget、pending body 或完整 `usable`，也不决定 refresh policy；v2 delivery ordering
-  不变。
-- **P1.3：pending body serviceability**。pending body 只在仍 serviceable 或 bounded cursor-ahead 时 resume，
-  否则按 cleanup-safe ownership abandon/supersede；失败不能 starvation、storm 或泄漏 immutable body。
-- **P1.4：manager-owned refresh single-flight**。把 `refreshInFlight`、合并后的更新压力和 waiter ownership 移入
-  manager；单个 waiter supersede 不取消仍有价值的公共 build，connection replacement 可以接续同一 session
-  refresh。每个 waiter 的 signal 只拥有该 waiter；公共 capture、publish 和 install 只由 manager dispose 或
-  manager-owned deadline 终止。`minimumCut` 是 inclusive floor：旧 waiter 可以接收已满足自身 floor 的 `R`，
-  较新的 waiter 不得被同一结果降级，并至多合并出一个 follow-up flight。Generation replacement 本身不抬高
-  floor；只有 exact checkpoint invalidation 或 P1.3 pending supersede 提供新的 replacement floor。此步必须
-  显式更新当前 generation-supersede 的 capture/publish 契约。
+### 保留的直接测试
 
-P1.1 的直接 gate 是：manager 在 30 秒边界后仍返回同一 latest 且 `ageFresh=false`；两个无 mutation 的 cold
-attach 相隔超过 30 秒仍使用同一 `snapshotId`，authority encode 和 publish 总计各一次。现有 16 attach
-单 build 只是回归保护，不作为本层新增进展。旧 checkpoint 的 tail gap/静态超预算仍必须 invalidate 并 recapture。
-P1.1 单独通过不表示 Phase 1 完成；下列总 gate 仍需 P1.2–P1.4 的直接证据。
+- `apps/host-daemon/src/cloud/delivery-barrier-waiter.test.ts`、`delivery-recovery-queue.test.ts` 与
+  `delivery-scheduler.test.ts` 检查 v2 marker identity、non-ready 收敛、fixed ordering、range admission、共享
+  checkpoint invalidation 和 recovery generation fence；
+- `apps/terminal-cloud/src/browser/terminal-session.test.ts` 检查 attach start、warm commit、snapshot
+  restore/candidate deadline owner 和 matching generation transition；
+- `apps/terminal-cloud/test/relay.test.ts`、`runtime.test.ts` 与 protocol schema tests 检查 exact barrier outcome、
+  capability negotiation、hibernation 和 legacy/enriched rolling compatibility；
+- `apps/host-daemon/src/cloud/snapshot-checkpoint-manager.test.ts` 检查 age classification 不驱逐或续期、
+  lineage/high-water、single-flight、waiter detach、minimum cut、invalidation floor、dispose 和 manager deadline；
+- `apps/host-daemon/src/cloud/snapshot-publisher.test.ts` 检查 immutable retry、pending re-admission、cursor-ahead
+  deadline、cleanup ownership 与 retained-body 上限；
+- `apps/host-daemon/src/journal.test.ts` 检查 no-copy scalar plan 与 same-revision materialization；
+- `apps/host-daemon/src/cloud/host-relay-connection.test.ts` 检查旧 connection 关闭后 replacement 接续同一
+  unresolved flight，且旧 connection 不接收 marker；
+- `apps/terminal-cloud/test/snapshot-retention.test.ts` 检查 completed row、R2 object verification、cursor-ahead 和
+  bounded upload/cleanup ledger。
 
-P1.2 的直接 gate 是：mixed output/resize range 返回精确 scalar facts 且不复制 frames；CURRENT cold tail
-超 256 KiB credit 或 512 frames 时不 materialize 旧 range，under-limit range 才从同一 journal revision
-materialize。Materialized frame count/encoded bytes 与 plan 不一致时 fail closed，不能发送 barrier、截断 tail
-或 commit。Warm policy、pending serviceability 与完整 `usable` 不在本层声明内。
+这些测试的证据来自明确状态、identity、frame ordering、资源 owner 和本地 Worker storage/R2 oracle。测试总数、
+绿色 CI、timeout 数值或 clean build 本身不证明这些状态。
 
-P1.3 的直接 gate 是：build 后首次 PUT 前、每次 retry/resume 前以及 exact upload success 安装前，重新以
-最新 `H=session.cursor` 检查 P1.2 的 Host-local range、现有 256 KiB credit 和 512-frame 上限；失去 eligibility
-的 body 立即不再作为 recovery candidate。尚未 PUT 的 local body 可 exact-CAS 释放；结果不确定的 PUT 必须
-转入同一 session 最多一个 local cleanup owner，并继续使用同一 ID/body 做 reconciliation；只有 exact success、
-checksum cleanup-confirmed，或 Cloud 明确接管的 completed object 才能释放。Active/build 与 cleanup 合计最多
-保留两个 immutable body，cleanup 满时不得构造第三个。
+### 当前局限
 
-Cloud 只在 exact completed row 和 R2 object 已验证、且唯一失败是 committed head 尚未追上 cut 时返回
-`409 snapshot-cursor-ahead`。该 identity 从第一次收到此精确结果起最多等待 120 秒；attach、relay reconnect、
-caller timeout、backoff 和后续相同响应都不能续期。generic `snapshot-conflict`、transport/5xx 和 unknown 结果
-不能冒充 cursor-ahead，也不能直接释放 body。部署顺序必须 Cloud-first：旧 Host 会保守重试新错误码；新 Host
-连接旧 Cloud 时仍保守保留 generic 409，因此在 rolling 窗口中只会暂时退化为旧行为，不牺牲 immutable retry。
-本层不改变 Cloud generic `uncertain` 的 alarm/GC 语义；Host 进程退出后该类 reservation 的 durable cleanup
-仍是后续 gate，不能由运行期的单个 local cleanup slot 推导。
+- Host suite 大量使用 fake authority、fake timer、mock publisher 和 mock WebSocket；Worker suite 使用本地
+  workerd/Miniflare，不代表 production Cloudflare、真实 R2 或真实网络；
+- 现有测试不证明任意 Browser 都能取得 blob，也不证明真实 WTerm/Ghostty restore/adopt 后的完整 tail
+  continuity；
+- JavaScript deadline 不能抢占同步 full snapshot WASM encode，因此 5 秒 capture budget 不是 actor hard max；
+- 本地 cleanup slot 只约束运行中的 Host；进程崩溃后 generic `uncertain` upload 的 durable reconciliation 仍未
+  完成；
+- Phase 0/1 不证明 Recovery v3、multi-client fairness、load/soak、性能/SLO、production dashboard 或真实滚动
+  发布。
 
-P1.4 的直接 gate 是：16 个尚未完成的 cold attach 都注册为真实 waiter，但 authority capture、encode、publish
-和 install 各至多一次；取消其中 15 个 waiter 不取消公共 flight。旧 relay connection 在 unresolved publish
-期间关闭时只取消旧 waiter，replacement connection 接续同一 flight，旧 connection 不收到 barrier/commit，
-replacement 才能完成 delivery。若 flight 在 `R` 完成时已有最低 `H>R` 的 live waiter，`R` 只满足允许它的旧
-waiter，manager 合并压力并启动恰好一个满足 `H` 的 follow-up；所有 waiter 已离开时，已有 flight 可以安装
-有用 checkpoint，但不得无 owner 地启动 follow-up。Exact shared checkpoint invalidation 必须清除所有 scheduler
-preparation 中的旧引用；迟到结果不得把它重新分配给 recovery。Waiter abort 不取消公共 flight；manager
-dispose 或 manager-owned deadline 会终止公共 flight，并使迟到 completion 无法安装。
+### 后续需要的测试
 
-Phase 1 stacked-candidate gate 是：P1.1–P1.4 的直接证据和完整 CI 在同一 exact revision 上同时通过。其可声明
-16 个 attach 共享一个 session-owned refresh、90–120 秒 upload/retry 中失去 Host-local serviceability 的
-checkpoint 不会被 Host 安装或交付（已经发出的 PUT 仍可能在 Cloud 完成）、idle checkpoint 不因 TTL 被错误
-删除，且运行中的 Host 不会出现 pending body starvation/storm 或无界 retained-body 增长。它仍不证明 Cloud
-blob 对任意 Browser 完整 usable，不提供 Host 崩溃后 generic `uncertain` 的 durable cleanup，不把同步 full
-snapshot capture 伪装成可抢占的 actor hard deadline，也不关闭 Recovery v3、性能/SLO 或生产 rollout gate。
-在 parent PR 合入 `main` 前，只能称 stacked candidate 完成，不能称主线 Phase 1 已完成。
+- Durable Object v4→v5 ticket/capability 数据迁移 fixture，以及 Cloud-first rolling deployment 的
+  production-like staging 验证；
+- DO hibernation、R2 HEAD/PUT/delete、response loss、Host crash/restart 和 generic uncertain reconciliation 的
+  fault injection；
+- 真实 snapshot restore/adopt、parser continuation 与 exact tail-continuity oracle；
+- Recovery v3 的 state model、property/fuzz、duplicate/gap/reset/adopt/closure 和 multi-client aggregate budget；
+- 性能验证只在 workload、link profile、环境隔离、warm-up、样本量和统计方法另行批准后实施。
 
 ### Phase 2：Recovery v3，继续使用 full snapshot
 
