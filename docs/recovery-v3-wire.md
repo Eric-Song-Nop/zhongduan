@@ -1,7 +1,8 @@
 # Recovery v3 Wire Contract
 
-> 状态：P2.0–P2.5a 为 stacked candidates；Recovery v3 的 Host/Cloud/Browser runtime 已在完整
-> capability gate 后接通，P2.5a 增加 no-payload delivery ledger 与 cold-owner safety。默认 production
+> 状态：P2.0–P2.5b 为 stacked candidates；Recovery v3 的 Host/Cloud/Browser runtime 已在完整
+> capability gate 后接通，P2.5a 增加 no-payload delivery ledger/cold-owner safety，P2.5b 增加
+> Host recovery source multi-outstanding 与 connection-local DRR。默认 production
 > kill switch 和 Host/Browser offers 仍选择 protocol v2，所以尚未 rollout
 >
 > 适用范围：Host authority data、Cloud delivery、Browser recovery 与滚动协商
@@ -158,7 +159,7 @@ identity cache。Cloud 只有 matching `RecoveryAdopted` 与 `RecoverySourceClos
 
 ## 当前启用状态与验证边界
 
-### P2.0–P2.5a stacked candidates
+### P2.0–P2.5b stacked candidates
 
 P2.0 保留 strict schema、codec、capability transport、authority version migration 和 generation strategy 的 v2
 default。P2.4 增加按 generation strategy 隔离的 Browser↔Cloud 与 Cloud↔Host strict control union；
@@ -263,8 +264,9 @@ P2.4 Cloud runtime 在这些 durable facts 上完成：
   outstanding envelope 时又来一条 canonical mutation、看到 same ordinal 或 data send outcome
   uncertain，只 reset/isolate 该 client generation；authority、v2 客户端与其他 v3 客户端继续。
 
-P2.5a runtime 仍按 per-lane stop-and-wait 调度；ledger 的多 obligation chain 只是 window prerequisite，不能
-描述为当前 sender 已开放 window。一次发送严格按以下顺序执行：
+P2.5a 里程碑将每条发送严格固定为以下顺序；它的 Cloud recovery path 已能按此接受
+连续 obligation 与 intermediate sent-prefix receipt，但当时 Host emitter 每个 control turn 只 drain
+一条。live lane 的 `sent == received` gate 仍是 stop-and-wait：
 
 ```text
 transactionSync: enqueue queued -> begin sending
@@ -275,6 +277,19 @@ transactionSync: confirm sent + advance lane.sent
 begin 与 confirm 都必须实际 CAS 同一 record；socket identity 变化、send throw 或 send 后 confirm 不可判定，
 都只 fence 当前 recovery generation，绝不尝试重发 outcome-uncertain payload。`sent` 表示 socket API 已接受且
 confirm 已提交，不等于 Browser 已 receipt。
+
+P2.5b 只改 Host recovery-lane emitter：`RecoverySourceManager` 只在 `send` 成功返回后推进
+sent high-water，已 sent 未 receipt 的 record 不再重发；同 grant 下可持有多个
+outstanding record，intermediate exact receipt 按 prefix 释放 retained payload，Done receipt 才产生
+stable `RecoverySourceClosed`。send throw 前不推进，direct retry 仍 byte-identical。
+
+独立 `RecoverySourceScheduler` 不持有 payload/source truth，只以 exact identity、bounded byte
+deficit 和 runnable queue 做 connection-local DRR。每个异步 data turn 最多发一条 record 后
+yield，使 control/input/canonical live 先运行；shared data socket 达到 high-water 只 blocked
+并经 bounded yield 重试，不关 Host pair、不推进 cursor。真实 send throw 仍是 pair-level
+outcome-uncertain failure。source no-progress/absolute deadline 只 retire exact tombstone 与 scheduler entry，
+健康 pair/其他 source 继续；该 identity 的迟到 control 幂等忽略，divergent identity 仍
+fail closed。
 
 Cloud 不拥有可跨 hibernation 恢复的 mutation payload。`queued`/`sending` 只可作为当前 DO turn 的短生命周期
 witness；fresh instance 在 `alarmMux.initialize()` 后、snapshot/recovery maintenance 与 v3 outbox drain 前执行
@@ -291,13 +306,14 @@ bounded `reconcileRecoveryDeliveryOwnersAfterWake()`：
 单 recovery ledger 的上限为 `2 MiB / 1024 records`。P2.5a 暴露
 `granted_cumulative_encoded_bytes - recovery_received_cumulative_encoded_bytes` reservation，但不宣称已经有
 Cloud session aggregate allocator；当前 Host retained-envelope owner 仍受既有 session `2 MiB / 1024 records`
-上限约束。P2.5c 才增加 session-scoped ephemeral shared ring、grant/live aggregate accounting、writer/live
-reservation 与 multi-client DRR。ring payload/refcount 不能持久化到 v9 ledger，冷启仍服从上述 no-payload
+上限约束，P2.5b 只在该上限内增加 Host source DRR。P2.5c 才增加 session-scoped
+ephemeral shared ring、grant/live aggregate accounting、writer/live reservation 与 Cloud 多 client/lane DRR。
+ring payload/refcount 不能持久化到 v9 ledger，冷启仍服从上述 no-payload
 fence。
 
 ### 默认生产启用状态与后置 gate
 
-P2.5a 的 runtime/ledger wiring 已经存在，但默认配置不会选中它：
+P2.5a/P2.5b 的 runtime/ledger/Host scheduler wiring 已经存在，但默认配置不会选中它：
 
 - Wrangler 的 `RECOVERY_V3_ENABLED` 默认为 `"false"`；
 - Host `CloudApiClient` 与 Browser `TerminalSession` 的默认 capability offer 只包含 v2 baseline；
@@ -308,11 +324,10 @@ P2.5a 的 runtime/ledger wiring 已经存在，但默认配置不会选中它：
 
 因此当前状态是“capability-gated runtime 已接通”，而不是“Recovery v3 已上线”。v3
 generation 不使用 v2 global pause/fixed-commit barrier/pin；默认 v2 generation 和 rolling fallback
-仍完整保留 pause/barrier/pin invariant，不得因 P2.5a wiring 单独放宽。
+仍完整保留 pause/barrier/pin invariant，不得因 P2.5a/P2.5b wiring 单独放宽。
 
-P2.5 后续 slice 仍需实际扩大 bounded per-lane window；P2.5c 仍需建立 session aggregate、ephemeral shared
-ring、writer/live reservation 与 multi-client DRR。P2.5a 的 fixed grant/stop-and-wait 只是有界 correctness
-路径。P2.6 仍需完成
+P2.5b 已打开 Host recovery window；P2.5c 仍需建立 Cloud session aggregate、ephemeral shared
+ring、writer/live reservation、live window 与多 client/lane DRR。P2.6 仍需完成
 three-owner deterministic crash/loss integration、真实 WTerm/Ghostty snapshot/parser continuation 与 exact-tail
 continuity oracle，以及 rolling downgrade/rollback gate。性能、load/soak、SLO 和 dashboard 继续后置，
 不能替代 correctness gates。
@@ -362,14 +377,20 @@ P2.4 owner-level wiring tests 保留以下直接证据：
 P2.5a direct Store/migration 与 runtime evidence 额外覆盖：v9 strict no-payload ledger、canonical decimal-u64
 ordering、以 obligation tail 为基线的连续链、`queued -> sending -> sent` exact CAS、sent-prefix receipt、容量与
 grant reservation、v8 uncertain outstanding fence，以及 wake 后 transient owner/缺失 socket pair/complete
-generation 的分流。sent record 在 hibernation 后不重发，当前调度仍被断言为 stop-and-wait。
+generation 的分流。sent record 在 hibernation 后不重发；这是 Cloud ledger/cold-owner evidence，
+不是 Host emitter 公平性 evidence。
 
-P2.4/P2.5a 证据是本地 workerd/Miniflare、fake WebSocket、fake timer/clock 与 caller-provided replica seam
+P2.5b direct Host evidence 额外覆盖：同 grant 下多个 sent-but-unreceived record、不重发、exact
+intermediate prefix release、send-throw 不推进、多 source deterministic DRR、每 record yield、
+shared-socket backpressure 只 blocked/retry、单 source deadline retire、迟到 exact control 以及健康
+pair/canonical/input/V2 regression。
+
+P2.4–P2.5b 证据是本地 workerd/Miniflare、fake WebSocket、fake timer/clock 与 caller-provided replica seam
 上的 wiring evidence。它不证明真实网络、production Cloudflare/R2、真实 WTerm/Ghostty parser
-continuation 与 tail equivalence，也不证明 wider lane window、session aggregate、shared-ring/DRR、性能或
-SLO；这些分别属于 P2.5 后续 slice、P2.5c、P2.6 及后续环境 gate。
+continuation 与 tail equivalence，也不证明 Cloud session aggregate/shared ring/多 client DRR、性能或
+SLO；这些分别属于 P2.5c、P2.6 及后续环境 gate。
 
-P2.0–P2.5a 不修改 WTerm/Ghostty。若 P2.5 后续 slice/P2.6 暴露真实 API 缺口，必须先在
+P2.0–P2.5b 不修改 WTerm/Ghostty。若 P2.5c/P2.6 暴露真实 API 缺口，必须先在
 `Eric-Song-Nop` 对应 fork 建立正式 PR 并完成 review/验证，再由 Zhongduan 的独立 stacked PR
 更新固定 submodule；不得直接改 vendor、指向
 upstream 或 pin 未审 commit。

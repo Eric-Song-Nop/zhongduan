@@ -18,10 +18,10 @@ import { EventJournal } from "../journal";
 import type { PtyProcess } from "../pty-process";
 import { TerminalSession, type SnapshotCapture } from "../session";
 import type { SemanticMouse } from "../terminal-authority";
-import { HOST_CANONICAL_QUEUE_LIMITS } from "./canonical-publisher";
 import { HostRelayConnection, HOST_CONTROL_QUEUE_LIMITS } from "./host-relay-connection";
 import type { HostSocketPair } from "./paired-websocket";
 import { RecoverySourceManager, type RecoverySourceManagerLimits } from "./recovery-source-manager";
+import { HOST_RECOVERY_DATA_HIGH_WATER_BYTES } from "./recovery-source-scheduler";
 import type { PublishedSnapshot } from "./snapshot-publisher";
 import {
   SnapshotCheckpointManager,
@@ -419,7 +419,7 @@ describe("HostRelayConnection", () => {
     v3.session.dispose();
   });
 
-  it("uses a partial receipt to continue one already-granted recovery record", async () => {
+  it("sends multiple granted records across fair data turns before an intermediate receipt", async () => {
     const v3 = createHarness({
       connection: {
         ...connectionSet,
@@ -445,9 +445,12 @@ describe("HostRelayConnection", () => {
         cumulativeGrantedEncodedBytes: "177",
       }),
     );
-    await vi.waitFor(() => expect(v3.data.sent).toHaveLength(3));
+    await vi.waitFor(() => expect(v3.data.sent).toHaveLength(4));
     const first = decodeDeliveryEnvelopeV3(v3.data.sent[2] as Uint8Array);
     expect(first).toMatchObject({ deliveryOrdinal: 1n, cumulativeEncodedBytes: 89n });
+    const done = decodeDeliveryEnvelopeV3(v3.data.sent[3] as Uint8Array);
+    expect(done).toMatchObject({ deliveryOrdinal: 2n, cumulativeEncodedBytes: 177n });
+    expect(decodeDataFrame(done.payload)).toMatchObject({ kind: DataFrameKind.ReplayCommit });
 
     v3.control.message(
       JSON.stringify({
@@ -461,10 +464,26 @@ describe("HostRelayConnection", () => {
         cumulativeEncodedBytes: "89",
       }),
     );
-    await vi.waitFor(() => expect(v3.data.sent).toHaveLength(4));
-    const done = decodeDeliveryEnvelopeV3(v3.data.sent[3] as Uint8Array);
-    expect(done).toMatchObject({ deliveryOrdinal: 2n, cumulativeEncodedBytes: 177n });
-    expect(decodeDataFrame(done.payload)).toMatchObject({ kind: DataFrameKind.ReplayCommit });
+    await settle();
+    expect(v3.data.sent).toHaveLength(4);
+    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-source-received",
+        recoveryId: prepare.recoveryId,
+        connectionId: prepare.connectionId,
+        streamId: prepare.streamId,
+        deliveryGeneration: prepare.deliveryGeneration,
+        lane: "recovery",
+        contiguousDeliveryOrdinal: "2",
+        cumulativeEncodedBytes: "177",
+      }),
+    );
+    await vi.waitFor(() => expect(v3.control.sent).toHaveLength(2));
+    expect(
+      decodeControlFrame(v3.control.sent[1] as string, RecoveryV3HostToCloudControlFrameSchema),
+    ).toMatchObject({ type: "recovery-source-closed", throughRecoveryOrdinal: "2" });
     v3.relay.close();
     v3.session.dispose();
   });
@@ -549,6 +568,115 @@ describe("HostRelayConnection", () => {
     v3.session.dispose();
   });
 
+  it("fences a replaced generation across late control and an already-scheduled data turn", async () => {
+    vi.useFakeTimers();
+    const v3 = createHarness({
+      connection: {
+        ...connectionSet,
+        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
+      },
+    });
+    await acknowledgeReady(v3);
+    const generationOne = recoveryPrepare(v3.session, "1");
+    const generationTwo = recoveryPrepare(v3.session, "2");
+
+    v3.control.message(JSON.stringify(generationOne));
+    await settleMicrotasks();
+    expect(v3.data.sent).toHaveLength(1);
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-start-ready",
+        recoveryId: generationOne.recoveryId,
+        connectionId: generationOne.connectionId,
+        streamId: generationOne.streamId,
+        deliveryGeneration: generationOne.deliveryGeneration,
+        committedThrough: generationOne.base,
+        cumulativeGrantedEncodedBytes: "88",
+      }),
+    );
+    await settleMicrotasks();
+    expect(v3.data.sent).toHaveLength(1);
+
+    v3.control.message(JSON.stringify(generationTwo));
+    await settleMicrotasks();
+    await settleMicrotasks();
+    expect(v3.data.sent).toHaveLength(2);
+    expect(decodeRecoveryStartFence(v3.data.sent[1] as Uint8Array)).toMatchObject({
+      deliveryGeneration: "2",
+    });
+
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-start-ready",
+        recoveryId: generationTwo.recoveryId,
+        connectionId: generationTwo.connectionId,
+        streamId: generationTwo.streamId,
+        deliveryGeneration: generationTwo.deliveryGeneration,
+        committedThrough: generationTwo.base,
+        cumulativeGrantedEncodedBytes: "88",
+      }),
+    );
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-source-grant",
+        recoveryId: generationOne.recoveryId,
+        connectionId: generationOne.connectionId,
+        streamId: generationOne.streamId,
+        deliveryGeneration: generationOne.deliveryGeneration,
+        cumulativeGrantedEncodedBytes: "88",
+      }),
+    );
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-source-received",
+        recoveryId: generationOne.recoveryId,
+        connectionId: generationOne.connectionId,
+        streamId: generationOne.streamId,
+        deliveryGeneration: generationOne.deliveryGeneration,
+        lane: "recovery",
+        contiguousDeliveryOrdinal: "1",
+        cumulativeEncodedBytes: "88",
+      }),
+    );
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-source-reset",
+        recoveryId: generationOne.recoveryId,
+        connectionId: generationOne.connectionId,
+        streamId: generationOne.streamId,
+        deliveryGeneration: generationOne.deliveryGeneration,
+        reason: "generation-reset",
+      }),
+    );
+    await settleMicrotasks();
+    await settleMicrotasks();
+    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(v3.data.sent).toHaveLength(3);
+    expect(decodeDeliveryEnvelopeV3(v3.data.sent[2] as Uint8Array)).toMatchObject({
+      deliveryGeneration: 2n,
+      deliveryOrdinal: 1n,
+    });
+    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-source-grant",
+        recoveryId: "recovery-host-divergent",
+        connectionId: generationOne.connectionId,
+        streamId: generationOne.streamId,
+        deliveryGeneration: generationOne.deliveryGeneration,
+        cumulativeGrantedEncodedBytes: "88",
+      }),
+    );
+    await settleMicrotasks();
+    expect(v3.control.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(v3.data.readyState).toBe(FakeWebSocket.CLOSED);
+    v3.session.dispose();
+  });
+
   it("fences the v3 owner on a recovery data send throw before later grants can reuse the pair", async () => {
     const v3 = createHarness({
       connection: {
@@ -597,7 +725,8 @@ describe("HostRelayConnection", () => {
     v3.session.dispose();
   });
 
-  it("checks shared data backpressure before a recovery send and never guesses after success", async () => {
+  it("yields recovery at shared data backpressure while canonical traffic stays live", async () => {
+    vi.useFakeTimers();
     const open = async () => {
       const harness = createHarness({
         connection: {
@@ -628,18 +757,35 @@ describe("HostRelayConnection", () => {
       );
 
     const blocked = await open();
-    blocked.harness.data.bufferedAmount = HOST_CANONICAL_QUEUE_LIMITS.maxBytes - 88 + 1;
+    blocked.harness.data.bufferedAmount = HOST_RECOVERY_DATA_HIGH_WATER_BYTES;
     start(blocked.harness, blocked.prepare);
-    await vi.waitFor(() => expect(blocked.harness.control.readyState).toBe(FakeWebSocket.CLOSED));
+    await vi.advanceTimersByTimeAsync(0);
     expect(blocked.harness.data.sent).toHaveLength(1);
-    expect(blocked.harness.control.closeReason).toContain("buffer exceeded");
+    expect(blocked.harness.control.readyState).toBe(FakeWebSocket.OPEN);
+
+    blocked.harness.pty.emit(Uint8Array.of(0x41));
+    await settleMicrotasks();
+    expect(blocked.harness.data.sent).toHaveLength(2);
+    expect(decodeDataFrame(blocked.harness.data.sent[1] as Uint8Array)).toMatchObject({
+      kind: DataFrameKind.PtyOutput,
+    });
+
+    blocked.harness.data.bufferedAmount = HOST_RECOVERY_DATA_HIGH_WATER_BYTES - 88;
+    await vi.advanceTimersByTimeAsync(10);
+    expect(blocked.harness.data.sent).toHaveLength(3);
+    expect(decodeDeliveryEnvelopeV3(blocked.harness.data.sent[2] as Uint8Array)).toMatchObject({
+      lane: "recovery",
+      deliveryOrdinal: 1n,
+    });
+    expect(blocked.harness.control.readyState).toBe(FakeWebSocket.OPEN);
     blocked.harness.session.dispose();
 
     const accepted = await open();
-    accepted.harness.data.bufferedAmount = HOST_CANONICAL_QUEUE_LIMITS.maxBytes - 88;
-    accepted.harness.data.bufferedAmountAfterBinarySend = HOST_CANONICAL_QUEUE_LIMITS.maxBytes + 1;
+    accepted.harness.data.bufferedAmount = HOST_RECOVERY_DATA_HIGH_WATER_BYTES - 88;
+    accepted.harness.data.bufferedAmountAfterBinarySend = HOST_RECOVERY_DATA_HIGH_WATER_BYTES + 1;
     start(accepted.harness, accepted.prepare);
-    await vi.waitFor(() => expect(accepted.harness.data.sent).toHaveLength(2));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(accepted.harness.data.sent).toHaveLength(2);
     expect((accepted.harness.data.sent[1] as Uint8Array).byteLength).toBe(88);
     expect(accepted.harness.control.readyState).toBe(FakeWebSocket.OPEN);
     expect(accepted.harness.recoverySourceManager.counters).toMatchObject({ ownedRecords: 1 });
@@ -647,7 +793,7 @@ describe("HostRelayConnection", () => {
     accepted.harness.session.dispose();
   });
 
-  it("uses concrete deadline identities to fence an expired v3 pair", async () => {
+  it("retires only an expired source and ignores its late exact control on the healthy pair", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     const v3 = createHarness({
@@ -670,10 +816,169 @@ describe("HostRelayConnection", () => {
     expect(v3.data.sent).toHaveLength(1);
 
     await vi.advanceTimersByTimeAsync(10);
-    expect(v3.control.readyState).toBe(FakeWebSocket.CLOSED);
-    expect(v3.control.closeReason).toContain(prepare.recoveryId);
-    expect(v3.control.closeReason).toContain("no-progress-deadline");
-    expect(v3.recoverySourceManager.counters).toMatchObject({ ownedRecords: 0, sources: 0 });
+    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
+    expect(v3.recoverySourceManager.counters).toMatchObject({ ownedRecords: 0, sources: 1 });
+
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-source-grant",
+        recoveryId: prepare.recoveryId,
+        connectionId: prepare.connectionId,
+        streamId: prepare.streamId,
+        deliveryGeneration: prepare.deliveryGeneration,
+        cumulativeGrantedEncodedBytes: "88",
+      }),
+    );
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-source-received",
+        recoveryId: prepare.recoveryId,
+        connectionId: prepare.connectionId,
+        streamId: prepare.streamId,
+        deliveryGeneration: prepare.deliveryGeneration,
+        lane: "recovery",
+        contiguousDeliveryOrdinal: "1",
+        cumulativeEncodedBytes: "88",
+      }),
+    );
+    await settleMicrotasks();
+    expect(v3.control.closeReason).toBeUndefined();
+    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
+    v3.session.dispose();
+  });
+
+  it("keeps the pair live when a pending prepare crosses its exact deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const v3 = createHarness({
+      connection: {
+        ...connectionSet,
+        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
+      },
+      monotonicNow: () => Date.now(),
+      recoveryDeadlineTickMs: 10,
+      recoveryLimits: {
+        ...RECOVERY_LIMITS,
+        noProgressDeadlineMs: 100,
+        recoveryDeadlineMs: 10,
+      },
+    });
+    const pending = deferred<Awaited<ReturnType<TerminalSession["prepareRecoveryGap"]>>>();
+    vi.spyOn(v3.session, "prepareRecoveryGap").mockReturnValue(pending.promise);
+    await acknowledgeReady(v3);
+    const prepare = recoveryPrepare(v3.session);
+
+    v3.control.message(JSON.stringify(prepare));
+    await settleMicrotasks();
+    expect(v3.recoverySourceManager.counters).toMatchObject({ pendingSources: 1 });
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(v3.recoverySourceManager.counters).toMatchObject({ pendingSources: 0, sources: 1 });
+    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
+
+    pending.resolve({ status: "unavailable", reason: "fence-unavailable" });
+    await settleMicrotasks();
+    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
+    v3.relay.close();
+    v3.session.dispose();
+  });
+
+  it("lets a live source continue after another source on the same pair expires", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const v3 = createHarness({
+      connection: {
+        ...connectionSet,
+        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
+      },
+      monotonicNow: () => Date.now(),
+      recoveryDeadlineTickMs: 10,
+      recoveryLimits: {
+        ...RECOVERY_LIMITS,
+        noProgressDeadlineMs: 10,
+        recoveryDeadlineMs: 100,
+      },
+    });
+    await acknowledgeReady(v3);
+    v3.pty.emit(Uint8Array.of(0x41));
+    await settleMicrotasks();
+    const expired = recoveryPrepare(v3.session);
+    const live = {
+      ...expired,
+      recoveryId: "recovery-host-00000002",
+      connectionId: "connection-browser-0002",
+      streamId: 2,
+    };
+
+    v3.control.message(JSON.stringify(expired));
+    v3.control.message(JSON.stringify(live));
+    await settleMicrotasks();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(v3.data.sent).toHaveLength(3);
+    const liveFence = decodeRecoveryStartFence(v3.data.sent[2] as Uint8Array);
+
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-start-ready",
+        recoveryId: live.recoveryId,
+        connectionId: live.connectionId,
+        streamId: live.streamId,
+        deliveryGeneration: live.deliveryGeneration,
+        committedThrough: liveFence.committedThrough,
+        cumulativeGrantedEncodedBytes: "89",
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(decodeDeliveryEnvelopeV3(v3.data.sent[3] as Uint8Array)).toMatchObject({
+      streamId: 2,
+      deliveryOrdinal: 1n,
+    });
+
+    await vi.advanceTimersByTimeAsync(5);
+    v3.data.bufferedAmount = HOST_RECOVERY_DATA_HIGH_WATER_BYTES;
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-source-received",
+        recoveryId: live.recoveryId,
+        connectionId: live.connectionId,
+        streamId: live.streamId,
+        deliveryGeneration: live.deliveryGeneration,
+        lane: "recovery",
+        contiguousDeliveryOrdinal: "1",
+        cumulativeEncodedBytes: "89",
+      }),
+    );
+    v3.control.message(
+      JSON.stringify({
+        type: "recovery-source-grant",
+        recoveryId: live.recoveryId,
+        connectionId: live.connectionId,
+        streamId: live.streamId,
+        deliveryGeneration: live.deliveryGeneration,
+        cumulativeGrantedEncodedBytes: "177",
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(v3.data.sent).toHaveLength(4);
+
+    await vi.advanceTimersByTimeAsync(5);
+    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(v3.recoverySourceManager.counters).toMatchObject({ sources: 2 });
+
+    v3.data.bufferedAmount = HOST_RECOVERY_DATA_HIGH_WATER_BYTES - 88;
+    await vi.advanceTimersByTimeAsync(5);
+    expect(decodeDeliveryEnvelopeV3(v3.data.sent[4] as Uint8Array)).toMatchObject({
+      streamId: 2,
+      deliveryOrdinal: 2n,
+      cumulativeEncodedBytes: 177n,
+    });
+    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
+    v3.relay.close();
     v3.session.dispose();
   });
 
@@ -708,7 +1013,7 @@ describe("HostRelayConnection", () => {
         cumulativeGrantedEncodedBytes: "88",
       }),
     );
-    await settleMicrotasks();
+    await vi.advanceTimersByTimeAsync(0);
     v3.control.message(
       JSON.stringify({
         type: "recovery-source-received",

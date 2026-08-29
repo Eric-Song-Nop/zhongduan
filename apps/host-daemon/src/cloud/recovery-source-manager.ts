@@ -27,6 +27,8 @@ import {
 
 import type { PreparedRecoveryGap, ReplayCursor, TerminalSession } from "../session";
 
+const MAX_RETIRED_GENERATIONS_PER_STREAM = 16;
+
 export interface RecoverySourceManagerLimits {
   readonly maxCanonicalBytesPerSource: number;
   readonly maxCanonicalFramesPerSource: number;
@@ -69,10 +71,11 @@ export interface RecoverySourceDrainLimits {
   readonly maxWireBytes: number;
 }
 
-export interface RecoverySourceDrainResult {
+export type RecoverySourceDrainResult = {
+  readonly status: "runnable" | "credit-blocked" | "complete" | "stale";
   readonly records: number;
   readonly wireBytes: number;
-}
+};
 
 export type RecoverySourceReceivedResult =
   | {
@@ -88,7 +91,7 @@ export type RecoverySourceReceivedResult =
     }
   | {
       readonly status: "invalid";
-      readonly reason: "unknown-source" | "beyond-sent" | "cumulative-mismatch";
+      readonly reason: "unknown-source" | "beyond-sent" | "cumulative-mismatch" | "non-monotonic";
     };
 
 export interface RecoverySourceDeadlineExpiration {
@@ -123,7 +126,6 @@ interface PendingPrepare {
   readonly ownerToken: RecoverySourceOwnerToken;
   readonly prepare: RecoveryV3HostPrepare;
   readonly promise: Promise<RecoverySourcePrepareResult>;
-  readonly replacedTombstone: RecoveryGenerationTombstone | null;
   readonly resolve: (result: RecoverySourcePrepareResult) => void;
   readonly startedAtMs: number;
   readonly token: symbol;
@@ -138,12 +140,15 @@ interface RecoverySource {
   lastProgressAtMs: number;
   lastReceivedOrdinal: bigint;
   nextSendIndex: number;
+  ownedRecords: number;
+  ownedWireBytes: number;
   readonly ownerToken: RecoverySourceOwnerToken;
   readonly prepare: RecoveryV3HostPrepare;
   readonly preparePromise: Promise<RecoverySourcePrepareResult>;
   readonly prepareResult: Extract<RecoverySourcePrepareResult, { status: "prepared" }>;
   ready: RecoveryV3HostStartReady | null;
-  records: readonly RetainedRecord[] | null;
+  readonly recordCumulativeEncodedBytes: readonly bigint[];
+  records: Array<RetainedRecord | null> | null;
   sentCumulativeEncodedBytes: bigint;
   sentDeliveryOrdinal: bigint;
   readonly startedAtMs: number;
@@ -175,7 +180,7 @@ export class RecoverySourceManager {
   readonly #session: TerminalSession;
   readonly #sourcesByStream = new Map<number, RecoverySource>();
   readonly #staleOwners = new WeakSet<RecoverySourceOwnerToken>();
-  readonly #tombstonesByStream = new Map<number, RecoveryGenerationTombstone>();
+  readonly #tombstonesByStream = new Map<number, readonly RecoveryGenerationTombstone[]>();
 
   #disposed = false;
   #lastNowMs: number;
@@ -211,7 +216,7 @@ export class RecoverySourceManager {
       ownedRecords: this.#ownedRecords,
       ownedWireBytes: this.#ownedWireBytes,
       pendingSources: this.#pendingByStream.size,
-      sources: this.#sourcesByStream.size + this.#tombstonesByStream.size,
+      sources: this.#streamCount(),
     };
   }
 
@@ -237,18 +242,12 @@ export class RecoverySourceManager {
 
     const existing = this.#existingPrepare(ownerToken, prepare);
     if (existing !== null) return existing;
-    const replacedTombstone = this.#tombstonesByStream.get(prepare.streamId) ?? null;
-    const replacesTombstone =
-      replacedTombstone !== null &&
-      replacedTombstone.ownerToken === ownerToken &&
-      BigInt(prepare.deliveryGeneration) > BigInt(replacedTombstone.identity.deliveryGeneration);
-    if (
-      this.#pendingByStream.size +
-        this.#sourcesByStream.size +
-        this.#tombstonesByStream.size -
-        (replacesTombstone ? 1 : 0) >=
-      this.#limits.maxSources
-    ) {
+    if (!this.#hasStream(prepare.streamId) && this.#streamCount() >= this.#limits.maxSources) {
+      return Promise.resolve(this.#rejected(prepare, "capacity-exceeded"));
+    }
+    // Every accepted pending/active generation reserves one history slot so a
+    // later reset or deadline can always retire it without losing exact identity.
+    if (!this.#hasRetirementCapacity(prepare.streamId, 1)) {
       return Promise.resolve(this.#rejected(prepare, "capacity-exceeded"));
     }
 
@@ -259,12 +258,10 @@ export class RecoverySourceManager {
       ownerToken,
       prepare,
       promise: deferred.promise,
-      replacedTombstone: replacesTombstone ? replacedTombstone : null,
       resolve: deferred.resolve,
       startedAtMs: nowMs,
       token: Symbol("recovery-source-prepare"),
     };
-    if (replacesTombstone) this.#tombstonesByStream.delete(prepare.streamId);
     this.#pendingByStream.set(prepare.streamId, pending);
 
     let sessionPrepare: ReturnType<TerminalSession["prepareRecoveryGap"]>;
@@ -361,18 +358,15 @@ export class RecoverySourceManager {
     this.#recordNow();
     const source = this.#sourceFor(ownerToken, routing);
     if (source === null || source.ready === null || source.records === null) {
-      return { records: 0, wireBytes: 0 };
+      return { status: "stale", records: 0, wireBytes: 0 };
     }
 
     let sentRecords = 0;
     let sentWireBytes = 0;
     while (sentRecords < maxRecords) {
-      const hasOutstanding = source.sentDeliveryOrdinal > source.lastReceivedOrdinal;
-      const recordIndex = hasOutstanding
-        ? Number(source.sentDeliveryOrdinal - 1n)
-        : source.nextSendIndex;
-      const record = source.records[recordIndex];
+      const record = source.records[source.nextSendIndex];
       if (record === undefined) break;
+      if (record === null) throw new Error("unsent Recovery source record was released");
       if (record.cumulativeEncodedBytes > source.cumulativeGrantedEncodedBytes) break;
       if (record.bytes.byteLength > maxWireBytes - sentWireBytes) break;
 
@@ -383,17 +377,18 @@ export class RecoverySourceManager {
       ) {
         break;
       }
-      if (!hasOutstanding) {
-        source.nextSendIndex += 1;
-        source.sentDeliveryOrdinal = record.deliveryOrdinal;
-        source.sentCumulativeEncodedBytes = record.cumulativeEncodedBytes;
-        source.lastProgressAtMs = Math.max(source.lastProgressAtMs, this.#lastNowMs);
-      }
+      source.nextSendIndex += 1;
+      source.sentDeliveryOrdinal = record.deliveryOrdinal;
+      source.sentCumulativeEncodedBytes = record.cumulativeEncodedBytes;
+      source.lastProgressAtMs = Math.max(source.lastProgressAtMs, this.#lastNowMs);
       sentRecords += 1;
       sentWireBytes += record.bytes.byteLength;
-      break;
     }
-    return { records: sentRecords, wireBytes: sentWireBytes };
+    return {
+      status: this.#drainStatus(ownerToken, routing, source),
+      records: sentRecords,
+      wireBytes: sentWireBytes,
+    };
   }
 
   received(
@@ -423,12 +418,16 @@ export class RecoverySourceManager {
     ) {
       return { status: "invalid", reason: "beyond-sent" };
     }
-    const record = records[Number(deliveryOrdinal - 1n)];
-    if (record === undefined || record.cumulativeEncodedBytes !== cumulativeEncodedBytes) {
+    const expectedCumulative = source.recordCumulativeEncodedBytes[Number(deliveryOrdinal - 1n)];
+    if (expectedCumulative === undefined || expectedCumulative !== cumulativeEncodedBytes) {
       return { status: "invalid", reason: "cumulative-mismatch" };
+    }
+    if (deliveryOrdinal < source.lastReceivedOrdinal) {
+      return { status: "invalid", reason: "non-monotonic" };
     }
     const advanced = deliveryOrdinal > source.lastReceivedOrdinal;
     if (advanced) {
+      this.#releaseReceivedPrefix(source, deliveryOrdinal);
       source.lastReceivedOrdinal = deliveryOrdinal;
       source.lastProgressAtMs = nowMs;
     }
@@ -461,8 +460,7 @@ export class RecoverySourceManager {
 
     const source = this.#sourceFor(ownerToken, reset);
     if (source !== null) {
-      this.#retireSource(source);
-      return true;
+      return this.#retireSource(source);
     }
     // An occupied stream with a different routing identity is not an
     // "unknown" source. Never let a stale or forged reset retire/fence the
@@ -476,52 +474,64 @@ export class RecoverySourceManager {
       return true;
     }
 
-    const tombstone = this.#tombstonesByStream.get(reset.streamId);
-    if (tombstone !== undefined) {
-      if (tombstone.ownerToken !== ownerToken) return false;
-      if (sameRouting(tombstone.identity, reset)) return true;
-      if (BigInt(reset.deliveryGeneration) <= BigInt(tombstone.identity.deliveryGeneration)) {
+    const tombstones = this.#tombstonesByStream.get(reset.streamId);
+    if (tombstones !== undefined) {
+      if (tombstones.some((tombstone) => tombstone.ownerToken !== ownerToken)) return false;
+      if (tombstones.some((tombstone) => sameRouting(tombstone.identity, reset))) return true;
+      if (BigInt(reset.deliveryGeneration) <= this.#latestRetiredGeneration(tombstones)) {
         return false;
       }
-      this.#installTombstone(ownerToken, reset);
-      return true;
+      return this.#installTombstone(ownerToken, reset);
     }
 
     // Cloud may durably replace an unsent recovery-prepare outbox entry with
     // recovery-source-reset. The current authenticated pair must accept that
     // reset even though it has never observed the source. Retaining the exact
     // generation identity prevents a late prepare from resurrecting it.
-    if (
-      this.#pendingByStream.size + this.#sourcesByStream.size + this.#tombstonesByStream.size >=
-      this.#limits.maxSources
-    ) {
+    if (!this.#hasStream(reset.streamId) && this.#streamCount() >= this.#limits.maxSources) {
       return false;
     }
-    this.#installTombstone(ownerToken, reset);
-    return true;
+    return this.#installTombstone(ownerToken, reset);
   }
 
   resetOwner(ownerToken: RecoverySourceOwnerToken): number {
     assertOwnerToken(ownerToken);
     this.#recordNow();
     this.#staleOwners.add(ownerToken);
-    let reset = 0;
+    const resetStreams = new Set<number>();
     for (const pending of this.#pendingByStream.values()) {
       if (pending.ownerToken !== ownerToken) continue;
       this.#cancelPending(pending, this.#rejected(pending.prepare, "client-gone"));
-      reset += 1;
+      resetStreams.add(pending.prepare.streamId);
     }
     for (const source of this.#sourcesByStream.values()) {
       if (source.ownerToken !== ownerToken) continue;
       this.#removeSource(source);
-      reset += 1;
+      resetStreams.add(source.prepare.streamId);
     }
-    for (const [streamId, tombstone] of this.#tombstonesByStream) {
-      if (tombstone.ownerToken !== ownerToken) continue;
-      this.#tombstonesByStream.delete(streamId);
-      reset += 1;
+    for (const [streamId, tombstones] of this.#tombstonesByStream) {
+      const retained = tombstones.filter((tombstone) => tombstone.ownerToken !== ownerToken);
+      if (retained.length === tombstones.length) continue;
+      if (retained.length === 0) this.#tombstonesByStream.delete(streamId);
+      else this.#tombstonesByStream.set(streamId, Object.freeze(retained));
+      resetStreams.add(streamId);
     }
-    return reset;
+    return resetStreams.size;
+  }
+
+  isRetiredIdentity(
+    ownerToken: RecoverySourceOwnerToken,
+    identity: RecoveryV3HostRoutingIdentity,
+  ): boolean {
+    assertOwnerToken(ownerToken);
+    const routing = RecoveryV3HostRoutingIdentitySchema.parse(identity);
+    const tombstones = this.#tombstonesByStream.get(routing.streamId);
+    return (
+      tombstones?.some(
+        (tombstone) =>
+          tombstone.ownerToken === ownerToken && sameRouting(tombstone.identity, routing),
+      ) ?? false
+    );
   }
 
   checkDeadlines(ownerToken: RecoverySourceOwnerToken): RecoverySourceDeadlineExpiration[] {
@@ -555,7 +565,9 @@ export class RecoverySourceManager {
             ? "recovery-deadline"
             : "no-progress-deadline",
       });
-      this.#retireSource(source);
+      if (!this.#retireSource(source)) {
+        throw new Error("Recovery source retirement history capacity was exhausted");
+      }
     }
     return expired;
   }
@@ -590,6 +602,9 @@ export class RecoverySourceManager {
           ? pending.promise
           : Promise.resolve({ status: "conflict", reason: "divergent-retry" });
       }
+      if (!this.#hasRetirementCapacity(prepare.streamId, 2)) {
+        return Promise.resolve(this.#rejected(prepare, "capacity-exceeded"));
+      }
       this.#cancelPending(pending, this.#rejected(pending.prepare, "generation-fenced"), true);
     }
 
@@ -607,15 +622,20 @@ export class RecoverySourceManager {
           ? source.preparePromise
           : Promise.resolve({ status: "conflict", reason: "divergent-retry" });
       }
-      this.#retireSource(source);
+      if (!this.#hasRetirementCapacity(prepare.streamId, 2)) {
+        return Promise.resolve(this.#rejected(prepare, "capacity-exceeded"));
+      }
+      if (!this.#retireSource(source)) {
+        throw new Error("Recovery source retirement history capacity changed unexpectedly");
+      }
     }
 
-    const tombstone = this.#tombstonesByStream.get(prepare.streamId);
-    if (tombstone === undefined) return null;
-    if (tombstone.ownerToken !== ownerToken) {
+    const tombstones = this.#tombstonesByStream.get(prepare.streamId);
+    if (tombstones === undefined) return null;
+    if (tombstones.some((tombstone) => tombstone.ownerToken !== ownerToken)) {
       return Promise.resolve(this.#rejected(prepare, "client-gone"));
     }
-    if (generation <= BigInt(tombstone.identity.deliveryGeneration)) {
+    if (generation <= this.#latestRetiredGeneration(tombstones)) {
       return Promise.resolve(this.#rejected(prepare, "generation-fenced"));
     }
     return null;
@@ -667,12 +687,17 @@ export class RecoverySourceManager {
       lastProgressAtMs: pending.startedAtMs,
       lastReceivedOrdinal: 0n,
       nextSendIndex: 0,
+      ownedRecords: records.length,
+      ownedWireBytes: totalWireBytes,
       ownerToken: pending.ownerToken,
       prepare: pending.prepare,
       preparePromise: pending.promise,
       prepareResult,
       ready: null,
-      records,
+      recordCumulativeEncodedBytes: Object.freeze(
+        records.map((record) => record.cumulativeEncodedBytes),
+      ),
+      records: [...records],
       sentCumulativeEncodedBytes: 0n,
       sentDeliveryOrdinal: 0n,
       startedAtMs: pending.startedAtMs,
@@ -712,12 +737,6 @@ export class RecoverySourceManager {
     if (this.#pendingByStream.get(pending.prepare.streamId)?.token === pending.token) {
       this.#pendingByStream.delete(pending.prepare.streamId);
     }
-    if (result.status !== "prepared" && pending.replacedTombstone !== null) {
-      this.#installTombstone(
-        pending.replacedTombstone.ownerToken,
-        pending.replacedTombstone.identity,
-      );
-    }
     pending.resolve(result);
   }
 
@@ -728,7 +747,9 @@ export class RecoverySourceManager {
   ): void {
     this.#rollbackPendingSource(pending);
     this.#finishPending(pending, result);
-    if (retireGeneration) this.#installTombstone(pending.ownerToken, pending.prepare);
+    if (retireGeneration && !this.#installTombstone(pending.ownerToken, pending.prepare)) {
+      throw new Error("Recovery pending retirement history capacity was exhausted");
+    }
   }
 
   #rollbackPendingSource(pending: PendingPrepare): void {
@@ -750,11 +771,44 @@ export class RecoverySourceManager {
       : null;
   }
 
+  #drainStatus(
+    ownerToken: RecoverySourceOwnerToken,
+    identity: RecoveryV3HostRoutingIdentity,
+    source: RecoverySource,
+  ): RecoverySourceDrainResult["status"] {
+    if (this.#sourceFor(ownerToken, identity) !== source || source.records === null) return "stale";
+    const next = source.records[source.nextSendIndex];
+    if (next === undefined) return "complete";
+    if (next === null) throw new Error("unsent Recovery source record was released");
+    return next.cumulativeEncodedBytes <= source.cumulativeGrantedEncodedBytes
+      ? "runnable"
+      : "credit-blocked";
+  }
+
+  #releaseReceivedPrefix(source: RecoverySource, throughDeliveryOrdinal: bigint): void {
+    const records = source.records;
+    if (records === null) return;
+    const from = Number(source.lastReceivedOrdinal);
+    const through = Number(throughDeliveryOrdinal);
+    for (let index = from; index < through; index += 1) {
+      const record = records[index];
+      if (record === undefined) throw new Error("Recovery source receipt prefix is incomplete");
+      if (record === null) continue;
+      records[index] = null;
+      source.ownedRecords -= 1;
+      source.ownedWireBytes -= record.bytes.byteLength;
+      this.#ownedRecords -= 1;
+      this.#ownedWireBytes -= record.bytes.byteLength;
+    }
+  }
+
   #releaseRecords(source: RecoverySource): void {
     if (source.records === null) return;
     source.records = null;
-    this.#ownedRecords -= source.totalRecords;
-    this.#ownedWireBytes -= source.totalWireBytes;
+    this.#ownedRecords -= source.ownedRecords;
+    this.#ownedWireBytes -= source.ownedWireBytes;
+    source.ownedRecords = 0;
+    source.ownedWireBytes = 0;
   }
 
   #removeSource(source: RecoverySource): void {
@@ -764,27 +818,70 @@ export class RecoverySourceManager {
     this.#releaseRecords(source);
   }
 
-  #retireSource(source: RecoverySource): void {
+  #retireSource(source: RecoverySource): boolean {
+    if (!this.#installTombstone(source.ownerToken, source.prepare)) return false;
     this.#removeSource(source);
-    this.#installTombstone(source.ownerToken, source.prepare);
+    return true;
   }
 
   #installTombstone(
     ownerToken: RecoverySourceOwnerToken,
     identity: RecoveryV3HostRoutingIdentity,
-  ): void {
-    const deliveryGeneration = BigInt(identity.deliveryGeneration);
-    const existing = this.#tombstonesByStream.get(identity.streamId);
+  ): boolean {
+    const existing = this.#tombstonesByStream.get(identity.streamId) ?? [];
+    if (existing.some((tombstone) => tombstone.ownerToken !== ownerToken)) return false;
     if (
-      existing === undefined ||
-      existing.ownerToken !== ownerToken ||
-      deliveryGeneration > BigInt(existing.identity.deliveryGeneration)
+      existing.some(
+        (tombstone) =>
+          tombstone.ownerToken === ownerToken && sameRouting(tombstone.identity, identity),
+      )
     ) {
-      this.#tombstonesByStream.set(identity.streamId, {
-        identity: Object.freeze(routingIdentity(identity)),
-        ownerToken,
-      });
+      return true;
     }
+    if (existing.length >= MAX_RETIRED_GENERATIONS_PER_STREAM) return false;
+    this.#tombstonesByStream.set(
+      identity.streamId,
+      Object.freeze([
+        ...existing,
+        {
+          identity: Object.freeze(routingIdentity(identity)),
+          ownerToken,
+        },
+      ]),
+    );
+    return true;
+  }
+
+  #hasRetirementCapacity(streamId: number, additionalIdentities: number): boolean {
+    return (
+      (this.#tombstonesByStream.get(streamId)?.length ?? 0) + additionalIdentities <=
+      MAX_RETIRED_GENERATIONS_PER_STREAM
+    );
+  }
+
+  #hasStream(streamId: number): boolean {
+    return (
+      this.#pendingByStream.has(streamId) ||
+      this.#sourcesByStream.has(streamId) ||
+      this.#tombstonesByStream.has(streamId)
+    );
+  }
+
+  #latestRetiredGeneration(tombstones: readonly RecoveryGenerationTombstone[]): bigint {
+    let latest = -1n;
+    for (const tombstone of tombstones) {
+      const generation = BigInt(tombstone.identity.deliveryGeneration);
+      if (generation > latest) latest = generation;
+    }
+    return latest;
+  }
+
+  #streamCount(): number {
+    const streamIds = new Set<number>();
+    for (const streamId of this.#pendingByStream.keys()) streamIds.add(streamId);
+    for (const streamId of this.#sourcesByStream.keys()) streamIds.add(streamId);
+    for (const streamId of this.#tombstonesByStream.keys()) streamIds.add(streamId);
+    return streamIds.size;
   }
 
   #rejected(
