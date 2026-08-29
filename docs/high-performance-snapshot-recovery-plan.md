@@ -1,7 +1,8 @@
 # 高性能远程终端 Snapshot 与 Recovery v3 实施计划
 
-> 状态：Phase 0/1 为 CURRENT stacked candidate；Phase 2 的 wire/capability 与 pure Browser
-> RecoveryAssembler 为 stacked candidate，但生产 Recovery v3 runtime 仍不可达；Phase 3–5 为 TARGET
+> 状态：Phase 0/1 为 CURRENT stacked candidate；Phase 2 的 wire/capability、pure Browser
+> RecoveryAssembler 与 pure Host PreparedGap/source owner 为 stacked candidate，但生产 Recovery v3 runtime
+> 仍不可达；Phase 3–5 为 TARGET
 >
 > 决策日期：2026-08-28
 >
@@ -247,6 +248,26 @@ live `H+1...` 可能先于 `RecoveryStart`、snapshot 或 recovery frame 到达�
 apply 到 `K > H`；这不改变 adoption 条件。Assembler 始终采用同一 log 的连续前缀，不能因“画面看起来
 更新”跳过缺口。P2.1 不负责 HTTP snapshot download、WTerm restore/adopt、WebSocket send/retry timer、
 generation replan，也不在 completion 后长期消费 live；这些必须由后续 Browser/Cloud/Host wiring owner 接通。
+
+### Host PreparedGap 与 source owner
+
+P2.2 stacked candidate 只冻结 Host 内尚未接 production relay 的 bounded source primitives：
+
+- `TerminalSession` 在同一个 actor turn 内固定 `H`，验证 `(R,H]` 的 exact range、encoded bytes 与 frame count，
+  materialize 自有 copy，并同步执行 fence commit；失败不会暂停或终止 authority；
+- `CanonicalPublisher` 把 strict `RecoveryStartFence(H)` 作为不推进 cursor 的 ordered marker，保证实际出队
+  `H / fence(H) / H+1`，且不调用 v2 global pause；
+- session-scoped source manager 在 commit 内预编码 `(R,H] + RecoveryDone(H)` 的唯一 retained envelope copy，
+  只在累计 grant 内发送。send throw 不推进 cursor；matching retry 仍得到逐字节一致 record；
+- 只有覆盖实际已发送 Done ordinal/cumulative bytes 的 receipt 才 release-once payload 并产生 stable
+  `RecoverySourceClosed`。reset、deadline 和 generation replacement 释放 payload，但保留计入 source cap 的
+  owner+stream generation tombstone，防止同代迟到 prepare 重新建立 source；
+- per-source canonical cap、session aggregate envelope cap、source count、no-progress/absolute deadline 和
+  owner-token fence 都是直接状态事实；manager 本身不拥有 WebSocket、timer 或公平 scheduling policy。
+
+这些 primitives 未加入当前 Host control union、`HostRelayConnection` 或 delivery scheduler，Cloud 也尚未消费
+start fence，因此 production v3 仍不可达。P2.2 证明的是 cut/order/ownership 边界，不是 transport fairness、
+hibernation、跨进程 closure 或性能。
 
 ### Holdback 放在 Browser，而不是 Cloud durable payload
 
@@ -577,6 +598,10 @@ Phase 1 stacked candidate 的最终行为是：
   lane 顺序的短 interleaving，并用
   不调用 production cursor/assembler helper 的独立 reference reducer 逐步核对 effect、receipt 和 applied
   progress。当前 gate 使用仓库已有 Vitest 工具，不新增随机 generator 或 `fast-check` 依赖。
+- P2.2 Host owner tests 检查 actor 内 `(R,H]` fixed cut、真实 `TerminalSession -> CanonicalPublisher` 的
+  `H / fence(H) / H+1` 顺序、R=H 的 Done-only envelope、per-source/session cap、grant/send retry、actual Done
+  receipt closure、generation tombstone、16-source aggregate bound、deadline/reset/dispose；既有 v2 scheduler
+  regression 继续独立证明 pause/barrier/pin fallback 未改变。
 
 这些测试的证据来自明确状态、identity、frame ordering、资源 owner 和本地 Worker storage/R2 oracle。测试总数、
 绿色 CI、timeout 数值或 clean build 本身不证明这些状态。
@@ -590,8 +615,9 @@ Phase 1 stacked candidate 的最终行为是：
 - JavaScript deadline 不能抢占同步 full snapshot WASM encode，因此 5 秒 capture budget 不是 actor hard max；
 - 本地 cleanup slot 只约束运行中的 Host；进程崩溃后 generic `uncertain` upload 的 durable reconciliation 仍未
   完成；
-- P2.1 assembler 没有接入 `TerminalSession`/v2 `SessionCoordinator`，没有 HTTP snapshot、WTerm
-  restore/adopt、WebSocket control、长期 live owner、Host PreparedGap、Cloud generation/credit/closure wiring；
+- P2.1 assembler 没有接入 Browser `TerminalSession`/v2 `SessionCoordinator`；P2.2 Host primitives 没有接入
+  relay connection/control union/scheduler；当前仍没有 HTTP snapshot、WTerm restore/adopt、WebSocket control、
+  长期 live owner或 Cloud generation/credit/closure wiring；
   production capability 不 advertise v3 token，所以该路径当前不可达；
 - pure target tests 不证明真实 WTerm/Ghostty 的 parser continuation、atomic adopt 或 terminal state
   equivalence，也不证明跨进程 ownership、multi-client fairness、load/soak、性能/SLO、production dashboard
@@ -605,9 +631,9 @@ Phase 1 stacked candidate 的最终行为是：
   fault injection；
 - Browser wiring owner 接入 HTTP snapshot、真实 WTerm restore/adopt 与长期 live handoff，并用 parser
   continuation 和 exact tail-continuity oracle 验证 pure target seam；
-- Host/Cloud owner 接入 PreparedGap/start fence、lane scheduling、receipt credit、apply progress、closure 与
-  generation cleanup，再做跨 owner duplicate/gap/reset/adopt/closure fault integration 和 multi-client aggregate
-  budget；
+- Cloud owner 建立 start-fence durable install、lane cursor/credit、apply/closure 与 generation cleanup；随后把
+  Host primitives 接入 relay socket，并做跨 owner duplicate/gap/reset/adopt/closure fault integration 和
+  multi-client aggregate/fair scheduling；
 - 在完整三方 wiring 上扩展独立 reference model/property/fuzz，并验证 rolling capability downgrade/rollback；
 - 性能验证只在 workload、link profile、环境隔离、warm-up、样本量和统计方法另行批准后实施。
 
@@ -615,9 +641,10 @@ Phase 1 stacked candidate 的最终行为是：
 
 - P2.0 已冻结 protocol capability negotiation、v2 authority identity、v3 delivery envelope 与 generation
   strategy 的 v2 default；P2.1 已冻结不可达的 pure Browser bounded assembler、同 lane exact retry、跨 lane
-  conflict、gap/deadline/reset 与 receipt/apply/adopt progress；
-- 后续 Host/Cloud owner 实现 committed-through-H start fence、PreparedGap、live/recovery logical lane、receipt
-  credit、closure 与有界公平调度；
+  conflict、gap/deadline/reset 与 receipt/apply/adopt progress；P2.2 已冻结不可达的 Host committed-through-H
+  actor cut、ordered start fence、PreparedGap envelope source 与 release-once closure；
+- 后续 Cloud owner 实现 durable assembling state、live/recovery lane cursor、receipt credit、apply/closure 与
+  hibernation-safe cleanup；再把三方 runtime 接通并实现有界公平调度；
 - 后续 Browser wiring owner 才把 pure assembler 接入 `TerminalSession`、HTTP snapshot、WTerm
   restore/adopt、socket progress/retry 和 completion 后的长期 live；
 - 完整 negotiated state-machine gate 通过后，一次性删除 v3 路径的 global pause、fixed-commit barrier 和
