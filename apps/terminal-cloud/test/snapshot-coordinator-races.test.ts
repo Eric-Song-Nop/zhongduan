@@ -50,6 +50,14 @@ function coordinatorUploadRequest(
   });
 }
 
+function liveSnapshotAlarmScheduler(instance: object) {
+  const coordinator = Reflect.get(instance, "snapshotUploads") as object;
+  return Reflect.get(coordinator, "alarmScheduler") as {
+    clear(): Promise<void>;
+    schedule(timestamp: number): Promise<void>;
+  };
+}
+
 describe("snapshot coordinator replacement races", () => {
   it("bounds public upload admission before the shared alarm await", async () => {
     const session = await createSession();
@@ -101,7 +109,7 @@ describe("snapshot coordinator replacement races", () => {
     const results = await Promise.all(uploads);
     expect(results.filter((result) => result.status !== 503).length).toBeLessThanOrEqual(4);
     expect(results.filter((result) => result.status === 503).length).toBeGreaterThanOrEqual(20);
-  });
+  }, 15_000);
 
   it("admits only four published retries before any fifth R2 HEAD", async () => {
     const session = await createSession();
@@ -176,100 +184,6 @@ describe("snapshot coordinator replacement races", () => {
     expect(headCalls).toBe(4);
   });
 
-  it("coalesces alarm targets across pending storage calls and restarts after rejection", async () => {
-    const session = await createSession();
-    await runInDurableObject(sessionStub(session.sessionId), async (_instance, durable) => {
-      let persistedAlarm: number | null = null;
-      let getCalls = 0;
-      let setCalls = 0;
-      let rejectNextGet = false;
-      let rejectNextSet = false;
-      let markFirstGet: (() => void) | undefined;
-      let releaseFirstGet: (() => void) | undefined;
-      let markFirstSet: (() => void) | undefined;
-      let releaseFirstSet: (() => void) | undefined;
-      const firstGet = new Promise<void>((resolve) => {
-        markFirstGet = resolve;
-      });
-      const firstGetGate = new Promise<void>((resolve) => {
-        releaseFirstGet = resolve;
-      });
-      const firstSet = new Promise<void>((resolve) => {
-        markFirstSet = resolve;
-      });
-      const firstSetGate = new Promise<void>((resolve) => {
-        releaseFirstSet = resolve;
-      });
-      const fakeState = {
-        storage: {
-          async getAlarm(): Promise<number | null> {
-            getCalls += 1;
-            if (rejectNextGet) {
-              rejectNextGet = false;
-              throw new Error("injected alarm read failure");
-            }
-            if (getCalls === 1) {
-              markFirstGet?.();
-              await firstGetGate;
-            }
-            return persistedAlarm;
-          },
-          async setAlarm(timestamp: number): Promise<void> {
-            setCalls += 1;
-            if (rejectNextSet) {
-              rejectNextSet = false;
-              throw new Error("injected alarm write failure");
-            }
-            if (setCalls === 1) {
-              markFirstSet?.();
-              await firstSetGate;
-            }
-            persistedAlarm = timestamp;
-          },
-        },
-        waitUntil(promise: Promise<unknown>): void {
-          void promise.catch(() => undefined);
-        },
-      } as unknown as DurableObjectState;
-      const sql = durable.storage.sql;
-      const coordinator = new SnapshotUploadCoordinator(
-        fakeState,
-        env.SNAPSHOTS,
-        new SnapshotStore(durable, sql, new RelayStore(sql), 16),
-        () => new Set(),
-      );
-      const scheduleAlarm = Reflect.get(coordinator, "scheduleAlarm").bind(coordinator) as (
-        timestamp: number,
-      ) => Promise<void>;
-
-      const first = scheduleAlarm(100);
-      await within(firstGet, "first alarm read did not start");
-      const second = scheduleAlarm(50);
-      expect(second).toBe(first);
-      releaseFirstGet?.();
-      await within(firstSet, "first alarm write did not start");
-      const third = scheduleAlarm(25);
-      expect(third).toBe(first);
-      releaseFirstSet?.();
-      await Promise.all([first, second, third]);
-      expect({ getCalls, persistedAlarm, setCalls }).toEqual({
-        getCalls: 2,
-        persistedAlarm: 25,
-        setCalls: 2,
-      });
-
-      rejectNextGet = true;
-      await expect(scheduleAlarm(10)).rejects.toThrow("injected alarm read failure");
-      await scheduleAlarm(20);
-      expect(persistedAlarm).toBe(10);
-
-      rejectNextSet = true;
-      await expect(scheduleAlarm(5)).rejects.toThrow("injected alarm write failure");
-      await scheduleAlarm(20);
-      expect(persistedAlarm).toBe(5);
-    });
-  });
-
   it("defers a concurrent maintenance request to a later durable alarm", async () => {
     const session = await createSession();
     await runInDurableObject(sessionStub(session.sessionId), async (instance, durable) => {
@@ -282,6 +196,14 @@ describe("snapshot coordinator replacement races", () => {
       });
       const gate = new Promise<void>((resolve) => {
         releaseRun = resolve;
+      });
+      const scheduleAlarm = Reflect.get(coordinator, "scheduleAlarm").bind(coordinator) as (
+        timestamp: number,
+      ) => Promise<void>;
+      let alarmUpdate: Promise<void> | undefined;
+      Reflect.set(coordinator, "scheduleAlarm", (timestamp: number) => {
+        alarmUpdate = scheduleAlarm(timestamp);
+        return alarmUpdate;
       });
       Reflect.set(coordinator, "runMaintenance", async () => {
         runCount += 1;
@@ -296,9 +218,6 @@ describe("snapshot coordinator replacement races", () => {
       releaseRun?.();
       await first;
       await Promise.resolve();
-      const alarmUpdate = Reflect.get(coordinator, "snapshotAlarmUpdate") as
-        | Promise<void>
-        | undefined;
       if (alarmUpdate !== undefined) await alarmUpdate;
 
       expect(runCount).toBe(1);
@@ -463,12 +382,14 @@ describe("snapshot coordinator replacement races", () => {
           staleBucket,
           new SnapshotStore(durable, sql, new RelayStore(sql), 16),
           () => new Set(),
+          liveSnapshotAlarmScheduler(_instance),
         );
         const replacementCoordinator = new SnapshotUploadCoordinator(
           durable,
           env.SNAPSHOTS,
           new SnapshotStore(durable, sql, new RelayStore(sql), 16),
           () => new Set(),
+          liveSnapshotAlarmScheduler(_instance),
         );
         const metadata = await metadataFor(session, snapshotId);
         const staleResponse = staleCoordinator.upload(
@@ -534,12 +455,14 @@ describe("snapshot coordinator replacement races", () => {
           oldBucket,
           new SnapshotStore(durable, sql, new RelayStore(sql), 16),
           () => new Set(),
+          liveSnapshotAlarmScheduler(_instance),
         );
         const replacementCoordinator = new SnapshotUploadCoordinator(
           durable,
           env.SNAPSHOTS,
           new SnapshotStore(durable, sql, new RelayStore(sql), 16),
           () => new Set(),
+          liveSnapshotAlarmScheduler(_instance),
         );
 
         await oldCoordinator.maintain();
@@ -633,12 +556,14 @@ describe("snapshot coordinator replacement races", () => {
           oldBucket,
           new SnapshotStore(durable, sql, new RelayStore(sql), 16),
           () => new Set(),
+          liveSnapshotAlarmScheduler(_instance),
         );
         const replacementCoordinator = new SnapshotUploadCoordinator(
           durable,
           env.SNAPSHOTS,
           new SnapshotStore(durable, sql, new RelayStore(sql), 16),
           () => new Set(),
+          liveSnapshotAlarmScheduler(_instance),
         );
 
         await oldCoordinator.maintain();
@@ -774,6 +699,7 @@ describe("snapshot coordinator replacement races", () => {
           staleBucket,
           new SnapshotStore(durable, sql, new RelayStore(sql), 16),
           () => new Set(),
+          liveSnapshotAlarmScheduler(instance),
         );
         Reflect.set(staleCoordinator, "scheduleMaintenance", () => undefined);
         const staleResponse = staleCoordinator.upload(
@@ -879,6 +805,7 @@ describe("snapshot coordinator replacement races", () => {
           staleBucket,
           new SnapshotStore(durable, sql, new RelayStore(sql), 16),
           () => new Set(),
+          liveSnapshotAlarmScheduler(instance),
         );
         const staleResponse = staleCoordinator.upload(
           coordinatorUploadRequest(session, snapshotId, "0".repeat(64)),

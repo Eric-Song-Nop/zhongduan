@@ -8,6 +8,7 @@ import { SnapshotStore } from "../src/worker/snapshot-store";
 import {
   bucketWithOverrides,
   createSession,
+  forceNextSessionAlarmDue,
   metadataFor,
   matchesSnapshotKey,
   overrideSnapshotBucket,
@@ -647,6 +648,7 @@ describe("snapshot upload deadlines", () => {
       await durable.storage.setAlarm(Date.now() + 60_000);
     });
     const alarmStartedAt = Date.now();
+    await forceNextSessionAlarmDue(session.sessionId);
     expect(await runDurableObjectAlarm(sessionStub(session.sessionId))).toBe(true);
     const watchdog = await runInDurableObject(
       sessionStub(session.sessionId),

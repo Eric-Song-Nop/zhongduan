@@ -42,17 +42,30 @@ type ClientReservationResult =
   | { client: ClientRow; ok: true }
   | { ok: false; reason: "client-owner-mismatch" | "too-many-clients" };
 
+export interface RelayConnectionRecoveryLifecycle {
+  fenceClientGeneration(
+    clientId: string,
+    currentGeneration: string,
+    now: number,
+  ): readonly string[];
+  fenceHost(currentHostFence: string, now: number): readonly string[];
+  fenceRemovedClient(clientId: string, now: number): readonly string[];
+}
+
 export class RelayConnectionStore {
   constructor(
     private readonly state: DurableObjectState,
     private readonly sql: SqlStorage,
     private readonly store: RelayStore,
+    private readonly recoveries: RelayConnectionRecoveryLifecycle,
+    private readonly onRecoveriesFenced: () => void,
     private readonly maxBrowserClients: number,
     private readonly maxPendingSets: number,
   ) {}
 
   reserveConnectionSet(input: ConnectionSetReservation): ConnectionSetReservationResult {
     let result: ConnectionSetReservationResult | undefined;
+    let recoveriesFenced = false;
     this.state.storage.transactionSync(() => {
       this.#cleanupExpired(input.now);
       if (
@@ -95,6 +108,9 @@ export class RelayConnectionStore {
           input.role,
           input.expiresAt,
           input.now,
+          () => {
+            recoveriesFenced = true;
+          },
         );
         if (!reservation.ok) {
           result = reservation;
@@ -131,6 +147,7 @@ export class RelayConnectionStore {
       }
       result = { client, deliveryGeneration, ok: true };
     });
+    if (recoveriesFenced) this.onRecoveriesFenced();
     if (result === undefined) throw new Error("connection reservation did not resolve");
     return result;
   }
@@ -138,6 +155,7 @@ export class RelayConnectionStore {
   claimBrowserControl(ticket: TicketRow): TicketRow | undefined {
     if (ticket.client_id === null || ticket.channel !== "control") return undefined;
     let claimed: TicketRow | undefined;
+    let recoveriesFenced = false;
     this.state.storage.transactionSync(() => {
       const now = Date.now();
       this.#cleanupExpired(now);
@@ -186,9 +204,16 @@ export class RelayConnectionStore {
         activatedClient?.registered_at !== null &&
         activatedClient?.delivery_generation === currentTicket.delivery_generation
       ) {
+        this.recoveries.fenceClientGeneration(
+          activatedClient.client_id,
+          activatedClient.delivery_generation,
+          now,
+        );
+        recoveriesFenced = true;
         claimed = this.store.ticket(ticket.ticket_digest);
       }
     });
+    if (recoveriesFenced) this.onRecoveriesFenced();
     return claimed;
   }
 
@@ -231,7 +256,9 @@ export class RelayConnectionStore {
 
   advanceHostFence(connectionSetId: string): string {
     let nextFence = "0";
+    let recoveriesFenced = false;
     this.state.storage.transactionSync(() => {
+      const now = Date.now();
       const session = this.store.session();
       if (session === undefined) throw new Error("session is not initialized");
       const currentFence = BigInt(session.host_fence);
@@ -240,37 +267,47 @@ export class RelayConnectionStore {
       this.sql.exec(
         "UPDATE session_state SET host_fence = ?, updated_at = ? WHERE singleton = 1",
         nextFence,
-        Date.now(),
+        now,
       );
       this.sql.exec(
         "UPDATE connection_ticket SET host_fence = ? WHERE connection_set_id = ?",
         nextFence,
         connectionSetId,
       );
+      this.recoveries.fenceHost(nextFence, now);
+      recoveriesFenced = true;
     });
+    if (recoveriesFenced) this.onRecoveriesFenced();
     return nextFence;
   }
 
   invalidateHostConnection(connectionSetId: string, expectedFence: string): boolean {
     let invalidated = false;
+    let recoveriesFenced = false;
     this.state.storage.transactionSync(() => {
+      const now = Date.now();
       const session = this.store.session();
       if (session?.host_fence !== expectedFence) return;
       if (BigInt(expectedFence) >= MAX_U64) throw new Error("host fence space exhausted");
       this.sql.exec(
         "UPDATE session_state SET host_fence = ?, updated_at = ? WHERE singleton = 1",
         (BigInt(expectedFence) + 1n).toString(),
-        Date.now(),
+        now,
       );
       this.sql.exec("DELETE FROM connection_ticket WHERE connection_set_id = ?", connectionSetId);
+      this.recoveries.fenceHost((BigInt(expectedFence) + 1n).toString(), now);
+      recoveriesFenced = true;
       invalidated = true;
     });
+    if (recoveriesFenced) this.onRecoveriesFenced();
     return invalidated;
   }
 
   replaceBrowserDelivery(input: BrowserDeliveryReplacement): boolean {
     let replaced = false;
+    let recoveriesFenced = false;
     this.state.storage.transactionSync(() => {
+      const now = Date.now();
       const client = this.store.clientById(input.clientId);
       if (
         client === undefined ||
@@ -284,7 +321,7 @@ export class RelayConnectionStore {
         `UPDATE client_delivery SET delivery_generation = ?, updated_at = ?
          WHERE client_id = ? AND delivery_generation = ?`,
         input.nextGeneration,
-        Date.now(),
+        now,
         input.clientId,
         input.currentGeneration,
       );
@@ -310,8 +347,11 @@ export class RelayConnectionStore {
         input.expiresAt,
         input.relayCapabilitiesJson,
       );
+      this.recoveries.fenceClientGeneration(input.clientId, input.nextGeneration, now);
+      recoveriesFenced = true;
       replaced = true;
     });
+    if (recoveriesFenced) this.onRecoveriesFenced();
     return replaced;
   }
 
@@ -321,6 +361,7 @@ export class RelayConnectionStore {
     role: "writer" | "observer",
     expiresAt: number,
     now: number,
+    onRecoveriesFenced: () => void,
   ): ClientReservationResult {
     const existing = this.store.clientById(clientId);
     if (existing !== undefined) {
@@ -332,7 +373,7 @@ export class RelayConnectionStore {
           `UPDATE client_delivery SET reservation_expires_at = ?, updated_at = ?
            WHERE client_id = ? AND registered_at IS NULL`,
           expiresAt,
-          Date.now(),
+          now,
           clientId,
         );
       }
@@ -342,7 +383,10 @@ export class RelayConnectionStore {
     let clientCount = this.sql.exec("SELECT COUNT(*) AS value FROM client_delivery").one() as {
       value: number;
     };
-    if (clientCount.value >= this.maxBrowserClients && this.#evictInactiveClient(now)) {
+    if (
+      clientCount.value >= this.maxBrowserClients &&
+      this.#evictInactiveClient(now, onRecoveriesFenced)
+    ) {
       clientCount = this.sql.exec("SELECT COUNT(*) AS value FROM client_delivery").one() as {
         value: number;
       };
@@ -391,7 +435,7 @@ export class RelayConnectionStore {
     return (currentGeneration + 1n).toString();
   }
 
-  #evictInactiveClient(now: number): boolean {
+  #evictInactiveClient(now: number, onRecoveriesFenced: () => void): boolean {
     const candidates = this.sql
       .exec("SELECT * FROM client_delivery ORDER BY updated_at ASC")
       .toArray() as unknown as ClientRow[];
@@ -410,6 +454,7 @@ export class RelayConnectionStore {
       const lease = this.store.writerLease();
       if (lease?.client_id === candidate.client_id && lease.expires_at > now) continue;
 
+      this.recoveries.fenceRemovedClient(candidate.client_id, now);
       this.sql.exec(
         `DELETE FROM client_delivery
          WHERE client_id = ?
@@ -423,6 +468,7 @@ export class RelayConnectionStore {
         now,
       );
       if (this.store.clientById(candidate.client_id) === undefined) {
+        onRecoveriesFenced();
         return true;
       }
     }

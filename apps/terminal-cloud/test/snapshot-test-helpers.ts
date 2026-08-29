@@ -2,6 +2,7 @@ import { SNAPSHOT_MEDIA_TYPE, SnapshotHeader, type SnapshotMetadata } from "@zho
 import { env, exports as workerExports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { expect } from "vitest";
+import { DurableAlarmComponent, type DurableAlarmMux } from "../src/worker/durable-alarm-mux";
 import { isSnapshotObjectKey } from "../src/worker/snapshot-contract";
 
 export interface CreatedSession {
@@ -26,6 +27,7 @@ export interface UploadOverrides {
 export const origin = "https://terminal.example.test";
 export const engineId = "ghostty:test+snapshot-v1+wterm:test";
 export const encoder = new TextEncoder();
+export const FORCED_SESSION_ALARM_NOW = Date.UTC(2188, 0, 1);
 let sessionCounter = 0;
 
 export async function within<T>(promise: Promise<T>, label: string, timeoutMs = 1_000): Promise<T> {
@@ -89,6 +91,19 @@ export async function createSession(): Promise<CreatedSession> {
 
 export function sessionStub(sessionId: string) {
   return env.TERMINAL_SESSIONS.get(env.TERMINAL_SESSIONS.idFromName(`v1:${sessionId}`));
+}
+
+export async function forceSessionAlarmDue(instance: object): Promise<void> {
+  // cloudflare:test can force a future alarm; model it as a real snapshot component fact.
+  const alarmMux = Reflect.get(instance, "alarmMux") as DurableAlarmMux;
+  await alarmMux.scheduler(DurableAlarmComponent.snapshot).schedule(Date.now() + 60_000);
+  Reflect.set(alarmMux, "now", () => FORCED_SESSION_ALARM_NOW);
+}
+
+export async function forceNextSessionAlarmDue(sessionId: string): Promise<void> {
+  await runInDurableObject(sessionStub(sessionId), async (instance) => {
+    await forceSessionAlarmDue(instance);
+  });
 }
 
 export function matchesSnapshotKey(key: string, sessionId: string, snapshotId: string): boolean {

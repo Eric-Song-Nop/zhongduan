@@ -33,11 +33,14 @@ import {
 import { RelayConnectionStore } from "./relay-connection-store";
 import type { CloudEnv } from "./env";
 import { advanceDeliveryCursor } from "./relay-delivery";
+import { DurableAlarmComponent, DurableAlarmMux } from "./durable-alarm-mux";
 import {
   BoundedSerialQueue,
   RELAY_MESSAGE_QUEUE_PROFILES,
   type SocketQueueLimits,
 } from "./relay-message-queue";
+import { RelayRecoveryMaintenance } from "./relay-recovery-maintenance";
+import { RelayRecoveryStore } from "./relay-recovery-store";
 import {
   readSocketAttachment as readAttachment,
   SocketAttachmentSchema,
@@ -120,6 +123,8 @@ const TICKET_LIFETIME_MS = 30_000;
 const WRITER_LEASE_MS = 30_000;
 const MAX_BROWSER_CONNECTIONS = 16;
 const MAX_PENDING_CONNECTION_SETS = MAX_BROWSER_CONNECTIONS + 1;
+const MAX_RECOVERY_ATTEMPTS = MAX_BROWSER_CONNECTIONS;
+const MAX_RECOVERY_OUTBOX_ENTRIES = MAX_RECOVERY_ATTEMPTS * 7;
 const MAX_CONTROL_MESSAGE_CHARS = 6 * 1024 * 1024 + 4_096;
 const MAX_HOST_DATA_BYTES = DATA_HEADER_BYTES + 16 * 1024;
 const SOCKET_REPLACED = 4001;
@@ -192,8 +197,11 @@ function selectEnabledRelayCapabilities(
 export class TerminalSessionDO extends DurableObject<CloudEnv> {
   private readonly sql: SqlStorage;
   private readonly store: RelayStore;
+  private readonly recoveries: RelayRecoveryStore;
   private readonly connections: RelayConnectionStore;
   private readonly snapshots: SnapshotStore;
+  private readonly alarmMux: DurableAlarmMux;
+  private readonly recoveryMaintenance: RelayRecoveryMaintenance;
   private readonly snapshotUploads: SnapshotUploadCoordinator;
   private readonly messageQueue = new BoundedSerialQueue<WebSocket>();
 
@@ -202,19 +210,45 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     this.sql = ctx.storage.sql;
     this.store = new RelayStore(this.sql);
     migrateRelayStore(ctx, this.sql);
+    this.recoveries = new RelayRecoveryStore(this.sql, this.store, {
+      maxAttempts: MAX_RECOVERY_ATTEMPTS,
+      maxOutboxEntries: MAX_RECOVERY_OUTBOX_ENTRIES,
+    });
+    this.snapshots = new SnapshotStore(ctx, this.sql, this.store, MAX_BROWSER_CONNECTIONS);
+    this.alarmMux = new DurableAlarmMux(ctx, {
+      [DurableAlarmComponent.snapshot]: () => this.snapshotUploads.maintain(),
+      [DurableAlarmComponent.recovery]: async () => {
+        const result = await this.recoveryMaintenance.maintain();
+        if (result.expired.length > 0) this.snapshotUploads.scheduleMaintenance();
+      },
+    });
+    this.snapshotUploads = new SnapshotUploadCoordinator(
+      ctx,
+      env.SNAPSHOTS,
+      this.snapshots,
+      () => this.pinnedSnapshotIds(),
+      this.alarmMux.scheduler(DurableAlarmComponent.snapshot),
+    );
+    this.recoveryMaintenance = new RelayRecoveryMaintenance(
+      ctx,
+      this.recoveries,
+      this.alarmMux.scheduler(DurableAlarmComponent.recovery),
+    );
     this.connections = new RelayConnectionStore(
       ctx,
       this.sql,
       this.store,
+      this.recoveries,
+      () => this.recoveriesFenced(),
       MAX_BROWSER_CONNECTIONS,
       MAX_PENDING_CONNECTION_SETS,
     );
-    this.snapshots = new SnapshotStore(ctx, this.sql, this.store, MAX_BROWSER_CONNECTIONS);
-    this.snapshotUploads = new SnapshotUploadCoordinator(ctx, env.SNAPSHOTS, this.snapshots, () =>
-      this.pinnedSnapshotIds(),
-    );
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
-    void this.ctx.blockConcurrencyWhile(() => this.snapshotUploads.initialize());
+    void this.ctx.blockConcurrencyWhile(async () => {
+      await this.alarmMux.initialize();
+      await this.snapshotUploads.initialize();
+      await this.recoveryMaintenance.initialize();
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -262,7 +296,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   }
 
   async alarm(): Promise<void> {
-    await this.snapshotUploads.maintain();
+    await this.alarmMux.alarm();
   }
 
   private validateInboundMessage(
@@ -2093,6 +2127,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         pinned.add(attachment.snapshotId);
       }
     }
+    for (const snapshotId of this.recoveries.pinnedSnapshotIds()) pinned.add(snapshotId);
     return pinned;
+  }
+
+  private recoveriesFenced(): void {
+    this.snapshotUploads.scheduleMaintenance();
+    this.ctx.waitUntil(this.recoveryMaintenance.refresh());
   }
 }

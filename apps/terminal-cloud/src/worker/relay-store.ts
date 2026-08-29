@@ -276,5 +276,137 @@ export function migrateRelayStore(state: DurableObjectState, sql: SqlStorage): v
       }
       state.storage.kv.put("schema-version", 6);
     });
+    version = 6;
+  }
+
+  if (version < 7) {
+    state.storage.transactionSync(() => {
+      sql.exec(`
+        CREATE TABLE IF NOT EXISTS recovery_attempt (
+          recovery_id TEXT PRIMARY KEY CHECK (length(recovery_id) BETWEEN 16 AND 128),
+          client_id TEXT NOT NULL CHECK (length(client_id) BETWEEN 16 AND 128),
+          connection_id TEXT NOT NULL CHECK (length(connection_id) BETWEEN 16 AND 128),
+          host_fence TEXT NOT NULL CHECK (length(host_fence) BETWEEN 1 AND 20),
+          stream_id INTEGER NOT NULL CHECK (stream_id BETWEEN 1 AND 4294967295),
+          delivery_generation TEXT NOT NULL CHECK (length(delivery_generation) BETWEEN 1 AND 20),
+          engine_id TEXT NOT NULL CHECK (length(engine_id) BETWEEN 1 AND 512),
+          state TEXT NOT NULL CHECK (
+            state IN ('preparing', 'installed', 'assembling', 'complete', 'resetting')
+          ),
+          prepare_json TEXT NOT NULL CHECK (
+            json_valid(prepare_json) AND length(prepare_json) <= 4096
+          ),
+          start_json TEXT CHECK (
+            start_json IS NULL OR (json_valid(start_json) AND length(start_json) <= 8192)
+          ),
+          base_cursor_json TEXT NOT NULL CHECK (
+            json_valid(base_cursor_json) AND length(base_cursor_json) <= 512
+          ),
+          committed_through_json TEXT CHECK (
+            committed_through_json IS NULL OR (
+              json_valid(committed_through_json) AND length(committed_through_json) <= 512
+            )
+          ),
+          live_floor_json TEXT CHECK (
+            live_floor_json IS NULL OR (
+              json_valid(live_floor_json) AND length(live_floor_json) <= 512
+            )
+          ),
+          granted_cumulative_encoded_bytes TEXT NOT NULL DEFAULT '0'
+            CHECK (length(granted_cumulative_encoded_bytes) BETWEEN 1 AND 20),
+          recovery_done_through_json TEXT CHECK (
+            recovery_done_through_json IS NULL OR (
+              json_valid(recovery_done_through_json)
+              AND length(recovery_done_through_json) <= 512
+            )
+          ),
+          recovery_done_ordinal TEXT CHECK (
+            recovery_done_ordinal IS NULL OR length(recovery_done_ordinal) BETWEEN 1 AND 20
+          ),
+          recovery_done_cumulative_encoded_bytes TEXT CHECK (
+            recovery_done_cumulative_encoded_bytes IS NULL OR (
+              length(recovery_done_cumulative_encoded_bytes) BETWEEN 1 AND 20
+            )
+          ),
+          replica_applied_json TEXT NOT NULL CHECK (
+            json_valid(replica_applied_json) AND length(replica_applied_json) <= 512
+          ),
+          adopted_json TEXT CHECK (
+            adopted_json IS NULL OR (json_valid(adopted_json) AND length(adopted_json) <= 1024)
+          ),
+          source_closed_json TEXT CHECK (
+            source_closed_json IS NULL OR (
+              json_valid(source_closed_json) AND length(source_closed_json) <= 1024
+            )
+          ),
+          hard_deadline_at INTEGER NOT NULL,
+          no_progress_timeout_ms INTEGER NOT NULL CHECK (no_progress_timeout_ms > 0),
+          no_progress_deadline_at INTEGER NOT NULL,
+          reset_reason TEXT CHECK (
+            reset_reason IS NULL OR reset_reason IN (
+              'generation-reset', 'start-send-failed', 'ack-outcome-uncertain',
+              'deadline', 'pair-fenced', 'session-disposed'
+            )
+          ),
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          UNIQUE (client_id, delivery_generation)
+        ) STRICT
+      `);
+      sql.exec(`
+        CREATE INDEX IF NOT EXISTS recovery_attempt_deadline
+        ON recovery_attempt(state, no_progress_deadline_at, hard_deadline_at)
+      `);
+      sql.exec(`
+        CREATE TABLE IF NOT EXISTS recovery_delivery_lane (
+          recovery_id TEXT NOT NULL,
+          lane TEXT NOT NULL CHECK (lane IN ('live', 'recovery')),
+          sent_delivery_ordinal TEXT NOT NULL CHECK (
+            length(sent_delivery_ordinal) BETWEEN 1 AND 20
+          ),
+          sent_cumulative_encoded_bytes TEXT NOT NULL CHECK (
+            length(sent_cumulative_encoded_bytes) BETWEEN 1 AND 20
+          ),
+          sent_authority_cursor_json TEXT NOT NULL CHECK (
+            json_valid(sent_authority_cursor_json)
+            AND length(sent_authority_cursor_json) <= 512
+          ),
+          received_delivery_ordinal TEXT NOT NULL CHECK (
+            length(received_delivery_ordinal) BETWEEN 1 AND 20
+          ),
+          received_cumulative_encoded_bytes TEXT NOT NULL CHECK (
+            length(received_cumulative_encoded_bytes) BETWEEN 1 AND 20
+          ),
+          received_authority_cursor_json TEXT NOT NULL CHECK (
+            json_valid(received_authority_cursor_json)
+            AND length(received_authority_cursor_json) <= 512
+          ),
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (recovery_id, lane),
+          FOREIGN KEY (recovery_id) REFERENCES recovery_attempt(recovery_id) ON DELETE CASCADE
+        ) STRICT
+      `);
+      sql.exec(`
+        CREATE TABLE IF NOT EXISTS recovery_control_outbox (
+          recovery_id TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (
+            kind IN (
+              'recovery-prepare', 'recovery-start', 'recovery-start-ready',
+              'recovery-source-grant', 'recovery-source-received',
+              'recovery-source-closed', 'recovery-source-reset'
+            )
+          ),
+          destination TEXT NOT NULL CHECK (destination IN ('host', 'browser')),
+          payload_json TEXT NOT NULL CHECK (
+            json_valid(payload_json) AND length(payload_json) <= 16384
+          ),
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (recovery_id, kind),
+          FOREIGN KEY (recovery_id) REFERENCES recovery_attempt(recovery_id) ON DELETE CASCADE
+        ) STRICT
+      `);
+      state.storage.kv.put("schema-version", 7);
+    });
   }
 }

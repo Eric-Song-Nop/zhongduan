@@ -8,6 +8,7 @@ import {
   type FinalizedSnapshot,
 } from "./snapshot-contract";
 import { deleteRetiredSnapshotObjects } from "./snapshot-gc";
+import type { DurableAlarmScheduler } from "./durable-alarm-mux";
 import {
   SnapshotStore,
   SNAPSHOT_MAINTENANCE_BATCH_LIMIT,
@@ -88,8 +89,6 @@ export class SnapshotUploadCoordinator {
   private readonly snapshotOperationOwners = new Map<string, SnapshotOperationOwner>();
   private activeSnapshotUploadRequests = 0;
   private activeSnapshotBodyUploadId: string | undefined;
-  private snapshotAlarmTarget: number | undefined;
-  private snapshotAlarmUpdate: Promise<void> | undefined;
   private snapshotMaintenance: Promise<void> | undefined;
   private readonly snapshotMaintenanceTasks = new Map<string, Promise<void>>();
   private snapshotMaintenanceRequested = false;
@@ -101,6 +100,7 @@ export class SnapshotUploadCoordinator {
     private snapshotBucket: R2Bucket,
     private readonly snapshots: SnapshotStore,
     private readonly pinnedSnapshotIds: () => ReadonlySet<string>,
+    private readonly alarmScheduler: DurableAlarmScheduler,
   ) {}
 
   async upload(
@@ -689,27 +689,7 @@ export class SnapshotUploadCoordinator {
   }
 
   private scheduleAlarm(timestamp: number): Promise<void> {
-    this.snapshotAlarmTarget = Math.min(this.snapshotAlarmTarget ?? timestamp, timestamp);
-    if (this.snapshotAlarmUpdate !== undefined) return this.snapshotAlarmUpdate;
-    const update = this.flushAlarmTargets();
-    this.snapshotAlarmUpdate = update;
-    return update;
-  }
-
-  private async flushAlarmTargets(): Promise<void> {
-    try {
-      while (this.snapshotAlarmTarget !== undefined) {
-        let target = this.snapshotAlarmTarget;
-        const alarm = await this.ctx.storage.getAlarm();
-        if (this.snapshotAlarmTarget !== undefined) {
-          target = Math.min(target, this.snapshotAlarmTarget);
-        }
-        if (alarm === null || target < alarm) await this.ctx.storage.setAlarm(target);
-        if (this.snapshotAlarmTarget === target) this.snapshotAlarmTarget = undefined;
-      }
-    } finally {
-      this.snapshotAlarmUpdate = undefined;
-    }
+    return this.alarmScheduler.schedule(timestamp);
   }
 
   private async recoverMultipartForMaintenance(

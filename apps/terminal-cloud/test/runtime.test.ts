@@ -1,4 +1,11 @@
-import { RELAY_CAPABILITIES_HEADER, RelayCapability } from "@zhongduan/protocol";
+import {
+  ClientControlFrameSchema,
+  HostControlFrameSchema,
+  RELAY_CAPABILITIES_HEADER,
+  RecoveryV3ClientControlFrameSchema,
+  RecoveryV3HostToCloudControlFrameSchema,
+  RelayCapability,
+} from "@zhongduan/protocol";
 import { env, exports as workerExports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
@@ -12,6 +19,7 @@ interface CreatedSession {
 
 interface ConnectionSet {
   clientId: string | null;
+  connectionId: string;
   connectionSetId: string;
   controlTicket: string;
   dataTicket: string;
@@ -106,6 +114,12 @@ function nextMessage(socket: WebSocket): Promise<string> {
   return new Promise((resolve, reject) => {
     socket.addEventListener("message", (event) => resolve(String(event.data)), { once: true });
     socket.addEventListener("error", () => reject(new Error("websocket failed")), { once: true });
+  });
+}
+
+function nextClose(socket: WebSocket): Promise<CloseEvent> {
+  return new Promise((resolve) => {
+    socket.addEventListener("close", resolve, { once: true });
   });
 }
 
@@ -259,6 +273,79 @@ describe("cloud relay runtime", () => {
     ).toBe(true);
     control.socket?.close(1000, "test complete");
     data.socket?.close(1000, "test complete");
+  });
+
+  // This is a production-v2 rejection gate, not Recovery v3 runtime coverage.
+  it("keeps Recovery v3 control candidates unreachable through production v2 sockets", async () => {
+    const session = await createSession();
+    const host = await createConnectionSet(session.sessionId, session.hostCapability);
+    const browser = await createConnectionSet(session.sessionId, session.observerCapability);
+    expect(host.negotiatedCapabilities).toBeUndefined();
+    expect(browser.negotiatedCapabilities).toBeUndefined();
+
+    const hostCandidate = {
+      type: "recovery-source-closed",
+      recoveryId: "recovery_runtime_gate_0001",
+      connectionId: browser.connectionId,
+      streamId: browser.streamId,
+      deliveryGeneration: browser.deliveryGeneration,
+      throughRecoveryOrdinal: "1",
+      throughRecoveryCumulativeEncodedBytes: "1",
+    } as const;
+    const browserCandidate = {
+      type: "delivery-received",
+      deliveryGeneration: browser.deliveryGeneration,
+      lane: "recovery",
+      contiguousDeliveryOrdinal: "1",
+      cumulativeEncodedBytes: "1",
+    } as const;
+    expect(RecoveryV3HostToCloudControlFrameSchema.safeParse(hostCandidate).success).toBe(true);
+    expect(RecoveryV3ClientControlFrameSchema.safeParse(browserCandidate).success).toBe(true);
+    expect(HostControlFrameSchema.safeParse(hostCandidate).success).toBe(false);
+    expect(ClientControlFrameSchema.safeParse(browserCandidate).success).toBe(false);
+
+    const hostControl = await upgrade(session.sessionId, "control", host.controlTicket);
+    const browserControl = await upgrade(session.sessionId, "control", browser.controlTicket);
+    expect(hostControl.response.status).toBe(101);
+    expect(browserControl.response.status).toBe(101);
+    if (hostControl.socket === undefined || browserControl.socket === undefined) {
+      throw new Error("control upgrade did not return both WebSockets");
+    }
+    const hostClosed = nextClose(hostControl.socket);
+    const browserClosed = nextClose(browserControl.socket);
+    hostControl.socket.send(JSON.stringify(hostCandidate));
+    browserControl.socket.send(JSON.stringify(browserCandidate));
+    await expect(hostClosed).resolves.toMatchObject({
+      code: 4400,
+      reason: "invalid host control frame",
+    });
+    await expect(browserClosed).resolves.toMatchObject({
+      code: 4400,
+      reason: "invalid browser control frame",
+    });
+
+    const stub = env.TERMINAL_SESSIONS.get(
+      env.TERMINAL_SESSIONS.idFromName(`v1:${session.sessionId}`),
+    );
+    const durable = await runInDurableObject(stub, (_instance, state) => ({
+      attemptCount: state.storage.sql
+        .exec<{ value: number }>("SELECT COUNT(*) AS value FROM recovery_attempt")
+        .one().value,
+      browser: state.storage.sql
+        .exec<{ recovery_strategy: string }>(
+          "SELECT recovery_strategy FROM client_delivery WHERE client_id = ?",
+          browser.clientId,
+        )
+        .one(),
+      outboxCount: state.storage.sql
+        .exec<{ value: number }>("SELECT COUNT(*) AS value FROM recovery_control_outbox")
+        .one().value,
+    }));
+    expect(durable).toEqual({
+      attemptCount: 0,
+      browser: { recovery_strategy: "v2" },
+      outboxCount: 0,
+    });
   });
 
   it("keeps the exact legacy response keys when the negotiation bootstrap is absent", async () => {
