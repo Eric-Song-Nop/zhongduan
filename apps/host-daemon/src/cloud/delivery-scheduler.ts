@@ -638,14 +638,24 @@ export class HostDeliveryScheduler {
     active.controller.signal.throwIfAborted();
     const base = checkpoint.base;
     const commit = this.#session.cursor;
-    const replay = this.#session.replayThrough(base, commit);
+    const replayPlan = this.#session.planReplayThrough(base, commit);
     if (
-      replay.status !== "ok" ||
+      replayPlan.status !== "ok" ||
       deliveryOutstandingBytes(
         { eventSeq: base.lastEventSeq, nextPtyOffset: base.nextPtyOffset },
         { eventSeq: commit.lastEventSeq, nextPtyOffset: commit.nextPtyOffset },
       ) > BigInt(WARM_REPLAY_MAX_OUTSTANDING_BYTES) ||
-      replay.frames.length > WARM_REPLAY_MAX_FRAMES
+      replayPlan.exactFrames > WARM_REPLAY_MAX_FRAMES
+    ) {
+      this.#invalidateCheckpoint(checkpoint);
+      throw new ColdTailUnavailableError();
+    }
+    const replay = replayPlan.materialize();
+    if (
+      replay.status !== "ok" ||
+      replay.frames.length !== replayPlan.exactFrames ||
+      replay.frames.reduce((total, frame) => total + frame.byteLength, 0) !==
+        replayPlan.exactEncodedBytes
     ) {
       this.#invalidateCheckpoint(checkpoint);
       throw new ColdTailUnavailableError();

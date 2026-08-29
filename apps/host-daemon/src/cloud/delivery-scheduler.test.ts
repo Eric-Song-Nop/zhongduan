@@ -21,6 +21,7 @@ import {
   SNAPSHOT_RECOVERY_MAX_QUIET_WAIT_MS,
   SNAPSHOT_RECOVERY_QUIET_MS,
   WARM_REPLAY_MAX_FRAMES,
+  WARM_REPLAY_MAX_OUTSTANDING_BYTES,
 } from "./delivery-scheduler";
 import {
   SnapshotCleanupConfirmedError,
@@ -241,6 +242,24 @@ async function settle(): Promise<void> {
   await Promise.resolve();
   await new Promise<void>((resolve) => setImmediate(resolve));
   await Promise.resolve();
+}
+
+function observePlannedMaterializations(session: TerminalSession): number[] {
+  const planReplayThrough = session.planReplayThrough.bind(session);
+  const materializeCounts: number[] = [];
+  vi.spyOn(session, "planReplayThrough").mockImplementation((base, commit) => {
+    const plan = planReplayThrough(base, commit);
+    if (plan.status !== "ok") return plan;
+    const index = materializeCounts.push(0) - 1;
+    return {
+      ...plan,
+      materialize: () => {
+        materializeCounts[index]! += 1;
+        return plan.materialize();
+      },
+    };
+  });
+  return materializeCounts;
 }
 
 function describeData(encoded: Uint8Array): string {
@@ -804,12 +823,14 @@ describe("HostDeliveryScheduler", () => {
       () => Promise.resolve(),
       () => checkpointNow,
     );
+    const materializeCounts = observePlannedMaterializations(harness.session);
     activate(harness);
     harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
 
     attach(harness, { connectionId: "connection_AAAAAAAAA", streamId: 1 });
     for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
     expect(publish).toHaveBeenCalledOnce();
+    expect(materializeCounts).toEqual([1]);
 
     checkpointNow += SNAPSHOT_CHECKPOINT_FRESHNESS_MS + 1;
     for (let index = 0; index < WARM_REPLAY_MAX_FRAMES + 1; index += 1) {
@@ -819,6 +840,7 @@ describe("HostDeliveryScheduler", () => {
     for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
 
     expect(publish).toHaveBeenCalledOnce();
+    expect(materializeCounts).toEqual([1, 0]);
     await vi.advanceTimersByTimeAsync(SNAPSHOT_RECOVERY_QUIET_MS);
     for (let turn = 0; turn < 64; turn += 1) await Promise.resolve();
 
@@ -830,8 +852,144 @@ describe("HostDeliveryScheduler", () => {
     expect(snapshotIds).toEqual([`snapshot_${"A".repeat(16)}`, `snapshot_${"B".repeat(16)}`]);
     expect(encodeSnapshot).toHaveBeenCalledTimes(2);
     expect(publish).toHaveBeenCalledTimes(2);
+    expect(materializeCounts).toEqual([1, 0, 1]);
     expect(harness.closeReasons).toEqual([]);
   });
+
+  it("materializes a cold tail at the credit-byte limit but not beyond it", async () => {
+    vi.useFakeTimers();
+    let publishCalls = 0;
+    const publish = vi.fn(async (snapshot: SnapshotCapture) => {
+      publishCalls += 1;
+      return publishedSnapshot(snapshot, publishCalls === 1 ? "A" : "B");
+    });
+    const harness = createHarness({ publish });
+    const materializeCounts = observePlannedMaterializations(harness.session);
+    activate(harness);
+    harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
+
+    attach(harness, { connectionId: "connection_AAAAAAAAA", streamId: 1 });
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+    expect(materializeCounts).toEqual([1]);
+
+    const exactPayloadBytes = WARM_REPLAY_MAX_OUTSTANDING_BYTES - 16 * 64;
+    harness.pty.emit(new Uint8Array(exactPayloadBytes));
+    attach(harness, { connectionId: "connection_BBBBBBBBB", streamId: 2 });
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+    expect(materializeCounts).toEqual([1, 1]);
+    expect(publish).toHaveBeenCalledOnce();
+
+    harness.pty.emit(Uint8Array.of(0x41));
+    attach(harness, { connectionId: "connection_CCCCCCCCC", streamId: 3 });
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+    expect(materializeCounts).toEqual([1, 1, 0]);
+    expect(publish).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_RECOVERY_QUIET_MS);
+    for (let turn = 0; turn < 64; turn += 1) await Promise.resolve();
+
+    const snapshotIds = harness.data
+      .map(decodeDataFrame)
+      .filter((frame) => frame.kind === DataFrameKind.DeliveryBarrier)
+      .map((frame) => decodeDeliveryBarrierPayload(frame.payload))
+      .flatMap((payload) => (payload.mode === "snapshot" ? [payload.snapshotId] : []));
+    expect(snapshotIds).toEqual([
+      `snapshot_${"A".repeat(16)}`,
+      `snapshot_${"A".repeat(16)}`,
+      `snapshot_${"B".repeat(16)}`,
+    ]);
+    expect(materializeCounts).toEqual([1, 1, 0, 1]);
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(harness.closeReasons).toEqual([]);
+  });
+
+  it("does not materialize a cold tail one credit byte beyond the limit", async () => {
+    vi.useFakeTimers();
+    const publish = vi.fn(async (snapshot: SnapshotCapture) => publishedSnapshot(snapshot, "A"));
+    const harness = createHarness({ publish });
+    const materializeCounts = observePlannedMaterializations(harness.session);
+    activate(harness);
+    harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
+
+    attach(harness, { connectionId: "connection_AAAAAAAAA", streamId: 1 });
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+    expect(materializeCounts).toEqual([1]);
+
+    const payloadBytes = WARM_REPLAY_MAX_OUTSTANDING_BYTES - 16 * 64 + 1;
+    harness.pty.emit(new Uint8Array(payloadBytes));
+    attach(harness, { connectionId: "connection_BBBBBBBBB", streamId: 2 });
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+
+    expect(harness.session.eventSeq).toBe(16n);
+    expect(harness.session.nextPtyOffset + harness.session.eventSeq * 64n).toBe(
+      BigInt(WARM_REPLAY_MAX_OUTSTANDING_BYTES + 1),
+    );
+    expect(materializeCounts).toEqual([1, 0]);
+    expect(publish).toHaveBeenCalledOnce();
+    expect(
+      harness.data
+        .map(decodeDataFrame)
+        .filter((frame) => frame.kind === DataFrameKind.DeliveryBarrier),
+    ).toHaveLength(1);
+    expect(harness.closeReasons).toEqual([]);
+  });
+
+  it.each(["frames", "encoded-bytes"] as const)(
+    "fails a cold replay closed when materialized %s differ from its range plan",
+    async (mismatch) => {
+      vi.useFakeTimers();
+      let corruptPlan = false;
+      let publishCalls = 0;
+      const publish = vi.fn(async (snapshot: SnapshotCapture) => {
+        publishCalls += 1;
+        return publishedSnapshot(snapshot, publishCalls === 1 ? "A" : "B");
+      });
+      const harness = createHarness({ publish });
+      const planReplayThrough = harness.session.planReplayThrough.bind(harness.session);
+      vi.spyOn(harness.session, "planReplayThrough").mockImplementation((base, commit) => {
+        const plan = planReplayThrough(base, commit);
+        if (plan.status !== "ok" || !corruptPlan) return plan;
+        return mismatch === "frames"
+          ? { ...plan, exactFrames: plan.exactFrames + 1 }
+          : { ...plan, exactEncodedBytes: plan.exactEncodedBytes + 1 };
+      });
+      activate(harness);
+      harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
+
+      attach(harness, { connectionId: "connection_AAAAAAAAA", streamId: 1 });
+      for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+      expect(publish).toHaveBeenCalledOnce();
+
+      harness.pty.emit(Uint8Array.of(0x41));
+      corruptPlan = true;
+      attach(harness, { connectionId: "connection_BBBBBBBBB", streamId: 2 });
+      for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+
+      const barriersBeforeRetry = harness.data
+        .map(decodeDataFrame)
+        .filter((frame) => frame.kind === DataFrameKind.DeliveryBarrier);
+      expect(barriersBeforeRetry).toHaveLength(1);
+      expect(
+        harness.data
+          .map(decodeDataFrame)
+          .filter((frame) => frame.kind === DataFrameKind.ReplayCommit),
+      ).toHaveLength(1);
+      expect(publish).toHaveBeenCalledOnce();
+
+      corruptPlan = false;
+      await vi.advanceTimersByTimeAsync(SNAPSHOT_RECOVERY_QUIET_MS);
+      for (let turn = 0; turn < 64; turn += 1) await Promise.resolve();
+
+      const snapshotIds = harness.data
+        .map(decodeDataFrame)
+        .filter((frame) => frame.kind === DataFrameKind.DeliveryBarrier)
+        .map((frame) => decodeDeliveryBarrierPayload(frame.payload))
+        .flatMap((payload) => (payload.mode === "snapshot" ? [payload.snapshotId] : []));
+      expect(snapshotIds).toEqual([`snapshot_${"A".repeat(16)}`, `snapshot_${"B".repeat(16)}`]);
+      expect(publish).toHaveBeenCalledTimes(2);
+      expect(harness.closeReasons).toEqual([]);
+    },
+  );
 
   it("invalidates an overlong cached tail and recaptures once after canonical quiet", async () => {
     vi.useFakeTimers();

@@ -344,6 +344,13 @@ measure(R,H) -> {
 }
 ```
 
+P1.2 只关闭其中 Host 当前内存 journal 的 `gap`、`exactTailFrames` 和 `exactEncodedBytes` 事实，以及
+CURRENT cold path 的 tail-envelope eligibility。它不会把 `cursor-ahead`、blob availability、mutation age、
+estimated delivery、Browser budget 或 refresh policy 伪装成已经实现的 `usable`。Range plan 在 canonical pause
+后固定同一个 `{R,H}`，先返回 scalar facts；只有现有 256 KiB credit / 512 frame gate 通过后才 materialize，且
+materialize 必须来自同一个 journal revision。`exactEncodedBytes` 是 stored frame 长度之和；现有 256 KiB
+准入仍使用 `payload bytes + 64 bytes/event`，两者不能混称或借此修改策略。
+
 只有 `status=ok` 且 bytes、frames、age、delivery/browser budgets 全部满足时才 usable。不能把
 serviceability 简化成 capture timestamp 加固定 `serviceableUntil`：output byte rate、frame rate、journal
 segment retention 和 Cloud head 都会动态变化。
@@ -517,8 +524,11 @@ Phase 1 只能从通过上述契约和完整 CI 的 exact Phase 0 revision 开�
   `SnapshotCheckpointManager`，跨 relay connection 复用现有 publisher 和 immutable latest；30 秒只改变
   `ageFresh`，不删除 checkpoint。Scheduler 仍用现有 journal replay、frame/byte 上限决定当前 delivery，且
   capture/quiet/backoff/generation cancellation 与 v2 ordering 不变。
-- **P1.2：动态 serviceability facts**。在 materialize replay 前计算实际 range bytes/frames/gap，并区分
-  identity-valid、针对 `H` usable 和 refresh policy；仍不改变 v2 delivery ordering。
+- **P1.2：Host journal range facts 与 CURRENT cold-tail admission**。在 materialize replay 前，对 canonical
+  pause 后固定的 `{R,H}` 计算实际 encoded bytes、frames 和 gap；超出现有 credit/frame envelope 时不复制旧
+  tail，仍走 exact-checkpoint invalidation 与 quiet 后 recapture。它只证明 Host-local eligibility，不证明
+  Cloud blob、Browser budget、pending body 或完整 `usable`，也不决定 refresh policy；v2 delivery ordering
+  不变。
 - **P1.3：pending body serviceability**。pending body 只在仍 serviceable 或 bounded cursor-ahead 时 resume，
   否则按 cleanup-safe ownership abandon/supersede；失败不能 starvation、storm 或泄漏 immutable body。
 - **P1.4：manager-owned refresh single-flight**。把 `refreshInFlight`、合并后的更新压力和 waiter ownership 移入
@@ -529,6 +539,11 @@ P1.1 的直接 gate 是：manager 在 30 秒边界后仍返回同一 latest 且 
 attach 相隔超过 30 秒仍使用同一 `snapshotId`，authority encode 和 publish 总计各一次。现有 16 attach
 单 build 只是回归保护，不作为本层新增进展。旧 checkpoint 的 tail gap/静态超预算仍必须 invalidate 并 recapture。
 P1.1 单独通过不表示 Phase 1 完成；下列总 gate 仍需 P1.2–P1.4 的直接证据。
+
+P1.2 的直接 gate 是：mixed output/resize range 返回精确 scalar facts 且不复制 frames；CURRENT cold tail
+超 256 KiB credit 或 512 frames 时不 materialize 旧 range，under-limit range 才从同一 journal revision
+materialize。Materialized frame count/encoded bytes 与 plan 不一致时 fail closed，不能发送 barrier、截断 tail
+或 commit。Warm policy、pending serviceability 与完整 `usable` 不在本层声明内。
 
 Gate：16 个 attach 只 build 一次；90–120 秒 upload/retry 不会发布出生即不可服务的 checkpoint；idle
 checkpoint 不因 TTL 被错误删除；无 pending body starvation/storm/leak。
