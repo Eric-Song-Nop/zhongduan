@@ -488,10 +488,12 @@ describe("HostDeliveryScheduler", () => {
       return publishedSnapshot(snapshot, publishCalls === 1 ? "A" : "B");
     });
     const harness = createHarness({ publish });
+    const invalidate = vi.spyOn(harness.snapshotCheckpointManager, "invalidate");
     activate(harness);
     let barriers = 0;
     harness.setBarrierResponder((encoded) => {
       barriers += 1;
+      if (barriers === 1) harness.pty.emit(Uint8Array.of(0x41));
       answerBarrier(harness, encoded, barriers === 1 ? outcome : { status: "ready" });
     });
 
@@ -499,6 +501,12 @@ describe("HostDeliveryScheduler", () => {
     for (let turn = 0; turn < 16; turn += 1) await Promise.resolve();
     expect(publish).toHaveBeenCalledOnce();
     expect(barriers).toBe(1);
+    expect(invalidate).toHaveBeenCalledOnce();
+    expect(invalidate.mock.calls[0]?.[1]).toEqual({
+      sessionEpoch: 1n,
+      lastEventSeq: 0n,
+      nextPtyOffset: 0n,
+    });
 
     await vi.advanceTimersByTimeAsync(SNAPSHOT_RECOVERY_QUIET_MS - 1);
     expect(publish).toHaveBeenCalledOnce();
@@ -746,8 +754,14 @@ describe("HostDeliveryScheduler", () => {
   it("reuses one published checkpoint across sixteen idle cold deliveries", async () => {
     const authority = new FakeTerminalAuthority();
     const encodeSnapshot = vi.spyOn(authority, "encodeSnapshot");
-    const publish = vi.fn(async (snapshot: SnapshotCapture) => publishedSnapshot(snapshot));
+    const upload = deferred<PublishedSnapshot>();
+    const started = deferred<SnapshotCapture>();
+    const publish = vi.fn((snapshot: SnapshotCapture) => {
+      started.resolve(snapshot);
+      return upload.promise;
+    });
     const harness = createHarness({ publish }, authority);
+    const refresh = vi.spyOn(harness.snapshotCheckpointManager, "refresh");
     activate(harness);
     harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
 
@@ -757,13 +771,24 @@ describe("HostDeliveryScheduler", () => {
         streamId: index,
       });
     }
+    const snapshot = await started.promise;
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+
+    expect(refresh).toHaveBeenCalledTimes(16);
+    expect(encodeSnapshot).toHaveBeenCalledOnce();
+    expect(publish).toHaveBeenCalledOnce();
+    expect(
+      harness.data
+        .map(decodeDataFrame)
+        .filter((frame) => frame.kind === DataFrameKind.DeliveryBarrier),
+    ).toEqual([]);
+
+    upload.resolve(publishedSnapshot(snapshot));
     await settle();
 
     const frames = harness.data.map(decodeDataFrame);
     const barriers = frames.filter((frame) => frame.kind === DataFrameKind.DeliveryBarrier);
     const barrierPayloads = barriers.map((frame) => decodeDeliveryBarrierPayload(frame.payload));
-    expect(encodeSnapshot).toHaveBeenCalledOnce();
-    expect(publish).toHaveBeenCalledOnce();
     expect(barriers).toHaveLength(16);
     expect(barrierPayloads.every((payload) => payload.mode === "snapshot")).toBe(true);
     expect(
@@ -774,6 +799,66 @@ describe("HostDeliveryScheduler", () => {
       ).size,
     ).toBe(1);
     expect(frames.filter((frame) => frame.kind === DataFrameKind.ReplayCommit)).toHaveLength(16);
+    expect(harness.closeReasons).toEqual([]);
+  });
+
+  it("detaches every waiter holding an exact-invalidated shared checkpoint", async () => {
+    vi.useFakeTimers();
+    let publishCalls = 0;
+    const publish = vi.fn(async (snapshot: SnapshotCapture) => {
+      publishCalls += 1;
+      return publishedSnapshot(snapshot, publishCalls === 1 ? "A" : "B");
+    });
+    const harness = createHarness({ publish });
+    const barriers: Uint8Array[] = [];
+    activate(harness);
+    harness.setBarrierResponder((encoded) => barriers.push(encoded));
+
+    for (let index = 1; index <= 16; index += 1) {
+      attach(harness, {
+        connectionId: `connection_${index.toString().padStart(16, "0")}`,
+        streamId: index,
+      });
+    }
+    for (let turn = 0; turn < 64; turn += 1) await Promise.resolve();
+
+    expect(publish).toHaveBeenCalledOnce();
+    expect(barriers).toHaveLength(1);
+    expect(decodeDeliveryBarrierPayload(decodeDataFrame(barriers[0]!).payload)).toMatchObject({
+      mode: "snapshot",
+      snapshotId: `snapshot_${"A".repeat(16)}`,
+    });
+
+    answerBarrier(harness, barriers[0]!, {
+      status: "rejected",
+      reason: "snapshot-missing",
+      retryScope: "refresh-checkpoint",
+    });
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
+
+    expect(barriers).toHaveLength(1);
+    expect(publish).toHaveBeenCalledOnce();
+
+    harness.setBarrierResponder((encoded) => {
+      barriers.push(encoded);
+      answerBarrier(harness, encoded);
+    });
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_RECOVERY_QUIET_MS);
+    for (let turn = 0; turn < 64; turn += 1) await Promise.resolve();
+
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(barriers).toHaveLength(17);
+    expect(
+      barriers.slice(1).map((encoded) => {
+        const payload = decodeDeliveryBarrierPayload(decodeDataFrame(encoded).payload);
+        return payload.mode === "snapshot" ? payload.snapshotId : payload.mode;
+      }),
+    ).toEqual(Array.from({ length: 16 }, () => `snapshot_${"B".repeat(16)}`));
+    expect(
+      harness.data
+        .map(decodeDataFrame)
+        .filter((frame) => frame.kind === DataFrameKind.ReplayCommit),
+    ).toHaveLength(16);
     expect(harness.closeReasons).toEqual([]);
   });
 
@@ -910,6 +995,7 @@ describe("HostDeliveryScheduler", () => {
     vi.useFakeTimers();
     const publish = vi.fn(async (snapshot: SnapshotCapture) => publishedSnapshot(snapshot, "A"));
     const harness = createHarness({ publish });
+    const invalidate = vi.spyOn(harness.snapshotCheckpointManager, "invalidate");
     const materializeCounts = observePlannedMaterializations(harness.session);
     activate(harness);
     harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
@@ -929,6 +1015,8 @@ describe("HostDeliveryScheduler", () => {
     );
     expect(materializeCounts).toEqual([1, 0]);
     expect(publish).toHaveBeenCalledOnce();
+    expect(invalidate).toHaveBeenCalledOnce();
+    expect(invalidate.mock.calls[0]?.[1]).toEqual(harness.session.cursor);
     expect(
       harness.data
         .map(decodeDataFrame)
@@ -948,6 +1036,7 @@ describe("HostDeliveryScheduler", () => {
         return publishedSnapshot(snapshot, publishCalls === 1 ? "A" : "B");
       });
       const harness = createHarness({ publish });
+      const invalidate = vi.spyOn(harness.snapshotCheckpointManager, "invalidate");
       const planReplayThrough = harness.session.planReplayThrough.bind(harness.session);
       vi.spyOn(harness.session, "planReplayThrough").mockImplementation((base, commit) => {
         const plan = planReplayThrough(base, commit);
@@ -978,6 +1067,8 @@ describe("HostDeliveryScheduler", () => {
           .filter((frame) => frame.kind === DataFrameKind.ReplayCommit),
       ).toHaveLength(1);
       expect(publish).toHaveBeenCalledOnce();
+      expect(invalidate).toHaveBeenCalledOnce();
+      expect(invalidate.mock.calls[0]?.[1]).toEqual(harness.session.cursor);
 
       corruptPlan = false;
       await vi.advanceTimersByTimeAsync(SNAPSHOT_RECOVERY_QUIET_MS);
@@ -1223,7 +1314,6 @@ describe("HostDeliveryScheduler", () => {
       },
     };
     const harness = createHarness(publisher);
-    const install = vi.spyOn(harness.snapshotCheckpointManager, "install");
     activate(harness);
     harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
     attach(harness);
@@ -1243,7 +1333,7 @@ describe("HostDeliveryScheduler", () => {
     for (let index = 0; index < 8; index += 1) await Promise.resolve();
 
     expect(publishCalls).toBe(1);
-    expect(install).not.toHaveBeenCalled();
+    expect(harness.snapshotCheckpointManager.latestValid()).toBeUndefined();
     expect(harness.closeReasons).toEqual([]);
     expect(harness.controls).toEqual([]);
     expect(harness.pty.writes).toContainEqual(Uint8Array.of(0x03));
@@ -1255,8 +1345,7 @@ describe("HostDeliveryScheduler", () => {
     await Promise.resolve();
 
     expect(publishCalls).toBe(2);
-    expect(install).toHaveBeenCalledOnce();
-    expect(install.mock.calls[0]?.[0]).toMatchObject({
+    expect(harness.snapshotCheckpointManager.latestValid()?.checkpoint.published).toMatchObject({
       metadata: { snapshotId: `snapshot_${"Q".repeat(16)}` },
     });
     expect(harness.closeReasons).toEqual([]);
@@ -1299,37 +1388,64 @@ describe("HostDeliveryScheduler", () => {
   });
 
   it("silently supersedes pre-marker work and resumes canonical before the new generation", async () => {
-    const firstStarted = deferred<void>();
-    let publishCalls = 0;
+    const upload = deferred<PublishedSnapshot>();
+    const started = deferred<SnapshotCapture>();
+    let publisherSignal: AbortSignal | undefined;
+    const publish = vi.fn((snapshot: SnapshotCapture, signal?: AbortSignal) => {
+      publisherSignal = signal;
+      signal?.addEventListener("abort", () => upload.reject(signal.reason), { once: true });
+      started.resolve(snapshot);
+      return upload.promise;
+    });
     const publisher: SnapshotPublisherLike = {
-      publish(snapshot, signal) {
-        publishCalls += 1;
-        if (publishCalls !== 1) return Promise.resolve(publishedSnapshot(snapshot, "B"));
-        firstStarted.resolve();
-        return new Promise((_resolve, reject) => {
-          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
-        });
-      },
+      publish,
     };
-    const harness = createHarness(publisher);
+    const authority = new FakeTerminalAuthority();
+    const encodeSnapshot = vi.spyOn(authority, "encodeSnapshot");
+    const harness = createHarness(publisher, authority);
+    const refresh = vi.spyOn(harness.snapshotCheckpointManager, "refresh");
     activate(harness);
     harness.pty.emit(Uint8Array.of(0x41));
     attach(harness, { deliveryGeneration: "1" });
-    await firstStarted.promise;
+    const snapshot = await started.promise;
     harness.pty.emit(Uint8Array.of(0x42));
     harness.setBarrierResponder((encoded) => answerBarrier(harness, encoded));
 
     attach(harness, { deliveryGeneration: "2" });
+    for (let turn = 0; turn < 16; turn += 1) await Promise.resolve();
+
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(refresh.mock.calls[0]?.[0].signal?.aborted).toBe(true);
+    expect(refresh.mock.calls[1]?.[0]).not.toHaveProperty("minimumCut");
+    expect(publisherSignal?.aborted).toBe(false);
+    expect(encodeSnapshot).toHaveBeenCalledOnce();
+    expect(publish).toHaveBeenCalledOnce();
+    expect(
+      harness.data
+        .map(decodeDataFrame)
+        .filter((frame) => frame.kind === DataFrameKind.DeliveryBarrier),
+    ).toEqual([]);
+
+    upload.resolve(publishedSnapshot(snapshot, "A"));
     await settle();
 
-    expect(publishCalls).toBe(2);
+    expect(encodeSnapshot).toHaveBeenCalledOnce();
+    expect(publish).toHaveBeenCalledOnce();
     expect(harness.controls).toEqual([]);
     expect(harness.data.map(describeData)).toEqual([
       "canonical:1:65",
       "canonical:2:66",
       "barrier:2",
+      "directed:2:66",
       "commit:2",
     ]);
+    const markerFrames = harness.data
+      .map(decodeDataFrame)
+      .filter(
+        (frame) =>
+          frame.kind === DataFrameKind.DeliveryBarrier || frame.kind === DataFrameKind.ReplayCommit,
+      );
+    expect(markerFrames.map((frame) => frame.deliveryGeneration)).toEqual([2n, 2n]);
     expect(harness.closeReasons).toEqual([]);
   });
 });
