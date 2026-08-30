@@ -125,8 +125,17 @@ Recovery v3 的 capability/wire schema 采用 Cloud-first 滚动顺序。P2.0 Cl
 只确认已实现的 v2 能力；未提供 bootstrap token 的旧 Host/Browser 仍收到旧 connection-set response shape。
 新 Host/Browser 连接旧 Cloud 时看不到 `negotiatedCapabilities`，必须完整使用 v2。Durable Object 的 additive
 schema migration 把既有 session 固定为 authority data v2，并把既有 generation strategy 默认设为 v2。
-在 Browser assembler、Host source owner、Cloud durable state、receipt/closure 与 fairness gate 全部通过前，
-生产 endpoint 不得 advertise v3 token，Cloud kill switch 必须保持关闭，也不得单独移除 v2 pause/barrier/pin。
+Phase 2 已完成 Browser assembler、Host source owner、Cloud durable state、receipt/closure/fairness，以及本地
+three-owner continuity、committed-WASM Ghostty continuation 与 WTerm adoption correctness gates；这些仍只是
+stacked candidate 的本地证据，不代表 production Cloudflare/R2、真实跨进程网络、性能或 rollout 批准。
+当前 Wrangler `RECOVERY_V3_ENABLED="false"`，Host `CloudApiClient` 与 Browser `TerminalSession` 的默认
+capability offer 也只有 v2 baseline。
+在独立 production-like staging 与 rollout 审批完成前，生产 endpoint 不得 advertise v3 token，Cloud kill
+switch 必须保持关闭，也不得单独移除 v2 pause/barrier/pin。
+rollout 获批后，strategy 也只能在新的 Browser generation claim 时选择并持久化；已有 generation 不得原地
+从 v2 切到 v3 或把两套协议拼接。既有 v3 attempt 必须完成或被明确 reset/fence；关闭 kill switch 会阻止
+新 v3 generation，并在 attachment decode/outbox drain 前对已持久化的 v3 状态 fail closed，要求重连并建立
+新的 v2 generation，而不是原地降级。v2 pause/barrier/pin 要保留到独立 retirement gate。
 若回滚到不认识 negotiation token 的旧 DO 代码，已经用新 attachment 建立的 socket 会 fail closed，运维上应预期
 这些连接重连；additive SQLite facts 与 authority log 不因此回退或丢失。不要把“已有连接不断开”当作该回滚
 路径的保证。

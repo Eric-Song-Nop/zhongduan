@@ -1,9 +1,10 @@
 # Recovery v3 Wire Contract
 
-> 状态：P2.0–P2.5c 为 stacked candidates；Recovery v3 的 Host/Cloud/Browser runtime 已在完整
+> 状态：P2.0–P2.6 为 stacked candidates；Recovery v3 的 Host/Cloud/Browser runtime 已在完整
 > capability gate 后接通，P2.5a 增加 no-payload delivery ledger/cold-owner safety，P2.5b 增加
 > Host recovery source multi-outstanding 与 connection-local DRR，P2.5c 增加 Cloud session aggregate、
-> ephemeral shared ring、live window 与四类 delivery scheduler。默认 production
+> ephemeral shared ring、live window 与四类 delivery scheduler，P2.6 完成本地 three-owner fault/continuity、
+> committed-WASM continuation 与 WTerm adoption gates。默认 production
 > kill switch 和 Host/Browser offers 仍选择 protocol v2，所以尚未 rollout
 >
 > 适用范围：Host authority data、Cloud delivery、Browser recovery 与滚动协商
@@ -160,7 +161,7 @@ identity cache。Cloud 只有 matching `RecoveryAdopted` 与 `RecoverySourceClos
 
 ## 当前启用状态与验证边界
 
-### P2.0–P2.5c stacked candidates
+### P2.0–P2.6 stacked candidates
 
 P2.0 保留 strict schema、codec、capability transport、authority version migration 和 generation strategy 的 v2
 default。P2.4 增加按 generation strategy 隔离的 Browser↔Cloud 与 Cloud↔Host strict control union；
@@ -179,7 +180,8 @@ receipt/apply/adopt/completion progress；它自己不做网络、HTTP 或 WTerm
 - 只按小 quantum apply 连续 authority 前缀。cold target 未安装时 receipt 与 apply 分离；warm target 必须精确
   位于 `R`，cold install 必须匹配 recovery attempt、base 与 engine；candidate 是否确由 start 中的 snapshot
   manifest restore 而来不属于 P2.1 pure owner 的证明边界；P2.4 接入 exact snapshot transport，
-  真实 WTerm/Ghostty continuation oracle 仍属于 P2.6；
+  P2.6 的独立 committed-WASM gate 提供真实 GhosttyCore continuation oracle，另一个 jsdom gate 检查
+  production `WTermReplicaHost` 的 atomic adoption；
 - `RecoveryDone(H)` 是 recovery lane 的最后 record。它可早于 restore/apply 完成到达，但不能早于缺失的
   lower recovery ordinal；Done 已验证且 applied 至少到 `H` 后才 handoff-eligible；
 - caller 完成真实 atomic handoff 后才 confirm，随后产生稳定 `RecoveryAdopted(K)`，其中 `K >= H`；
@@ -345,10 +347,10 @@ P2.5a–P2.5c 的 runtime/ledger/Host/Cloud scheduler wiring 已经存在，但�
 generation 不使用 v2 global pause/fixed-commit barrier/pin；默认 v2 generation 和 rolling fallback
 仍完整保留 pause/barrier/pin invariant，不得因 P2.5a–P2.5c wiring 单独放宽。
 
-P2.5c 已打开 Cloud aggregate-bounded live/recovery window；P2.6 仍需完成
-three-owner deterministic crash/loss integration、真实 WTerm/Ghostty snapshot/parser continuation 与 exact-tail
-continuity oracle，以及 rolling downgrade/rollback gate。性能、load/soak、SLO 和 dashboard 继续后置，
-不能替代 correctness gates。
+P2.5c 已打开 Cloud aggregate-bounded live/recovery window；P2.6 已完成本地 deterministic three-owner
+fault/continuity、真实 committed-WASM Ghostty snapshot/parser continuation、真实 WTerm atomic adoption，以及
+generation-scoped downgrade/rollback gate。性能、load/soak、SLO、dashboard、production Cloudflare/R2 与真实
+跨进程网络验证继续后置，不能替代 correctness gates，也不能由这些本地 gates 反向宣称。
 
 ### 保留的直接证据
 
@@ -409,12 +411,19 @@ P2.5c direct Store/ring/scheduler/runtime evidence 额外覆盖：`R + L` sessio
 refcount、四类 `4 / 2 / 2 / 1` weighted byte-DRR、live consecutive obligations、每 record
 `scheduler.wait(0)` opportunity，以及 wake 时 `queued`/`sending` fence、`sent` 零重发。
 
-P2.4–P2.5c 证据是本地 workerd/Miniflare、fake WebSocket、fake timer/clock 与 caller-provided replica seam
-上的 wiring evidence。它不证明真实网络、production Cloudflare/R2、真实 WTerm/Ghostty parser
-continuation 与 tail equivalence，也不证明真实 ingress priority、物理 socket high-water、性能或 SLO；
-这些分别属于 P2.6 及后续环境 gate。
+P2.6 local gates 额外覆盖：真实 Host recovery owners、本地 workerd Durable Object/SQL/R2/hibernating
+WebSocket 与 Browser `RecoveryRuntime`/assembler 的 non-empty snapshot@R、`(R,H]` gap 与 `H+1...` live
+continuity；ACK/Adopted/SourceClosed retry 与 unsafe wake。独立 local rollout gate 验证 strategy 只在新 claim
+的 Browser generation 选择，并覆盖 generation-scoped replacement/rollback；committed-WASM Ghostty
+uninterrupted-vs-restored exact-tail equivalence；以及 jsdom 中真实 `WTermReplicaHost` 的 atomic DOM adoption。
+three-owner harness 的 authority/PTY、ReplicaHost 与 snapshot body 是 literal test owners，wire trace 仍是 control
+Start 先到，固定 `bufferedAmount=0` shim 不提供 client-side backpressure 证据。因此这些测试不等于单一真实
+Ghostty 三进程 E2E，也不证明真实网络、production Cloudflare/R2、像素渲染、真实 ingress priority、物理
+socket high-water、性能或 SLO。fault drop/hold 使用 manual timer、progress callback 与 socket-send seams；
+unsafe `queued`/`sending` 状态通过 `runInDurableObject` 与 production Store white-box seed，再由真实本地 DO
+hibernation/socket 验证 fence，不等同于物理 send cut、OS crash 或真实网络丢包重排。
 
-P2.0–P2.5c 不修改 WTerm/Ghostty。若 P2.6 暴露真实 API 缺口，必须先在
-`Eric-Song-Nop` 对应 fork 建立正式 PR 并完成 review/验证，再由 Zhongduan 的独立 stacked PR
-更新固定 submodule；不得直接改 vendor、指向
-upstream 或 pin 未审 commit。
+P2.0–P2.6 不修改 WTerm/Ghostty production code 或固定 submodule；P2.6 复用 committed WASM 与现有
+adoption API，未发现需要 fork 修复的 API 缺口。未来若环境 gate 暴露缺陷，仍必须先在
+`Eric-Song-Nop` 对应 fork 建立正式 PR 并完成 review/验证，再由 Zhongduan 的独立 stacked PR 更新固定
+submodule；不得直接改 vendor、指向 upstream 或 pin 未审 commit。

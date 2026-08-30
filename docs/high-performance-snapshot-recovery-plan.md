@@ -1,12 +1,13 @@
 # 高性能远程终端 Snapshot 与 Recovery v3 实施计划
 
-> 状态：Phase 0/1 为 CURRENT stacked candidates；Phase 2 的 P2.0–P2.5c（wire/capability、
+> 状态：Phase 0/1 为 CURRENT stacked candidates；Phase 2 的 P2.0–P2.6（wire/capability、
 > Browser/Host/Cloud owner、capability-gated runtime wiring、no-payload delivery ledger/cold safety，以及
-> Host recovery source 的 multi-outstanding/DRR scheduling、Cloud session aggregate/shared ring/delivery scheduler）
+> Host recovery source 的 multi-outstanding/DRR scheduling、Cloud session aggregate/shared ring/delivery scheduler，
+> 以及本地 three-owner fault/continuity、committed-WASM continuation/adoption gates）
 > 为 stacked candidates。默认生产 kill switch 与 Host/Browser capability offer 仍选择 v2，尚未 rollout；
-> P2.6 与 Phase 3–5 为 TARGET
+> Phase 3–5 与 production-like rollout/performance validation 为 TARGET
 >
-> 决策日期：2026-08-28
+> 决策日期：2026-08-30
 >
 > 适用范围：Host authority、snapshot/checkpoint、journal、Cloud delivery 和 Browser replica
 
@@ -222,7 +223,8 @@ P2.1 保留的 pure 行为是：
   receipt 已拥有的 bounded copy，但不推进 applied cursor；cold install 必须匹配 recovery attempt、base 与
   engine，warm target 必须精确位于 base `R`。candidate 是否确由 start 中的 snapshot manifest restore 而来，
   不属于 P2.1 pure owner 的证明边界；P2.4 runtime 会把 exact start manifest 交给现有
-  snapshot transport，真实 WTerm/Ghostty continuation oracle 仍属于 P2.6；
+  snapshot transport，P2.6 的独立 committed-WASM gate 提供真实 GhosttyCore continuation oracle，另一个
+  jsdom gate 检查 production `WTermReplicaHost` 的 atomic adoption；
 - `RecoveryDone(H)` 必须是 recovery lane 的最后一条 record，并拥有稳定 ordinal/bytes。Done 可以早于
   snapshot restore 或连续 apply 完成到达，但不能越过缺失的较低 recovery ordinal；只有 Done 已验证且
   applied cursor 至少为 `H` 时 handoff 才 eligible；
@@ -787,6 +789,17 @@ Phase 1 stacked candidate 的最终行为是：
   live consecutive obligations、每 record `scheduler.wait(0)` 调度机会、exact generation cancel/fence，及 wake
   时 `queued`/`sending` reset、`sent` 零重发。这些本地证据不证明真实 ingress priority、物理 socket
   high-water、production Cloudflare、性能或 SLO。
+- P2.6 local gates 把真实 Host recovery owners、本地 workerd Durable Object/SQL/R2/hibernating
+  WebSocket 与 Browser `RecoveryRuntime`/assembler 接进同一个确定性 harness，检查 non-empty
+  snapshot@R、`(R,H]` gap、`H+1...` live continuation、跨 channel handler 时序、ACK/Adopted/SourceClosed
+  retry 与 unsafe wake。另一个 local rollout gate 检查只有新 claim 的 Browser generation 才选择 strategy，
+  并验证 generation-scoped replacement/rollback。独立 committed-WASM tests 对比 uninterrupted 与
+  snapshot+exact-tail Ghostty state，并在 jsdom 中检查真实 `WTermReplicaHost` 的 atomic DOM adoption。
+  three-owner harness 的 authority/PTY、ReplicaHost 与 snapshot payload 是 literal test owners；它不是单一
+  真实 Ghostty 三进程 E2E，也不提供 client-side backpressure、像素渲染、真实网络或性能证据。drop/hold
+  使用 manual timer、progress callback 与 socket-send seams；unsafe `queued`/`sending` 状态通过
+  `runInDurableObject` 与 production Store white-box seed，再由真实本地 DO hibernation/socket 验证 fence，
+  因而不等同于物理 send cut、OS crash 或真实网络丢包重排。
 
 这些测试的证据来自明确状态、identity、frame ordering、资源 owner 和本地 Worker storage/R2 oracle。测试总数、
 绿色 CI、timeout 数值或 clean build 本身不证明这些状态。
@@ -795,8 +808,9 @@ Phase 1 stacked candidate 的最终行为是：
 
 - Host suite 大量使用 fake authority、fake timer、mock publisher 和 mock WebSocket；Worker suite 使用本地
   workerd/Miniflare，不代表 production Cloudflare、真实 R2 或真实网络；
-- 现有测试不证明任意 Browser 都能取得 blob，也不证明真实 WTerm/Ghostty restore/adopt 后的完整 tail
-  continuity；
+- P2.6 已分别证明 committed-WASM Ghostty continuation equivalence、真实 WTerm atomic adoption，以及
+  literal owner 上的本地 three-owner transport continuity；这些是三条互补的本地证据，不等于任意 Browser
+  都能在 production Cloudflare/R2 与真实网络中取得 blob 并完成单一真实 Ghostty 三进程 E2E；
 - JavaScript deadline 不能抢占同步 full snapshot WASM encode，因此 5 秒 capture budget 不是 actor hard max；
 - 本地 cleanup slot 只约束运行中的 Host；进程崩溃后 generic `uncertain` upload 的 durable reconciliation 仍未
   完成；
@@ -809,9 +823,9 @@ Phase 1 stacked candidate 的最终行为是：
   multi-outstanding；P2.5c 已打开 Cloud live window，并以 session aggregate、ephemeral shared ring、
   writer reserve 与多 client/lane scheduler 约束 outstanding payload。这个 scheduler yield 仍不证明真实
   ingress priority 或物理 socket high-water；
-- P2.4 的 snapshot transport/replica-host seam 与本地 runtime tests 不证明真实 WTerm/Ghostty 的
-  parser continuation、atomic adopt 或 terminal state equivalence。P2.6 的真实 continuity oracle、完整三方
-  deterministic fault integration 与 rolling downgrade/rollback gate 仍待完成；
+- P2.6 已关闭本地 deterministic continuity/rollout gate；three-owner 用例中的 wire trace 仍先收到 control
+  Start，所谓 reorder 只指 Browser handler 在 restore 尚未完成时接受 data/closure。其固定
+  `bufferedAmount=0` shim 也不代表 client-side backpressure 测量；
 - 当前 evidence 不证明真实跨进程网络、Cloudflare/R2 环境、load/soak、性能/SLO、
   production dashboard 或真实滚动发布。
 
@@ -821,9 +835,9 @@ Phase 1 stacked candidate 的最终行为是：
   recovery scalar direct migration fixtures 已保留；
 - 真实 Cloudflare alarm retry/eviction、DO hibernation、R2 HEAD/PUT/delete、response loss、Host crash/restart 和
   generic uncertain reconciliation 的 fault injection；
-- P2.6 在完整三方 wiring 上扩展独立 reference model/property/fuzz 与 deterministic
-  crash/loss integration，并用真实 WTerm/Ghostty parser continuation 与 exact tail-continuity oracle 验证
-  snapshot restore/adopt 后续，最后验证 rolling capability downgrade/rollback；
+- 在 production-like staging 上扩展独立 reference model/property/fuzz、跨进程 crash/loss 与真实网络
+  rolling downgrade/rollback；本地 deterministic owner fault、committed-WASM continuation 与 capability
+  generation rollback 已由 P2.1/P2.2/P2.5c/P2.6 的组合 gate 覆盖；
 - 性能验证只在 workload、link profile、环境隔离、warm-up、样本量和统计方法另行批准后实施。
 
 ### Phase 2：Recovery v3，继续使用 full snapshot
@@ -849,10 +863,11 @@ Phase 1 stacked candidate 的最终行为是：
   `4 / 2 / 2 / 1` 四类 weighted byte-DRR；initial grant `0` 只有在 exact start-ready ACK 后才 bounded refill，
   wake 时 transient `queued`/`sending` fail closed，`sent` 不重发。性能、load/soak、dashboard 与 SLO
   继续后置，不作为 correctness 的替代证据；
-- P2.6 才用 deterministic three-owner fault integration 和真实 WTerm/Ghostty snapshot/parser
-  continuation/exact-tail oracle 完成 continuity 与 rolling gate。默认 kill switch/offer 在此前保持
-  v2；v3 generation 不走 global pause/fixed-commit barrier/pin，但 v2 fallback 必须继续保留
-  现有 pause/barrier/pin invariant。
+- P2.6 已用 deterministic local three-owner fault integration、真实 committed-WASM Ghostty
+  snapshot/parser continuation/exact-tail oracle、真实 WTerm atomic adoption，以及 generation-scoped
+  downgrade/rollback 完成本地 continuity/rolling correctness gate。默认 kill switch/offer 仍保持 v2；
+  v3 generation 不走 global pause/fixed-commit barrier/pin，但 v2 fallback 必须继续保留现有
+  pause/barrier/pin invariant。
 
 Gate：snapshot 下载/restore 时 `(R,H]` 与 `H+1...` 任意交错仍只采用连续前缀；
 ACK/Done/Adopted/SourceClosed 丢失可恢复；一个慢客户端不阻塞 authority、writer 或其他客户端；full
@@ -860,10 +875,10 @@ snapshot 路径通过独立 reference model/property、owner-level deterministic
 snapshot/continuation equivalence。浏览器端到端只保留 capability downgrade 和 wiring smoke，并明确不作为
 lane interleaving、ownership、terminal state 或性能证明。
 
-P2.0–P2.5c 没有修改 WTerm/Ghostty。若 P2.6 暴露真实 API 缺口，必须先在
-`Eric-Song-Nop` 的对应 fork 创建正式 PR、完成 review/验证，再由 Zhongduan 的独立 stacked PR
-更新固定 submodule 指针；不得直接修改
-vendor、指向 upstream 或 pin 未审 commit。
+P2.0–P2.6 没有修改 WTerm/Ghostty production code 或固定 submodule 指针；P2.6 直接复用 committed
+WASM 与现有 adoption API，没有发现需要 fork 修复的 API 缺口。未来若新增 gate 暴露真实缺陷，仍必须先在
+`Eric-Song-Nop` 的对应 fork 创建正式 PR、完成 review/验证，再由 Zhongduan 的独立 stacked PR 更新固定
+submodule 指针；不得直接修改 vendor、指向 upstream 或 pin 未审 commit。
 
 ### Phase 3：严格有界 immutable cut
 
