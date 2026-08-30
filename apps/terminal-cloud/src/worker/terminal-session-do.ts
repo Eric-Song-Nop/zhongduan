@@ -68,6 +68,19 @@ import {
   type RecoveryDeliveryRecordIdentity,
 } from "./relay-recovery-store";
 import {
+  RelayV3DeliveryRing,
+  type RelayV3DeliveryGenerationIdentity,
+  type RelayV3DeliveryRef,
+  type RelayV3DeliveryRefIdentity,
+} from "./relay-v3-delivery-ring";
+import {
+  RelayV3DeliveryScheduler,
+  type RelayV3DeliveryClass,
+  type RelayV3DeliveryJobView,
+  type RelayV3DeliverySendResult,
+  type RelayV3DeliverySendTurn,
+} from "./relay-v3-delivery-scheduler";
+import {
   readSocketAttachment as readAttachment,
   SocketAttachmentSchema,
   writeSocketAttachment as writeAttachment,
@@ -137,10 +150,15 @@ interface AcquiredLease {
 
 type HostControlSendResult = "sent" | "rejected" | "uncertain";
 
-type RecoveryDataSendPlan = {
+type RecoveryDataQueuePlan = {
   attempt: RecoveryAttemptRow;
-  browserData: WebSocket;
-  encoded: Uint8Array;
+  deliveryClass: RelayV3DeliveryClass;
+  identity: RelayV3DeliveryRefIdentity;
+  record: RecoveryDeliveryRecordIdentity;
+};
+
+type RecoveryDeliveryRefRecord = {
+  generation: RelayV3DeliveryGenerationIdentity;
   record: RecoveryDeliveryRecordIdentity;
 };
 
@@ -193,15 +211,22 @@ const MAX_RECOVERY_ATTEMPTS = MAX_BROWSER_CONNECTIONS;
 const MAX_RECOVERY_OUTBOX_ENTRIES = MAX_RECOVERY_ATTEMPTS * 7;
 const MAX_RECOVERY_DELIVERY_RECORDS = 1_024;
 const MAX_RECOVERY_DELIVERY_ENCODED_BYTES = 2 * 1024 * 1024;
+const MAX_RECOVERY_ATTEMPT_LIVE_RECORDS = 64;
+const MAX_RECOVERY_ATTEMPT_LIVE_ENCODED_BYTES = 512 * 1024;
+const MAX_RECOVERY_GRANT_WINDOW_ENCODED_BYTES = 96 * 1024;
+const MAX_RECOVERY_SESSION_ENCODED_BYTES = 2 * 1024 * 1024;
+const MAX_RECOVERY_SESSION_RECORDS = 1_024;
+const MAX_RECOVERY_SESSION_RECOVERY_ENCODED_BYTES = 1_536 * 1024;
+const MAX_RECOVERY_SESSION_RECOVERY_RECORDS = 1_008;
 const MAX_CONTROL_MESSAGE_CHARS = 6 * 1024 * 1024 + 4_096;
 const MAX_HOST_DATA_BYTES = DATA_HEADER_BYTES + 16 * 1024;
 const MAX_HOST_RECOVERY_DATA_BYTES = DELIVERY_ENVELOPE_V3_HEADER_BYTES + MAX_HOST_DATA_BYTES;
+const MIN_HOST_RECOVERY_DATA_BYTES = DELIVERY_ENVELOPE_V3_HEADER_BYTES + DATA_HEADER_BYTES;
+const RECOVERY_WRITER_DELIVERY_RESERVE_ENCODED_BYTES = MAX_HOST_RECOVERY_DATA_BYTES;
+const RECOVERY_WRITER_DELIVERY_RESERVE_RECORDS = 1;
 const RECOVERY_HARD_DEADLINE_MS = 60_000;
 const RECOVERY_NO_PROGRESS_TIMEOUT_MS = 15_000;
-// P2.5a keeps the P2.4 runtime stop-and-wait policy while making its scalar
-// delivery ownership durable. Later scheduler slices may spend this bounded
-// ledger as a wider window without changing the storage cap.
-const RECOVERY_INITIAL_CUMULATIVE_GRANT = MAX_RECOVERY_DELIVERY_ENCODED_BYTES.toString();
+const RECOVERY_INITIAL_CUMULATIVE_GRANT = "0";
 const RECOVERY_OUTBOX_DRAIN_BATCH = 16;
 const SOCKET_REPLACED = 4001;
 const SLOW_CLIENT = 4008;
@@ -295,6 +320,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   private readonly recoveryMaintenance: RelayRecoveryMaintenance;
   private readonly snapshotUploads: SnapshotUploadCoordinator;
   private readonly messageQueue = new BoundedSerialQueue<WebSocket>();
+  private readonly recoveryDeliveryRing: RelayV3DeliveryRing;
+  private readonly recoveryDeliveryScheduler: RelayV3DeliveryScheduler;
+  private readonly recoveryDeliveryRefRecords = new Map<
+    RelayV3DeliveryRef,
+    RecoveryDeliveryRefRecord
+  >();
   private readonly recoveryV3Enabled: boolean;
   private recoveryOutboxDrainScheduled = false;
 
@@ -306,15 +337,48 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     migrateRelayStore(ctx, this.sql);
     this.recoveries = new RelayRecoveryStore(this.sql, this.store, {
       maxAttempts: MAX_RECOVERY_ATTEMPTS,
+      maxAttemptLiveEncodedBytes: MAX_RECOVERY_ATTEMPT_LIVE_ENCODED_BYTES,
+      maxAttemptLiveRecords: MAX_RECOVERY_ATTEMPT_LIVE_RECORDS,
       maxDeliveryEncodedBytes: MAX_RECOVERY_DELIVERY_ENCODED_BYTES,
       maxDeliveryRecords: MAX_RECOVERY_DELIVERY_RECORDS,
+      maxDeliveryEnvelopeEncodedBytes: MAX_HOST_RECOVERY_DATA_BYTES,
       maxOutboxEntries: MAX_RECOVERY_OUTBOX_ENTRIES,
+      maxRecoveryGrantWindowEncodedBytes: MAX_RECOVERY_GRANT_WINDOW_ENCODED_BYTES,
+      maxSessionDeliveryEncodedBytes: MAX_RECOVERY_SESSION_ENCODED_BYTES,
+      maxSessionDeliveryRecords: MAX_RECOVERY_SESSION_RECORDS,
+      maxSessionRecoveryEncodedBytes: MAX_RECOVERY_SESSION_RECOVERY_ENCODED_BYTES,
+      maxSessionRecoveryRecords: MAX_RECOVERY_SESSION_RECOVERY_RECORDS,
+      minDeliveryEnvelopeEncodedBytes: MIN_HOST_RECOVERY_DATA_BYTES,
+      writerDeliveryReserveEncodedBytes: RECOVERY_WRITER_DELIVERY_RESERVE_ENCODED_BYTES,
+      writerDeliveryReserveRecords: RECOVERY_WRITER_DELIVERY_RESERVE_RECORDS,
+    });
+    this.recoveryDeliveryRing = new RelayV3DeliveryRing({
+      maxPhysicalBytes: MAX_RECOVERY_SESSION_ENCODED_BYTES,
+      maxPhysicalEntries: MAX_RECOVERY_SESSION_RECORDS,
+      maxReferences: MAX_RECOVERY_SESSION_RECORDS,
+    });
+    this.recoveryDeliveryScheduler = new RelayV3DeliveryScheduler({
+      ring: this.recoveryDeliveryRing,
+      yieldDataTurn: (delayMs) => this.yieldRecoveryDeliveryTurn(delayMs),
+      send: (turn) => this.sendScheduledRecoveryDelivery(turn),
+      onFailure: (job) => this.failScheduledRecoveryDelivery(job),
     });
     this.snapshots = new SnapshotStore(ctx, this.sql, this.store, MAX_BROWSER_CONNECTIONS);
     this.alarmMux = new DurableAlarmMux(ctx, {
       [DurableAlarmComponent.snapshot]: () => this.snapshotUploads.maintain(),
       [DurableAlarmComponent.recovery]: async () => {
         const result = await this.recoveryMaintenance.maintain();
+        for (const recoveryId of result.expired) {
+          const attempt = this.recoveries.attempt(recoveryId);
+          if (attempt !== undefined) {
+            this.isolateRecoveryAttempt(attempt, "Recovery v3 deadline expired");
+          } else {
+            this.cancelRecoveryDeliveriesByRecoveryId(recoveryId);
+          }
+        }
+        for (const recoveryId of result.pruned) {
+          this.cancelRecoveryDeliveriesByRecoveryId(recoveryId);
+        }
         if (result.expired.length > 0) {
           this.snapshotUploads.scheduleMaintenance();
           this.scheduleRecoveryOutboxDrain();
@@ -1657,24 +1721,46 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       });
       const now = Date.now();
       let result: ReturnType<RelayRecoveryStore["beginPreparing"]> | undefined;
-      this.ctx.storage.transactionSync(() => {
-        result = this.recoveries.beginPreparing({
-          clientId: current.client.client_id,
-          hardDeadlineAt: now + RECOVERY_HARD_DEADLINE_MS,
-          hostFence: current.hostAttachment.hostFence!,
-          noProgressTimeoutMs: RECOVERY_NO_PROGRESS_TIMEOUT_MS,
-          now,
-          prepare,
+      let capacityVictims: RecoveryAttemptRow[] = [];
+      try {
+        this.ctx.storage.transactionSync(() => {
+          result = this.recoveries.beginPreparing({
+            clientId: current.client.client_id,
+            hardDeadlineAt: now + RECOVERY_HARD_DEADLINE_MS,
+            hostFence: current.hostAttachment.hostFence!,
+            noProgressTimeoutMs: RECOVERY_NO_PROGRESS_TIMEOUT_MS,
+            now,
+            prepare,
+          });
+          if (result?.ok && result.changed) {
+            capacityVictims = this.recoveries
+              .reconcileSessionDeliveryCapacity(now)
+              .flatMap((recoveryId) => {
+                const victim = this.recoveries.attempt(recoveryId);
+                return victim === undefined ? [] : [victim];
+              });
+          }
         });
-      });
+      } catch {
+        if (lease !== undefined)
+          this.releaseWriterLeaseTransaction(attachment.clientId!, lease.fence);
+        this.failRecoveryBrowser(attachment, "Recovery v3 delivery capacity could not reconcile");
+        return;
+      }
       if (result === undefined || !result.ok) {
         if (lease !== undefined)
           this.releaseWriterLeaseTransaction(attachment.clientId!, lease.fence);
         this.failRecoveryBrowser(attachment, "Recovery v3 prepare could not start");
         return;
       }
-      this.ctx.waitUntil(this.recoveryMaintenance.refresh());
-      this.snapshotUploads.scheduleMaintenance();
+      for (const victim of capacityVictims) {
+        this.isolateRecoveryAttempt(victim, "Recovery v3 delivery capacity reserved for writer");
+      }
+      if (capacityVictims.length > 0) this.afterRecoveryTransition();
+      else {
+        this.ctx.waitUntil(this.recoveryMaintenance.refresh());
+        this.snapshotUploads.scheduleMaintenance();
+      }
     }
 
     const activeControl = SocketAttachmentSchema.parse({
@@ -2211,7 +2297,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
 
     const now = Date.now();
-    let record: RecoveryDeliveryRecordIdentity | undefined;
+    let plan: RecoveryDataQueuePlan | undefined;
     this.ctx.storage.transactionSync(() => {
       const enqueued = this.recoveries.enqueueValidatedLaneDelivery(
         attempt.recovery_id,
@@ -2222,24 +2308,18 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         this.recoveries.resetUndeliverableDeliveryOwner(attempt.recovery_id, now);
         return;
       }
-      const begun = this.recoveries.beginLaneDeliverySend(enqueued.record, now);
-      if (!begun.ok) {
-        this.recoveries.resetUnsafeDeliveryOutcome(attempt.recovery_id, now);
-        return;
-      }
-      record = enqueued.record;
+      plan = this.recoveryDataQueuePlan(attempt, enqueued.record);
     });
-    if (record === undefined) {
+    if (plan === undefined) {
       this.isolateRecoveryAttempt(attempt, "invalid or repeated Recovery v3 envelope");
       this.afterRecoveryTransition();
       return;
     }
-    this.sendRecoveryEnvelopeToBrowser({
-      attempt,
-      browserData: browser.data,
-      encoded,
-      record,
-    });
+    this.queueRecoveryEncodedAfterCommit(plan, encoded);
+    // The store owns grant arithmetic and may have upserted a new exact grant
+    // intent while admitting this recovery record. The runtime only schedules
+    // its bounded durable outbox owner after the enclosing commit.
+    this.scheduleRecoveryOutboxDrain();
   }
 
   private async handleHostData(
@@ -2310,6 +2390,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         this.failCurrentHost(attachment, "canonical data sequence gap");
         return;
       }
+      this.queueLiveCanonicalAfterCommit(recoveryPlans, encoded);
       const pendingResets: Promise<void>[] = [];
       for (const browserData of this.browserDataSockets()) {
         const browserAttachment = readAttachment(browserData);
@@ -2329,7 +2410,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
           }
         }
       }
-      for (const plan of recoveryPlans) this.sendRecoveryEnvelopeToBrowser(plan);
       await Promise.all(pendingResets);
       return;
     }
@@ -2422,7 +2502,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     session: SessionRow,
     frame: DataFrame,
     canonical: Uint8Array,
-  ): RecoveryDataSendPlan[] | undefined {
+  ): RecoveryDataQueuePlan[] | undefined {
     if (!this.isNextCanonicalFrame(session, frame)) return undefined;
     const attempts = this.sql
       .exec(
@@ -2444,7 +2524,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       frame.kind === DataFrameKind.PtyOutput
         ? frame.ptyOffset + BigInt(frame.payload.byteLength)
         : frame.ptyOffset;
-    const plans: RecoveryDataSendPlan[] = [];
+    const plans: RecoveryDataQueuePlan[] = [];
     const isolated: RecoveryAttemptRow[] = [];
     const now = Date.now();
     let committed = false;
@@ -2481,12 +2561,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         const live = this.recoveries
           .lanes(attempt.recovery_id)
           .find((lane) => lane.lane === "live");
-        if (
-          browser === undefined ||
-          live === undefined ||
-          live.sent_delivery_ordinal !== live.received_delivery_ordinal ||
-          live.sent_cumulative_encoded_bytes !== live.received_cumulative_encoded_bytes
-        ) {
+        if (browser === undefined || live === undefined) {
           this.recoveries.resetUndeliverableDeliveryOwner(attempt.recovery_id, now);
           isolated.push(attempt);
           continue;
@@ -2494,14 +2569,21 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
 
         let envelope: Uint8Array;
         try {
+          const tail = this.recoveries
+            .deliveryRecords(attempt.recovery_id)
+            .filter((record) => record.lane === "live")
+            .at(-1);
           const encodedBytes =
             BigInt(DELIVERY_ENVELOPE_V3_HEADER_BYTES) + BigInt(canonical.byteLength);
-          const previousCumulative = BigInt(live.sent_cumulative_encoded_bytes);
+          const previousOrdinal = BigInt(tail?.delivery_ordinal ?? live.sent_delivery_ordinal);
+          const previousCumulative = BigInt(
+            tail?.cumulative_encoded_bytes ?? live.sent_cumulative_encoded_bytes,
+          );
           if (previousCumulative > MAX_U64 - encodedBytes) throw new Error("delivery overflow");
           envelope = encodeDeliveryEnvelopeV3({
             lane: "live",
             deliveryGeneration: BigInt(attempt.delivery_generation),
-            deliveryOrdinal: BigInt(live.sent_delivery_ordinal) + 1n,
+            deliveryOrdinal: previousOrdinal + 1n,
             cumulativeEncodedBytes: previousCumulative + encodedBytes,
             streamId: attempt.stream_id,
             payload: canonical,
@@ -2521,18 +2603,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
           isolated.push(attempt);
           continue;
         }
-        const begun = this.recoveries.beginLaneDeliverySend(enqueued.record, now);
-        if (!begun.ok) {
-          this.recoveries.resetUnsafeDeliveryOutcome(attempt.recovery_id, now);
-          isolated.push(attempt);
-          continue;
-        }
-        plans.push({
-          attempt,
-          browserData: browser.data,
-          encoded: envelope,
-          record: enqueued.record,
-        });
+        plans.push(this.recoveryDataQueuePlan(attempt, enqueued.record));
       }
     });
     if (!committed) return undefined;
@@ -2836,51 +2907,330 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     return browser?.control === webSocket ? attempt : undefined;
   }
 
-  private sendRecoveryEnvelopeToBrowser(plan: RecoveryDataSendPlan): void {
-    const browser = this.recoveryBrowserSockets(plan.attempt);
-    if (browser?.data !== plan.browserData || plan.browserData.readyState !== WebSocket.OPEN) {
-      this.fenceUncertainRecoveryDelivery(
-        plan.attempt,
-        "Recovery v3 data socket changed before delivery",
+  private recoveryDataQueuePlan(
+    attempt: RecoveryAttemptRow,
+    record: RecoveryDeliveryRecordIdentity,
+  ): RecoveryDataQueuePlan {
+    const writer = this.clientById(attempt.client_id)?.role === "writer";
+    const deliveryClass: RelayV3DeliveryClass =
+      record.lane === "live"
+        ? writer
+          ? "writer-live"
+          : "observer-live"
+        : writer
+          ? "writer-recovery"
+          : "observer-recovery";
+    return {
+      attempt,
+      deliveryClass,
+      identity: {
+        recoveryId: attempt.recovery_id,
+        clientId: attempt.client_id,
+        connectionId: attempt.connection_id,
+        streamId: attempt.stream_id,
+        deliveryGeneration: attempt.delivery_generation,
+        lane: record.lane,
+        deliveryOrdinal: record.deliveryOrdinal,
+        cumulativeEncodedBytes: record.cumulativeEncodedBytes,
+      },
+      record,
+    };
+  }
+
+  private queueRecoveryEncodedAfterCommit(plan: RecoveryDataQueuePlan, encoded: Uint8Array): void {
+    const retained = this.recoveryDeliveryRing.retainRecoveryEncoded(encoded, plan.identity);
+    if (!retained.ok) {
+      this.fenceQueuedRecoveryDeliveries(
+        [plan],
+        `Recovery v3 delivery ring rejected recovery payload: ${retained.reason}`,
       );
       return;
     }
-    try {
-      plan.browserData.send(plan.encoded);
-    } catch {
-      this.fenceUncertainRecoveryDelivery(
-        plan.attempt,
-        "Recovery v3 data send outcome is uncertain",
+    if (!this.enqueueRecoveryDeliveryRef(plan, retained.ref)) {
+      this.fenceQueuedRecoveryDeliveries([plan], "Recovery v3 scheduler rejected recovery payload");
+    }
+  }
+
+  private queueLiveCanonicalAfterCommit(
+    plans: readonly RecoveryDataQueuePlan[],
+    canonical: Uint8Array,
+  ): void {
+    if (plans.length === 0) return;
+    const ordered = [...plans].sort((left, right) => {
+      const leftWriter = left.deliveryClass === "writer-live";
+      const rightWriter = right.deliveryClass === "writer-live";
+      if (leftWriter !== rightWriter) return leftWriter ? -1 : 1;
+      if (left.attempt.created_at !== right.attempt.created_at) {
+        return left.attempt.created_at - right.attempt.created_at;
+      }
+      return left.attempt.recovery_id < right.attempt.recovery_id
+        ? -1
+        : left.attempt.recovery_id > right.attempt.recovery_id
+          ? 1
+          : 0;
+    });
+    const encodedBytes = ordered[0]!.record.encodedBytes;
+    if (ordered.some((plan) => plan.record.encodedBytes !== encodedBytes)) {
+      this.fenceQueuedRecoveryDeliveries(ordered, "Recovery v3 live fanout encoded sizes diverged");
+      return;
+    }
+    const retained = this.recoveryDeliveryRing.retainLiveCanonical(
+      canonical,
+      ordered.map((plan) => plan.identity),
+      encodedBytes,
+    );
+    if (!retained.ok) {
+      this.fenceQueuedRecoveryDeliveries(
+        ordered,
+        `Recovery v3 delivery ring rejected live fanout: ${retained.reason}`,
       );
       return;
+    }
+
+    const rejected: RecoveryDataQueuePlan[] = [];
+    for (let index = 0; index < ordered.length; index += 1) {
+      const plan = ordered[index]!;
+      const ref = retained.refs[index]!;
+      if (!this.enqueueRecoveryDeliveryRef(plan, ref)) rejected.push(plan);
+    }
+    if (rejected.length > 0) {
+      this.fenceQueuedRecoveryDeliveries(rejected, "Recovery v3 scheduler rejected live fanout");
+    }
+  }
+
+  private enqueueRecoveryDeliveryRef(
+    plan: RecoveryDataQueuePlan,
+    ref: RelayV3DeliveryRef,
+  ): boolean {
+    this.recoveryDeliveryRefRecords.set(ref, {
+      generation: plan.identity,
+      record: plan.record,
+    });
+    if (
+      this.recoveryDeliveryScheduler.enqueue({
+        deliveryClass: plan.deliveryClass,
+        ref,
+      })
+    ) {
+      return true;
+    }
+    this.recoveryDeliveryRefRecords.delete(ref);
+    this.recoveryDeliveryRing.cancel(ref);
+    return false;
+  }
+
+  private yieldRecoveryDeliveryTurn(delayMs: number): Promise<void> {
+    return scheduler.wait(delayMs);
+  }
+
+  private fenceQueuedRecoveryDeliveries(
+    plans: readonly RecoveryDataQueuePlan[],
+    closeReason: string,
+  ): void {
+    const attempts = new Map(plans.map((plan) => [plan.attempt.recovery_id, plan.attempt]));
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      for (const recoveryId of attempts.keys()) {
+        const current = this.recoveries.attempt(recoveryId);
+        if (current === undefined || current.state === "resetting") continue;
+        const reset = this.recoveries.resetUnsafeDeliveryOutcome(recoveryId, now);
+        if (!reset.ok && current.state !== "complete") {
+          this.recoveries.reset(recoveryId, "generation-reset", now);
+        }
+      }
+    });
+    for (const attempt of attempts.values()) {
+      this.isolateRecoveryAttempt(attempt, closeReason);
+    }
+    this.afterRecoveryTransition();
+  }
+
+  private sendScheduledRecoveryDelivery(turn: RelayV3DeliverySendTurn): RelayV3DeliverySendResult {
+    const owner = this.recoveryDeliveryRefRecords.get(turn.ref);
+    if (owner === undefined) return "stale";
+    if (!this.sameScheduledDeliveryOwner(owner, turn)) {
+      this.recoveryDeliveryRefRecords.delete(turn.ref);
+      return "stale";
+    }
+
+    const attempt = this.recoveries.attempt(turn.identity.recoveryId);
+    if (attempt === undefined || !this.isExactScheduledAttempt(attempt, turn.identity)) {
+      this.recoveryDeliveryRefRecords.delete(turn.ref);
+      return "stale";
+    }
+    const browser = this.recoveryBrowserSockets(attempt);
+    if (browser === undefined || browser.data.readyState !== WebSocket.OPEN) return "fatal";
+
+    let encoded: Uint8Array;
+    try {
+      encoded = this.encodedScheduledDelivery(turn);
+    } catch {
+      return "fatal";
+    }
+
+    let begun: ReturnType<RelayRecoveryStore["beginLaneDeliverySend"]> | undefined;
+    try {
+      this.ctx.storage.transactionSync(() => {
+        begun = this.recoveries.beginLaneDeliverySend(owner.record, Date.now());
+      });
+    } catch {
+      return "fatal";
+    }
+    if (begun === undefined || !begun.ok || !begun.changed) {
+      const current = this.recoveries.attempt(turn.identity.recoveryId);
+      if (current === undefined || current.state === "resetting") {
+        this.recoveryDeliveryRefRecords.delete(turn.ref);
+        return "stale";
+      }
+      return "fatal";
+    }
+
+    const exactBrowser = this.recoveryBrowserSockets(attempt);
+    if (
+      exactBrowser?.data !== browser.data ||
+      browser.data.readyState !== WebSocket.OPEN ||
+      !this.isExactScheduledAttempt(
+        this.recoveries.attempt(turn.identity.recoveryId),
+        turn.identity,
+      )
+    ) {
+      return "fatal";
+    }
+    try {
+      browser.data.send(encoded);
+    } catch {
+      return "fatal";
     }
 
     let confirmed: ReturnType<RelayRecoveryStore["confirmLaneDeliverySend"]> | undefined;
     try {
       this.ctx.storage.transactionSync(() => {
-        confirmed = this.recoveries.confirmLaneDeliverySend(plan.record, Date.now());
+        confirmed = this.recoveries.confirmLaneDeliverySend(owner.record, Date.now());
       });
     } catch {
-      this.fenceUncertainRecoveryDelivery(
-        plan.attempt,
-        "Recovery v3 data send confirmation failed",
-      );
+      return "fatal";
+    }
+    if (confirmed === undefined || !confirmed.ok || !confirmed.changed) return "fatal";
+    this.recoveryDeliveryRefRecords.delete(turn.ref);
+    return "sent";
+  }
+
+  private encodedScheduledDelivery(turn: RelayV3DeliverySendTurn): Uint8Array {
+    if (turn.identity.lane === "live") {
+      const encoded = encodeDeliveryEnvelopeV3({
+        lane: "live",
+        deliveryGeneration: BigInt(turn.identity.deliveryGeneration),
+        deliveryOrdinal: BigInt(turn.identity.deliveryOrdinal),
+        cumulativeEncodedBytes: BigInt(turn.identity.cumulativeEncodedBytes),
+        streamId: turn.identity.streamId,
+        payload: turn.payload,
+      });
+      if (encoded.byteLength !== turn.encodedBytes) {
+        throw new Error("scheduled live delivery size diverged");
+      }
+      return encoded;
+    }
+
+    if (turn.payload.byteLength !== turn.encodedBytes) {
+      throw new Error("scheduled recovery delivery size diverged");
+    }
+    const envelope = decodeDeliveryEnvelopeV3(turn.payload);
+    if (
+      envelope.lane !== "recovery" ||
+      envelope.streamId !== turn.identity.streamId ||
+      envelope.deliveryGeneration.toString() !== turn.identity.deliveryGeneration ||
+      envelope.deliveryOrdinal.toString() !== turn.identity.deliveryOrdinal ||
+      envelope.cumulativeEncodedBytes.toString() !== turn.identity.cumulativeEncodedBytes
+    ) {
+      throw new Error("scheduled recovery delivery identity diverged");
+    }
+    return turn.payload;
+  }
+
+  private sameScheduledDeliveryOwner(
+    owner: RecoveryDeliveryRefRecord,
+    turn: RelayV3DeliveryJobView,
+  ): boolean {
+    return (
+      owner.generation.recoveryId === turn.identity.recoveryId &&
+      owner.generation.clientId === turn.identity.clientId &&
+      owner.generation.connectionId === turn.identity.connectionId &&
+      owner.generation.streamId === turn.identity.streamId &&
+      owner.generation.deliveryGeneration === turn.identity.deliveryGeneration &&
+      owner.record.recoveryId === turn.identity.recoveryId &&
+      owner.record.lane === turn.identity.lane &&
+      owner.record.deliveryOrdinal === turn.identity.deliveryOrdinal &&
+      owner.record.cumulativeEncodedBytes === turn.identity.cumulativeEncodedBytes &&
+      owner.record.encodedBytes === turn.encodedBytes
+    );
+  }
+
+  private isExactScheduledAttempt(
+    attempt: RecoveryAttemptRow | undefined,
+    identity: RelayV3DeliveryRefIdentity,
+  ): attempt is RecoveryAttemptRow {
+    return (
+      attempt !== undefined &&
+      attempt.state !== "resetting" &&
+      attempt.recovery_id === identity.recoveryId &&
+      attempt.client_id === identity.clientId &&
+      attempt.connection_id === identity.connectionId &&
+      attempt.stream_id === identity.streamId &&
+      attempt.delivery_generation === identity.deliveryGeneration
+    );
+  }
+
+  private failScheduledRecoveryDelivery(job: RelayV3DeliveryJobView): void {
+    const owner = this.recoveryDeliveryRefRecords.get(job.ref);
+    this.recoveryDeliveryRefRecords.delete(job.ref);
+    const attempt = this.recoveries.attempt(job.identity.recoveryId);
+    this.cancelRecoveryDeliveryGeneration(job.identity);
+    if (
+      owner === undefined ||
+      attempt === undefined ||
+      attempt.state === "resetting" ||
+      !this.isExactScheduledAttempt(attempt, job.identity)
+    ) {
       return;
     }
-    if (confirmed === undefined || !confirmed.ok || !confirmed.changed) {
-      this.fenceUncertainRecoveryDelivery(
-        plan.attempt,
-        "Recovery v3 data send confirmation is uncertain",
-      );
+    this.ctx.storage.transactionSync(() => {
+      const now = Date.now();
+      const reset = this.recoveries.resetUnsafeDeliveryOutcome(attempt.recovery_id, now);
+      if (!reset.ok) {
+        this.recoveries.resetUndeliverableDeliveryOwner(attempt.recovery_id, now);
+      }
+    });
+    this.isolateRecoveryAttempt(attempt, "Recovery v3 data send outcome is uncertain");
+    this.afterRecoveryTransition();
+  }
+
+  private cancelRecoveryDeliveryGeneration(identity: RelayV3DeliveryGenerationIdentity): void {
+    this.recoveryDeliveryScheduler.forgetGeneration(identity);
+    for (const [ref, owner] of this.recoveryDeliveryRefRecords) {
+      if (
+        owner.generation.recoveryId !== identity.recoveryId ||
+        owner.generation.clientId !== identity.clientId ||
+        owner.generation.connectionId !== identity.connectionId ||
+        owner.generation.streamId !== identity.streamId ||
+        owner.generation.deliveryGeneration !== identity.deliveryGeneration
+      ) {
+        continue;
+      }
+      this.recoveryDeliveryScheduler.cancel(ref);
+      this.recoveryDeliveryRing.cancel(ref);
+      this.recoveryDeliveryRefRecords.delete(ref);
     }
   }
 
-  private fenceUncertainRecoveryDelivery(attempt: RecoveryAttemptRow, closeReason: string): void {
-    this.ctx.storage.transactionSync(() => {
-      this.recoveries.resetUnsafeDeliveryOutcome(attempt.recovery_id, Date.now());
-    });
-    this.isolateRecoveryAttempt(attempt, closeReason);
-    this.afterRecoveryTransition();
+  private cancelRecoveryDeliveriesByRecoveryId(recoveryId: string): void {
+    const generations = new Map<string, RelayV3DeliveryGenerationIdentity>();
+    for (const owner of this.recoveryDeliveryRefRecords.values()) {
+      if (owner.generation.recoveryId !== recoveryId) continue;
+      generations.set(JSON.stringify(owner.generation), owner.generation);
+    }
+    for (const generation of generations.values()) {
+      this.cancelRecoveryDeliveryGeneration(generation);
+    }
   }
 
   private reconcileRecoveryDeliveryOwnersAfterWake(): void {
@@ -2928,6 +3278,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         if (attempt === undefined) continue;
         this.recoveries.resetUndeliverableDeliveryOwner(recoveryId, now);
         isolate.set(recoveryId, attempt);
+      }
+      for (const recoveryId of this.recoveries.reconcileSessionDeliveryCapacity(now)) {
+        const attempt =
+          attempts.find((candidate) => candidate.recovery_id === recoveryId) ??
+          this.recoveries.attempt(recoveryId);
+        if (attempt !== undefined) isolate.set(recoveryId, attempt);
       }
     });
 
@@ -2989,6 +3345,13 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   }
 
   private isolateRecoveryAttempt(attempt: RecoveryAttemptRow, reason: string): void {
+    this.cancelRecoveryDeliveryGeneration({
+      recoveryId: attempt.recovery_id,
+      clientId: attempt.client_id,
+      connectionId: attempt.connection_id,
+      streamId: attempt.stream_id,
+      deliveryGeneration: attempt.delivery_generation,
+    });
     const exactSockets = this.ctx
       .getWebSockets(`client:${attempt.client_id}`)
       .map((socket) => ({ attachment: readAttachment(socket), socket }))
@@ -3620,7 +3983,42 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       closeProtocol(webSocket, reason);
       return;
     }
+    const recoveryAttempt =
+      attachment.recoveryStrategy === "v3"
+        ? attachment.recoveryLookupKey === null
+          ? this.recoveries.attemptByConnectionIdentity(
+              attachment.clientId,
+              attachment.connectionId,
+              attachment.streamId,
+              attachment.deliveryGeneration,
+            )
+          : this.recoveries.attempt(attachment.recoveryLookupKey)
+        : undefined;
+    if (recoveryAttempt !== undefined) {
+      this.cancelRecoveryDeliveryGeneration({
+        recoveryId: recoveryAttempt.recovery_id,
+        clientId: recoveryAttempt.client_id,
+        connectionId: recoveryAttempt.connection_id,
+        streamId: recoveryAttempt.stream_id,
+        deliveryGeneration: recoveryAttempt.delivery_generation,
+      });
+    }
+    let recoveryReset = false;
     this.ctx.storage.transactionSync(() => {
+      const currentAttempt =
+        recoveryAttempt === undefined
+          ? undefined
+          : this.recoveries.attempt(recoveryAttempt.recovery_id);
+      if (currentAttempt !== undefined && currentAttempt.state !== "resetting") {
+        const reset =
+          currentAttempt.state === "complete"
+            ? this.recoveries.resetUndeliverableDeliveryOwner(
+                currentAttempt.recovery_id,
+                Date.now(),
+              )
+            : this.recoveries.reset(currentAttempt.recovery_id, "generation-reset", Date.now());
+        recoveryReset = reset.ok && reset.changed;
+      }
       this.releaseWriterLease(attachment.clientId!, attachment.leaseFence);
       this.connections.closeConnectionSet(attachment.connectionSetId);
     });
@@ -3636,6 +4034,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       4400,
       reason,
     );
+    if (recoveryReset) this.afterRecoveryTransition();
   }
 
   private closeSockets(
@@ -3679,6 +4078,26 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     // The durable fence transition commits before this callback. Its explicit
     // scope prevents an unrelated client activation from closing a paired v3
     // socket that has not sent Attach yet.
+    const scheduledGenerations = new Map<string, RelayV3DeliveryGenerationIdentity>();
+    for (const owner of this.recoveryDeliveryRefRecords.values()) {
+      const attempt = this.recoveries.attempt(owner.generation.recoveryId);
+      const fenced =
+        scope.kind === "removed-client"
+          ? owner.generation.clientId === scope.clientId
+          : scope.kind === "client-generation"
+            ? owner.generation.clientId === scope.clientId &&
+              owner.generation.deliveryGeneration !== scope.currentGeneration
+            : attempt === undefined ||
+              attempt.state === "resetting" ||
+              attempt.host_fence !== scope.currentHostFence;
+      if (fenced) {
+        scheduledGenerations.set(JSON.stringify(owner.generation), owner.generation);
+      }
+    }
+    for (const generation of scheduledGenerations.values()) {
+      this.cancelRecoveryDeliveryGeneration(generation);
+    }
+
     const stale = new Map<string, { attachment: SocketAttachment; socket: WebSocket }>();
     for (const socket of this.browserControlSockets()) {
       const attachment = readAttachment(socket);

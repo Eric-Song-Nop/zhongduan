@@ -1,8 +1,9 @@
 # Recovery v3 Wire Contract
 
-> 状态：P2.0–P2.5b 为 stacked candidates；Recovery v3 的 Host/Cloud/Browser runtime 已在完整
+> 状态：P2.0–P2.5c 为 stacked candidates；Recovery v3 的 Host/Cloud/Browser runtime 已在完整
 > capability gate 后接通，P2.5a 增加 no-payload delivery ledger/cold-owner safety，P2.5b 增加
-> Host recovery source multi-outstanding 与 connection-local DRR。默认 production
+> Host recovery source multi-outstanding 与 connection-local DRR，P2.5c 增加 Cloud session aggregate、
+> ephemeral shared ring、live window 与四类 delivery scheduler。默认 production
 > kill switch 和 Host/Browser offers 仍选择 protocol v2，所以尚未 rollout
 >
 > 适用范围：Host authority data、Cloud delivery、Browser recovery 与滚动协商
@@ -159,7 +160,7 @@ identity cache。Cloud 只有 matching `RecoveryAdopted` 与 `RecoverySourceClos
 
 ## 当前启用状态与验证边界
 
-### P2.0–P2.5b stacked candidates
+### P2.0–P2.5c stacked candidates
 
 P2.0 保留 strict schema、codec、capability transport、authority version migration 和 generation strategy 的 v2
 default。P2.4 增加按 generation strategy 隔离的 Browser↔Cloud 与 Cloud↔Host strict control union；
@@ -291,6 +292,28 @@ outcome-uncertain failure。source no-progress/absolute deadline 只 retire exac
 健康 pair/其他 source 继续；该 identity 的迟到 control 幂等忽略，divergent identity 仍
 fail closed。
 
+P2.5c stacked candidate 把 Cloud 的 recovery reservation 与 live outstanding 收进同一个 session
+aggregate。bytes 使用 `R + L`：`R = granted cumulative recovery bytes - recovery received cumulative bytes`，
+`L` 是 live ledger 中仍实际存在的 record bytes；actual recovery rows 不再重复增加 bytes。records 使用
+实际 live/recovery rows 加上 `floor((grant - recovery tail) / 88)` 个 pessimistic future slots，1–87 bytes
+余数不占一个完整 slot。admission 同时服从 `2 MiB / 1024 records` session cap、
+`1.5 MiB / 1008 records` recovery share、`512 KiB / 64 records` per-attempt live cap 与 `96 KiB`
+recovery grant window。
+
+install fence 固定 `grantedCumulativeEncodedBytes = 0`。只有 exact `recovery-start-ready` outbox
+intent 被 ACK 并由同一 durable transition 消费后，allocator 才做 bounded refill；recovery enqueue、
+matching receipt、source close 与 reset 释放容量时也触发 deterministic bounded refill。有 active writer
+时，observer aggregate 不能侵占 `16472 bytes / 1 record` writer reserve；capacity reconciliation
+按 observer-first 隔离，writer 自身仍受全局 hard cap。
+
+session-scoped ephemeral ring 对一条 canonical live mutation 只保留一个 physical payload copy，并给每个
+exact Browser/lane obligation 分配 opaque ref；recovery ref 持有 exact encoded envelope。ring payload、
+refcount 和 handle 都不进入 v9 SQL。Cloud scheduler 使用
+`writer-live / observer-live / writer-recovery / observer-recovery = 4 / 2 / 2 / 1` class slots 和 bounded
+per-flow byte deficit；每条 record 在 socket send 前执行 `await scheduler.wait(0)`，只提供一次 DO 调度
+机会，不承诺 ingress priority、物理 socket high-water、性能或 SLO。live lane 可以在 receipt 前持有连续
+obligations；recovery lane 仍由 `96 KiB` grant window 与 aggregate reservation 共同约束。
+
 Cloud 不拥有可跨 hibernation 恢复的 mutation payload。`queued`/`sending` 只可作为当前 DO turn 的短生命周期
 witness；fresh instance 在 `alarmMux.initialize()` 后、snapshot/recovery maintenance 与 v3 outbox drain 前执行
 bounded `reconcileRecoveryDeliveryOwnersAfterWake()`：
@@ -303,17 +326,13 @@ bounded `reconcileRecoveryDeliveryOwnersAfterWake()`：
 - v8 scalar lane 若 `sent != received`，旧写入顺序无法证明 socket send 发生，v9 migration 必须按 uncertain fence，
   不能合成 `sent` record。
 
-单 recovery ledger 的上限为 `2 MiB / 1024 records`。P2.5a 暴露
-`granted_cumulative_encoded_bytes - recovery_received_cumulative_encoded_bytes` reservation，但不宣称已经有
-Cloud session aggregate allocator；当前 Host retained-envelope owner 仍受既有 session `2 MiB / 1024 records`
-上限约束，P2.5b 只在该上限内增加 Host source DRR。P2.5c 才增加 session-scoped
-ephemeral shared ring、grant/live aggregate accounting、writer/live reservation 与 Cloud 多 client/lane DRR。
-ring payload/refcount 不能持久化到 v9 ledger，冷启仍服从上述 no-payload
-fence。
+P2.5c 的 session aggregate 与 ring 仍没有改变 Cloud no-payload durability：ring payload/refcount 不持久化到
+v9 ledger。冷启时 `queued`/`sending` 必须按上述 unsafe-outcome fence exact generation；exact pair 仍存在的
+`sent` 只等待 receipt，唤醒时不重发 payload。
 
 ### 默认生产启用状态与后置 gate
 
-P2.5a/P2.5b 的 runtime/ledger/Host scheduler wiring 已经存在，但默认配置不会选中它：
+P2.5a–P2.5c 的 runtime/ledger/Host/Cloud scheduler wiring 已经存在，但默认配置不会选中它：
 
 - Wrangler 的 `RECOVERY_V3_ENABLED` 默认为 `"false"`；
 - Host `CloudApiClient` 与 Browser `TerminalSession` 的默认 capability offer 只包含 v2 baseline；
@@ -324,10 +343,9 @@ P2.5a/P2.5b 的 runtime/ledger/Host scheduler wiring 已经存在，但默认配
 
 因此当前状态是“capability-gated runtime 已接通”，而不是“Recovery v3 已上线”。v3
 generation 不使用 v2 global pause/fixed-commit barrier/pin；默认 v2 generation 和 rolling fallback
-仍完整保留 pause/barrier/pin invariant，不得因 P2.5a/P2.5b wiring 单独放宽。
+仍完整保留 pause/barrier/pin invariant，不得因 P2.5a–P2.5c wiring 单独放宽。
 
-P2.5b 已打开 Host recovery window；P2.5c 仍需建立 Cloud session aggregate、ephemeral shared
-ring、writer/live reservation、live window 与多 client/lane DRR。P2.6 仍需完成
+P2.5c 已打开 Cloud aggregate-bounded live/recovery window；P2.6 仍需完成
 three-owner deterministic crash/loss integration、真实 WTerm/Ghostty snapshot/parser continuation 与 exact-tail
 continuity oracle，以及 rolling downgrade/rollback gate。性能、load/soak、SLO 和 dashboard 继续后置，
 不能替代 correctness gates。
@@ -385,12 +403,18 @@ intermediate prefix release、send-throw 不推进、多 source deterministic DR
 shared-socket backpressure 只 blocked/retry、单 source deadline retire、迟到 exact control 以及健康
 pair/canonical/input/V2 regression。
 
-P2.4–P2.5b 证据是本地 workerd/Miniflare、fake WebSocket、fake timer/clock 与 caller-provided replica seam
-上的 wiring evidence。它不证明真实网络、production Cloudflare/R2、真实 WTerm/Ghostty parser
-continuation 与 tail equivalence，也不证明 Cloud session aggregate/shared ring/多 client DRR、性能或
-SLO；这些分别属于 P2.5c、P2.6 及后续环境 gate。
+P2.5c direct Store/ring/scheduler/runtime evidence 额外覆盖：`R + L` session bytes、actual records 加
+`floor(unmaterialized recovery grant / 88)` pessimistic slots、cap/cap+1、grant `0` 到 exact start-ready ACK
+后的 bounded refill、writer reserve/observer-first reconciliation、single physical canonical live copy 与 exact
+refcount、四类 `4 / 2 / 2 / 1` weighted byte-DRR、live consecutive obligations、每 record
+`scheduler.wait(0)` opportunity，以及 wake 时 `queued`/`sending` fence、`sent` 零重发。
 
-P2.0–P2.5b 不修改 WTerm/Ghostty。若 P2.5c/P2.6 暴露真实 API 缺口，必须先在
+P2.4–P2.5c 证据是本地 workerd/Miniflare、fake WebSocket、fake timer/clock 与 caller-provided replica seam
+上的 wiring evidence。它不证明真实网络、production Cloudflare/R2、真实 WTerm/Ghostty parser
+continuation 与 tail equivalence，也不证明真实 ingress priority、物理 socket high-water、性能或 SLO；
+这些分别属于 P2.6 及后续环境 gate。
+
+P2.0–P2.5c 不修改 WTerm/Ghostty。若 P2.6 暴露真实 API 缺口，必须先在
 `Eric-Song-Nop` 对应 fork 建立正式 PR 并完成 review/验证，再由 Zhongduan 的独立 stacked PR
 更新固定 submodule；不得直接改 vendor、指向
 upstream 或 pin 未审 commit。

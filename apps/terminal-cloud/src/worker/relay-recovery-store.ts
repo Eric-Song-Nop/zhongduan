@@ -115,6 +115,26 @@ export interface RecoveryDeliveryUsage {
   records: number;
 }
 
+/**
+ * Session-wide delivery accounting. Recovery payload bytes are charged once
+ * through the outstanding Host grant, while their durable scalar rows still
+ * consume record capacity.
+ */
+export interface RecoverySessionDeliveryUsage {
+  encodedBytes: number;
+  liveEncodedBytes: number;
+  liveRecords: number;
+  observerEncodedBytes: number;
+  observerRecords: number;
+  records: number;
+  recoveryEncodedBytes: number;
+  recoveryRecords: number;
+  recoveryReservedEncodedBytes: number;
+  recoveryReservedRecords: number;
+  writerEncodedBytes: number;
+  writerRecords: number;
+}
+
 export interface RecoveryControlOutboxRow {
   created_at: number;
   destination: "browser" | "host";
@@ -126,9 +146,20 @@ export interface RecoveryControlOutboxRow {
 
 export interface RelayRecoveryStoreLimits {
   maxAttempts: number;
+  maxAttemptLiveEncodedBytes: number;
+  maxAttemptLiveRecords: number;
   maxDeliveryEncodedBytes: number;
   maxDeliveryRecords: number;
+  maxDeliveryEnvelopeEncodedBytes: number;
   maxOutboxEntries: number;
+  maxRecoveryGrantWindowEncodedBytes: number;
+  maxSessionDeliveryEncodedBytes: number;
+  maxSessionDeliveryRecords: number;
+  maxSessionRecoveryEncodedBytes: number;
+  maxSessionRecoveryRecords: number;
+  minDeliveryEnvelopeEncodedBytes: number;
+  writerDeliveryReserveEncodedBytes: number;
+  writerDeliveryReserveRecords: number;
 }
 
 export interface BeginPreparingInput {
@@ -182,7 +213,22 @@ export type RecoveryDeliveryEnqueueResult =
     }
   | { ok: false; reason: RecoveryStoreRejectReason };
 
+interface RecoveryAttemptDeliveryContribution {
+  attempt: RecoveryAttemptRow;
+  encodedBytes: number;
+  liveEncodedBytes: number;
+  liveRecords: number;
+  records: number;
+  recoveryEncodedBytes: number;
+  recoveryRecords: number;
+  recoveryReservedEncodedBytes: number;
+  recoveryReservedRecords: number;
+  recoveryTailCumulativeEncodedBytes: bigint;
+  recoveryReceivedCumulativeEncodedBytes: bigint;
+}
+
 const ok = (changed: boolean): RecoveryStoreResult => ({ changed, ok: true });
+const MAX_U64 = (1n << 64n) - 1n;
 const rejected = (
   reason: RecoveryStoreRejectReason,
 ): { ok: false; reason: RecoveryStoreRejectReason } => ({
@@ -240,13 +286,38 @@ export class RelayRecoveryStore {
     private readonly relay: RelayStore,
     private readonly limits: RelayRecoveryStoreLimits,
   ) {
+    const positiveLimits = [
+      limits.maxAttempts,
+      limits.maxAttemptLiveEncodedBytes,
+      limits.maxAttemptLiveRecords,
+      limits.maxDeliveryEncodedBytes,
+      limits.maxDeliveryRecords,
+      limits.maxDeliveryEnvelopeEncodedBytes,
+      limits.maxOutboxEntries,
+      limits.maxRecoveryGrantWindowEncodedBytes,
+      limits.maxSessionDeliveryEncodedBytes,
+      limits.maxSessionDeliveryRecords,
+      limits.maxSessionRecoveryEncodedBytes,
+      limits.maxSessionRecoveryRecords,
+      limits.minDeliveryEnvelopeEncodedBytes,
+      limits.writerDeliveryReserveEncodedBytes,
+      limits.writerDeliveryReserveRecords,
+    ];
     if (
-      !isPositiveSafeInteger(limits.maxAttempts) ||
+      positiveLimits.some((value) => !isPositiveSafeInteger(value)) ||
       limits.maxAttempts === Number.MAX_SAFE_INTEGER ||
-      !isPositiveSafeInteger(limits.maxDeliveryEncodedBytes) ||
-      !isPositiveSafeInteger(limits.maxDeliveryRecords) ||
       limits.maxDeliveryRecords === Number.MAX_SAFE_INTEGER ||
-      !isPositiveSafeInteger(limits.maxOutboxEntries)
+      limits.maxSessionDeliveryRecords === Number.MAX_SAFE_INTEGER ||
+      limits.maxAttemptLiveEncodedBytes > limits.maxDeliveryEncodedBytes ||
+      limits.maxAttemptLiveRecords > limits.maxDeliveryRecords ||
+      limits.maxDeliveryEnvelopeEncodedBytes > limits.maxRecoveryGrantWindowEncodedBytes ||
+      limits.maxRecoveryGrantWindowEncodedBytes > limits.maxDeliveryEncodedBytes ||
+      limits.maxRecoveryGrantWindowEncodedBytes > limits.maxSessionRecoveryEncodedBytes ||
+      limits.maxSessionRecoveryEncodedBytes > limits.maxSessionDeliveryEncodedBytes ||
+      limits.maxSessionRecoveryRecords > limits.maxSessionDeliveryRecords ||
+      limits.minDeliveryEnvelopeEncodedBytes > limits.maxDeliveryEnvelopeEncodedBytes ||
+      limits.writerDeliveryReserveEncodedBytes > limits.maxSessionDeliveryEncodedBytes ||
+      limits.writerDeliveryReserveRecords > limits.maxSessionDeliveryRecords
     ) {
       throw new RangeError("invalid recovery store limits");
     }
@@ -383,6 +454,62 @@ export class RelayRecoveryStore {
       }
     }
     return { encodedBytes, records: records.length };
+  }
+
+  sessionDeliveryUsage(): RecoverySessionDeliveryUsage {
+    const usage: RecoverySessionDeliveryUsage = {
+      encodedBytes: 0,
+      liveEncodedBytes: 0,
+      liveRecords: 0,
+      observerEncodedBytes: 0,
+      observerRecords: 0,
+      records: 0,
+      recoveryEncodedBytes: 0,
+      recoveryRecords: 0,
+      recoveryReservedEncodedBytes: 0,
+      recoveryReservedRecords: 0,
+      writerEncodedBytes: 0,
+      writerRecords: 0,
+    };
+    for (const contribution of this.#sessionDeliveryContributions()) {
+      usage.liveEncodedBytes = this.#addUsage(
+        usage.liveEncodedBytes,
+        contribution.liveEncodedBytes,
+      );
+      usage.liveRecords = this.#addUsage(usage.liveRecords, contribution.liveRecords);
+      usage.recoveryEncodedBytes = this.#addUsage(
+        usage.recoveryEncodedBytes,
+        contribution.recoveryEncodedBytes,
+      );
+      usage.recoveryRecords = this.#addUsage(usage.recoveryRecords, contribution.recoveryRecords);
+      usage.recoveryReservedEncodedBytes = this.#addUsage(
+        usage.recoveryReservedEncodedBytes,
+        contribution.recoveryReservedEncodedBytes,
+      );
+      usage.recoveryReservedRecords = this.#addUsage(
+        usage.recoveryReservedRecords,
+        contribution.recoveryReservedRecords,
+      );
+      if (this.#attemptRole(contribution.attempt) === "writer") {
+        usage.writerEncodedBytes = this.#addUsage(
+          usage.writerEncodedBytes,
+          contribution.encodedBytes,
+        );
+        usage.writerRecords = this.#addUsage(usage.writerRecords, contribution.records);
+      } else {
+        usage.observerEncodedBytes = this.#addUsage(
+          usage.observerEncodedBytes,
+          contribution.encodedBytes,
+        );
+        usage.observerRecords = this.#addUsage(usage.observerRecords, contribution.records);
+      }
+    }
+    usage.encodedBytes = this.#addUsage(usage.liveEncodedBytes, usage.recoveryReservedEncodedBytes);
+    usage.records = this.#addUsage(
+      this.#addUsage(usage.liveRecords, usage.recoveryRecords),
+      usage.recoveryReservedRecords,
+    );
+    return usage;
   }
 
   recoveryGrantReservation(recoveryId: string): string {
@@ -580,10 +707,7 @@ export class RelayRecoveryStore {
     if (attempt.state === "resetting") return rejected("attempt-resetting");
     const startJson = canonicalJson(start);
     if (attempt.state !== "preparing") {
-      if (
-        attempt.start_json !== startJson ||
-        BigInt(attempt.granted_cumulative_encoded_bytes) < BigInt(grant)
-      ) {
+      if (attempt.start_json !== startJson || attempt.granted_cumulative_encoded_bytes !== grant) {
         return rejected("immutable-conflict");
       }
       return ok(false);
@@ -600,6 +724,9 @@ export class RelayRecoveryStore {
       session.next_pty_offset !== fence.committedThrough.nextPtyOffset
     ) {
       return rejected("head-mismatch");
+    }
+    if (!this.#canReserveRecoveryGrant(attempt, BigInt(grant))) {
+      return rejected("delivery-capacity");
     }
 
     const prepareOutbox = this.outboxEntry(fence.recoveryId, "recovery-prepare");
@@ -680,7 +807,13 @@ export class RelayRecoveryStore {
     const frame = decodeDataFrame(envelope.payload);
     this.#validateTime(now);
     const encodedBytes = encoded.byteLength;
-    if (!isPositiveSafeInteger(encodedBytes)) return rejected("invalid-progress");
+    if (
+      !isPositiveSafeInteger(encodedBytes) ||
+      encodedBytes < this.limits.minDeliveryEnvelopeEncodedBytes ||
+      encodedBytes > this.limits.maxDeliveryEnvelopeEncodedBytes
+    ) {
+      return rejected("invalid-progress");
+    }
     const attempt = this.attempt(recoveryId);
     if (attempt === undefined) return rejected("missing-attempt");
     const ownership = this.#validateAttemptGeneration(
@@ -751,7 +884,7 @@ export class RelayRecoveryStore {
     ) {
       return rejected("invalid-progress");
     }
-    if (!this.#hasDeliveryCapacity(recoveryId, encodedBytes)) {
+    if (!this.#hasDeliveryCapacity(attempt, envelope.lane, encodedBytes)) {
       return rejected("delivery-capacity");
     }
     const identity: RecoveryDeliveryRecordIdentity = {
@@ -787,6 +920,7 @@ export class RelayRecoveryStore {
         recoveryId,
       );
     }
+    if (envelope.lane === "recovery") this.refillRecoveryGrantWindows(now);
     return { changed: true, ok: true, record: identity };
   }
 
@@ -1028,6 +1162,7 @@ export class RelayRecoveryStore {
         now,
       );
     }
+    this.refillRecoveryGrantWindows(now);
     return ok(true);
   }
 
@@ -1170,6 +1305,7 @@ export class RelayRecoveryStore {
       now,
     );
     this.#completeIfClosed(closed.recoveryId, now);
+    this.refillRecoveryGrantWindows(now);
     return ok(true);
   }
 
@@ -1190,6 +1326,10 @@ export class RelayRecoveryStore {
     if (!this.#canProgress(attempt)) return rejected("state-conflict");
     if (this.#deadlineExpired(attempt, now)) return rejected("deadline-expired");
     if (next < previous) return rejected("invalid-progress");
+    if (!this.#hostReadyForRecoveryGrant(attempt)) return rejected("state-conflict");
+    if (!this.#canReserveRecoveryGrant(attempt, next)) {
+      return rejected("delivery-capacity");
+    }
     if (!this.#hasOutboxCapacityFor(recoveryId, "recovery-source-grant")) {
       return rejected("outbox-capacity");
     }
@@ -1211,6 +1351,69 @@ export class RelayRecoveryStore {
     );
     this.#upsertOutbox(recoveryId, "recovery-source-grant", "host", canonicalJson(frame), now);
     return ok(true);
+  }
+
+  /**
+   * Deterministically gives each eligible source at most one envelope-sized
+   * credit slice. Repeated calls slide each source toward its byte window; a
+   * grant is never created while its start-ready intent remains unacknowledged.
+   */
+  refillRecoveryGrantWindows(now: number): string[] {
+    this.#validateTime(now);
+    const candidates = this.#sessionDeliveryContributions()
+      .filter(({ attempt }) => {
+        return (
+          (attempt.state === "installed" || attempt.state === "assembling") &&
+          attempt.source_closed_json === null &&
+          attempt.recovery_done_ordinal === null &&
+          !this.#deadlineExpired(attempt, now) &&
+          this.#validateAttemptGeneration(attempt, attempt.delivery_generation) === undefined &&
+          this.#hostReadyForRecoveryGrant(attempt)
+        );
+      })
+      .sort((left, right) => {
+        const leftWriter = this.#attemptRole(left.attempt) === "writer";
+        const rightWriter = this.#attemptRole(right.attempt) === "writer";
+        if (leftWriter !== rightWriter) return leftWriter ? -1 : 1;
+        if (left.recoveryReservedEncodedBytes !== right.recoveryReservedEncodedBytes) {
+          return left.recoveryReservedEncodedBytes - right.recoveryReservedEncodedBytes;
+        }
+        if (left.attempt.updated_at !== right.attempt.updated_at) {
+          return left.attempt.updated_at - right.attempt.updated_at;
+        }
+        return left.attempt.recovery_id < right.attempt.recovery_id
+          ? -1
+          : left.attempt.recovery_id > right.attempt.recovery_id
+            ? 1
+            : 0;
+      });
+    const changed: string[] = [];
+    for (const { attempt } of candidates) {
+      const current = this.attempt(attempt.recovery_id);
+      if (current === undefined) continue;
+      const contribution = this.#attemptDeliveryContribution(current);
+      const currentGrant = BigInt(current.granted_cumulative_encoded_bytes);
+      const windowTarget =
+        contribution.recoveryReceivedCumulativeEncodedBytes +
+        BigInt(this.limits.maxRecoveryGrantWindowEncodedBytes);
+      const sliceTarget = currentGrant + BigInt(this.limits.maxDeliveryEnvelopeEncodedBytes);
+      const target = [windowTarget, sliceTarget, MAX_U64].reduce((minimum, value) =>
+        value < minimum ? value : minimum,
+      );
+      const next = this.#maximumGrantWithinCapacity(current, target);
+      if (next <= currentGrant) continue;
+      const currentHeadroom = currentGrant - contribution.recoveryTailCumulativeEncodedBytes;
+      const nextHeadroom = next - contribution.recoveryTailCumulativeEncodedBytes;
+      if (
+        currentHeadroom < BigInt(this.limits.maxDeliveryEnvelopeEncodedBytes) &&
+        nextHeadroom < BigInt(this.limits.maxDeliveryEnvelopeEncodedBytes)
+      ) {
+        continue;
+      }
+      const result = this.advanceRecoveryGrant(current.recovery_id, next.toString(), now);
+      if (result.ok && result.changed) changed.push(current.recovery_id);
+    }
+    return changed;
   }
 
   /**
@@ -1243,6 +1446,7 @@ export class RelayRecoveryStore {
         recoveryId,
       );
     }
+    if (kind === "recovery-start-ready") this.refillRecoveryGrantWindows(now);
     this.#pruneFencedTerminalAttempt(recoveryId);
     return ok(true);
   }
@@ -1352,6 +1556,7 @@ export class RelayRecoveryStore {
       reason,
     });
     this.#insertOutbox(recoveryId, "recovery-source-reset", "host", canonicalJson(frame), now);
+    this.refillRecoveryGrantWindows(now);
     return ok(true);
   }
 
@@ -1408,6 +1613,65 @@ export class RelayRecoveryStore {
     this.#requireResetOutboxCapacity(fenced);
     for (const row of fenced) this.#resetOrThrow(row.recovery_id, "pair-fenced", now);
     return fenced.map((row) => row.recovery_id);
+  }
+
+  /**
+   * Fences valid legacy rows until the session satisfies the aggregate budget.
+   * Victims are stable: observers first, then largest contribution, newest
+   * update, and descending recovery id. Complete attempts are fenced locally
+   * because no Host recovery source remains to reset.
+   */
+  reconcileSessionDeliveryCapacity(now: number): string[] {
+    this.#validateTime(now);
+    const fenced: string[] = [];
+    for (let index = 0; index < this.limits.maxAttempts; index += 1) {
+      const contributions = this.#sessionDeliveryContributions();
+      const usage = this.sessionDeliveryUsage();
+      const sessionOverBudget = !this.#sessionUsageWithinLimits(usage);
+      const individuallyInvalid = contributions.filter(
+        (contribution) => !this.#attemptUsageWithinLimits(contribution),
+      );
+      if (!sessionOverBudget && individuallyInvalid.length === 0) return fenced;
+      const candidates = (sessionOverBudget ? contributions : individuallyInvalid)
+        .filter(
+          ({ attempt, encodedBytes, records }) =>
+            (encodedBytes > 0 || records > 0) &&
+            attempt.state !== "preparing" &&
+            attempt.state !== "resetting",
+        )
+        .sort((left, right) => {
+          const leftWriter = this.#attemptRole(left.attempt) === "writer";
+          const rightWriter = this.#attemptRole(right.attempt) === "writer";
+          if (leftWriter !== rightWriter) return leftWriter ? 1 : -1;
+          if (left.encodedBytes !== right.encodedBytes) {
+            return right.encodedBytes - left.encodedBytes;
+          }
+          if (left.records !== right.records) return right.records - left.records;
+          if (left.attempt.updated_at !== right.attempt.updated_at) {
+            return right.attempt.updated_at - left.attempt.updated_at;
+          }
+          return left.attempt.recovery_id < right.attempt.recovery_id
+            ? 1
+            : left.attempt.recovery_id > right.attempt.recovery_id
+              ? -1
+              : 0;
+        });
+      const victim = candidates[0]?.attempt;
+      if (victim === undefined) {
+        throw new Error("recovery session delivery capacity cannot be reconciled");
+      }
+      const result = this.#fenceDeliveryOwner(victim, "generation-reset", now);
+      if (!result.ok || !result.changed) {
+        throw new Error(
+          `recovery capacity fence failed: ${result.ok ? "state did not advance" : result.reason}`,
+        );
+      }
+      fenced.push(victim.recovery_id);
+    }
+    if (!this.#sessionUsageWithinLimits(this.sessionDeliveryUsage())) {
+      throw new Error("recovery session delivery capacity cannot be reconciled");
+    }
+    return fenced;
   }
 
   expireDeadlines(now: number): string[] {
@@ -1473,6 +1737,7 @@ export class RelayRecoveryStore {
     if (updated.toArray().length !== 1) return rejected("state-conflict");
     this.sql.exec("DELETE FROM recovery_control_outbox WHERE recovery_id = ?", attempt.recovery_id);
     this.sql.exec("DELETE FROM recovery_delivery_lane WHERE recovery_id = ?", attempt.recovery_id);
+    this.refillRecoveryGrantWindows(now);
     return ok(true);
   }
 
@@ -1778,17 +2043,393 @@ export class RelayRecoveryStore {
     return rows;
   }
 
-  #hasDeliveryCapacity(recoveryId: string, additionalEncodedBytes: number): boolean {
+  #sessionDeliveryContributions(): RecoveryAttemptDeliveryContribution[] {
+    const attempts = this.sql
+      .exec(
+        `SELECT * FROM recovery_attempt
+         ORDER BY recovery_id LIMIT ?`,
+        this.limits.maxAttempts + 1,
+      )
+      .toArray() as unknown as RecoveryAttemptRow[];
+    if (attempts.length > this.limits.maxAttempts) {
+      throw new Error("recovery attempt capacity exceeded");
+    }
+    return attempts.map((attempt) => this.#attemptDeliveryContribution(attempt));
+  }
+
+  #attemptDeliveryContribution(attempt: RecoveryAttemptRow): RecoveryAttemptDeliveryContribution {
+    const laneUsage = this.sql
+      .exec(
+        `SELECT lane, COUNT(*) AS records, COALESCE(SUM(encoded_bytes), 0) AS encoded_bytes
+         FROM recovery_delivery_record
+         WHERE recovery_id = ?
+         GROUP BY lane ORDER BY lane
+         LIMIT 3`,
+        attempt.recovery_id,
+      )
+      .toArray() as unknown as {
+      encoded_bytes: number;
+      lane: RecoveryLane;
+      records: number;
+    }[];
+    if (laneUsage.length > 2) throw new Error("invalid durable recovery delivery lanes");
+    let liveEncodedBytes = 0;
+    let liveRecords = 0;
+    let recoveryEncodedBytes = 0;
+    let recoveryRecords = 0;
+    for (const lane of laneUsage) {
+      if (
+        (lane.lane !== "live" && lane.lane !== "recovery") ||
+        !Number.isSafeInteger(lane.records) ||
+        lane.records < 0 ||
+        !Number.isSafeInteger(lane.encoded_bytes) ||
+        lane.encoded_bytes < 0
+      ) {
+        throw new Error("invalid durable session delivery usage");
+      }
+      if (lane.lane === "live") {
+        liveEncodedBytes = lane.encoded_bytes;
+        liveRecords = lane.records;
+      } else {
+        recoveryEncodedBytes = lane.encoded_bytes;
+        recoveryRecords = lane.records;
+      }
+    }
+
+    let recoveryReservedEncodedBytes = 0;
+    let recoveryReservedRecords = 0;
+    let recoveryReceivedCumulativeEncodedBytes = 0n;
+    let recoveryTailCumulativeEncodedBytes = 0n;
+    const lane = this.#lane(attempt.recovery_id, "recovery");
+    if (lane !== undefined) {
+      recoveryReceivedCumulativeEncodedBytes = BigInt(
+        DecimalU64Schema.parse(lane.received_cumulative_encoded_bytes),
+      );
+      const tail = this.sql
+        .exec(
+          `SELECT cumulative_encoded_bytes FROM recovery_delivery_record
+           WHERE recovery_id = ? AND lane = 'recovery'
+           ORDER BY length(delivery_ordinal) DESC, delivery_ordinal DESC
+           LIMIT 1`,
+          attempt.recovery_id,
+        )
+        .toArray()[0] as { cumulative_encoded_bytes: string } | undefined;
+      recoveryTailCumulativeEncodedBytes =
+        tail === undefined
+          ? recoveryReceivedCumulativeEncodedBytes
+          : BigInt(DecimalU64Schema.parse(tail.cumulative_encoded_bytes));
+      if (recoveryTailCumulativeEncodedBytes < recoveryReceivedCumulativeEncodedBytes) {
+        throw new Error("recovery delivery tail precedes received progress");
+      }
+    }
+
+    const reservesRecovery =
+      (attempt.state === "installed" || attempt.state === "assembling") &&
+      attempt.source_closed_json === null;
+    const granted = BigInt(DecimalU64Schema.parse(attempt.granted_cumulative_encoded_bytes));
+    if (reservesRecovery) {
+      if (lane === undefined || granted < recoveryTailCumulativeEncodedBytes) {
+        throw new Error("recovery grant precedes durable delivery tail");
+      }
+      const outstanding = granted - recoveryReceivedCumulativeEncodedBytes;
+      const unmaterialized = granted - recoveryTailCumulativeEncodedBytes;
+      recoveryReservedEncodedBytes = this.#usageNumber(outstanding);
+      recoveryReservedRecords = this.#usageNumber(
+        unmaterialized / BigInt(this.limits.minDeliveryEnvelopeEncodedBytes),
+      );
+    } else if (attempt.state === "preparing" && granted !== 0n) {
+      throw new Error("preparing recovery attempt retained a grant");
+    }
+
+    return {
+      attempt,
+      encodedBytes: this.#addUsage(liveEncodedBytes, recoveryReservedEncodedBytes),
+      liveEncodedBytes,
+      liveRecords,
+      records: this.#addUsage(
+        this.#addUsage(liveRecords, recoveryRecords),
+        recoveryReservedRecords,
+      ),
+      recoveryEncodedBytes,
+      recoveryRecords,
+      recoveryReservedEncodedBytes,
+      recoveryReservedRecords,
+      recoveryTailCumulativeEncodedBytes,
+      recoveryReceivedCumulativeEncodedBytes,
+    };
+  }
+
+  #addUsage(left: number, right: number): number {
+    const result = left + right;
+    if (!Number.isSafeInteger(result) || result < 0) {
+      throw new Error("recovery session delivery usage overflow");
+    }
+    return result;
+  }
+
+  #usageNumber(value: bigint): number {
+    if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error("recovery session delivery usage overflow");
+    }
+    return Number(value);
+  }
+
+  #hasDeliveryCapacity(
+    attempt: RecoveryAttemptRow,
+    lane: RecoveryLane,
+    additionalEncodedBytes: number,
+  ): boolean {
     let usage: RecoveryDeliveryUsage;
+    let sessionUsage: RecoverySessionDeliveryUsage;
+    let contribution: RecoveryAttemptDeliveryContribution;
     try {
-      usage = this.deliveryUsage(recoveryId);
+      usage = this.deliveryUsage(attempt.recovery_id);
+      sessionUsage = this.sessionDeliveryUsage();
+      contribution = this.#attemptDeliveryContribution(attempt);
     } catch {
       return false;
     }
-    return (
-      usage.records < this.limits.maxDeliveryRecords &&
-      usage.encodedBytes + additionalEncodedBytes <= this.limits.maxDeliveryEncodedBytes
+    if (
+      usage.records >= this.limits.maxDeliveryRecords ||
+      usage.encodedBytes + additionalEncodedBytes > this.limits.maxDeliveryEncodedBytes
+    ) {
+      return false;
+    }
+    if (lane === "live") {
+      const observerAdmission =
+        this.#attemptRole(attempt) !== "observer" ||
+        !this.#hasActiveWriterDeliveryOwner() ||
+        (sessionUsage.observerEncodedBytes + additionalEncodedBytes <=
+          this.limits.maxSessionDeliveryEncodedBytes -
+            this.limits.writerDeliveryReserveEncodedBytes &&
+          sessionUsage.observerRecords + 1 <=
+            this.limits.maxSessionDeliveryRecords - this.limits.writerDeliveryReserveRecords);
+      return (
+        contribution.liveRecords < this.limits.maxAttemptLiveRecords &&
+        contribution.liveEncodedBytes + additionalEncodedBytes <=
+          this.limits.maxAttemptLiveEncodedBytes &&
+        sessionUsage.encodedBytes + additionalEncodedBytes <=
+          this.limits.maxSessionDeliveryEncodedBytes &&
+        sessionUsage.records + 1 <= this.limits.maxSessionDeliveryRecords &&
+        observerAdmission
+      );
+    }
+
+    const nextTail =
+      contribution.recoveryTailCumulativeEncodedBytes + BigInt(additionalEncodedBytes);
+    const grant = BigInt(attempt.granted_cumulative_encoded_bytes);
+    if (nextTail > grant) return false;
+    const nextReservedRecords = this.#usageNumber(
+      (grant - nextTail) / BigInt(this.limits.minDeliveryEnvelopeEncodedBytes),
     );
+    const nextSessionRecords =
+      sessionUsage.records - contribution.recoveryReservedRecords + nextReservedRecords + 1;
+    const nextRecoveryRecords =
+      sessionUsage.recoveryRecords +
+      1 +
+      (sessionUsage.recoveryReservedRecords - contribution.recoveryReservedRecords) +
+      nextReservedRecords;
+    const nextAttemptRecords =
+      contribution.records - contribution.recoveryReservedRecords + nextReservedRecords + 1;
+    const observerAdmission =
+      this.#attemptRole(attempt) !== "observer" ||
+      !this.#hasActiveWriterDeliveryOwner() ||
+      (sessionUsage.observerEncodedBytes <=
+        this.limits.maxSessionDeliveryEncodedBytes -
+          this.limits.writerDeliveryReserveEncodedBytes &&
+        sessionUsage.observerRecords - contribution.records + nextAttemptRecords <=
+          this.limits.maxSessionDeliveryRecords - this.limits.writerDeliveryReserveRecords);
+    return (
+      sessionUsage.recoveryRecords + 1 <= this.limits.maxSessionRecoveryRecords &&
+      nextRecoveryRecords <= this.limits.maxSessionRecoveryRecords &&
+      nextSessionRecords <= this.limits.maxSessionDeliveryRecords &&
+      sessionUsage.encodedBytes <= this.limits.maxSessionDeliveryEncodedBytes &&
+      sessionUsage.recoveryReservedEncodedBytes <= this.limits.maxSessionRecoveryEncodedBytes &&
+      observerAdmission
+    );
+  }
+
+  #canReserveRecoveryGrant(attempt: RecoveryAttemptRow, nextGrant: bigint): boolean {
+    let usage: RecoverySessionDeliveryUsage;
+    let contribution: RecoveryAttemptDeliveryContribution;
+    try {
+      usage = this.sessionDeliveryUsage();
+      contribution = this.#attemptDeliveryContribution(attempt);
+    } catch {
+      return false;
+    }
+    const currentGrant = BigInt(attempt.granted_cumulative_encoded_bytes);
+    if (nextGrant < currentGrant || nextGrant < contribution.recoveryTailCumulativeEncodedBytes) {
+      return false;
+    }
+    const nextOutstanding = nextGrant - contribution.recoveryReceivedCumulativeEncodedBytes;
+    if (nextOutstanding > BigInt(this.limits.maxRecoveryGrantWindowEncodedBytes)) {
+      return false;
+    }
+    const nextReservedRecords = this.#usageNumber(
+      (nextGrant - contribution.recoveryTailCumulativeEncodedBytes) /
+        BigInt(this.limits.minDeliveryEnvelopeEncodedBytes),
+    );
+    const nextReservedEncodedBytes = this.#usageNumber(nextOutstanding);
+    const nextSessionEncodedBytes =
+      usage.encodedBytes - contribution.recoveryReservedEncodedBytes + nextReservedEncodedBytes;
+    const nextSessionRecords =
+      usage.records - contribution.recoveryReservedRecords + nextReservedRecords;
+    const nextRecoveryReservedEncodedBytes =
+      usage.recoveryReservedEncodedBytes -
+      contribution.recoveryReservedEncodedBytes +
+      nextReservedEncodedBytes;
+    const nextRecoveryEffectiveRecords =
+      usage.recoveryRecords +
+      usage.recoveryReservedRecords -
+      contribution.recoveryReservedRecords +
+      nextReservedRecords;
+    const nextContributionEncodedBytes = contribution.liveEncodedBytes + nextReservedEncodedBytes;
+    const nextContributionRecords =
+      contribution.liveRecords + contribution.recoveryRecords + nextReservedRecords;
+    const observerAdmission =
+      this.#attemptRole(attempt) !== "observer" ||
+      !this.#hasActiveWriterDeliveryOwner() ||
+      (usage.observerEncodedBytes - contribution.encodedBytes + nextContributionEncodedBytes <=
+        this.limits.maxSessionDeliveryEncodedBytes -
+          this.limits.writerDeliveryReserveEncodedBytes &&
+        usage.observerRecords - contribution.records + nextContributionRecords <=
+          this.limits.maxSessionDeliveryRecords - this.limits.writerDeliveryReserveRecords);
+    return (
+      nextSessionEncodedBytes <= this.limits.maxSessionDeliveryEncodedBytes &&
+      nextSessionRecords <= this.limits.maxSessionDeliveryRecords &&
+      nextRecoveryReservedEncodedBytes <= this.limits.maxSessionRecoveryEncodedBytes &&
+      nextRecoveryEffectiveRecords <= this.limits.maxSessionRecoveryRecords &&
+      observerAdmission
+    );
+  }
+
+  #maximumGrantWithinCapacity(attempt: RecoveryAttemptRow, targetGrant: bigint): bigint {
+    const currentGrant = BigInt(attempt.granted_cumulative_encoded_bytes);
+    if (targetGrant <= currentGrant) return currentGrant;
+    let usage: RecoverySessionDeliveryUsage;
+    let contribution: RecoveryAttemptDeliveryContribution;
+    try {
+      usage = this.sessionDeliveryUsage();
+      contribution = this.#attemptDeliveryContribution(attempt);
+    } catch {
+      return currentGrant;
+    }
+    let availableSessionBytes = this.limits.maxSessionDeliveryEncodedBytes - usage.encodedBytes;
+    const availableRecoveryBytes =
+      this.limits.maxSessionRecoveryEncodedBytes - usage.recoveryReservedEncodedBytes;
+    let availableSessionRecords = this.limits.maxSessionDeliveryRecords - usage.records;
+    const recoveryEffectiveRecords = usage.recoveryRecords + usage.recoveryReservedRecords;
+    const availableRecoveryRecords =
+      this.limits.maxSessionRecoveryRecords - recoveryEffectiveRecords;
+    if (this.#attemptRole(attempt) === "observer" && this.#hasActiveWriterDeliveryOwner()) {
+      availableSessionBytes = Math.min(
+        availableSessionBytes,
+        this.limits.maxSessionDeliveryEncodedBytes -
+          this.limits.writerDeliveryReserveEncodedBytes -
+          usage.observerEncodedBytes,
+      );
+      availableSessionRecords = Math.min(
+        availableSessionRecords,
+        this.limits.maxSessionDeliveryRecords -
+          this.limits.writerDeliveryReserveRecords -
+          usage.observerRecords,
+      );
+    }
+    if (
+      availableSessionBytes < 0 ||
+      availableRecoveryBytes < 0 ||
+      availableSessionRecords < 0 ||
+      availableRecoveryRecords < 0
+    ) {
+      return currentGrant;
+    }
+
+    const byteDelta = Math.min(availableSessionBytes, availableRecoveryBytes);
+    const maxByBytes = currentGrant + BigInt(byteDelta);
+    const allowedReservedRecords =
+      contribution.recoveryReservedRecords +
+      Math.min(availableSessionRecords, availableRecoveryRecords);
+    const maxUnmaterializedBytes =
+      BigInt(allowedReservedRecords + 1) * BigInt(this.limits.minDeliveryEnvelopeEncodedBytes) - 1n;
+    const maxByRecords = contribution.recoveryTailCumulativeEncodedBytes + maxUnmaterializedBytes;
+    const maxByWindow =
+      contribution.recoveryReceivedCumulativeEncodedBytes +
+      BigInt(this.limits.maxRecoveryGrantWindowEncodedBytes);
+    const next = [targetGrant, maxByBytes, maxByRecords, maxByWindow, MAX_U64].reduce(
+      (minimum, value) => (value < minimum ? value : minimum),
+    );
+    return next > currentGrant && this.#canReserveRecoveryGrant(attempt, next)
+      ? next
+      : currentGrant;
+  }
+
+  #attemptRole(attempt: RecoveryAttemptRow): "observer" | "writer" {
+    const client = this.relay.clientById(attempt.client_id);
+    return client !== undefined &&
+      client.registered_at !== null &&
+      client.stream_id === attempt.stream_id &&
+      client.delivery_generation === attempt.delivery_generation &&
+      client.role === "writer"
+      ? "writer"
+      : "observer";
+  }
+
+  #hasActiveWriterDeliveryOwner(): boolean {
+    const hostFence = this.relay.session()?.host_fence;
+    if (hostFence === undefined) return false;
+    const row = this.sql
+      .exec(
+        `SELECT attempt.recovery_id
+         FROM recovery_attempt AS attempt
+         JOIN client_delivery AS client ON client.client_id = attempt.client_id
+         WHERE client.role = 'writer' AND client.registered_at IS NOT NULL
+           AND client.stream_id = attempt.stream_id
+           AND client.delivery_generation = attempt.delivery_generation
+           AND attempt.host_fence = ?
+           AND attempt.state IN ('preparing', 'installed', 'assembling', 'complete')
+         ORDER BY attempt.recovery_id LIMIT 1`,
+        hostFence,
+      )
+      .toArray()[0];
+    return row !== undefined;
+  }
+
+  #sessionUsageWithinLimits(usage: RecoverySessionDeliveryUsage): boolean {
+    const observerReserveSatisfied =
+      !this.#hasActiveWriterDeliveryOwner() ||
+      (usage.observerEncodedBytes <=
+        this.limits.maxSessionDeliveryEncodedBytes -
+          this.limits.writerDeliveryReserveEncodedBytes &&
+        usage.observerRecords <=
+          this.limits.maxSessionDeliveryRecords - this.limits.writerDeliveryReserveRecords);
+    return (
+      usage.encodedBytes <= this.limits.maxSessionDeliveryEncodedBytes &&
+      usage.records <= this.limits.maxSessionDeliveryRecords &&
+      usage.recoveryReservedEncodedBytes <= this.limits.maxSessionRecoveryEncodedBytes &&
+      usage.recoveryRecords + usage.recoveryReservedRecords <=
+        this.limits.maxSessionRecoveryRecords &&
+      observerReserveSatisfied
+    );
+  }
+
+  #attemptUsageWithinLimits(contribution: RecoveryAttemptDeliveryContribution): boolean {
+    const actualEncodedBytes = this.#addUsage(
+      contribution.liveEncodedBytes,
+      contribution.recoveryEncodedBytes,
+    );
+    const actualRecords = this.#addUsage(contribution.liveRecords, contribution.recoveryRecords);
+    return (
+      actualEncodedBytes <= this.limits.maxDeliveryEncodedBytes &&
+      actualRecords <= this.limits.maxDeliveryRecords &&
+      contribution.liveEncodedBytes <= this.limits.maxAttemptLiveEncodedBytes &&
+      contribution.liveRecords <= this.limits.maxAttemptLiveRecords &&
+      contribution.recoveryReservedEncodedBytes <= this.limits.maxRecoveryGrantWindowEncodedBytes
+    );
+  }
+
+  #hostReadyForRecoveryGrant(attempt: RecoveryAttemptRow): boolean {
+    return this.outboxEntry(attempt.recovery_id, "recovery-start-ready") === undefined;
   }
 
   #canProgress(attempt: RecoveryAttemptRow): boolean {
