@@ -1,6 +1,6 @@
 import {
   DATA_HEADER_BYTES,
-  DELIVERY_ENVELOPE_V3_HEADER_BYTES,
+  DELIVERY_ENVELOPE_HEADER_BYTES,
   DataFrameKind,
   MAX_U64,
   RecoveryAdoptedSchema,
@@ -8,7 +8,7 @@ import {
   advanceDeliveryLaneCursor,
   applyMutationCursor,
   decodeDataFrame,
-  decodeDeliveryEnvelopeV3,
+  decodeDeliveryEnvelope,
   initialDeliveryLaneCursor,
   type AuthorityCursor,
   type DeliveryLaneCursor,
@@ -103,7 +103,7 @@ function assertSeedLaneCursor(
     throw new Error(`${lane} lane cursor is not valid scalar progress`);
   }
   const minimumCumulativeEncodedBytes =
-    cursor.deliveryOrdinal * BigInt(DATA_HEADER_BYTES + DELIVERY_ENVELOPE_V3_HEADER_BYTES);
+    cursor.deliveryOrdinal * BigInt(DATA_HEADER_BYTES + DELIVERY_ENVELOPE_HEADER_BYTES);
   if (cursor.cumulativeEncodedBytes < minimumCumulativeEncodedBytes) {
     throw new Error(`${lane} lane cursor is not valid scalar progress`);
   }
@@ -124,7 +124,7 @@ function cursorAtOrAfter(candidate: AuthorityCursor, floor: AuthorityCursor): bo
 }
 
 /**
- * Long-lived Recovery v3 live-lane mutation owner, seeded after RecoveryAssembler completion.
+ * Long-lived Recovery live-lane mutation owner, seeded after RecoveryAssembler completion.
  *
  * The constructor consumes one immutable assembler completion plus the exact target/engine binding
  * the caller already adopted. The completion contains scalar lane progress but not the raw envelope
@@ -233,12 +233,12 @@ export class RecoveryLiveReceiver {
     const raw = Uint8Array.from(inputBytes);
     if (this.#lastAcceptedRaw !== null && sameBytes(this.#lastAcceptedRaw, raw)) return true;
 
-    let envelope: ReturnType<typeof decodeDeliveryEnvelopeV3>;
+    let envelope: ReturnType<typeof decodeDeliveryEnvelope>;
     let frame: ReturnType<typeof decodeDataFrame>;
     let nextLaneCursor: DeliveryLaneCursor;
     let applied: ReturnType<typeof applyMutationCursor>;
     try {
-      envelope = decodeDeliveryEnvelopeV3(raw);
+      envelope = decodeDeliveryEnvelope(raw);
       frame = decodeDataFrame(envelope.payload);
       nextLaneCursor = advanceDeliveryLaneCursor(this.#liveLaneCursor, envelope);
       applied = applyMutationCursor(this.#replicaCursor, {

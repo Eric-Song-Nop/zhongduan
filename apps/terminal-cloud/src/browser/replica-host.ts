@@ -7,7 +7,7 @@ import {
   type GhosttyWasmSource,
 } from "@wterm/ghostty";
 import type { ReplicaCursor, ResizePayload } from "@zhongduan/protocol";
-import type { ReplicaHost, ReplicaSink, SnapshotManifest } from "@zhongduan/session-client";
+import type { ReplicaHost, ReplicaSink, SnapshotRestoreSource } from "@zhongduan/session-client";
 
 const MAX_CONTINUATION_BYTES = 64 * 1024;
 
@@ -156,14 +156,14 @@ export class WTermReplicaHost implements ReplicaHost {
 
   async restore(
     snapshot: Uint8Array,
-    manifest: SnapshotManifest,
+    source: SnapshotRestoreSource,
     signal: AbortSignal,
   ): Promise<ReplicaSink> {
     this.#assertLive();
-    if (manifest.engineId !== this.engineId) {
+    if (source.engineId !== this.engineId) {
       throw new Error("snapshot engine does not match the loaded Ghostty runtime");
     }
-    if (manifest.restoreThrough !== "finish") {
+    if (source.restoreThrough !== "finish") {
       throw new Error("browser replicas require a complete history restore");
     }
     signal.throwIfAborted();

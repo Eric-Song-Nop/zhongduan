@@ -1,20 +1,14 @@
 import {
-  RecoveryV3CloudToHostControlFrameSchema,
-  RecoveryV3HostToCloudControlFrameSchema,
-  RelayCapability,
-  RelayToHostControlFrameSchema,
+  HostControlFrameSchema as HostToCloudControlFrameSchema,
+  RelayToHostControlFrameSchema as CloudToHostControlFrameSchema,
   decodeControlFrame,
   encodeControlFrame,
-  type HostControlFrame,
-  type RecoveryV3CloudToHostControlFrame,
-  type RecoveryV3HostRoutingIdentity,
-  type RecoveryV3HostToCloudControlFrame,
-  type RelayToHostControlFrame,
+  type HostControlFrame as HostToCloudControlFrame,
+  type RelayToHostControlFrame as CloudToHostControlFrame,
 } from "@zhongduan/protocol";
 
 import type { ReplayCursor, TerminalSession } from "../session";
-import { HOST_CANONICAL_QUEUE_LIMITS } from "./canonical-publisher";
-import { HostDeliveryScheduler } from "./delivery-scheduler";
+import { CanonicalPublisher, HOST_CANONICAL_QUEUE_LIMITS } from "./canonical-publisher";
 import { dispatchForwardedInput, type ForwardedInput } from "./input-dispatcher";
 import type { HostSocketPair } from "./paired-websocket";
 import {
@@ -25,7 +19,6 @@ import {
   HOST_RECOVERY_DATA_HIGH_WATER_BYTES,
   RecoverySourceScheduler,
 } from "./recovery-source-scheduler";
-import type { SnapshotCheckpointManager } from "./snapshot-checkpoint-manager";
 
 export const HOST_READY_TIMEOUT_MS = 10_000;
 export const HOST_HEARTBEAT_INTERVAL_MS = 15_000;
@@ -38,12 +31,33 @@ export const HOST_CONTROL_QUEUE_LIMITS = {
 const MAX_CONTROL_MESSAGE_CHARS = 6 * 1024 * 1024 + 4_096;
 const MAX_CONTROL_BUFFERED_BYTES = 1024 * 1024;
 const textEncoder = new TextEncoder();
-const HOST_RECOVERY_V3_CAPABILITIES = [
-  RelayCapability.capabilityNegotiationV1,
-  RelayCapability.authorityDataV2,
-  RelayCapability.wireEndpointV3,
-  RelayCapability.recoveryV3GapFillV1,
-] as const;
+
+type RecoveryControlFrame = Extract<
+  CloudToHostControlFrame,
+  {
+    type:
+      | "recovery-prepare"
+      | "recovery-start-ready"
+      | "recovery-source-grant"
+      | "recovery-source-received"
+      | "recovery-source-reset";
+  }
+>;
+
+type RecoveryRoutingIdentity = Pick<
+  RecoveryControlFrame,
+  "recoveryId" | "connectionId" | "streamId" | "deliveryGeneration"
+>;
+
+function isRecoveryControlFrame(frame: CloudToHostControlFrame): frame is RecoveryControlFrame {
+  return (
+    frame.type === "recovery-prepare" ||
+    frame.type === "recovery-start-ready" ||
+    frame.type === "recovery-source-grant" ||
+    frame.type === "recovery-source-received" ||
+    frame.type === "recovery-source-reset"
+  );
+}
 
 export interface HostRelayConnectionOptions {
   heartbeatIntervalMs?: number;
@@ -54,7 +68,6 @@ export interface HostRelayConnectionOptions {
   recoveryDeadlineTickMs?: number;
   recoverySourceManager: RecoverySourceManager;
   session: TerminalSession;
-  snapshotCheckpointManager: SnapshotCheckpointManager;
 }
 
 export class HostRelayConnection {
@@ -63,13 +76,12 @@ export class HostRelayConnection {
   readonly #heartbeatTimeoutMs: number;
   readonly #monotonicNow: () => number;
   readonly #session: TerminalSession;
-  readonly #scheduler: HostDeliveryScheduler;
+  readonly #canonicalPublisher: CanonicalPublisher;
   readonly #readyTimeoutMs: number;
   readonly #recoveryDeadlineTickMs: number;
   readonly #recoveryOwnerToken: RecoverySourceOwnerToken = {};
   readonly #recoveryScheduler: RecoverySourceScheduler;
   readonly #recoverySourceManager: RecoverySourceManager;
-  readonly #recoveryV3Enabled: boolean;
   readonly #readyPromise: Promise<void>;
   readonly #resolveReady: () => void;
   readonly #rejectReady: (error: unknown) => void;
@@ -119,10 +131,11 @@ export class HostRelayConnection {
       ownerToken: this.#recoveryOwnerToken,
       sendData: (encoded) => this.#sendRecoveryData(encoded),
     });
-    const negotiated = new Set(options.pair.connection.negotiatedCapabilities ?? []);
-    this.#recoveryV3Enabled = HOST_RECOVERY_V3_CAPABILITIES.every((capability) =>
-      negotiated.has(capability),
-    );
+    this.#canonicalPublisher = new CanonicalPublisher({
+      onFailure: (reason) => this.#close(1011, reason),
+      sendData: (encoded) => this.#sendCanonicalData(encoded),
+      session: this.#session,
+    });
     let resolveReady!: () => void;
     let rejectReady!: (error: unknown) => void;
     this.#readyPromise = new Promise((resolve, reject) => {
@@ -136,14 +149,6 @@ export class HostRelayConnection {
       resolveClosed = resolve;
     });
     this.#resolveClosed = resolveClosed;
-    this.#scheduler = new HostDeliveryScheduler({
-      bufferedAmount: () => this.#pair.data.bufferedAmount,
-      closePair: (reason) => this.#close(1011, reason),
-      sendControl: (frame) => this.#sendControl(frame),
-      sendData: (frame) => this.#sendData(frame),
-      session: this.#session,
-      snapshotCheckpointManager: options.snapshotCheckpointManager,
-    });
   }
 
   async start(): Promise<void> {
@@ -151,7 +156,7 @@ export class HostRelayConnection {
       throw new Error("Host relay connection already started");
     this.#listen();
     try {
-      const cursor = this.#scheduler.prepareHostReady();
+      const cursor = this.#canonicalPublisher.prepare();
       this.#advertisedCursor = cursor;
       this.#sendControl({
         type: "host-ready",
@@ -257,23 +262,11 @@ export class HostRelayConnection {
 
   async #handleControl(encoded: string): Promise<void> {
     if (this.#closed) return;
-    let frame: RelayToHostControlFrame;
+    let frame: CloudToHostControlFrame;
     try {
-      frame = decodeControlFrame(encoded, RelayToHostControlFrameSchema);
+      frame = decodeControlFrame(encoded, CloudToHostControlFrameSchema);
     } catch {
-      if (!this.#recoveryV3Enabled) {
-        this.#close(1002, "invalid relay control frame");
-        return;
-      }
-      let recoveryFrame: RecoveryV3CloudToHostControlFrame;
-      try {
-        recoveryFrame = decodeControlFrame(encoded, RecoveryV3CloudToHostControlFrameSchema);
-      } catch {
-        this.#close(1002, "invalid relay control frame");
-        return;
-      }
-      if (!this.#ready) throw new Error("relay sent Recovery v3 traffic before host-ready ACK");
-      await this.#handleRecoveryControl(recoveryFrame);
+      this.#close(1002, "invalid relay control frame");
       return;
     }
 
@@ -282,22 +275,14 @@ export class HostRelayConnection {
       return;
     }
     if (!this.#ready) throw new Error("relay sent Host traffic before host-ready ACK");
-    if (frame.type === "delivery-barrier-result") {
-      this.#scheduler.handleBarrierResult(frame);
-      return;
-    }
-    if (frame.type === "attach-request") {
-      this.#scheduler.enqueueAttach(frame);
-      return;
-    }
-    if (frame.type === "delivery-reset") {
-      this.#scheduler.handleDeliveryReset(frame);
+    if (isRecoveryControlFrame(frame)) {
+      await this.#handleRecoveryControl(frame);
       return;
     }
     await this.#handleInput(frame);
   }
 
-  #handleReadyAck(frame: Extract<RelayToHostControlFrame, { type: "host-ready-ack" }>): void {
+  #handleReadyAck(frame: Extract<CloudToHostControlFrame, { type: "host-ready-ack" }>): void {
     const advertised = this.#advertisedCursor;
     if (this.#ready || advertised === undefined) {
       throw new Error("unexpected host-ready ACK");
@@ -307,17 +292,17 @@ export class HostRelayConnection {
       lastEventSeq: BigInt(frame.headEventSeq),
       nextPtyOffset: BigInt(frame.nextPtyOffset),
     };
-    this.#scheduler.activateHostReady(acknowledged);
+    this.#canonicalPublisher.activate(acknowledged);
     this.#ready = true;
     const now = this.#monotonicNow();
     this.#heartbeatLastControlAckAt = now;
     this.#heartbeatLastDataAckAt = now;
     this.#scheduleHeartbeat();
-    if (this.#recoveryV3Enabled) this.#scheduleRecoveryDeadlineTick();
+    this.#scheduleRecoveryDeadlineTick();
     this.#resolveReady();
   }
 
-  async #handleRecoveryControl(frame: RecoveryV3CloudToHostControlFrame): Promise<void> {
+  async #handleRecoveryControl(frame: RecoveryControlFrame): Promise<void> {
     if (frame.type === "recovery-prepare") {
       const pairFence = this.#pairFence;
       const result = await this.#recoverySourceManager.prepare(
@@ -327,12 +312,12 @@ export class HostRelayConnection {
           !this.#closed &&
           pairFence !== null &&
           pairFence === this.#pairFence &&
-          this.#scheduler.tryEnqueueRecoveryStartFence(encoded),
+          this.#canonicalPublisher.tryEnqueueRecoveryStartFence(encoded),
       );
       if (this.#closed || pairFence === null || pairFence !== this.#pairFence) return;
       if (result.status === "prepared") return;
       if (result.status === "rejected") {
-        this.#sendRecoveryControl(result.rejection);
+        this.#sendControl(result.rejection);
         return;
       }
       if (result.status === "unavailable" && result.reason === "deadline") return;
@@ -362,7 +347,7 @@ export class HostRelayConnection {
       }
       if (result.status === "closed") {
         this.#recoveryScheduler.forget(frame);
-        this.#sendRecoveryControl(result.closed);
+        this.#sendControl(result.closed);
       }
       if (result.status === "partial" && result.advanced) {
         this.#recoveryScheduler.notify(frame);
@@ -376,7 +361,7 @@ export class HostRelayConnection {
     this.#recoveryScheduler.forget(frame);
   }
 
-  #isRetiredRecoveryIdentity(identity: RecoveryV3HostRoutingIdentity): boolean {
+  #isRetiredRecoveryIdentity(identity: RecoveryRoutingIdentity): boolean {
     return this.#recoverySourceManager.isRetiredIdentity(this.#recoveryOwnerToken, {
       recoveryId: identity.recoveryId,
       connectionId: identity.connectionId,
@@ -385,12 +370,8 @@ export class HostRelayConnection {
     });
   }
 
-  #sendRecoveryControl(frame: RecoveryV3HostToCloudControlFrame): void {
-    this.#sendRawControl(encodeControlFrame(RecoveryV3HostToCloudControlFrameSchema.parse(frame)));
-  }
-
   #scheduleRecoveryDeadlineTick(): void {
-    if (this.#closed || !this.#recoveryV3Enabled) return;
+    if (this.#closed) return;
     if (this.#recoveryDeadlineTimer !== undefined) clearTimeout(this.#recoveryDeadlineTimer);
     this.#recoveryDeadlineTimer = setTimeout(() => {
       this.#recoveryDeadlineTimer = undefined;
@@ -451,8 +432,8 @@ export class HostRelayConnection {
     this.#sendControl(ack);
   }
 
-  #sendControl(frame: HostControlFrame): void {
-    this.#sendRawControl(encodeControlFrame(frame));
+  #sendControl(frame: HostToCloudControlFrame): void {
+    this.#sendRawControl(encodeControlFrame(HostToCloudControlFrameSchema.parse(frame)));
   }
 
   #sendRawControl(encoded: string): void {
@@ -476,6 +457,16 @@ export class HostRelayConnection {
       throw new Error("Host data frame must use an owned ArrayBuffer");
     }
     this.#pair.data.send(frame as Uint8Array<ArrayBuffer>);
+  }
+
+  #sendCanonicalData(frame: Uint8Array): void {
+    if (this.#pair.data.bufferedAmount > HOST_CANONICAL_QUEUE_LIMITS.maxBytes) {
+      throw new Error("Host data WebSocket buffer exceeded");
+    }
+    this.#sendData(frame);
+    if (this.#pair.data.bufferedAmount > HOST_CANONICAL_QUEUE_LIMITS.maxBytes) {
+      throw new Error("Host data WebSocket buffer exceeded");
+    }
   }
 
   #sendRecoveryData(frame: Uint8Array): void {
@@ -518,7 +509,7 @@ export class HostRelayConnection {
     this.#unlisten();
     this.#recoveryScheduler.dispose();
     this.#recoverySourceManager.resetOwner(this.#recoveryOwnerToken);
-    this.#scheduler.dispose(reason);
+    this.#canonicalPublisher.dispose();
     this.#rejectReady(new Error(reason));
     this.#pair.close(code, reason.slice(0, 120));
     this.#resolveClosed();

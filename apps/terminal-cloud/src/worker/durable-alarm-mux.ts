@@ -30,11 +30,9 @@ interface ComponentAlarmFact {
 
 interface PersistedAlarmFacts {
   components: Partial<Record<DurableAlarmComponent, ComponentAlarmFact>>;
-  initialized?: true;
-  version: 1;
 }
 
-const ALARM_FACTS_KEY = "terminal-session:alarm-mux:v1";
+const ALARM_FACTS_KEY = "terminal-session:alarm-mux";
 const COMPONENTS = [DurableAlarmComponent.snapshot, DurableAlarmComponent.recovery] as const;
 
 function assertTimestamp(timestamp: number): void {
@@ -58,28 +56,24 @@ function isAlarmFact(value: unknown): value is ComponentAlarmFact {
 }
 
 function parseAlarmFacts(value: unknown): PersistedAlarmFacts {
-  if (value === undefined) return { components: {}, version: 1 };
+  if (value === undefined) return { components: {} };
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("invalid durable alarm facts");
   }
   const stored = value as Record<string, unknown>;
   if (
-    stored.version !== 1 ||
+    Object.keys(stored).length !== 1 ||
     typeof stored.components !== "object" ||
     stored.components === null ||
     Array.isArray(stored.components)
   ) {
     throw new Error("invalid durable alarm facts");
   }
-  if (stored.initialized !== undefined && stored.initialized !== true) {
-    throw new Error("invalid durable alarm facts");
-  }
   const components = stored.components as Record<string, unknown>;
   if (!Object.keys(components).every((component) => COMPONENTS.includes(component as never))) {
     throw new Error("invalid durable alarm facts");
   }
-  const parsed: PersistedAlarmFacts = { components: {}, version: 1 };
-  if (stored.initialized === true) parsed.initialized = true;
+  const parsed: PersistedAlarmFacts = { components: {} };
   for (const component of COMPONENTS) {
     const fact = components[component];
     if (fact === undefined) continue;
@@ -98,7 +92,7 @@ function hasFacts(facts: PersistedAlarmFacts): boolean {
 }
 
 function shouldPersist(facts: PersistedAlarmFacts): boolean {
-  return facts.initialized === true || hasFacts(facts);
+  return hasFacts(facts);
 }
 
 /**
@@ -151,16 +145,6 @@ export class DurableAlarmMux {
   }
 
   async initialize(): Promise<void> {
-    await this.updateFacts(async (facts) => {
-      if (facts.initialized === true) return;
-      if (!hasFacts(facts)) {
-        const legacyAlarm = await this.ctx.storage.getAlarm();
-        if (legacyAlarm !== null) {
-          facts.components[DurableAlarmComponent.snapshot] = { dueAt: legacyAlarm };
-        }
-      }
-      facts.initialized = true;
-    });
     await this.reconcile();
   }
 

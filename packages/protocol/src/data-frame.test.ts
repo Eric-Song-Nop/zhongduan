@@ -2,14 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   DATA_HEADER_BYTES,
-  DATA_PROTOCOL_VERSION,
+  DATA_FORMAT,
   DataFrameKind,
   decodeDataFrame,
   encodeDataFrame,
   encodeResizePayload,
-  rewriteDelivery,
 } from "./data-frame";
-import { decodeDeliveryBarrierPayload, encodeDeliveryBarrierPayload } from "./delivery-barrier";
 import { ProtocolError } from "./errors";
 import { applyMutationCursor } from "./replica-cursor";
 
@@ -30,31 +28,19 @@ describe("data frame codec", () => {
     const decoded = decodeDataFrame(encoded);
 
     expect(encoded.byteLength).toBe(DATA_HEADER_BYTES + outputFrame.payload.length);
-    expect(DATA_PROTOCOL_VERSION).toBe(2);
+    expect(DATA_FORMAT).toBe(1);
     expect(new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength).getUint8(4)).toBe(
-      2,
+      1,
     );
     expect(decoded).toEqual(outputFrame);
   });
 
-  it("rejects the pre-barrier v1 wire version", () => {
+  it("rejects a different wire format", () => {
     const encoded = encodeDataFrame(outputFrame);
-    new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength).setUint8(4, 1);
+    new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength).setUint8(4, 2);
     expect(() => decodeDataFrame(encoded)).toThrowError(
-      expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_VERSION" }),
+      expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_FORMAT" }),
     );
-  });
-
-  it("rewrites only relay-owned delivery fields", () => {
-    const encoded = encodeDataFrame(outputFrame);
-    const rewritten = decodeDataFrame(rewriteDelivery(encoded, 9n, 42));
-
-    expect(rewritten).toEqual({
-      ...outputFrame,
-      deliveryGeneration: 9n,
-      streamId: 42,
-    });
-    expect(decodeDataFrame(encoded)).toEqual(outputFrame);
   });
 
   it("rejects a payload length that does not match the websocket message", () => {
@@ -75,23 +61,6 @@ describe("data frame codec", () => {
     expect(() => decodeDataFrame(encoded)).toThrowError(
       expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_FLAGS" }),
     );
-  });
-
-  it("round-trips strict warm and snapshot delivery barrier payloads", () => {
-    const warm = { mode: "warm", connectionId: "connection_AAAAAAAAA" } as const;
-    const snapshot = {
-      mode: "snapshot",
-      connectionId: "connection_AAAAAAAAA",
-      snapshotId: "snapshot_AAAAAAAAAAA",
-    } as const;
-
-    expect(decodeDeliveryBarrierPayload(encodeDeliveryBarrierPayload(warm))).toEqual(warm);
-    expect(decodeDeliveryBarrierPayload(encodeDeliveryBarrierPayload(snapshot))).toEqual(snapshot);
-    expect(() =>
-      decodeDeliveryBarrierPayload(
-        new TextEncoder().encode(JSON.stringify({ ...warm, mode: "unknown", privilege: "host" })),
-      ),
-    ).toThrowError(expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_PAYLOAD" }));
   });
 });
 

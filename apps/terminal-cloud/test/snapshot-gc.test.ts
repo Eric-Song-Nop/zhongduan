@@ -30,7 +30,7 @@ describe("snapshot object garbage collection", () => {
     );
     const object = {
       checksums: { sha256: hexToBytes(metadata.sha256).buffer },
-      customMetadata: snapshotCustomMetadata(metadata, "multipart-verified"),
+      customMetadata: snapshotCustomMetadata(metadata),
       etag: "single-part-etag",
       httpMetadata: {
         cacheControl: "private, no-store",
@@ -39,13 +39,9 @@ describe("snapshot object garbage collection", () => {
       size: Number(metadata.compressedLength),
     };
 
-    expect(matchesSnapshotObject(object as R2Object, metadata, "multipart-verified")).toBe(false);
+    expect(matchesSnapshotObject(object as R2Object, metadata)).toBe(false);
     expect(
-      matchesSnapshotObject(
-        { ...object, etag: "multipart-etag-1" } as R2Object,
-        metadata,
-        "multipart-verified",
-      ),
+      matchesSnapshotObject({ ...object, etag: "multipart-etag-1" } as R2Object, metadata),
     ).toBe(true);
   });
 

@@ -173,6 +173,7 @@ describe("HostCloudRelay", () => {
     const resetOwner = vi.spyOn(recoverySourceManager, "resetOwner");
     const disposeRecovery = vi.spyOn(recoverySourceManager, "dispose");
     const disposeSnapshotPublisher = vi.fn();
+    const publishSnapshot = vi.fn(async () => Promise.reject(new Error("injected failure")));
     let connectionNumber = 0;
     const relay = new HostCloudRelay({
       api: {
@@ -197,7 +198,7 @@ describe("HostCloudRelay", () => {
       sessionId: "session_AAAAAAAAA",
       snapshotPublisher: {
         dispose: disposeSnapshotPublisher,
-        publish: async () => Promise.reject(new Error("unused")),
+        publish: publishSnapshot,
       },
       stableConnectionMs: 1_000,
       webSocketFactory: (url) => new ShortLivedWebSocket(url, true) as unknown as WebSocket,
@@ -206,6 +207,7 @@ describe("HostCloudRelay", () => {
     const firstReady = relay.start();
     await vi.advanceTimersByTimeAsync(0);
     await firstReady;
+    expect(publishSnapshot).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(105);
     expect(connectionNumber).toBe(2);
     expect(resetOwner).toHaveBeenCalledTimes(2);

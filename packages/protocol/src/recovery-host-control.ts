@@ -5,66 +5,66 @@ import {
   RecoveryResourceIdSchema,
   RecoverySourceClosedSchema,
   type RecoverySourceClosed,
-} from "./recovery-v3-control";
+} from "./recovery-control";
 import { DecimalU64Schema, PositiveDecimalU64Schema } from "./scalars";
 import { SnapshotResourceIdSchema } from "./snapshot";
 
 const streamId = z.number().int().min(1).max(0xffff_ffff);
 const engineId = z.string().min(1).max(512);
 
-export const RecoveryV3HostRoutingIdentitySchema = z.strictObject({
+export const RecoveryHostRoutingIdentitySchema = z.strictObject({
   recoveryId: RecoveryResourceIdSchema,
   connectionId: RecoveryResourceIdSchema,
   streamId,
   deliveryGeneration: PositiveDecimalU64Schema,
 });
-export type RecoveryV3HostRoutingIdentity = z.infer<typeof RecoveryV3HostRoutingIdentitySchema>;
+export type RecoveryHostRoutingIdentity = z.infer<typeof RecoveryHostRoutingIdentitySchema>;
 
-export const RecoveryV3HostRecoverySourceSchema = z.discriminatedUnion("kind", [
+export const RecoveryHostRecoverySourceSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("warm") }),
   z.strictObject({
     kind: z.literal("snapshot"),
     snapshotId: SnapshotResourceIdSchema,
   }),
 ]);
-export type RecoveryV3HostRecoverySource = z.infer<typeof RecoveryV3HostRecoverySourceSchema>;
+export type RecoveryHostRecoverySource = z.infer<typeof RecoveryHostRecoverySourceSchema>;
 
-const routingIdentity = RecoveryV3HostRoutingIdentitySchema.shape;
+const routingIdentity = RecoveryHostRoutingIdentitySchema.shape;
 
-export const RecoveryV3HostPrepareSchema = z.strictObject({
+export const RecoveryHostPrepareSchema = z.strictObject({
   type: z.literal("recovery-prepare"),
   ...routingIdentity,
   engineId,
   base: AuthorityCursorSchema,
-  source: RecoveryV3HostRecoverySourceSchema,
+  source: RecoveryHostRecoverySourceSchema,
 });
-export type RecoveryV3HostPrepare = z.infer<typeof RecoveryV3HostPrepareSchema>;
+export type RecoveryHostPrepare = z.infer<typeof RecoveryHostPrepareSchema>;
 
-export const RecoveryV3HostStartReadySchema = z.strictObject({
+export const RecoveryHostStartReadySchema = z.strictObject({
   type: z.literal("recovery-start-ready"),
   ...routingIdentity,
   committedThrough: AuthorityCursorSchema,
   cumulativeGrantedEncodedBytes: DecimalU64Schema,
 });
-export type RecoveryV3HostStartReady = z.infer<typeof RecoveryV3HostStartReadySchema>;
+export type RecoveryHostStartReady = z.infer<typeof RecoveryHostStartReadySchema>;
 
-export const RecoveryV3HostSourceGrantSchema = z.strictObject({
+export const RecoveryHostSourceGrantSchema = z.strictObject({
   type: z.literal("recovery-source-grant"),
   ...routingIdentity,
   cumulativeGrantedEncodedBytes: DecimalU64Schema,
 });
-export type RecoveryV3HostSourceGrant = z.infer<typeof RecoveryV3HostSourceGrantSchema>;
+export type RecoveryHostSourceGrant = z.infer<typeof RecoveryHostSourceGrantSchema>;
 
-export const RecoveryV3HostSourceReceivedSchema = z.strictObject({
+export const RecoveryHostSourceReceivedSchema = z.strictObject({
   type: z.literal("recovery-source-received"),
   ...routingIdentity,
   lane: z.literal("recovery"),
   contiguousDeliveryOrdinal: PositiveDecimalU64Schema,
   cumulativeEncodedBytes: PositiveDecimalU64Schema,
 });
-export type RecoveryV3HostSourceReceived = z.infer<typeof RecoveryV3HostSourceReceivedSchema>;
+export type RecoveryHostSourceReceived = z.infer<typeof RecoveryHostSourceReceivedSchema>;
 
-export const RecoveryV3HostSourceResetSchema = z.strictObject({
+export const RecoveryHostSourceResetSchema = z.strictObject({
   type: z.literal("recovery-source-reset"),
   ...routingIdentity,
   reason: z.enum([
@@ -76,9 +76,9 @@ export const RecoveryV3HostSourceResetSchema = z.strictObject({
     "session-disposed",
   ]),
 });
-export type RecoveryV3HostSourceReset = z.infer<typeof RecoveryV3HostSourceResetSchema>;
+export type RecoveryHostSourceReset = z.infer<typeof RecoveryHostSourceResetSchema>;
 
-export const RecoveryV3HostPrepareRejectedSchema = z.strictObject({
+export const RecoveryHostPrepareRejectedSchema = z.strictObject({
   type: z.literal("recovery-prepare-rejected"),
   ...routingIdentity,
   reason: z.enum([
@@ -91,39 +91,35 @@ export const RecoveryV3HostPrepareRejectedSchema = z.strictObject({
     "client-gone",
   ]),
 });
-export type RecoveryV3HostPrepareRejected = z.infer<typeof RecoveryV3HostPrepareRejectedSchema>;
+export type RecoveryHostPrepareRejected = z.infer<typeof RecoveryHostPrepareRejectedSchema>;
 
-export const RecoveryV3HostSourceClosedSchema = z.strictObject({
+export const RecoveryHostSourceClosedSchema = z.strictObject({
   type: z.literal("recovery-source-closed"),
   ...routingIdentity,
   throughRecoveryOrdinal: PositiveDecimalU64Schema,
   throughRecoveryCumulativeEncodedBytes: PositiveDecimalU64Schema,
 });
-export type RecoveryV3HostSourceClosed = z.infer<typeof RecoveryV3HostSourceClosedSchema>;
+export type RecoveryHostSourceClosed = z.infer<typeof RecoveryHostSourceClosedSchema>;
 
-export const RecoveryV3CloudToHostControlFrameSchema = z.discriminatedUnion("type", [
-  RecoveryV3HostPrepareSchema,
-  RecoveryV3HostStartReadySchema,
-  RecoveryV3HostSourceGrantSchema,
-  RecoveryV3HostSourceReceivedSchema,
-  RecoveryV3HostSourceResetSchema,
+export const RecoveryCloudToHostControlFrameSchema = z.discriminatedUnion("type", [
+  RecoveryHostPrepareSchema,
+  RecoveryHostStartReadySchema,
+  RecoveryHostSourceGrantSchema,
+  RecoveryHostSourceReceivedSchema,
+  RecoveryHostSourceResetSchema,
 ]);
-export type RecoveryV3CloudToHostControlFrame = z.infer<
-  typeof RecoveryV3CloudToHostControlFrameSchema
->;
+export type RecoveryCloudToHostControlFrame = z.infer<typeof RecoveryCloudToHostControlFrameSchema>;
 
-export const RecoveryV3HostToCloudControlFrameSchema = z.discriminatedUnion("type", [
-  RecoveryV3HostPrepareRejectedSchema,
-  RecoveryV3HostSourceClosedSchema,
+export const RecoveryHostToCloudControlFrameSchema = z.discriminatedUnion("type", [
+  RecoveryHostPrepareRejectedSchema,
+  RecoveryHostSourceClosedSchema,
 ]);
-export type RecoveryV3HostToCloudControlFrame = z.infer<
-  typeof RecoveryV3HostToCloudControlFrameSchema
->;
+export type RecoveryHostToCloudControlFrame = z.infer<typeof RecoveryHostToCloudControlFrameSchema>;
 
 export function toBrowserRecoverySourceClosed(
-  input: RecoveryV3HostSourceClosed,
+  input: RecoveryHostSourceClosed,
 ): RecoverySourceClosed {
-  const sourceClosed = RecoveryV3HostSourceClosedSchema.parse(input);
+  const sourceClosed = RecoveryHostSourceClosedSchema.parse(input);
   return RecoverySourceClosedSchema.parse({
     type: sourceClosed.type,
     recoveryId: sourceClosed.recoveryId,

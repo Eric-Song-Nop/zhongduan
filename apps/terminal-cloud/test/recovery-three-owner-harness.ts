@@ -1,17 +1,15 @@
 import {
-  DELIVERY_ENVELOPE_V3_HEADER_BYTES,
+  DELIVERY_ENVELOPE_HEADER_BYTES,
   DataFrameFlag,
   DataFrameKind,
-  RELAY_CAPABILITIES_HEADER,
-  RelayCapability,
   decodeDataFrame,
-  decodeDeliveryEnvelopeV3,
+  decodeDeliveryEnvelope,
   decodeServerControlFrame,
   encodeDataFrame,
-  encodeDeliveryEnvelopeV3,
+  encodeDeliveryEnvelope,
   type ConnectionSetResponse,
   type RecoveryStart,
-  type RecoveryV3ClientControlFrame,
+  type RecoveryProgressFrame,
   type ReplicaCursor,
   type ResizePayload,
 } from "@zhongduan/protocol";
@@ -20,7 +18,7 @@ import {
   type RecoveryRuntimeFailure,
   type ReplicaHost,
   type ReplicaSink,
-  type SnapshotManifest,
+  type SnapshotRestoreSource,
   type SnapshotTransport,
 } from "@zhongduan/session-client";
 import { env, exports as workerExports } from "cloudflare:workers";
@@ -36,11 +34,10 @@ import {
   RecoverySourceManager,
   type RecoverySourceManagerLimits,
 } from "../../host-daemon/src/cloud/recovery-source-manager";
-import { SnapshotCheckpointManager } from "../../host-daemon/src/cloud/snapshot-checkpoint-manager";
 import { RelayRecoveryStore } from "../src/worker/relay-recovery-store";
-import { SocketAttachmentV3Schema } from "../src/worker/relay-socket";
-import { RelayV3DeliveryRing } from "../src/worker/relay-v3-delivery-ring";
-import { RelayV3DeliveryScheduler } from "../src/worker/relay-v3-delivery-scheduler";
+import { SocketAttachmentSchema } from "../src/worker/relay-socket";
+import { RelayDeliveryRing } from "../src/worker/relay-delivery-ring";
+import { RelayDeliveryScheduler } from "../src/worker/relay-delivery-scheduler";
 import { installMiniflareMultipartEtagShim, uploadSnapshot } from "./snapshot-test-helpers";
 
 export interface CreatedThreeOwnerSession {
@@ -64,12 +61,11 @@ export interface LiteralOracleState {
 
 export interface ProgressAttempt {
   readonly encoded: string;
-  readonly frame: RecoveryV3ClientControlFrame;
+  readonly frame: RecoveryProgressFrame;
   readonly sent: boolean;
 }
 
 interface OpenHost {
-  readonly checkpointManager: SnapshotCheckpointManager;
   readonly connection: HostRelayConnection;
   readonly pair: HostSocketPair;
 }
@@ -88,21 +84,6 @@ interface HeldStart {
 const origin = "https://terminal.example.test";
 const engineId = "fake-terminal-authority/v1";
 const epoch = 7n;
-const hostCapabilities = [
-  RelayCapability.capabilityNegotiationV1,
-  RelayCapability.authorityDataV2,
-  RelayCapability.wireEndpointV3,
-  RelayCapability.recoveryV3GapFillV1,
-] as const;
-const browserCapabilities = [
-  RelayCapability.capabilityNegotiationV1,
-  RelayCapability.authorityDataV2,
-  RelayCapability.wireEndpointV3,
-  RelayCapability.deliveryEnvelopeV3,
-  RelayCapability.deliveryReceiveCreditV1,
-  RelayCapability.authorityApplyProgressV1,
-  RelayCapability.recoveryV3GapFillV1,
-] as const;
 const recoveryLimits: RecoverySourceManagerLimits = {
   maxCanonicalBytesPerSource: 256 * 1024,
   maxCanonicalFramesPerSource: 512,
@@ -249,11 +230,11 @@ export class LiteralReplicaHost implements ReplicaHost {
 
   async restore(
     snapshot: Uint8Array,
-    manifest: SnapshotManifest,
+    source: SnapshotRestoreSource,
     signal: AbortSignal,
   ): Promise<ReplicaSink> {
     signal.throwIfAborted();
-    if (manifest.engineId !== engineId) throw new Error("literal snapshot engine mismatch");
+    if (source.engineId !== engineId) throw new Error("literal snapshot engine mismatch");
     const decoded = JSON.parse(new TextDecoder().decode(snapshot)) as {
       engineId?: unknown;
       mutations?: unknown;
@@ -307,7 +288,7 @@ export interface OpenRawRecoveryBrowser {
   readonly start: RecoveryStart;
 }
 
-type RecoveryServerControlFrame = ReturnType<typeof decodeServerControlFrame<"v3">>;
+type RecoveryServerControlFrame = ReturnType<typeof decodeServerControlFrame>;
 
 type AttemptRow = Record<string, SqlStorageValue> & {
   readonly adopted_json: string | null;
@@ -372,11 +353,7 @@ export class ThreeOwnerHarness {
   }
 
   async openHost(): Promise<OpenHost> {
-    const connection = await createConnectionSet(
-      this.cloud.sessionId,
-      this.cloud.hostCapability,
-      hostCapabilities,
-    );
+    const connection = await createConnectionSet(this.cloud.sessionId, this.cloud.hostCapability);
     const control = await this.upgrade("control", connection.controlTicket);
     const data = await this.upgrade("data", connection.dataTicket);
     // The workerd hibernation-test client WebSocket omits the standard outbound buffer metric.
@@ -399,26 +376,6 @@ export class ThreeOwnerHarness {
         closeSocket(control, code, reason);
       },
     };
-    const checkpointManager = new SnapshotCheckpointManager({
-      publisher: {
-        publish: async (snapshot) => ({
-          metadata: {
-            sessionId: this.cloud.sessionId,
-            snapshotId: "snapshot_three_owner_unused",
-            engineId: snapshot.engineId,
-            sessionEpoch: snapshot.sessionEpoch.toString(),
-            cutEventSeq: snapshot.cutEventSeq.toString(),
-            nextPtyOffset: snapshot.nextPtyOffset.toString(),
-            compression: "none",
-            compressedLength: snapshot.bytes.byteLength.toString(),
-            uncompressedLength: snapshot.bytes.byteLength.toString(),
-            sha256: "0".repeat(64),
-          },
-        }),
-      },
-      session: this.session,
-      sessionId: this.cloud.sessionId,
-    });
     const host = new HostRelayConnection({
       heartbeatIntervalMs: 60_000,
       heartbeatTimeoutMs: 120_000,
@@ -426,10 +383,9 @@ export class ThreeOwnerHarness {
       recoveryDeadlineTickMs: 60_000,
       recoverySourceManager: this.recoverySources,
       session: this.session,
-      snapshotCheckpointManager: checkpointManager,
     });
     await host.start();
-    const opened = { checkpointManager, connection: host, pair };
+    const opened = { connection: host, pair };
     this.hosts.push(opened);
     return opened;
   }
@@ -496,7 +452,6 @@ export class ThreeOwnerHarness {
     const connection = await createConnectionSet(
       this.cloud.sessionId,
       capability,
-      browserCapabilities,
       options.clientId,
     );
     if (connection.clientId === null) throw new Error("Browser connection lacks client identity");
@@ -566,7 +521,7 @@ export class ThreeOwnerHarness {
       if (typeof event.data !== "string") return;
       let frame: RecoveryServerControlFrame;
       try {
-        frame = decodeServerControlFrame(event.data, "v3");
+        frame = decodeServerControlFrame(event.data);
       } catch {
         return;
       }
@@ -585,11 +540,11 @@ export class ThreeOwnerHarness {
     });
     data.addEventListener("message", (event) => {
       void binaryEventBytes(event).then((bytes) => {
-        const envelope = decodeDeliveryEnvelopeV3(bytes);
+        const envelope = decodeDeliveryEnvelope(bytes);
         trace.push(`data:${envelope.lane}:${envelope.deliveryOrdinal}`);
         if (
           envelope.lane === "recovery" &&
-          decodeDataFrame(envelope.payload).kind === DataFrameKind.ReplayCommit
+          decodeDataFrame(envelope.payload).kind === DataFrameKind.RecoveryDone
         ) {
           finalRecoveryDeliveryOrdinal = envelope.deliveryOrdinal.toString();
         }
@@ -645,7 +600,6 @@ export class ThreeOwnerHarness {
     const connection = await createConnectionSet(
       this.cloud.sessionId,
       this.cloud.observerCapability,
-      browserCapabilities,
       clientId,
     );
     if (connection.clientId === null) throw new Error("raw Browser lacks client identity");
@@ -731,7 +685,6 @@ export class ThreeOwnerHarness {
       durable,
       hostSources: this.recoverySources.counters,
       host: {
-        negotiatedCapabilities: this.currentHost.pair.connection.negotiatedCapabilities,
         controlReadyState: this.currentHost.pair.control.readyState,
         dataReadyState: this.currentHost.pair.data.readyState,
         controlTrace: this.hostControlTrace,
@@ -837,7 +790,7 @@ export class ThreeOwnerHarness {
         .getWebSockets(`client:${browser.clientId}`)
         .find(
           (socket) =>
-            SocketAttachmentV3Schema.parse(socket.deserializeAttachment()).channel === "data",
+            SocketAttachmentSchema.parse(socket.deserializeAttachment()).channel === "data",
         );
       if (serverData === undefined) throw new Error("slow Browser data socket is missing");
       Object.defineProperty(serverData, "send", {
@@ -859,7 +812,6 @@ export class ThreeOwnerHarness {
     }
     for (const host of this.hosts) {
       host.connection.close();
-      host.checkpointManager.dispose();
     }
     this.recoverySources.dispose();
     this.session.dispose();
@@ -867,14 +819,14 @@ export class ThreeOwnerHarness {
     await scheduler.wait(0);
     await runInDurableObject(this.stub, async (instance) => {
       const deliveryScheduler = Reflect.get(instance, "recoveryDeliveryScheduler");
-      if (deliveryScheduler instanceof RelayV3DeliveryScheduler) {
+      if (deliveryScheduler instanceof RelayDeliveryScheduler) {
         await deliveryScheduler.whenIdle();
         if (deliveryScheduler.queuedRecords !== 0) {
           throw new Error("three-owner cleanup left scheduled delivery records");
         }
       }
       const ring = Reflect.get(instance, "recoveryDeliveryRing");
-      if (ring instanceof RelayV3DeliveryRing) {
+      if (ring instanceof RelayDeliveryRing) {
         const usage = ring.usage;
         if (usage.physicalBytes !== 0 || usage.physicalEntries !== 0 || usage.references !== 0) {
           throw new Error("three-owner cleanup left delivery-ring ownership");
@@ -1058,7 +1010,7 @@ export function nextClose(socket: WebSocket): Promise<CloseEvent> {
 
 function emptyRecoveryDone(connection: ConnectionSetResponse): Uint8Array {
   const payload = encodeDataFrame({
-    kind: DataFrameKind.ReplayCommit,
+    kind: DataFrameKind.RecoveryDone,
     flags: DataFrameFlag.None,
     sessionEpoch: epoch,
     deliveryGeneration: 0n,
@@ -1067,11 +1019,11 @@ function emptyRecoveryDone(connection: ConnectionSetResponse): Uint8Array {
     streamId: 0,
     payload: new Uint8Array(),
   });
-  return encodeDeliveryEnvelopeV3({
+  return encodeDeliveryEnvelope({
     lane: "recovery",
     deliveryGeneration: BigInt(connection.deliveryGeneration),
     deliveryOrdinal: 1n,
-    cumulativeEncodedBytes: BigInt(DELIVERY_ENVELOPE_V3_HEADER_BYTES + payload.byteLength),
+    cumulativeEncodedBytes: BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + payload.byteLength),
     streamId: connection.streamId,
     payload,
   });
@@ -1096,7 +1048,6 @@ async function createCloudSession(): Promise<CreatedThreeOwnerSession> {
 async function createConnectionSet(
   sessionId: string,
   capability: string,
-  capabilities: readonly string[],
   clientId?: string,
 ): Promise<ConnectionSetResponse> {
   const response = await workerExports.default.fetch(
@@ -1105,7 +1056,6 @@ async function createConnectionSet(
       headers: {
         authorization: `Bearer ${capability}`,
         "content-type": "application/json",
-        [RELAY_CAPABILITIES_HEADER]: capabilities.join(","),
       },
       body: JSON.stringify(clientId === undefined ? {} : { clientId }),
     }),
@@ -1116,7 +1066,7 @@ async function createConnectionSet(
   return response.json<ConnectionSetResponse>();
 }
 
-function progressKey(frame: RecoveryV3ClientControlFrame): string {
+function progressKey(frame: RecoveryProgressFrame): string {
   if (frame.type === "delivery-received") {
     return `${frame.type}:${frame.lane}:${frame.contiguousDeliveryOrdinal}:${frame.cumulativeEncodedBytes}`;
   }
@@ -1141,7 +1091,7 @@ function nextServerFrame(
       if (typeof event.data !== "string") return;
       let frame: RecoveryServerControlFrame;
       try {
-        frame = decodeServerControlFrame(event.data, "v3");
+        frame = decodeServerControlFrame(event.data);
       } catch {
         return;
       }

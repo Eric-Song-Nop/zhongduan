@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
-  RelayV3DeliveryRing,
-  type RelayV3DeliveryRef,
-  type RelayV3DeliveryRefIdentity,
-} from "../src/worker/relay-v3-delivery-ring";
+  RelayDeliveryRing,
+  type RelayDeliveryRef,
+  type RelayDeliveryRefIdentity,
+} from "../src/worker/relay-delivery-ring";
 import {
-  RelayV3DeliveryScheduler,
-  type RelayV3DeliveryClass,
-} from "../src/worker/relay-v3-delivery-scheduler";
+  RelayDeliveryScheduler,
+  type RelayDeliveryClass,
+} from "../src/worker/relay-delivery-scheduler";
 
 const KIB = 1024;
 
@@ -16,7 +16,7 @@ function identity(
   lane: "live" | "recovery",
   ordinal: number,
   encodedBytes: number,
-): RelayV3DeliveryRefIdentity {
+): RelayDeliveryRefIdentity {
   return {
     recoveryId: `recovery-${flow}`,
     clientId: `client-${flow}`,
@@ -30,12 +30,12 @@ function identity(
 }
 
 function retain(
-  ring: RelayV3DeliveryRing,
+  ring: RelayDeliveryRing,
   flow: string,
   lane: "live" | "recovery",
   ordinal: number,
   bytes: number,
-): RelayV3DeliveryRef {
+): RelayDeliveryRef {
   const payload = new Uint8Array(lane === "live" ? bytes - 40 : bytes);
   const retained =
     lane === "live"
@@ -45,19 +45,19 @@ function retain(
   return "refs" in retained ? retained.refs[0]! : retained.ref;
 }
 
-function schedulerRing(maxReferences = 512): RelayV3DeliveryRing {
-  return new RelayV3DeliveryRing({
+function schedulerRing(maxReferences = 512): RelayDeliveryRing {
+  return new RelayDeliveryRing({
     maxPhysicalBytes: 16 * 1024 * KIB,
     maxPhysicalEntries: maxReferences,
     maxReferences,
   });
 }
 
-describe("RelayV3DeliveryScheduler", () => {
+describe("RelayDeliveryScheduler", () => {
   it("serves the four classes in exact 4/2/2/1 weighted byte rounds", async () => {
     const ring = schedulerRing();
     const events: string[] = [];
-    const scheduler = new RelayV3DeliveryScheduler({
+    const scheduler = new RelayDeliveryScheduler({
       ring,
       yieldDataTurn: async (delayMs) => {
         expect(delayMs).toBe(0);
@@ -73,7 +73,7 @@ describe("RelayV3DeliveryScheduler", () => {
         throw new Error("unexpected delivery failure");
       },
     });
-    const counts: Record<RelayV3DeliveryClass, number> = {
+    const counts: Record<RelayDeliveryClass, number> = {
       "writer-live": 8,
       "observer-live": 4,
       "writer-recovery": 4,
@@ -81,7 +81,7 @@ describe("RelayV3DeliveryScheduler", () => {
     };
 
     for (const [deliveryClass, count] of Object.entries(counts) as Array<
-      [RelayV3DeliveryClass, number]
+      [RelayDeliveryClass, number]
     >) {
       const lane = deliveryClass.endsWith("live") ? "live" : "recovery";
       for (let ordinal = 1; ordinal <= count; ordinal += 1) {
@@ -128,7 +128,7 @@ describe("RelayV3DeliveryScheduler", () => {
     const ring = schedulerRing();
     const sends: string[] = [];
     const bytesByFlow = new Map<string, number>();
-    const scheduler = new RelayV3DeliveryScheduler({
+    const scheduler = new RelayDeliveryScheduler({
       ring,
       yieldDataTurn: async () => undefined,
       send: ({ identity: sentIdentity, payload }) => {
@@ -166,8 +166,8 @@ describe("RelayV3DeliveryScheduler", () => {
 
   it("preserves 4/2/2/1 class weights for sustained 16 KiB records", async () => {
     const ring = schedulerRing();
-    const sends: RelayV3DeliveryClass[] = [];
-    const scheduler = new RelayV3DeliveryScheduler({
+    const sends: RelayDeliveryClass[] = [];
+    const scheduler = new RelayDeliveryScheduler({
       ring,
       yieldDataTurn: async () => undefined,
       send: ({ deliveryClass }) => {
@@ -178,7 +178,7 @@ describe("RelayV3DeliveryScheduler", () => {
         throw new Error("unexpected delivery failure");
       },
     });
-    const records: Record<RelayV3DeliveryClass, number> = {
+    const records: Record<RelayDeliveryClass, number> = {
       "writer-live": 32,
       "observer-live": 16,
       "writer-recovery": 16,
@@ -186,7 +186,7 @@ describe("RelayV3DeliveryScheduler", () => {
     };
 
     for (const [deliveryClass, count] of Object.entries(records) as Array<
-      [RelayV3DeliveryClass, number]
+      [RelayDeliveryClass, number]
     >) {
       const lane = deliveryClass.endsWith("live") ? "live" : "recovery";
       for (let ordinal = 1; ordinal <= count; ordinal += 1) {
@@ -200,11 +200,11 @@ describe("RelayV3DeliveryScheduler", () => {
     }
 
     await scheduler.whenIdle();
-    const weightedRecordRound: RelayV3DeliveryClass[] = [
-      ...Array<RelayV3DeliveryClass>(16).fill("writer-live"),
-      ...Array<RelayV3DeliveryClass>(8).fill("observer-live"),
-      ...Array<RelayV3DeliveryClass>(8).fill("writer-recovery"),
-      ...Array<RelayV3DeliveryClass>(4).fill("observer-recovery"),
+    const weightedRecordRound: RelayDeliveryClass[] = [
+      ...Array<RelayDeliveryClass>(16).fill("writer-live"),
+      ...Array<RelayDeliveryClass>(8).fill("observer-live"),
+      ...Array<RelayDeliveryClass>(8).fill("writer-recovery"),
+      ...Array<RelayDeliveryClass>(4).fill("observer-recovery"),
     ];
     expect(sends).toEqual([...weightedRecordRound, ...weightedRecordRound]);
     expect(ring.usage).toEqual({ physicalBytes: 0, physicalEntries: 0, references: 0 });
@@ -217,7 +217,7 @@ describe("RelayV3DeliveryScheduler", () => {
       releaseTurn = resolve;
     });
     let sends = 0;
-    const scheduler = new RelayV3DeliveryScheduler({
+    const scheduler = new RelayDeliveryScheduler({
       ring,
       yieldDataTurn: () => turn,
       send: () => {
@@ -250,7 +250,7 @@ describe("RelayV3DeliveryScheduler", () => {
     const ring = schedulerRing();
     const sentJobs: string[] = [];
     const failedJobs: string[] = [];
-    const scheduler = new RelayV3DeliveryScheduler({
+    const scheduler = new RelayDeliveryScheduler({
       ring,
       yieldDataTurn: async () => undefined,
       send: ({ identity: sentIdentity }) => {
@@ -297,7 +297,7 @@ describe("RelayV3DeliveryScheduler", () => {
     const ring = schedulerRing();
     const sentOrdinals: string[] = [];
     let failures = 0;
-    const scheduler = new RelayV3DeliveryScheduler({
+    const scheduler = new RelayDeliveryScheduler({
       ring,
       yieldDataTurn: async () => undefined,
       send: ({ identity: sentIdentity }) => {
@@ -335,7 +335,7 @@ describe("RelayV3DeliveryScheduler", () => {
     const failureGate = new Promise<void>((resolve) => {
       releaseFailure = resolve;
     });
-    const scheduler = new RelayV3DeliveryScheduler({
+    const scheduler = new RelayDeliveryScheduler({
       ring,
       yieldDataTurn: async () => undefined,
       send: ({ identity: sentIdentity }) => {
@@ -376,9 +376,9 @@ describe("RelayV3DeliveryScheduler", () => {
   it("re-fences exact-generation work admitted by a yielding failure callback", async () => {
     const ring = schedulerRing();
     const sentJobs: string[] = [];
-    let reenteredRef: RelayV3DeliveryRef | undefined;
-    let scheduler!: RelayV3DeliveryScheduler;
-    scheduler = new RelayV3DeliveryScheduler({
+    let reenteredRef: RelayDeliveryRef | undefined;
+    let scheduler!: RelayDeliveryScheduler;
+    scheduler = new RelayDeliveryScheduler({
       ring,
       yieldDataTurn: async () => undefined,
       send: ({ identity: sentIdentity }) => {
@@ -426,7 +426,7 @@ describe("RelayV3DeliveryScheduler", () => {
     const ring = schedulerRing();
     const ringOwnedRef = retain(ring, "ring-owner", "recovery", 1, 16 * KIB);
     const scheduledRef = retain(ring, "scheduler-owner", "recovery", 1, 16 * KIB);
-    const scheduler = new RelayV3DeliveryScheduler({
+    const scheduler = new RelayDeliveryScheduler({
       ring,
       yieldDataTurn: async () => undefined,
       send: () => {
@@ -465,7 +465,7 @@ describe("RelayV3DeliveryScheduler", () => {
     const firstGate = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
-    const scheduler = new RelayV3DeliveryScheduler({
+    const scheduler = new RelayDeliveryScheduler({
       ring,
       yieldDataTurn: async () => undefined,
       send: async () => {

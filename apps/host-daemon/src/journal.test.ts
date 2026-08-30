@@ -52,11 +52,11 @@ describe("EventJournal", () => {
     journal.append(outputFrame(3n, 2n, 0x43));
 
     expect(journal.entries().map((frame) => decodeDataFrame(frame).eventSeq)).toEqual([2n, 3n]);
-    expect(journal.replayFrom({ lastEventSeq: 0n, nextPtyOffset: 0n })).toEqual({
+    expect(journal.readFrom({ lastEventSeq: 0n, nextPtyOffset: 0n })).toEqual({
       status: "gap",
     });
 
-    const replay = journal.replayFrom({ lastEventSeq: 1n, nextPtyOffset: 1n });
+    const replay = journal.readFrom({ lastEventSeq: 1n, nextPtyOffset: 1n });
     expect(replay.status).toBe("ok");
     if (replay.status === "ok") {
       expect(replay.frames.map((frame) => decodeDataFrame(frame).eventSeq)).toEqual([2n, 3n]);
@@ -75,34 +75,12 @@ describe("EventJournal", () => {
     now = 11;
     journal.append(outputFrame(2n, 1n, 0x42));
 
-    expect(journal.replayFrom({ lastEventSeq: 1n, nextPtyOffset: 999n })).toEqual({
+    expect(journal.readFrom({ lastEventSeq: 1n, nextPtyOffset: 999n })).toEqual({
       status: "gap",
     });
-    expect(journal.replayFrom({ lastEventSeq: 1n, nextPtyOffset: 1n })).toMatchObject({
+    expect(journal.readFrom({ lastEventSeq: 1n, nextPtyOffset: 1n })).toMatchObject({
       status: "ok",
     });
-  });
-
-  it("replays only through the exact pinned commit", () => {
-    const journal = new EventJournal();
-    journal.append(outputFrame(1n, 0n, 0x41));
-    journal.append(outputFrame(2n, 1n, 0x42));
-    journal.append(outputFrame(3n, 2n, 0x43));
-
-    const replay = journal.replayThrough(
-      { lastEventSeq: 0n, nextPtyOffset: 0n },
-      { lastEventSeq: 2n, nextPtyOffset: 2n },
-    );
-    expect(replay.status).toBe("ok");
-    if (replay.status === "ok") {
-      expect(replay.frames.map((frame) => decodeDataFrame(frame).eventSeq)).toEqual([1n, 2n]);
-    }
-    expect(
-      journal.replayThrough(
-        { lastEventSeq: 0n, nextPtyOffset: 0n },
-        { lastEventSeq: 2n, nextPtyOffset: 99n },
-      ),
-    ).toEqual({ status: "gap" });
   });
 
   it("plans exact encoded bytes and frames without materializing the retained range", () => {
@@ -115,7 +93,7 @@ describe("EventJournal", () => {
     journal.append(last);
     const slice = vi.spyOn(Uint8Array.prototype, "slice");
 
-    const plan = journal.planReplayThrough(
+    const plan = journal.planRangeThrough(
       { lastEventSeq: 0n, nextPtyOffset: 0n },
       { lastEventSeq: 3n, nextPtyOffset: 8n },
     );
@@ -137,13 +115,13 @@ describe("EventJournal", () => {
     slice.mockRestore();
 
     expect(
-      journal.planReplayThrough(
+      journal.planRangeThrough(
         { lastEventSeq: 1n, nextPtyOffset: 3n },
         { lastEventSeq: 2n, nextPtyOffset: 3n },
       ),
     ).toMatchObject({ status: "ok", exactEncodedBytes: resize.byteLength, exactFrames: 1 });
     expect(
-      journal.planReplayThrough(
+      journal.planRangeThrough(
         { lastEventSeq: 3n, nextPtyOffset: 8n },
         { lastEventSeq: 3n, nextPtyOffset: 8n },
       ),
@@ -153,7 +131,7 @@ describe("EventJournal", () => {
   it("fails a planned range closed when the retained journal revision changes", () => {
     const journal = new EventJournal();
     journal.append(outputFrame(1n, 0n, 0x41));
-    const plan = journal.planReplayThrough(
+    const plan = journal.planRangeThrough(
       { lastEventSeq: 0n, nextPtyOffset: 0n },
       { lastEventSeq: 1n, nextPtyOffset: 1n },
     );

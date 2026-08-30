@@ -1,4 +1,4 @@
-import type { RecoveryV3HostRoutingIdentity } from "@zhongduan/protocol";
+import type { RecoveryHostRoutingIdentity } from "@zhongduan/protocol";
 import { describe, expect, it, vi } from "vitest";
 
 import type {
@@ -17,7 +17,7 @@ interface PendingTurn {
   readonly resolve: () => void;
 }
 
-function routing(streamId: number): RecoveryV3HostRoutingIdentity {
+function routing(streamId: number): RecoveryHostRoutingIdentity {
   return {
     recoveryId: `recovery-source-${streamId.toString().padStart(8, "0")}`,
     connectionId: `connection_${streamId.toString().padStart(5, "A")}`,
@@ -49,7 +49,7 @@ describe("RecoverySourceScheduler", () => {
     const manager = {
       drainGranted(
         _owner: RecoverySourceOwnerToken,
-        identity: RecoveryV3HostRoutingIdentity,
+        identity: RecoveryHostRoutingIdentity,
         _limits: RecoverySourceDrainLimits,
         send: (encoded: Uint8Array) => void,
       ): RecoverySourceDrainResult {
@@ -89,7 +89,7 @@ describe("RecoverySourceScheduler", () => {
     const manager = {
       drainGranted(
         actualOwner: RecoverySourceOwnerToken,
-        identity: RecoveryV3HostRoutingIdentity,
+        identity: RecoveryHostRoutingIdentity,
         limits: RecoverySourceDrainLimits,
         send: (encoded: Uint8Array) => void,
       ): RecoverySourceDrainResult {
@@ -160,7 +160,7 @@ describe("RecoverySourceScheduler", () => {
     const manager = {
       drainGranted(
         _owner: RecoverySourceOwnerToken,
-        identity: RecoveryV3HostRoutingIdentity,
+        identity: RecoveryHostRoutingIdentity,
         limits: RecoverySourceDrainLimits,
         send: (encoded: Uint8Array) => void,
       ): RecoverySourceDrainResult {
@@ -217,7 +217,7 @@ describe("RecoverySourceScheduler", () => {
     const manager = {
       drainGranted(
         _owner: RecoverySourceOwnerToken,
-        identity: RecoveryV3HostRoutingIdentity,
+        identity: RecoveryHostRoutingIdentity,
         limits: RecoverySourceDrainLimits,
         send: (encoded: Uint8Array) => void,
       ): RecoverySourceDrainResult {
@@ -260,7 +260,7 @@ describe("RecoverySourceScheduler", () => {
     const drainGranted = vi.fn(
       (
         _owner: RecoverySourceOwnerToken,
-        _identity: RecoveryV3HostRoutingIdentity,
+        _identity: RecoveryHostRoutingIdentity,
         _limits: RecoverySourceDrainLimits,
         send: (encoded: Uint8Array) => void,
       ): RecoverySourceDrainResult => {
@@ -299,7 +299,7 @@ describe("RecoverySourceScheduler", () => {
     const manager = {
       drainGranted(
         _owner: RecoverySourceOwnerToken,
-        _identity: RecoveryV3HostRoutingIdentity,
+        _identity: RecoveryHostRoutingIdentity,
         _limits: RecoverySourceDrainLimits,
         send: (encoded: Uint8Array) => void,
       ): RecoverySourceDrainResult {

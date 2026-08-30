@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
-  RelayV3DeliveryRing,
-  type RelayV3DeliveryRefIdentity,
-} from "../src/worker/relay-v3-delivery-ring";
+  RelayDeliveryRing,
+  type RelayDeliveryRefIdentity,
+} from "../src/worker/relay-delivery-ring";
 
 function identity(
   suffix: string,
   lane: "live" | "recovery",
-  overrides: Partial<RelayV3DeliveryRefIdentity> = {},
-): RelayV3DeliveryRefIdentity {
+  overrides: Partial<RelayDeliveryRefIdentity> = {},
+): RelayDeliveryRefIdentity {
   return {
     recoveryId: `recovery-${suffix}`,
     clientId: `client-${suffix}`,
@@ -22,9 +22,9 @@ function identity(
   };
 }
 
-describe("RelayV3DeliveryRing", () => {
+describe("RelayDeliveryRing", () => {
   it("owns one immutable live payload behind independent exact references", () => {
-    const ring = new RelayV3DeliveryRing({
+    const ring = new RelayDeliveryRing({
       maxPhysicalBytes: 3,
       maxPhysicalEntries: 1,
       maxReferences: 3,
@@ -61,7 +61,7 @@ describe("RelayV3DeliveryRing", () => {
   });
 
   it("owns one exact recovery encoding and releases it only once", () => {
-    const ring = new RelayV3DeliveryRing({
+    const ring = new RelayDeliveryRing({
       maxPhysicalBytes: 8,
       maxPhysicalEntries: 2,
       maxReferences: 2,
@@ -81,8 +81,8 @@ describe("RelayV3DeliveryRing", () => {
     expect(ring.usage).toEqual({ physicalBytes: 0, physicalEntries: 0, references: 0 });
   });
 
-  it("charges a live canonical reference for the complete v3 wire envelope", () => {
-    const ring = new RelayV3DeliveryRing({
+  it("charges a live canonical reference for the complete delivery wire envelope", () => {
+    const ring = new RelayDeliveryRing({
       maxPhysicalBytes: 3,
       maxPhysicalEntries: 1,
       maxReferences: 1,
@@ -99,7 +99,7 @@ describe("RelayV3DeliveryRing", () => {
   });
 
   it("rejects physical cap plus one atomically", () => {
-    const bytesRing = new RelayV3DeliveryRing({
+    const bytesRing = new RelayDeliveryRing({
       maxPhysicalBytes: 3,
       maxPhysicalEntries: 2,
       maxReferences: 2,
@@ -114,7 +114,7 @@ describe("RelayV3DeliveryRing", () => {
     ).toEqual({ ok: false, reason: "physical-capacity" });
     expect(bytesRing.usage).toEqual({ physicalBytes: 3, physicalEntries: 1, references: 1 });
 
-    const entryRing = new RelayV3DeliveryRing({
+    const entryRing = new RelayDeliveryRing({
       maxPhysicalBytes: 2,
       maxPhysicalEntries: 1,
       maxReferences: 2,
@@ -129,7 +129,7 @@ describe("RelayV3DeliveryRing", () => {
   });
 
   it("rejects reference cap plus one and duplicate exact identities atomically", () => {
-    const ring = new RelayV3DeliveryRing({
+    const ring = new RelayDeliveryRing({
       maxPhysicalBytes: 8,
       maxPhysicalEntries: 2,
       maxReferences: 2,
@@ -155,7 +155,7 @@ describe("RelayV3DeliveryRing", () => {
   });
 
   it("forgets only an exact generation identity and dispose releases the rest once", () => {
-    const ring = new RelayV3DeliveryRing({
+    const ring = new RelayDeliveryRing({
       maxPhysicalBytes: 8,
       maxPhysicalEntries: 4,
       maxReferences: 4,

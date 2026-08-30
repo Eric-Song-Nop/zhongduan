@@ -10,7 +10,6 @@ export const FinalizedSnapshotSchema = SnapshotMetadataSchema.safeExtend({
   objectKey: z.string().min(1).max(1024),
   r2Version: z.string().min(1).max(256),
   etag: z.string().min(1).max(256),
-  uploadKind: z.enum(["single-put-verified", "multipart-verified"]),
 });
 
 export type FinalizedSnapshot = z.infer<typeof FinalizedSnapshotSchema>;
@@ -59,10 +58,6 @@ export function snapshotUploadHeaders(metadata: SnapshotMetadata): Headers {
   });
 }
 
-export function snapshotObjectKey(sessionId: string, snapshotId: string): string {
-  return `v1/sessions/${sessionId}/snapshots/${snapshotId}.bin`;
-}
-
 export function snapshotAttemptObjectKey(
   sessionId: string,
   snapshotId: string,
@@ -71,22 +66,18 @@ export function snapshotAttemptObjectKey(
   return `v1/sessions/${sessionId}/snapshots/${snapshotId}/attempts/${attemptId}.bin`;
 }
 
-export function isSnapshotObjectKey(
+export function isSnapshotAttemptObjectKey(
   objectKey: string,
   sessionId: string,
   snapshotId: string,
 ): boolean {
-  if (objectKey === snapshotObjectKey(sessionId, snapshotId)) return true;
   const prefix = `v1/sessions/${sessionId}/snapshots/${snapshotId}/attempts/`;
   if (!objectKey.startsWith(prefix) || !objectKey.endsWith(".bin")) return false;
   return /^[A-Za-z0-9_-]{16,128}$/u.test(objectKey.slice(prefix.length, -4));
 }
 
-export function snapshotCustomMetadata(
-  metadata: SnapshotMetadata,
-  uploadKind: FinalizedSnapshot["uploadKind"] = "single-put-verified",
-): Record<string, string> {
-  const customMetadata = {
+export function snapshotCustomMetadata(metadata: SnapshotMetadata): Record<string, string> {
+  return {
     compression: metadata.compression,
     cutEventSeq: metadata.cutEventSeq,
     engineId: metadata.engineId,
@@ -98,7 +89,6 @@ export function snapshotCustomMetadata(
     compressedLength: metadata.compressedLength,
     uncompressedLength: metadata.uncompressedLength,
   };
-  return uploadKind === "multipart-verified" ? { ...customMetadata, uploadKind } : customMetadata;
 }
 
 export function hexToBytes(hex: string): Uint8Array {
@@ -120,19 +110,13 @@ export function matchesMultipartPartEtag(etag: string, expectedMd5: string): boo
   return etag.replaceAll('"', "").toLowerCase() === expectedMd5;
 }
 
-export function matchesSnapshotObject(
-  object: R2Object,
-  metadata: SnapshotMetadata,
-  uploadKind: FinalizedSnapshot["uploadKind"] = "single-put-verified",
-): boolean {
-  const expectedCustomMetadata = snapshotCustomMetadata(metadata, uploadKind);
+export function matchesSnapshotObject(object: R2Object, metadata: SnapshotMetadata): boolean {
+  const expectedCustomMetadata = snapshotCustomMetadata(metadata);
   const actualCustomMetadata = object.customMetadata ?? {};
   const checksum = object.checksums.sha256;
   const checksumMatches =
-    uploadKind === "multipart-verified"
-      ? object.etag.endsWith("-1") &&
-        (checksum === undefined || bytesToHex(checksum) === metadata.sha256)
-      : checksum !== undefined && bytesToHex(checksum) === metadata.sha256;
+    object.etag.endsWith("-1") &&
+    (checksum === undefined || bytesToHex(checksum) === metadata.sha256);
   return (
     object.size === Number(metadata.compressedLength) &&
     object.httpMetadata?.contentType === SNAPSHOT_MEDIA_TYPE &&

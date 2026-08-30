@@ -101,8 +101,7 @@ export function TerminalApp({ capability, capabilityError, onReload }: TerminalA
 
     void (async () => {
       const dispatcher = new InputDispatcher({
-        getObservedEventSeq: () =>
-          sessionRef.current?.coordinator.activeCursor?.lastEventSeq ?? null,
+        getObservedEventSeq: () => sessionRef.current?.activeCursor?.lastEventSeq ?? null,
       });
       let host: WTermReplicaHost;
       try {

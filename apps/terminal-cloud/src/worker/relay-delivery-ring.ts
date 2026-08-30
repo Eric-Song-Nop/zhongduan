@@ -1,53 +1,53 @@
-import { DELIVERY_ENVELOPE_V3_HEADER_BYTES } from "@zhongduan/protocol";
+import { DELIVERY_ENVELOPE_HEADER_BYTES } from "@zhongduan/protocol";
 
-export type RelayV3DeliveryLane = "live" | "recovery";
+export type RelayDeliveryLane = "live" | "recovery";
 
-export interface RelayV3DeliveryRefIdentity {
+export interface RelayDeliveryRefIdentity {
   readonly recoveryId: string;
   readonly clientId: string;
   readonly connectionId: string;
   readonly streamId: number;
   readonly deliveryGeneration: string;
-  readonly lane: RelayV3DeliveryLane;
+  readonly lane: RelayDeliveryLane;
   readonly deliveryOrdinal: string;
   readonly cumulativeEncodedBytes: string;
 }
 
-export type RelayV3DeliveryGenerationIdentity = Pick<
-  RelayV3DeliveryRefIdentity,
+export type RelayDeliveryGenerationIdentity = Pick<
+  RelayDeliveryRefIdentity,
   "recoveryId" | "clientId" | "connectionId" | "streamId" | "deliveryGeneration"
 >;
 
-export interface RelayV3DeliveryRingLimits {
+export interface RelayDeliveryRingLimits {
   readonly maxPhysicalBytes: number;
   readonly maxPhysicalEntries: number;
   readonly maxReferences: number;
 }
 
-export interface RelayV3DeliveryRingUsage {
+export interface RelayDeliveryRingUsage {
   readonly physicalBytes: number;
   readonly physicalEntries: number;
   readonly references: number;
 }
 
-const deliveryRefBrand: unique symbol = Symbol("RelayV3DeliveryRef");
+const deliveryRefBrand: unique symbol = Symbol("RelayDeliveryRef");
 
-export interface RelayV3DeliveryRef {
+export interface RelayDeliveryRef {
   readonly [deliveryRefBrand]: true;
 }
 
-export type RelayV3DeliveryRetainFailure = {
+export type RelayDeliveryRetainFailure = {
   readonly ok: false;
   readonly reason: "disposed" | "identity-conflict" | "physical-capacity" | "reference-capacity";
 };
 
-export type RelayV3LiveRetainResult =
-  | { readonly ok: true; readonly refs: readonly RelayV3DeliveryRef[] }
-  | RelayV3DeliveryRetainFailure;
+export type RelayLiveRetainResult =
+  | { readonly ok: true; readonly refs: readonly RelayDeliveryRef[] }
+  | RelayDeliveryRetainFailure;
 
-export type RelayV3RecoveryRetainResult =
-  | { readonly ok: true; readonly ref: RelayV3DeliveryRef }
-  | RelayV3DeliveryRetainFailure;
+export type RelayRecoveryRetainResult =
+  | { readonly ok: true; readonly ref: RelayDeliveryRef }
+  | RelayDeliveryRetainFailure;
 
 interface PhysicalEntry {
   readonly payload: Uint8Array;
@@ -57,7 +57,7 @@ interface PhysicalEntry {
 interface ReferenceEntry {
   readonly encodedBytes: number;
   readonly entryKey: symbol;
-  readonly identity: RelayV3DeliveryRefIdentity;
+  readonly identity: RelayDeliveryRefIdentity;
   readonly identityKey: string;
 }
 
@@ -69,7 +69,7 @@ function requirePositiveSafeInteger(value: number, name: string): void {
   }
 }
 
-function validateIdentity(identity: RelayV3DeliveryRefIdentity): void {
+function validateIdentity(identity: RelayDeliveryRefIdentity): void {
   for (const [name, value] of [
     ["recoveryId", identity.recoveryId],
     ["clientId", identity.clientId],
@@ -89,7 +89,7 @@ function validateIdentity(identity: RelayV3DeliveryRefIdentity): void {
   }
 }
 
-function immutableIdentity(identity: RelayV3DeliveryRefIdentity): RelayV3DeliveryRefIdentity {
+function immutableIdentity(identity: RelayDeliveryRefIdentity): RelayDeliveryRefIdentity {
   validateIdentity(identity);
   return Object.freeze({
     recoveryId: identity.recoveryId,
@@ -103,7 +103,7 @@ function immutableIdentity(identity: RelayV3DeliveryRefIdentity): RelayV3Deliver
   });
 }
 
-function identityKey(identity: RelayV3DeliveryRefIdentity): string {
+function identityKey(identity: RelayDeliveryRefIdentity): string {
   return JSON.stringify([
     identity.recoveryId,
     identity.clientId,
@@ -122,26 +122,26 @@ function payloadView(payload: ArrayBuffer | Uint8Array): Uint8Array {
   return source;
 }
 
-function newOpaqueRef(): RelayV3DeliveryRef {
+function newOpaqueRef(): RelayDeliveryRef {
   return Object.freeze({ [deliveryRefBrand]: true as const });
 }
 
-export class RelayV3DeliveryRing {
-  readonly #limits: RelayV3DeliveryRingLimits;
+export class RelayDeliveryRing {
+  readonly #limits: RelayDeliveryRingLimits;
   readonly #physical = new Map<symbol, PhysicalEntry>();
-  readonly #references = new Map<RelayV3DeliveryRef, ReferenceEntry>();
-  readonly #refsByIdentity = new Map<string, RelayV3DeliveryRef>();
+  readonly #references = new Map<RelayDeliveryRef, ReferenceEntry>();
+  readonly #refsByIdentity = new Map<string, RelayDeliveryRef>();
   #physicalBytes = 0;
   #disposed = false;
 
-  constructor(limits: RelayV3DeliveryRingLimits) {
+  constructor(limits: RelayDeliveryRingLimits) {
     requirePositiveSafeInteger(limits.maxPhysicalBytes, "maxPhysicalBytes");
     requirePositiveSafeInteger(limits.maxPhysicalEntries, "maxPhysicalEntries");
     requirePositiveSafeInteger(limits.maxReferences, "maxReferences");
     this.#limits = Object.freeze({ ...limits });
   }
 
-  get usage(): RelayV3DeliveryRingUsage {
+  get usage(): RelayDeliveryRingUsage {
     return {
       physicalBytes: this.#physicalBytes,
       physicalEntries: this.#physical.size,
@@ -151,9 +151,9 @@ export class RelayV3DeliveryRing {
 
   retainLiveCanonical(
     payload: ArrayBuffer | Uint8Array,
-    identities: readonly RelayV3DeliveryRefIdentity[],
+    identities: readonly RelayDeliveryRefIdentity[],
     encodedBytes: number,
-  ): RelayV3LiveRetainResult {
+  ): RelayLiveRetainResult {
     if (identities.length === 0)
       throw new RangeError("live delivery requires at least one reference");
     for (const identity of identities) {
@@ -161,7 +161,7 @@ export class RelayV3DeliveryRing {
         throw new RangeError("live canonical references must use the live lane");
       }
     }
-    if (encodedBytes !== payload.byteLength + DELIVERY_ENVELOPE_V3_HEADER_BYTES) {
+    if (encodedBytes !== payload.byteLength + DELIVERY_ENVELOPE_HEADER_BYTES) {
       throw new RangeError("encodedBytes must equal the complete live delivery envelope size");
     }
     const result = this.#retain(payload, identities, encodedBytes);
@@ -170,8 +170,8 @@ export class RelayV3DeliveryRing {
 
   retainRecoveryEncoded(
     payload: ArrayBuffer | Uint8Array,
-    identity: RelayV3DeliveryRefIdentity,
-  ): RelayV3RecoveryRetainResult {
+    identity: RelayDeliveryRefIdentity,
+  ): RelayRecoveryRetainResult {
     if (identity.lane !== "recovery") {
       throw new RangeError("exact recovery references must use the recovery lane");
     }
@@ -179,31 +179,31 @@ export class RelayV3DeliveryRing {
     return result.ok ? { ok: true, ref: result.refs[0]! } : result;
   }
 
-  identity(ref: RelayV3DeliveryRef): RelayV3DeliveryRefIdentity | undefined {
+  identity(ref: RelayDeliveryRef): RelayDeliveryRefIdentity | undefined {
     return this.#references.get(ref)?.identity;
   }
 
-  encodedBytes(ref: RelayV3DeliveryRef): number | undefined {
+  encodedBytes(ref: RelayDeliveryRef): number | undefined {
     return this.#references.get(ref)?.encodedBytes;
   }
 
-  payload(ref: RelayV3DeliveryRef): Uint8Array | undefined {
+  payload(ref: RelayDeliveryRef): Uint8Array | undefined {
     const reference = this.#references.get(ref);
     if (reference === undefined) return undefined;
     const entry = this.#physical.get(reference.entryKey);
     return entry === undefined ? undefined : entry.payload.slice();
   }
 
-  confirm(ref: RelayV3DeliveryRef): boolean {
+  confirm(ref: RelayDeliveryRef): boolean {
     return this.#release(ref);
   }
 
-  cancel(ref: RelayV3DeliveryRef): boolean {
+  cancel(ref: RelayDeliveryRef): boolean {
     return this.#release(ref);
   }
 
-  forgetGeneration(identity: RelayV3DeliveryGenerationIdentity): number {
-    const forgotten: RelayV3DeliveryRef[] = [];
+  forgetGeneration(identity: RelayDeliveryGenerationIdentity): number {
+    const forgotten: RelayDeliveryRef[] = [];
     for (const [ref, reference] of this.#references) {
       if (
         reference.identity.recoveryId === identity.recoveryId &&
@@ -229,11 +229,11 @@ export class RelayV3DeliveryRing {
 
   #retain(
     payload: ArrayBuffer | Uint8Array,
-    identities: readonly RelayV3DeliveryRefIdentity[],
+    identities: readonly RelayDeliveryRefIdentity[],
     encodedBytes: number,
   ):
-    | { readonly ok: true; readonly refs: readonly RelayV3DeliveryRef[] }
-    | RelayV3DeliveryRetainFailure {
+    | { readonly ok: true; readonly refs: readonly RelayDeliveryRef[] }
+    | RelayDeliveryRetainFailure {
     if (this.#disposed) return { ok: false, reason: "disposed" };
     const retainedIdentities = identities.map(immutableIdentity);
     const requestedKeys = retainedIdentities.map(identityKey);
@@ -278,7 +278,7 @@ export class RelayV3DeliveryRing {
     return { ok: true, refs: Object.freeze(refs) };
   }
 
-  #release(ref: RelayV3DeliveryRef): boolean {
+  #release(ref: RelayDeliveryRef): boolean {
     const reference = this.#references.get(ref);
     if (reference === undefined) return false;
     const entry = this.#physical.get(reference.entryKey);

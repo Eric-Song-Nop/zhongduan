@@ -1,21 +1,21 @@
 import {
-  type RelayV3DeliveryGenerationIdentity,
-  type RelayV3DeliveryLane,
-  type RelayV3DeliveryRef,
-  type RelayV3DeliveryRefIdentity,
-  RelayV3DeliveryRing,
-} from "./relay-v3-delivery-ring";
+  type RelayDeliveryGenerationIdentity,
+  type RelayDeliveryLane,
+  type RelayDeliveryRef,
+  type RelayDeliveryRefIdentity,
+  RelayDeliveryRing,
+} from "./relay-delivery-ring";
 
-export const RELAY_V3_DELIVERY_CLASSES = [
+export const RELAY_DELIVERY_CLASSES = [
   "writer-live",
   "observer-live",
   "writer-recovery",
   "observer-recovery",
 ] as const;
 
-export type RelayV3DeliveryClass = (typeof RELAY_V3_DELIVERY_CLASSES)[number];
+export type RelayDeliveryClass = (typeof RELAY_DELIVERY_CLASSES)[number];
 
-export const RELAY_V3_DELIVERY_CLASS_WEIGHTS: Readonly<Record<RelayV3DeliveryClass, number>> =
+export const RELAY_DELIVERY_CLASS_WEIGHTS: Readonly<Record<RelayDeliveryClass, number>> =
   Object.freeze({
     "writer-live": 4,
     "observer-live": 2,
@@ -23,45 +23,45 @@ export const RELAY_V3_DELIVERY_CLASS_WEIGHTS: Readonly<Record<RelayV3DeliveryCla
     "observer-recovery": 1,
   });
 
-const weightedClassRound: readonly RelayV3DeliveryClass[] = RELAY_V3_DELIVERY_CLASSES.flatMap(
+const weightedClassRound: readonly RelayDeliveryClass[] = RELAY_DELIVERY_CLASSES.flatMap(
   (deliveryClass) =>
-    Array<RelayV3DeliveryClass>(RELAY_V3_DELIVERY_CLASS_WEIGHTS[deliveryClass]).fill(deliveryClass),
+    Array<RelayDeliveryClass>(RELAY_DELIVERY_CLASS_WEIGHTS[deliveryClass]).fill(deliveryClass),
 );
 
-export const RELAY_V3_DELIVERY_BASE_QUANTUM_BYTES = 64 * 1024;
-export const RELAY_V3_DELIVERY_MAX_DEFICIT_BYTES = 512 * 1024;
-export const RELAY_V3_DELIVERY_MAX_RECORDS_PER_VISIT = 4;
+export const RELAY_DELIVERY_BASE_QUANTUM_BYTES = 64 * 1024;
+export const RELAY_DELIVERY_MAX_DEFICIT_BYTES = 512 * 1024;
+export const RELAY_DELIVERY_MAX_RECORDS_PER_VISIT = 4;
 
-export type RelayV3DeliverySendResult = "sent" | "stale" | "fatal";
+export type RelayDeliverySendResult = "sent" | "stale" | "fatal";
 
-export interface RelayV3DeliveryJobView {
-  readonly deliveryClass: RelayV3DeliveryClass;
-  readonly ref: RelayV3DeliveryRef;
-  readonly identity: RelayV3DeliveryRefIdentity;
+export interface RelayDeliveryJobView {
+  readonly deliveryClass: RelayDeliveryClass;
+  readonly ref: RelayDeliveryRef;
+  readonly identity: RelayDeliveryRefIdentity;
   readonly encodedBytes: number;
 }
 
-export interface RelayV3DeliverySendTurn extends RelayV3DeliveryJobView {
+export interface RelayDeliverySendTurn extends RelayDeliveryJobView {
   readonly payload: Uint8Array;
 }
 
-export interface RelayV3DeliverySchedulerOptions {
-  readonly ring: RelayV3DeliveryRing;
+export interface RelayDeliverySchedulerOptions {
+  readonly ring: RelayDeliveryRing;
   readonly yieldDataTurn: (delayMs: number) => Promise<void>;
   readonly send: (
-    turn: RelayV3DeliverySendTurn,
-  ) => RelayV3DeliverySendResult | Promise<RelayV3DeliverySendResult>;
-  readonly onFailure: (job: RelayV3DeliveryJobView) => void | Promise<void>;
+    turn: RelayDeliverySendTurn,
+  ) => RelayDeliverySendResult | Promise<RelayDeliverySendResult>;
+  readonly onFailure: (job: RelayDeliveryJobView) => void | Promise<void>;
 }
 
-export interface RelayV3DeliveryEnqueue {
-  readonly deliveryClass: RelayV3DeliveryClass;
-  readonly ref: RelayV3DeliveryRef;
+export interface RelayDeliveryEnqueue {
+  readonly deliveryClass: RelayDeliveryClass;
+  readonly ref: RelayDeliveryRef;
 }
 
 type JobState = "queued" | "yielding" | "sending" | "done" | "cancelled";
 
-interface PendingJob extends RelayV3DeliveryJobView {
+interface PendingJob extends RelayDeliveryJobView {
   readonly flowKey: string;
   state: JobState;
 }
@@ -76,14 +76,11 @@ interface DeliveryClassState {
   readonly flows: Map<string, DeliveryFlow>;
 }
 
-function laneForClass(deliveryClass: RelayV3DeliveryClass): RelayV3DeliveryLane {
+function laneForClass(deliveryClass: RelayDeliveryClass): RelayDeliveryLane {
   return deliveryClass === "writer-live" || deliveryClass === "observer-live" ? "live" : "recovery";
 }
 
-function flowKey(
-  deliveryClass: RelayV3DeliveryClass,
-  identity: RelayV3DeliveryRefIdentity,
-): string {
+function flowKey(deliveryClass: RelayDeliveryClass, identity: RelayDeliveryRefIdentity): string {
   return JSON.stringify([
     deliveryClass,
     identity.recoveryId,
@@ -96,8 +93,8 @@ function flowKey(
 }
 
 function sameGeneration(
-  candidate: RelayV3DeliveryRefIdentity,
-  expected: RelayV3DeliveryGenerationIdentity,
+  candidate: RelayDeliveryRefIdentity,
+  expected: RelayDeliveryGenerationIdentity,
 ): boolean {
   return (
     candidate.recoveryId === expected.recoveryId &&
@@ -108,23 +105,23 @@ function sameGeneration(
   );
 }
 
-export class RelayV3DeliveryScheduler {
-  readonly #ring: RelayV3DeliveryRing;
+export class RelayDeliveryScheduler {
+  readonly #ring: RelayDeliveryRing;
   readonly #yieldDataTurn: (delayMs: number) => Promise<void>;
-  readonly #send: RelayV3DeliverySchedulerOptions["send"];
-  readonly #onFailure: RelayV3DeliverySchedulerOptions["onFailure"];
-  readonly #classes = new Map<RelayV3DeliveryClass, DeliveryClassState>();
-  readonly #jobs = new Map<RelayV3DeliveryRef, PendingJob>();
+  readonly #send: RelayDeliverySchedulerOptions["send"];
+  readonly #onFailure: RelayDeliverySchedulerOptions["onFailure"];
+  readonly #classes = new Map<RelayDeliveryClass, DeliveryClassState>();
+  readonly #jobs = new Map<RelayDeliveryRef, PendingJob>();
   #classCursor = 0;
   #drainPromise: Promise<void> | undefined;
   #disposed = false;
 
-  constructor(options: RelayV3DeliverySchedulerOptions) {
+  constructor(options: RelayDeliverySchedulerOptions) {
     this.#ring = options.ring;
     this.#yieldDataTurn = options.yieldDataTurn;
     this.#send = options.send;
     this.#onFailure = options.onFailure;
-    for (const deliveryClass of RELAY_V3_DELIVERY_CLASSES) {
+    for (const deliveryClass of RELAY_DELIVERY_CLASSES) {
       this.#classes.set(deliveryClass, { flowOrder: [], flows: new Map() });
     }
   }
@@ -133,7 +130,7 @@ export class RelayV3DeliveryScheduler {
     return this.#jobs.size;
   }
 
-  enqueue(input: RelayV3DeliveryEnqueue): boolean {
+  enqueue(input: RelayDeliveryEnqueue): boolean {
     if (this.#disposed || this.#jobs.has(input.ref)) return false;
     const identity = this.#ring.identity(input.ref);
     const encodedBytes = this.#ring.encodedBytes(input.ref);
@@ -141,7 +138,7 @@ export class RelayV3DeliveryScheduler {
       identity === undefined ||
       encodedBytes === undefined ||
       encodedBytes <= 0 ||
-      encodedBytes > RELAY_V3_DELIVERY_MAX_DEFICIT_BYTES ||
+      encodedBytes > RELAY_DELIVERY_MAX_DEFICIT_BYTES ||
       identity.lane !== laneForClass(input.deliveryClass)
     ) {
       return false;
@@ -169,7 +166,7 @@ export class RelayV3DeliveryScheduler {
     return true;
   }
 
-  cancel(ref: RelayV3DeliveryRef): boolean {
+  cancel(ref: RelayDeliveryRef): boolean {
     const job = this.#jobs.get(ref);
     if (job === undefined || job.state === "sending" || job.state === "done") return false;
     job.state = "cancelled";
@@ -178,7 +175,7 @@ export class RelayV3DeliveryScheduler {
     return true;
   }
 
-  forgetGeneration(identity: RelayV3DeliveryGenerationIdentity): number {
+  forgetGeneration(identity: RelayDeliveryGenerationIdentity): number {
     const refs = [...this.#jobs.values()]
       .filter((job) => sameGeneration(job.identity, identity))
       .map((job) => job.ref);
@@ -230,7 +227,7 @@ export class RelayV3DeliveryScheduler {
     }
   }
 
-  async #visitClass(deliveryClass: RelayV3DeliveryClass): Promise<void> {
+  async #visitClass(deliveryClass: RelayDeliveryClass): Promise<void> {
     const classState = this.#classes.get(deliveryClass)!;
     const key = classState.flowOrder[0];
     if (key === undefined) return;
@@ -238,13 +235,13 @@ export class RelayV3DeliveryScheduler {
     if (flow === undefined) throw new Error("delivery class references a missing flow");
 
     flow.deficit = Math.min(
-      RELAY_V3_DELIVERY_MAX_DEFICIT_BYTES,
-      flow.deficit + RELAY_V3_DELIVERY_BASE_QUANTUM_BYTES,
+      RELAY_DELIVERY_MAX_DEFICIT_BYTES,
+      flow.deficit + RELAY_DELIVERY_BASE_QUANTUM_BYTES,
     );
     let attempted = 0;
     while (
       !this.#disposed &&
-      attempted < RELAY_V3_DELIVERY_MAX_RECORDS_PER_VISIT &&
+      attempted < RELAY_DELIVERY_MAX_RECORDS_PER_VISIT &&
       flow.jobs.length > 0
     ) {
       const job = flow.jobs[0]!;
@@ -270,7 +267,7 @@ export class RelayV3DeliveryScheduler {
       }
 
       job.state = "sending";
-      let result: RelayV3DeliverySendResult;
+      let result: RelayDeliverySendResult;
       try {
         result = await this.#send({
           deliveryClass: job.deliveryClass,
@@ -295,7 +292,7 @@ export class RelayV3DeliveryScheduler {
     }
   }
 
-  async #complete(job: PendingJob, result: RelayV3DeliverySendResult): Promise<void> {
+  async #complete(job: PendingJob, result: RelayDeliverySendResult): Promise<void> {
     job.state = "done";
     this.#detach(job);
     if (result === "sent") this.#ring.confirm(job.ref);

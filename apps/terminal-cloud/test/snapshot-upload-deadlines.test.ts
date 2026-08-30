@@ -281,7 +281,7 @@ describe("snapshot upload deadlines", () => {
     );
     const multipart = await env.SNAPSHOTS.createMultipartUpload(objectKey, {
       httpMetadata: { contentType: SNAPSHOT_MEDIA_TYPE, cacheControl: "private, no-store" },
-      customMetadata: snapshotCustomMetadata(metadata, "multipart-verified"),
+      customMetadata: snapshotCustomMetadata(metadata),
     });
     await runInDurableObject(sessionStub(session.sessionId), (_instance, durable) => {
       const snapshots = new SnapshotStore(

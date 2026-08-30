@@ -1,52 +1,31 @@
-# Stacked PR 路线
+# MVP Roadmap
 
-> 历史文档：这里记录 MVP 最初的 stacked PR 规划。相关实现已于 2026-08-28 合并到
-> `main`，不再用本页判断当前功能或部署状态。当前入口见[项目 README](../README.md)和
-> [部署指南](deployment.md)。当前演进的最高级协议不变量见[终端协议架构](terminal-protocol-architecture.md)，
-> 具体工作分别见[高性能远程终端 Snapshot 恢复实施计划](high-performance-snapshot-recovery-plan.md)与
-> [输入稳定性与高 RTT 交互实施计划](input-stability-plan.md)。
->
-> Recovery v3 当前的 P2.5a stacked candidate 交付 Cloud v9 no-payload delivery ledger、
-> enqueue/begin/send/confirm ordering 与 hibernation 后的 delivery-owner fence；P2.5b 在现有
-> `2 MiB / 1024 records` cap/grant 内交付 Host recovery source multi-outstanding、connection-local
-> DRR、shared data backpressure yield 与 per-source deadline isolation；P2.5c stacked candidate 交付
-> `R + L` Cloud session aggregate、actual + `floor(unmaterialized/88)` record accounting、grant `0` 到
-> exact start-ready ACK 后 bounded refill、ephemeral shared canonical ring、writer reserve/observer-first
-> reconcile、live/recovery windows，以及 `4 / 2 / 2 / 1` 四类 weighted byte-DRR。每 record
-> `scheduler.wait(0)` 只提供调度机会，不是 ingress priority、物理 socket high-water、性能或 SLO 证明。
-> wake 时 `queued`/`sending` fail closed，`sent` 不重发；P2.6 stacked candidate 已完成本地 deterministic
-> three-owner continuity、generation-scoped rollout/rollback、committed-WASM Ghostty continuation 与真实
-> WTerm atomic adoption gates。
-> 默认 production kill switch=false，Host/Browser offer 仍选择 v2，production-like staging、真实网络和
-> 性能验证继续后置。这不改写下方历史 MVP stack，也不修改 WTerm/Ghostty production code 或固定 pin；
-> 未来真实 API 缺口仍须先在 `Eric-Song-Nop` 对应 fork 走独立 PR，再更新 Zhongduan 固定 submodule。
+## 已完成的本地 correctness 基础
 
-每层 PR 都基于前一层分支，并提供一个可运行或可验证的纵向能力。后续 PR 只在其直接依赖合并后改 base，不压平历史。
+- Host authority、journal、snapshot capture和 immutable publish；
+- 唯一 Recovery wire/control/runtime；
+- Host retained source、multi-outstanding receipt、byte-DRR与deadline隔离；
+- Cloud no-payload durable ledger、shared ring、writer reserve与weighted delivery scheduling；
+- Browser assembler、snapshot restore、atomic adopt与long-lived live receiver；
+- writer lease、input epoch、semantic input和exact Host ACK；
+- Durable Object hibernation、outbox replay、generation/Host fence与fault gates；
+- committed Ghostty WASM continuation和 WTermReplicaHost adoption gates；
+- pre-MVP旧恢复代码、策略、兼容schema和命名清理。
 
-| Stack | 分支                          | 可验证交付                                                                                                | 依赖                      |
-| ----- | ----------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------- |
-| 1     | `mvp/protocol-contract`       | Vite+ workspace、严格控制协议、二进制有序 mutation codec、连续性测试和 CI                                 | 无                        |
-| 2     | `mvp/host-live-session`       | 本地 daemon 启动真实 shell；PTY output、semantic input、resize、query response 和有界 journal 端到端工作  | Stack 1                   |
-| 3     | `mvp/cloudflare-relay`        | Host 和浏览器通过认证的双 WebSocket 与 Hibernation DO 交互；单 writer lease、fencing 和慢客户端隔离可测试 | Stack 2                   |
-| 4     | `mvp/wterm-snapshot-recovery` | 固定 engine 的 snapshot encode、passive restore、continuation + tail、显式 ownership 和原子 core adoption | Stack 3；wterm fork stack |
-| 5     | `mvp/reconnect-checkpoint`    | warm tail-only reconnect、R2 snapshot publish、cold attach、journal gap 和 delivery generation reset      | Stack 4                   |
-| 6     | `mvp/operational-gate`        | staging E2E 覆盖 Vim/tmux/htop、DO hibernation、output spew、故障注入和资源预算                           | Stack 5                   |
+## MVP 前剩余工作
 
-## wterm Fork Stack
+1. 在 production-like Cloudflare环境验证真实 WebSocket/R2/hibernate/failure序列；
+2. 加入部署观测、容量告警与可操作的session诊断；
+3. 运行真实 PTY/Ghostty/WTerm端到端continuity、长会话和多client soak；
+4. 冻结MVP的resource limits与用户可见重连行为；
+5. 完成安全审查、部署演练与显式上线批准。
 
-| Stack | 分支                       | 可验证交付                                                                                                | 依赖        |
-| ----- | -------------------------- | --------------------------------------------------------------------------------------------------------- | ----------- |
-| W1    | `mvp/core-lifecycle`       | `TerminalCore.dispose()`、集中 effects policy、幂等销毁与 ownership 测试                                  | fork `main` |
-| W2    | `mvp/ghostty-snapshot`     | 固定 Ghostty SHA、WASM snapshot encode/decode、`GhosttyRuntime`、passive restore 和 continuation fixtures | W1          |
-| W3    | `mvp/atomic-core-adoption` | `takeCore()` 和 `WTerm.adoptCore()`，真实浏览器无空白帧、无重复 effects                                   | W2          |
+## 后置方向
 
-## 完成门槛
+- rolling/delta snapshot与history pages；
+- presentation/history后台构建；
+- 更细粒度的client优先级与动态credit调参；
+- 性能benchmark、dashboard和SLO；
+- shell integration、completion/context与更丰富的terminal sideband。
 
-- 普通交互走 raw fast path，网络正常时不周期性传输全量状态。
-- warm reconnect 不需要 snapshot；cold attach 恢复 snapshot + 完整有序 tail。
-- 半截 CSI 和 UTF-8 snapshot 与不切流 baseline 的终端状态相同。
-- 浏览器 replica 不产生任何 PTY response；Host 对 TUI query 只响应一次。
-- `yes` 等持续输出不会导致无界内存或 snapshot storm，control 仍可传递 Ctrl-C。
-- PTY、journal、发送队列、snapshot 构建和 passive restore 均有明确上限与指标。
-- Host 与浏览器 `engineId` 不同会 fail closed 并请求兼容客户端，不尝试猜测解码。
-- restore、abort、adopt 和 destroy 的每条路径都恰好释放一次 WASM state。
+历史实现和为什么在MVP前删除，见 [Recovery 实现沿革](recovery-history.md)。

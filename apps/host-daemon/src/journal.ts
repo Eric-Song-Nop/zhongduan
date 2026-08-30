@@ -20,14 +20,14 @@ export interface JournalCursor {
   nextPtyOffset: bigint;
 }
 
-export type JournalReplay = { status: "ok"; frames: Uint8Array[] } | { status: "gap" };
+export type JournalRange = { status: "ok"; frames: Uint8Array[] } | { status: "gap" };
 
-export type JournalReplayPlan =
+export type JournalRangePlan =
   | {
       status: "ok";
       exactEncodedBytes: number;
       exactFrames: number;
-      materialize(): JournalReplay;
+      materialize(): JournalRange;
     }
   | { status: "gap" };
 
@@ -129,22 +129,17 @@ export class EventJournal {
     return this.#segments.flatMap((segment) => segment.entries.map((entry) => entry.frame.slice()));
   }
 
-  replayFrom(cursor: JournalCursor): JournalReplay {
+  readFrom(cursor: JournalCursor): JournalRange {
     this.#maintain();
-    return this.#replayRange(cursor, this.#headCursor);
+    return this.#readRange(cursor, this.#headCursor);
   }
 
-  replayThrough(cursor: JournalCursor, commit: JournalCursor): JournalReplay {
-    this.#maintain();
-    return this.#replayRange(cursor, commit);
-  }
-
-  planReplayThrough(cursor: JournalCursor, commit: JournalCursor): JournalReplayPlan {
+  planRangeThrough(cursor: JournalCursor, commit: JournalCursor): JournalRangePlan {
     this.#maintain();
     return this.#planRange(cursor, commit);
   }
 
-  #replayRange(cursor: JournalCursor, commit: JournalCursor): JournalReplay {
+  #readRange(cursor: JournalCursor, commit: JournalCursor): JournalRange {
     if (
       cursor.lastEventSeq < this.#evictedCursor.lastEventSeq ||
       cursor.lastEventSeq > commit.lastEventSeq ||
@@ -177,7 +172,7 @@ export class EventJournal {
     };
   }
 
-  #planRange(cursor: JournalCursor, commit: JournalCursor): JournalReplayPlan {
+  #planRange(cursor: JournalCursor, commit: JournalCursor): JournalRangePlan {
     if (
       cursor.lastEventSeq < this.#evictedCursor.lastEventSeq ||
       cursor.lastEventSeq > commit.lastEventSeq ||
@@ -228,7 +223,7 @@ export class EventJournal {
     revision: bigint,
     exactFrames: number,
     exactEncodedBytes: number,
-  ): JournalReplay {
+  ): JournalRange {
     if (this.#revision !== revision) return { status: "gap" };
     const frames: Uint8Array[] = [];
     let materializedBytes = 0;

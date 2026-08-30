@@ -10,8 +10,8 @@ PTY + Host daemon  <->  Worker + SQLite Durable Object + R2  <->  wterm replica
 ```
 
 它面向需要在网络中断、页面刷新和 Durable Object 休眠后继续使用 Vim、tmux、htop
-等 TUI 的场景。正常连接传输有序 PTY mutation；恢复时优先重放短 journal，必要时恢复
-Ghostty snapshot 再接续 tail。
+等 TUI 的场景。正常连接传输有序 PTY mutation；恢复时从现有可见 replica 或 immutable
+Ghostty snapshot 建立 base，补齐 retained gap 并持续接收 live mutation。
 
 ## 核心协议不变量
 
@@ -21,14 +21,14 @@ Ghostty snapshot 再接续 tail。
 
 Host 是唯一 authority，`eventSeq` 只排序重建该 authority 所需的 mutation。Snapshot 可以吸收
 旧 mutation，但 snapshot cut 之后的 mutation 不能被任意跳过；预测也绝不能进入 PTY、权威
-Ghostty core、journal、snapshot 或 replay。当前 protocol v2 依靠 recovery 期间的 global pause
-和 pinned commit 守住这个边界；目标 protocol 只有在完整的 concurrent gap-fill 交接可用后才会
-取消 pause。规范边界、三个逻辑平面和 CURRENT/TARGET 区分见
-[终端协议架构与不变量](docs/terminal-protocol-architecture.md)。
+Ghostty core、journal、snapshot 或 recovery。当前唯一协议使用 concurrent gap-fill、generation-scoped
+delivery、durable scalar ledger 与 atomic replica adoption 守住这个边界；pause/barrier delivery 不属于
+当前实现。规范边界和三个逻辑平面见[终端协议架构与不变量](docs/terminal-protocol-architecture.md)。
 
 ## 当前状态
 
-这是可部署、可验证的 MVP，不是已经打包发布的通用远程运维产品。
+项目仍在 MVP 开发阶段。当前代码已经形成可构建、可验证的单一 Recovery 基础，但尚未完成
+production-like 演练、安全审查、容量冻结和正式上线批准。
 
 - 支持一个 Linux Host、最多一个活动 writer 和多个 observer。
 - writer 可以输入和调整尺寸；observer 只能查看。
@@ -44,7 +44,7 @@ Ghostty core、journal、snapshot 或 replay。当前 protocol v2 依靠 recover
 | `@zhongduan/host-daemon`    | 持有 PTY、Ghostty authority、journal、snapshot publisher 和 Cloud relay         |
 | `@zhongduan/terminal-cloud` | React SPA、Worker API、双 WebSocket relay、SQLite Durable Object 和 R2 snapshot |
 | `@zhongduan/protocol`       | 严格的 control schema、二进制 data frame 和 Cloud API contract                  |
-| `@zhongduan/session-client` | 浏览器 attach、warm/cold recovery 和 replica commit 协调                        |
+| `@zhongduan/session-client` | 浏览器 attach、warm/cold recovery 和 atomic replica adoption 协调               |
 | `vendor/wterm`              | 固定 fork，提供 Ghostty runtime、snapshot restore 和 DOM renderer               |
 
 ## 环境要求
@@ -110,10 +110,11 @@ URL fragment 不会发送给 HTTP 服务器，页面加载后也会立即从地�
 - [部署指南](docs/deployment.md)
 - [MVP 架构](docs/mvp-architecture.md)
 - [终端协议架构与不变量](docs/terminal-protocol-architecture.md)
+- [Recovery 协议](docs/recovery-protocol.md)
+- [Recovery 实现沿革](docs/recovery-history.md)
 - [高性能远程终端 Snapshot 恢复实施计划](docs/high-performance-snapshot-recovery-plan.md)
 - [输入稳定性与高 RTT 交互实施计划](docs/input-stability-plan.md)
 - [Wire protocol](docs/wire-protocol.md)
-- [设计记录与资源约束](resource.md)
 
 ## License
 

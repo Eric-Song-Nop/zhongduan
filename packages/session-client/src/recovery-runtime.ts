@@ -1,9 +1,9 @@
 import {
-  RecoveryV3ClientControlFrameSchema,
+  RecoveryProgressFrameSchema,
   type AuthorityCursor,
   type RecoverySourceClosed,
   type RecoveryStart,
-  type RecoveryV3ClientControlFrame,
+  type RecoveryProgressFrame,
   type ReplicaCursor,
 } from "@zhongduan/protocol";
 
@@ -13,7 +13,7 @@ import {
   type RecoveryAssemblerResetReason,
 } from "./recovery-assembler";
 import { RecoveryLiveReceiver, type RecoveryLiveReceiverFailure } from "./recovery-live-receiver";
-import type { ReplicaHost, ReplicaSink, SnapshotManifest, SnapshotTransport } from "./types";
+import type { ReplicaHost, ReplicaSink, SnapshotRestoreSource, SnapshotTransport } from "./types";
 
 export type RecoveryRuntimeState =
   | "awaiting-start"
@@ -39,7 +39,7 @@ export interface RecoveryRuntimeOptions {
   readonly streamId: number;
   readonly now?: () => number;
   readonly onFailure: (reason: RecoveryRuntimeFailure) => void;
-  readonly onProgress: (frame: RecoveryV3ClientControlFrame) => boolean | void;
+  readonly onProgress: (frame: RecoveryProgressFrame) => boolean | void;
   readonly onStateChange?: () => void;
   readonly progressRetryMs?: number;
   readonly setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
@@ -66,35 +66,13 @@ function replicaCursor(cursor: AuthorityCursor, deliveryGeneration: bigint): Rep
   };
 }
 
-function snapshotManifest(start: RecoveryStart): SnapshotManifest {
-  if (start.source.kind !== "snapshot") throw new Error("recovery source is not a snapshot");
-  return {
-    type: "snapshot-manifest",
-    snapshotId: start.source.snapshotId,
-    engineId: start.source.engineId,
-    sessionEpoch: start.source.sessionEpoch,
-    streamId: start.streamId,
-    deliveryGeneration: start.deliveryGeneration,
-    cutEventSeq: start.source.cutEventSeq,
-    nextPtyOffset: start.source.nextPtyOffset,
-    commitEventSeq: start.committedThrough.eventSeq,
-    commitPtyOffset: start.committedThrough.nextPtyOffset,
-    compression: start.source.compression,
-    compressedLength: start.source.compressedLength,
-    uncompressedLength: start.source.uncompressedLength,
-    sha256: start.source.sha256,
-    downloadPath: start.source.downloadPath,
-    restoreThrough: start.source.restoreThrough,
-  };
-}
-
-function frameKey(frame: RecoveryV3ClientControlFrame): string {
+function frameKey(frame: RecoveryProgressFrame): string {
   return frame.type === "delivery-received" ? `${frame.type}:${frame.lane}` : frame.type;
 }
 
 function sameProgress(
-  left: RecoveryV3ClientControlFrame | undefined,
-  right: RecoveryV3ClientControlFrame,
+  left: RecoveryProgressFrame | undefined,
+  right: RecoveryProgressFrame,
 ): boolean {
   return left !== undefined && JSON.stringify(left) === JSON.stringify(right);
 }
@@ -108,11 +86,11 @@ function disposeCallerOwned(replica: ReplicaSink): void {
 }
 
 /**
- * One Recovery v3 delivery-generation owner.
+ * One Recovery delivery-generation owner.
  *
  * It binds the pure assembler to snapshot restore, the exact ReplicaHost handoff, stable progress
  * retries, and the long-lived live-lane receiver. The caller still owns the WebSocket and replaces
- * this object wholesale when the negotiated generation changes.
+ * this object wholesale when the delivery generation changes.
  */
 export class RecoveryRuntime {
   readonly #deliveryGeneration: bigint;
@@ -130,7 +108,7 @@ export class RecoveryRuntime {
   readonly #scheduleWork: NonNullable<RecoveryRuntimeOptions["scheduleWork"]>;
   readonly #snapshots: SnapshotTransport;
   readonly #assembler: RecoveryAssembler;
-  readonly #pendingProgress = new Map<string, RecoveryV3ClientControlFrame>();
+  readonly #pendingProgress = new Map<string, RecoveryProgressFrame>();
 
   #adopted = false;
   #adoptedReplica: ReplicaSink | null = null;
@@ -247,7 +225,7 @@ export class RecoveryRuntime {
     const accepted = this.#assembler.acceptStart(start, now);
     if (!accepted) return this.#failFromAssembler();
     this.#sourceKind = start.source.kind;
-    if (start.source.kind === "snapshot") this.#startRestore(start);
+    if (start.source.kind === "snapshot") this.#startRestore(start, start.source);
     this.#drive(true);
     return this.#isOpen();
   }
@@ -393,19 +371,18 @@ export class RecoveryRuntime {
     });
   }
 
-  #startRestore(start: RecoveryStart): void {
+  #startRestore(start: RecoveryStart, source: SnapshotRestoreSource): void {
     if (this.#restoreStartedFor !== null) return;
     this.#restoreStartedFor = start.recoveryId;
     const abort = new AbortController();
     this.#restoreAbort = abort;
     const epoch = this.#workEpoch;
-    const manifest = snapshotManifest(start);
     void (async () => {
       let candidate: ReplicaSink | null = null;
       try {
-        const snapshot = await this.#snapshots.load(manifest, abort.signal);
+        const snapshot = await this.#snapshots.load(source, abort.signal);
         abort.signal.throwIfAborted();
-        candidate = await this.#host.restore(snapshot, manifest, abort.signal);
+        candidate = await this.#host.restore(snapshot, source, abort.signal);
         abort.signal.throwIfAborted();
         if (epoch !== this.#workEpoch || !this.#isOpen()) {
           const staleCandidate = candidate;
@@ -452,9 +429,9 @@ export class RecoveryRuntime {
     this.#publish(receipts.live, force);
   }
 
-  #publish(frame: RecoveryV3ClientControlFrame | null, force: boolean): void {
+  #publish(frame: RecoveryProgressFrame | null, force: boolean): void {
     if (frame === null || !this.#isOpen()) return;
-    const parsed = RecoveryV3ClientControlFrameSchema.parse(frame);
+    const parsed = RecoveryProgressFrameSchema.parse(frame);
     const key = frameKey(parsed);
     const previous = this.#pendingProgress.get(key);
     this.#pendingProgress.set(key, parsed);
@@ -466,7 +443,7 @@ export class RecoveryRuntime {
     this.#scheduleProgressRetry();
   }
 
-  #sendProgress(frame: RecoveryV3ClientControlFrame): boolean {
+  #sendProgress(frame: RecoveryProgressFrame): boolean {
     try {
       const sent = this.#onProgress(frame);
       if (!this.#isOpen()) return false;

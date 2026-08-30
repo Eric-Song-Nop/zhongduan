@@ -1,20 +1,17 @@
 import type { InputSink, TerminalInputEvent, TerminalMouseInputEvent } from "@wterm/core";
 import {
-  ClientControlFrameSchema,
-  type ClientControlFrame,
+  ClientInputFrameSchema,
+  type ClientInputFrame,
+  type InputAcknowledgementFrame,
   type ResizePayload,
-  type ServerControlFrame,
 } from "@zhongduan/protocol";
 
 const MAX_PENDING_ACKS = 1_024;
 const MAX_QUEUED_INPUTS = 256;
 
-type InputAck = Extract<ServerControlFrame, { type: "input-ack" }>;
-type InputFrame = Exclude<ClientControlFrame, { type: "ack" | "attach" | "writer-lease-renew" }>;
-
 export interface InputDispatcherStatus {
   connected: boolean;
-  lastStatus: InputAck["status"] | "idle";
+  lastStatus: InputAcknowledgementFrame["status"] | "idle";
   pending: number;
   replicaCurrent: boolean;
   resizeConfirmed: boolean;
@@ -28,7 +25,7 @@ export interface InputDispatcherOptions {
   queueMicrotask?: (callback: () => void) => void;
 }
 
-type FrameSender = (frame: InputFrame) => boolean;
+type FrameSender = (frame: ClientInputFrame) => boolean;
 
 function boundedInteger(value: number, maximum = 1_000_000): number {
   if (!Number.isFinite(value)) return 0;
@@ -63,7 +60,7 @@ export class InputDispatcher implements InputSink {
   readonly #getObservedEventSeq: () => bigint | null;
   readonly #queueMicrotask: (callback: () => void) => void;
   readonly #listeners = new Set<() => void>();
-  readonly #pending = new Map<bigint, InputFrame["type"]>();
+  readonly #pending = new Map<bigint, ClientInputFrame["type"]>();
   #inputEpoch: string;
   #nextSequence = 1n;
   #sender: FrameSender | null = null;
@@ -152,7 +149,7 @@ export class InputDispatcher implements InputSink {
     this.#emit();
   }
 
-  acceptAcknowledgement(frame: InputAck): void {
+  acceptAcknowledgement(frame: InputAcknowledgementFrame): void {
     if (frame.inputEpoch !== this.#inputEpoch) return;
     const sequence = BigInt(frame.clientInputSeq);
     if (!this.#pending.delete(sequence)) return;
@@ -196,7 +193,7 @@ export class InputDispatcher implements InputSink {
     const events = this.#queue;
     this.#queue = [];
     for (const event of events) {
-      let frame: InputFrame | null;
+      let frame: ClientInputFrame | null;
       try {
         frame = this.#toFrame(event);
       } catch {
@@ -226,7 +223,7 @@ export class InputDispatcher implements InputSink {
     this.#emit();
   }
 
-  #toFrame(event: TerminalInputEvent): InputFrame | null {
+  #toFrame(event: TerminalInputEvent): ClientInputFrame | null {
     const writerLease = this.#writerLease;
     if (writerLease === null) return null;
     const identity = {
@@ -279,7 +276,7 @@ export class InputDispatcher implements InputSink {
         frame = this.#mouseFrame(event, identity);
         break;
     }
-    return ClientControlFrameSchema.parse(frame) as InputFrame;
+    return ClientInputFrameSchema.parse(frame);
   }
 
   #mouseFrame(

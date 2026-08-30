@@ -1,46 +1,36 @@
 import {
   ConnectionSetResponseSchema,
   DATA_HEADER_BYTES,
-  DELIVERY_ENVELOPE_V3_HEADER_BYTES,
+  DELIVERY_ENVELOPE_HEADER_BYTES,
   DataFrameKind,
   HostCapabilityReclaimRequestSchema,
   MAX_U64,
   PositiveDecimalU64Schema,
-  RELAY_CAPABILITIES_HEADER,
-  RelayCapability,
-  RelayCapabilitySchema,
   RelayToHostControlFrameSchema,
-  RecoveryV3CloudToHostControlFrameSchema,
-  RecoveryV3HostPrepareSchema,
-  RecoveryV3ServerControlFrameSchema,
-  selectRelayCapabilities,
-  selectRecoveryStrategy,
+  RecoveryCloudToHostControlFrameSchema,
+  RecoveryHostPrepareSchema,
+  RecoveryServerControlFrameSchema,
   ServerControlFrameSchema,
   decodeClientControlFrame,
   decodeDataFrame,
-  decodeDeliveryEnvelopeV3,
-  decodeDeliveryBarrierPayload,
+  decodeDeliveryEnvelope,
   decodeHostControlFrame,
   decodeRecoveryStartFence,
   decodeRelayToHostControlFrame,
   decodeServerControlFrame,
   encodeControlFrame,
-  encodeDeliveryEnvelopeV3,
-  rewriteDelivery,
+  encodeDeliveryEnvelope,
   type AuthorityCursor,
   type ClientControlFrame,
-  type ClientControlFrameV3,
   type DataFrame,
-  type DeliveryBarrierPayload,
-  type HostControlFrameV3,
+  type HostControlFrame,
   type RecoveryStart,
   type RecoveryStartFence,
-  type RecoveryStrategy,
-  type RecoveryV3ClientControlFrame,
-  type RecoveryV3HostPrepare,
-  type RecoveryV3HostPrepareRejected,
-  type RecoveryV3HostSourceClosed,
-  type RecoveryV3HostSourceReset,
+  type RecoveryProgressFrame,
+  type RecoveryHostPrepare,
+  type RecoveryHostPrepareRejected,
+  type RecoveryHostSourceClosed,
+  type RecoveryHostSourceReset,
 } from "@zhongduan/protocol";
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
@@ -53,7 +43,6 @@ import {
 } from "./relay-connection-state";
 import { RelayConnectionStore, type RecoveryFenceScope } from "./relay-connection-store";
 import type { CloudEnv } from "./env";
-import { advanceDeliveryCursor } from "./relay-delivery";
 import { DurableAlarmComponent, DurableAlarmMux } from "./durable-alarm-mux";
 import {
   BoundedSerialQueue,
@@ -68,18 +57,18 @@ import {
   type RecoveryDeliveryRecordIdentity,
 } from "./relay-recovery-store";
 import {
-  RelayV3DeliveryRing,
-  type RelayV3DeliveryGenerationIdentity,
-  type RelayV3DeliveryRef,
-  type RelayV3DeliveryRefIdentity,
-} from "./relay-v3-delivery-ring";
+  RelayDeliveryRing,
+  type RelayDeliveryGenerationIdentity,
+  type RelayDeliveryRef,
+  type RelayDeliveryRefIdentity,
+} from "./relay-delivery-ring";
 import {
-  RelayV3DeliveryScheduler,
-  type RelayV3DeliveryClass,
-  type RelayV3DeliveryJobView,
-  type RelayV3DeliverySendResult,
-  type RelayV3DeliverySendTurn,
-} from "./relay-v3-delivery-scheduler";
+  RelayDeliveryScheduler,
+  type RelayDeliveryClass,
+  type RelayDeliveryJobView,
+  type RelayDeliverySendResult,
+  type RelayDeliverySendTurn,
+} from "./relay-delivery-scheduler";
 import {
   readSocketAttachment as readAttachment,
   SocketAttachmentSchema,
@@ -88,7 +77,7 @@ import {
   type SocketAttachment,
 } from "./relay-socket";
 import {
-  migrateRelayStore,
+  initializeRelayStore,
   RelayStore,
   type ClientRow,
   type SessionRow,
@@ -117,32 +106,6 @@ const CreateConnectionSetSchema = z.strictObject({
   role: z.enum(["host", "writer", "observer"]),
   clientId: identifier.optional(),
 });
-const RelayCapabilitiesSchema = z.array(RelayCapabilitySchema).max(16);
-const BROWSER_RELAY_CAPABILITIES = [
-  RelayCapability.capabilityNegotiationV1,
-  RelayCapability.authorityDataV2,
-] as const;
-const HOST_RELAY_CAPABILITIES = [
-  ...BROWSER_RELAY_CAPABILITIES,
-  RelayCapability.deliveryBarrierOutcomeV1,
-] as const;
-const HOST_RECOVERY_V3_CAPABILITIES = [
-  RelayCapability.capabilityNegotiationV1,
-  RelayCapability.authorityDataV2,
-  RelayCapability.wireEndpointV3,
-  RelayCapability.recoveryV3GapFillV1,
-] as const;
-const BROWSER_RECOVERY_V3_CAPABILITIES = [
-  RelayCapability.capabilityNegotiationV1,
-  RelayCapability.authorityDataV2,
-  RelayCapability.wireEndpointV3,
-  RelayCapability.deliveryEnvelopeV3,
-  RelayCapability.deliveryReceiveCreditV1,
-  RelayCapability.authorityApplyProgressV1,
-  RelayCapability.recoveryV3GapFillV1,
-] as const;
-const CLOUD_RECOVERY_V3_CAPABILITIES = BROWSER_RECOVERY_V3_CAPABILITIES;
-
 interface AcquiredLease {
   fence: string;
   token: string;
@@ -152,17 +115,17 @@ type HostControlSendResult = "sent" | "rejected" | "uncertain";
 
 type RecoveryDataQueuePlan = {
   attempt: RecoveryAttemptRow;
-  deliveryClass: RelayV3DeliveryClass;
-  identity: RelayV3DeliveryRefIdentity;
+  deliveryClass: RelayDeliveryClass;
+  identity: RelayDeliveryRefIdentity;
   record: RecoveryDeliveryRecordIdentity;
 };
 
 type RecoveryDeliveryRefRecord = {
-  generation: RelayV3DeliveryGenerationIdentity;
+  generation: RelayDeliveryGenerationIdentity;
   record: RecoveryDeliveryRecordIdentity;
 };
 
-type RecoveryBrowserSockets = {
+type BrowserSockets = {
   control: WebSocket;
   controlAttachment: SocketAttachment;
   data: WebSocket;
@@ -174,34 +137,10 @@ interface BrowserAttachContext {
   controlAttachment: SocketAttachment;
   dataAttachment: SocketAttachment;
   dataSocket: WebSocket;
-  session: SessionRow;
-}
-
-interface RecoveryBrowserAttachContext {
-  client: ClientRow;
-  controlAttachment: SocketAttachment;
-  dataAttachment: SocketAttachment;
-  dataSocket: WebSocket;
   hostAttachment: SocketAttachment;
   hostControl: WebSocket;
   session: SessionRow;
 }
-
-type BrowserAttachContextResult =
-  | { ok: true; value: BrowserAttachContext }
-  | {
-      ok: false;
-      client?: ClientRow;
-      reason:
-        | "already-attached"
-        | "cursor-ahead"
-        | "data-missing"
-        | "engine-mismatch"
-        | "epoch-changed"
-        | "session-missing"
-        | "stale-delivery"
-        | "stale-control";
-    };
 
 const TICKET_LIFETIME_MS = 30_000;
 const WRITER_LEASE_MS = 30_000;
@@ -219,17 +158,16 @@ const MAX_RECOVERY_SESSION_RECORDS = 1_024;
 const MAX_RECOVERY_SESSION_RECOVERY_ENCODED_BYTES = 1_536 * 1024;
 const MAX_RECOVERY_SESSION_RECOVERY_RECORDS = 1_008;
 const MAX_CONTROL_MESSAGE_CHARS = 6 * 1024 * 1024 + 4_096;
-const MAX_HOST_DATA_BYTES = DATA_HEADER_BYTES + 16 * 1024;
-const MAX_HOST_RECOVERY_DATA_BYTES = DELIVERY_ENVELOPE_V3_HEADER_BYTES + MAX_HOST_DATA_BYTES;
-const MIN_HOST_RECOVERY_DATA_BYTES = DELIVERY_ENVELOPE_V3_HEADER_BYTES + DATA_HEADER_BYTES;
-const RECOVERY_WRITER_DELIVERY_RESERVE_ENCODED_BYTES = MAX_HOST_RECOVERY_DATA_BYTES;
+const MAX_CANONICAL_DATA_BYTES = DATA_HEADER_BYTES + 16 * 1024;
+const MAX_HOST_DATA_BYTES = DELIVERY_ENVELOPE_HEADER_BYTES + MAX_CANONICAL_DATA_BYTES;
+const MIN_HOST_DATA_BYTES = DELIVERY_ENVELOPE_HEADER_BYTES + DATA_HEADER_BYTES;
+const RECOVERY_WRITER_DELIVERY_RESERVE_ENCODED_BYTES = MAX_HOST_DATA_BYTES;
 const RECOVERY_WRITER_DELIVERY_RESERVE_RECORDS = 1;
 const RECOVERY_HARD_DEADLINE_MS = 60_000;
 const RECOVERY_NO_PROGRESS_TIMEOUT_MS = 15_000;
 const RECOVERY_INITIAL_CUMULATIVE_GRANT = "0";
 const RECOVERY_OUTBOX_DRAIN_BATCH = 16;
 const SOCKET_REPLACED = 4001;
-const SLOW_CLIENT = 4008;
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, {
@@ -266,48 +204,12 @@ function closeProtocol(webSocket: WebSocket, reason: string): void {
   }
 }
 
-function hasUnadvancedDeliveryCursor(attachment: SocketAttachment): boolean {
-  const eventCursorUnchanged =
-    (attachment.firstEventSeq === null &&
-      attachment.ackedEventSeq === null &&
-      attachment.sentEventSeq === null) ||
-    (attachment.firstEventSeq !== null &&
-      attachment.firstEventSeq === attachment.ackedEventSeq &&
-      attachment.firstEventSeq === attachment.sentEventSeq);
-  const ptyCursorUnchanged =
-    (attachment.firstPtyOffset === null &&
-      attachment.ackedPtyOffset === null &&
-      attachment.sentPtyOffset === null) ||
-    (attachment.firstPtyOffset !== null &&
-      attachment.firstPtyOffset === attachment.ackedPtyOffset &&
-      attachment.firstPtyOffset === attachment.sentPtyOffset);
-  return eventCursorUnchanged && ptyCursorUnchanged;
-}
-
 function sameAuthorityCursor(left: AuthorityCursor, right: AuthorityCursor): boolean {
   return (
     left.sessionEpoch === right.sessionEpoch &&
     left.eventSeq === right.eventSeq &&
     left.nextPtyOffset === right.nextPtyOffset
   );
-}
-
-function selectEnabledRelayCapabilities(
-  header: string | null,
-  peer: "browser" | "host",
-  recoveryV3Enabled: boolean,
-): RelayCapability[] | undefined {
-  const selected = selectRelayCapabilities(header);
-  if (selected === undefined) return undefined;
-  const requested = new Set(selected);
-  const baseline = peer === "host" ? HOST_RELAY_CAPABILITIES : BROWSER_RELAY_CAPABILITIES;
-  const recoveryFamily =
-    peer === "host" ? HOST_RECOVERY_V3_CAPABILITIES : BROWSER_RECOVERY_V3_CAPABILITIES;
-  const familyOffered = recoveryFamily.every((capability) => requested.has(capability));
-  const enabled = new Set<RelayCapability>(
-    recoveryV3Enabled && familyOffered ? [...baseline, ...recoveryFamily] : baseline,
-  );
-  return selected.filter((capability) => enabled.has(capability));
 }
 
 export class TerminalSessionDO extends DurableObject<CloudEnv> {
@@ -320,44 +222,47 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   private readonly recoveryMaintenance: RelayRecoveryMaintenance;
   private readonly snapshotUploads: SnapshotUploadCoordinator;
   private readonly messageQueue = new BoundedSerialQueue<WebSocket>();
-  private readonly recoveryDeliveryRing: RelayV3DeliveryRing;
-  private readonly recoveryDeliveryScheduler: RelayV3DeliveryScheduler;
+  private readonly recoveryDeliveryRing: RelayDeliveryRing;
+  private readonly recoveryDeliveryScheduler: RelayDeliveryScheduler;
   private readonly recoveryDeliveryRefRecords = new Map<
-    RelayV3DeliveryRef,
+    RelayDeliveryRef,
     RecoveryDeliveryRefRecord
   >();
-  private readonly recoveryV3Enabled: boolean;
   private recoveryOutboxDrainScheduled = false;
 
   constructor(ctx: DurableObjectState, env: CloudEnv) {
     super(ctx, env);
-    this.recoveryV3Enabled = env.RECOVERY_V3_ENABLED === "true";
     this.sql = ctx.storage.sql;
     this.store = new RelayStore(this.sql);
-    migrateRelayStore(ctx, this.sql);
+    const relayStoreReset = initializeRelayStore(ctx, this.sql);
+    if (relayStoreReset) {
+      for (const socket of ctx.getWebSockets()) {
+        if (socket.readyState < WebSocket.CLOSING) socket.close(4400, "relay storage reset");
+      }
+    }
     this.recoveries = new RelayRecoveryStore(this.sql, this.store, {
       maxAttempts: MAX_RECOVERY_ATTEMPTS,
       maxAttemptLiveEncodedBytes: MAX_RECOVERY_ATTEMPT_LIVE_ENCODED_BYTES,
       maxAttemptLiveRecords: MAX_RECOVERY_ATTEMPT_LIVE_RECORDS,
       maxDeliveryEncodedBytes: MAX_RECOVERY_DELIVERY_ENCODED_BYTES,
       maxDeliveryRecords: MAX_RECOVERY_DELIVERY_RECORDS,
-      maxDeliveryEnvelopeEncodedBytes: MAX_HOST_RECOVERY_DATA_BYTES,
+      maxDeliveryEnvelopeEncodedBytes: MAX_HOST_DATA_BYTES,
       maxOutboxEntries: MAX_RECOVERY_OUTBOX_ENTRIES,
       maxRecoveryGrantWindowEncodedBytes: MAX_RECOVERY_GRANT_WINDOW_ENCODED_BYTES,
       maxSessionDeliveryEncodedBytes: MAX_RECOVERY_SESSION_ENCODED_BYTES,
       maxSessionDeliveryRecords: MAX_RECOVERY_SESSION_RECORDS,
       maxSessionRecoveryEncodedBytes: MAX_RECOVERY_SESSION_RECOVERY_ENCODED_BYTES,
       maxSessionRecoveryRecords: MAX_RECOVERY_SESSION_RECOVERY_RECORDS,
-      minDeliveryEnvelopeEncodedBytes: MIN_HOST_RECOVERY_DATA_BYTES,
+      minDeliveryEnvelopeEncodedBytes: MIN_HOST_DATA_BYTES,
       writerDeliveryReserveEncodedBytes: RECOVERY_WRITER_DELIVERY_RESERVE_ENCODED_BYTES,
       writerDeliveryReserveRecords: RECOVERY_WRITER_DELIVERY_RESERVE_RECORDS,
     });
-    this.recoveryDeliveryRing = new RelayV3DeliveryRing({
+    this.recoveryDeliveryRing = new RelayDeliveryRing({
       maxPhysicalBytes: MAX_RECOVERY_SESSION_ENCODED_BYTES,
       maxPhysicalEntries: MAX_RECOVERY_SESSION_RECORDS,
       maxReferences: MAX_RECOVERY_SESSION_RECORDS,
     });
-    this.recoveryDeliveryScheduler = new RelayV3DeliveryScheduler({
+    this.recoveryDeliveryScheduler = new RelayDeliveryScheduler({
       ring: this.recoveryDeliveryRing,
       yieldDataTurn: (delayMs) => this.yieldRecoveryDeliveryTurn(delayMs),
       send: (turn) => this.sendScheduledRecoveryDelivery(turn),
@@ -371,7 +276,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         for (const recoveryId of result.expired) {
           const attempt = this.recoveries.attempt(recoveryId);
           if (attempt !== undefined) {
-            this.isolateRecoveryAttempt(attempt, "Recovery v3 deadline expired");
+            this.isolateRecoveryAttempt(attempt, "recovery deadline expired");
           } else {
             this.cancelRecoveryDeliveriesByRecoveryId(recoveryId);
           }
@@ -408,12 +313,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     );
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     void this.ctx.blockConcurrencyWhile(async () => {
+      if (relayStoreReset) await this.ctx.storage.deleteAlarm();
       await this.alarmMux.initialize();
       this.reconcileRecoveryDeliveryOwnersAfterWake();
       await this.snapshotUploads.initialize();
       await this.recoveryMaintenance.initialize();
-      if (this.recoveryV3Enabled) this.scheduleRecoveryOutboxDrain();
-      else this.fenceDisabledRecoveryV3();
+      this.scheduleRecoveryOutboxDrain();
     });
   }
 
@@ -478,12 +383,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       closeProtocol(webSocket, "invalid attachment");
       return undefined;
     }
-    // A rollback must never reinterpret a durable v3 attachment as v2, even
-    // when the inbound variant is shared by both strategy decoders.
-    if (attachment.recoveryStrategy === "v3" && !this.recoveryV3Enabled) {
-      this.failRecoveryBrowser(attachment, "Recovery v3 is disabled");
-      return undefined;
-    }
     if (attachment.channel === "control") {
       if (typeof message !== "string") {
         this.rejectInboundMessage(webSocket, attachment, "control channel requires text frames");
@@ -510,10 +409,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.rejectInboundMessage(webSocket, attachment, "host data channel requires binary frames");
       return undefined;
     }
-    const maximumBytes = this.isRecoveryV3Host(attachment)
-      ? MAX_HOST_RECOVERY_DATA_BYTES
-      : MAX_HOST_DATA_BYTES;
-    if (message.byteLength > maximumBytes) {
+    if (message.byteLength > MAX_HOST_DATA_BYTES) {
       this.rejectInboundMessage(webSocket, attachment, "host data frame is too large");
       return undefined;
     }
@@ -572,10 +468,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       closeProtocol(webSocket, "host data channel requires binary frames");
       return;
     }
-    const maximumBytes = this.isRecoveryV3Host(attachment)
-      ? MAX_HOST_RECOVERY_DATA_BYTES
-      : MAX_HOST_DATA_BYTES;
-    if (message.byteLength > maximumBytes) {
+    if (message.byteLength > MAX_HOST_DATA_BYTES) {
       this.failCurrentHost(attachment, "host data frame is too large");
       return;
     }
@@ -595,14 +488,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const attachment = readAttachment(webSocket);
     if (attachment === undefined) return;
 
-    if (
-      attachment.peer === "browser" &&
-      attachment.channel === "data" &&
-      attachment.snapshotId !== null
-    ) {
-      this.snapshotUploads.scheduleMaintenance();
-    }
-
     if (attachment.channel === "data") {
       if (attachment.peer === "host") {
         if (
@@ -616,34 +501,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         return;
       }
 
-      if (attachment.clientId === null) return;
-      if (attachment.recoveryStrategy === "v3") {
-        if (this.browserDataByClient(attachment.clientId, webSocket) === undefined) {
-          this.failRecoveryBrowser(attachment, "browser recovery data disconnected");
-        }
-        return;
-      }
-      const client = this.clientById(attachment.clientId);
-      const control = this.activeBrowserControl(attachment.clientId);
-      const controlAttachment = control === undefined ? undefined : readAttachment(control);
       if (
-        client?.delivery_generation !== attachment.deliveryGeneration ||
-        this.browserDataByClient(attachment.clientId, webSocket) !== undefined ||
-        control === undefined ||
-        controlAttachment?.connectionSetId !== attachment.connectionSetId ||
-        controlAttachment.connectionId !== attachment.connectionId
+        attachment.clientId !== null &&
+        this.browserDataByClient(attachment.clientId, webSocket) === undefined
       ) {
-        return;
+        this.failBrowser(attachment, "browser data disconnected");
       }
-      if (controlAttachment.controlState !== "active") {
-        this.isolateBrowserConnection(
-          control,
-          controlAttachment,
-          "browser data disconnected before attach",
-        );
-        return;
-      }
-      await this.resetBrowserDelivery(attachment.clientId, "data-disconnected", false);
       return;
     }
 
@@ -659,19 +522,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       return;
     }
 
-    if (attachment.clientId === null) return;
-    if (attachment.recoveryStrategy === "v3") {
-      if (this.activeBrowserControl(attachment.clientId, webSocket) === undefined) {
-        this.failRecoveryBrowser(attachment, "browser recovery control disconnected");
-      }
-      return;
+    if (
+      attachment.clientId !== null &&
+      this.activeBrowserControl(attachment.clientId, webSocket) === undefined
+    ) {
+      this.failBrowser(attachment, "browser control disconnected");
     }
-    this.releaseWriterLease(attachment.clientId, attachment.leaseFence);
-    if (this.activeBrowserControl(attachment.clientId, webSocket) !== undefined) return;
-    this.connections.closeConnectionSet(attachment.connectionSetId);
-    this.closeSockets((candidate) => {
-      return candidate.peer === "browser" && candidate.clientId === attachment.clientId;
-    }, webSocket);
   }
 
   async webSocketError(webSocket: WebSocket, _error: unknown): Promise<void> {
@@ -771,16 +627,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const controlTicket = randomId(32);
     const dataTicket = randomId(32);
     const requestedClientId = peer === "browser" ? (parsed.data.clientId ?? randomId()) : null;
-    const selectedCapabilitiesHeader = request.headers.get(RELAY_CAPABILITIES_HEADER);
-    const selectedCapabilitiesResult = selectEnabledRelayCapabilities(
-      selectedCapabilitiesHeader,
-      peer,
-      this.recoveryV3Enabled,
-    );
-    if (selectedCapabilitiesResult === undefined) {
-      return json({ error: "invalid-connection-set" }, 400);
-    }
-    const selectedCapabilities = selectedCapabilitiesResult;
     const [controlDigest, dataDigest, principalIdHash] = await Promise.all([
       sha256Hex(controlTicket),
       sha256Hex(dataTicket),
@@ -788,27 +634,14 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     ]);
     const now = Date.now();
     const expiresAt = now + TICKET_LIFETIME_MS;
-    const currentSession = this.session();
     const currentReadyHost = this.currentReadyHostAttachment();
     const hasPublishedSnapshot =
-      currentSession?.latest_snapshot_id !== null &&
-      currentSession?.latest_snapshot_id !== undefined &&
-      this.snapshots.published(currentSession.latest_snapshot_id) !== undefined;
-    const recoveryStrategy: RecoveryStrategy =
-      peer === "browser" && currentSession !== undefined
-        ? selectRecoveryStrategy({
-            authorityDataVersion: currentSession.authority_data_version,
-            browserCapabilities: selectedCapabilities,
-            cloudCapabilities: CLOUD_RECOVERY_V3_CAPABILITIES,
-            enabled: this.recoveryV3Enabled && hasPublishedSnapshot,
-            hostCapabilities: currentReadyHost?.relayCapabilities ?? [],
-          })
-        : "v2";
-    const recoveryHostFence =
-      recoveryStrategy === "v3" ? (currentReadyHost?.hostFence ?? null) : null;
-    if (recoveryStrategy === "v3" && recoveryHostFence === null) {
-      throw new Error("v3 reservation lost its ready Host witness");
+      session.latest_snapshot_id !== null &&
+      this.snapshots.published(session.latest_snapshot_id) !== undefined;
+    if (peer === "browser" && (!hasPublishedSnapshot || currentReadyHost?.hostFence == null)) {
+      return json({ error: "recovery-unavailable" }, 409);
     }
+    const hostFenceWitness = peer === "browser" ? currentReadyHost!.hostFence : null;
     const reservation = this.connections.reserveConnectionSet({
       clientId: requestedClientId,
       connectionId,
@@ -819,9 +652,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       now,
       peer,
       principalIdHash,
-      recoveryHostFence,
-      recoveryStrategy,
-      relayCapabilitiesJson: JSON.stringify(selectedCapabilities),
+      hostFenceWitness,
       role: parsed.data.role,
       subject: parsed.data.subject,
     });
@@ -843,10 +674,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         expiresAt,
         controlTicket,
         dataTicket,
-        ...(reservation.recoveryStrategy === "v3" ? { recoveryStrategy: "v3" } : {}),
-        ...(selectedCapabilities.includes(RelayCapability.capabilityNegotiationV1)
-          ? { negotiatedCapabilities: selectedCapabilities }
-          : {}),
       }),
     );
   }
@@ -867,46 +694,22 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       }
       return json({ error: "invalid-ticket" }, 401);
     }
-    let relayCapabilities: z.output<typeof RelayCapabilitiesSchema>;
-    try {
-      relayCapabilities = RelayCapabilitiesSchema.parse(
-        JSON.parse(ticket.relay_capabilities_json) as unknown,
-      );
-    } catch {
-      return json({ error: "invalid-ticket" }, 401);
-    }
-    if (JSON.stringify(relayCapabilities) !== ticket.relay_capabilities_json) {
-      return json({ error: "invalid-ticket" }, 401);
-    }
-    if (ticket.recovery_strategy === "v3" && !this.recoveryV3Enabled) {
-      if (ticket.peer === "browser" && channel === "control") {
-        this.connections.discardReservation(ticket);
-      }
-      return json({ error: "client-reservation-unavailable" }, 409);
-    }
-
     const readyHostFence = this.currentReadyHostAttachment()?.hostFence ?? undefined;
-    const ticketClient =
-      ticket.peer === "browser" && ticket.client_id !== null
-        ? this.clientById(ticket.client_id)
-        : undefined;
     const eligibleControl = eligibleControlForDataTicket(
       this.ctx,
       ticket,
       this.session()?.host_fence,
       readyHostFence,
-      ticketClient?.recovery_strategy,
-      relayCapabilities,
     );
     if (channel === "data" && eligibleControl === undefined) {
       return json({ error: "control-channel-required" }, 409);
     }
     if (ticket.peer === "browser" && channel === "control") {
-      const claimedTicket = this.connections.claimBrowserControl(
-        ticket,
-        readyHostFence,
-        this.recoveryV3Enabled,
-      );
+      if (readyHostFence === undefined) {
+        this.connections.discardReservation(ticket);
+        return json({ error: "client-reservation-unavailable" }, 409);
+      }
+      const claimedTicket = this.connections.claimBrowserControl(ticket, readyHostFence);
       if (claimedTicket === undefined) {
         this.connections.discardReservation(ticket);
         return json({ error: "client-reservation-unavailable" }, 409);
@@ -921,7 +724,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         (candidate) => candidate.peer === "host" && candidate.hostFence !== hostFence,
       );
       this.broadcastBrowserControl({ type: "host-offline" });
-      this.markBrowserDataCatchingUp();
     } else if (ticket.peer === "host" && channel === "data") {
       hostFence = eligibleControl?.hostFence ?? null;
       this.closeSockets((candidate) => {
@@ -961,53 +763,21 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
 
     this.connections.consumeTicket(ticketDigest);
-    const attachment =
-      ticket.peer === "browser" && ticket.recovery_strategy === "v3"
-        ? SocketAttachmentSchema.parse({
-            version: 3,
-            peer: "browser",
-            channel,
-            connectionSetId: ticket.connection_set_id,
-            connectionId: ticket.connection_id,
-            subject: ticket.subject,
-            clientId: ticket.client_id,
-            role: ticket.role,
-            streamId: ticket.stream_id,
-            deliveryGeneration: ticket.delivery_generation,
-            hostFence: null,
-            leaseFence: null,
-            relayCapabilities,
-            recoveryStrategy: "v3",
-            recoveryLookupKey: null,
-          })
-        : SocketAttachmentSchema.parse({
-            version: 2,
-            peer: ticket.peer,
-            channel,
-            connectionSetId: ticket.connection_set_id,
-            connectionId: ticket.connection_id,
-            subject: ticket.subject,
-            clientId: ticket.client_id,
-            role: ticket.role,
-            streamId: ticket.stream_id,
-            deliveryGeneration: ticket.delivery_generation,
-            hostFence,
-            leaseFence: null,
-            controlState:
-              ticket.peer === "browser" && channel === "control" ? "awaiting-attach" : null,
-            dataState: ticket.peer === "browser" && channel === "data" ? "awaiting-attach" : null,
-            firstEventSeq: null,
-            ackedEventSeq: null,
-            sentEventSeq: null,
-            firstPtyOffset: null,
-            ackedPtyOffset: null,
-            sentPtyOffset: null,
-            replayMode: null,
-            snapshotId: null,
-            replayCommitEventSeq: null,
-            replayCommitPtyOffset: null,
-            relayCapabilities,
-          });
+    const attachment = SocketAttachmentSchema.parse({
+      peer: ticket.peer,
+      channel,
+      connectionSetId: ticket.connection_set_id,
+      connectionId: ticket.connection_id,
+      subject: ticket.subject,
+      clientId: ticket.client_id,
+      role: ticket.role,
+      streamId: ticket.stream_id,
+      deliveryGeneration: ticket.delivery_generation,
+      hostFence: ticket.peer === "host" ? hostFence : null,
+      leaseFence: null,
+      recoveryLookupKey: null,
+      ready: false,
+    });
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
@@ -1031,11 +801,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   ): Promise<void> {
     if (!this.isCurrentHost(attachment)) return;
 
-    let frame: HostControlFrameV3;
+    let frame: HostControlFrame;
     try {
-      frame = this.isRecoveryV3Host(attachment)
-        ? decodeHostControlFrame(message, "v3")
-        : decodeHostControlFrame(message, "v2");
+      frame = decodeHostControlFrame(message);
     } catch {
       closeProtocol(webSocket, "invalid host control frame");
       return;
@@ -1075,21 +843,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
           Date.now(),
         );
       });
-      writeAttachment(webSocket, { ...attachment, controlState: "active" });
-      const activeBrowsers = this.browserControlSockets().flatMap((browser) => {
-        const browserAttachment = readAttachment(browser);
-        return browserAttachment?.controlState === "active" && browserAttachment.clientId !== null
-          ? [{ browser, attachment: browserAttachment }]
-          : [];
-      });
-      await Promise.all(
-        activeBrowsers.map(({ attachment: browserAttachment }) => {
-          return this.resetBrowserDelivery(browserAttachment.clientId!, "host-reconnect", false, {
-            webSocket,
-            hostFence: attachment.hostFence!,
-          });
-        }),
-      );
+      writeAttachment(webSocket, { ...attachment, ready: true });
       const readyConnection = connectionSockets(this.ctx, attachment);
       if (
         webSocket.readyState !== WebSocket.OPEN ||
@@ -1119,259 +873,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.sendBrowserControl(browser, browserFrame, "input acknowledgement delivery failed");
       return;
     }
-
-    const browser = this.browserControlByConnection(frame.connectionId);
-    const browserAttachment = browser === undefined ? undefined : readAttachment(browser);
-    if (browserAttachment?.clientId !== null && browserAttachment?.clientId !== undefined) {
-      await this.resetBrowserDelivery(browserAttachment.clientId, frame.reason, false);
-    }
-  }
-
-  private handleDeliveryBarrier(
-    hostData: WebSocket,
-    hostAttachment: SocketAttachment,
-    session: SessionRow,
-    frame: DataFrame,
-  ): void {
-    const hostControl = matchingSocket(this.ctx, hostAttachment, "control");
-    const hostControlAttachment =
-      hostControl === undefined ? undefined : readAttachment(hostControl);
-    if (
-      hostData !== this.currentHostData() ||
-      hostControl === undefined ||
-      hostControl !== this.currentHostControl() ||
-      hostControlAttachment === undefined ||
-      hostControlAttachment.hostFence !== hostAttachment.hostFence ||
-      !sameConnection(hostControlAttachment, hostAttachment)
-    ) {
-      this.failCurrentHost(hostAttachment, "delivery barrier host channels are not current");
-      return;
-    }
-    let payload: DeliveryBarrierPayload;
-    try {
-      payload = decodeDeliveryBarrierPayload(frame.payload);
-    } catch {
-      this.failCurrentHost(hostAttachment, "invalid delivery barrier payload");
-      return;
-    }
-    if (
-      frame.streamId === 0 ||
-      frame.eventSeq !== BigInt(session.head_event_seq) ||
-      frame.ptyOffset !== BigInt(session.next_pty_offset)
-    ) {
-      this.failCurrentHost(hostAttachment, "delivery barrier does not match canonical head");
-      return;
-    }
-
-    const client = this.clientByStream(frame.streamId);
-    if (client === undefined || frame.deliveryGeneration !== BigInt(client.delivery_generation)) {
-      this.sendDeliveryBarrierResult(hostControl, frame, payload, {
-        status: "stale",
-        reason: "generation-fenced",
-      });
-      return;
-    }
-    const browserControl = this.activeBrowserControl(client.client_id);
-    const controlAttachment =
-      browserControl === undefined ? undefined : readAttachment(browserControl);
-    const browserData = this.browserDataByClient(client.client_id);
-    const dataAttachment = browserData === undefined ? undefined : readAttachment(browserData);
-    if (
-      browserControl === undefined ||
-      controlAttachment === undefined ||
-      browserData === undefined ||
-      dataAttachment === undefined ||
-      controlAttachment.controlState !== "active" ||
-      controlAttachment.clientId !== client.client_id ||
-      controlAttachment.connectionId !== payload.connectionId ||
-      controlAttachment.streamId !== client.stream_id ||
-      controlAttachment.deliveryGeneration !== client.delivery_generation ||
-      dataAttachment.clientId !== client.client_id ||
-      dataAttachment.connectionSetId !== controlAttachment.connectionSetId ||
-      dataAttachment.connectionId !== controlAttachment.connectionId ||
-      dataAttachment.streamId !== client.stream_id ||
-      dataAttachment.deliveryGeneration !== client.delivery_generation
-    ) {
-      this.sendDeliveryBarrierResult(hostControl, frame, payload, {
-        status: "stale",
-        reason: "client-gone",
-      });
-      return;
-    }
-    if (
-      dataAttachment.dataState !== "catching-up" ||
-      !hasUnadvancedDeliveryCursor(dataAttachment)
-    ) {
-      this.failCurrentHost(hostAttachment, "delivery barrier conflicts with active delivery");
-      return;
-    }
-
-    const expectedSnapshotId = payload.mode === "snapshot" ? payload.snapshotId : null;
-    const hasNoPin =
-      dataAttachment.replayMode === null &&
-      dataAttachment.snapshotId === null &&
-      dataAttachment.replayCommitEventSeq === null &&
-      dataAttachment.replayCommitPtyOffset === null;
-    const hasExactPin =
-      dataAttachment.replayMode === payload.mode &&
-      dataAttachment.snapshotId === expectedSnapshotId &&
-      dataAttachment.replayCommitEventSeq === frame.eventSeq.toString() &&
-      dataAttachment.replayCommitPtyOffset === frame.ptyOffset.toString();
-    if (!hasNoPin && !hasExactPin) {
-      this.failCurrentHost(hostAttachment, "delivery barrier conflicts with pinned delivery");
-      return;
-    }
-
-    let nextAttachment = dataAttachment;
-    let browserFrame: z.input<typeof ServerControlFrameSchema>;
-    if (payload.mode === "warm") {
-      if (dataAttachment.firstEventSeq === null || dataAttachment.firstPtyOffset === null) {
-        this.sendDeliveryBarrierResult(hostControl, frame, payload, {
-          status: "rejected",
-          reason: "missing-live-seed",
-          retryScope: "same-generation",
-        });
-        return;
-      }
-      nextAttachment = {
-        ...dataAttachment,
-        replayMode: "warm",
-        snapshotId: null,
-        replayCommitEventSeq: frame.eventSeq.toString(),
-        replayCommitPtyOffset: frame.ptyOffset.toString(),
-      };
-      browserFrame = {
-        type: "replay-start",
-        sessionEpoch: session.session_epoch,
-        streamId: client.stream_id,
-        deliveryGeneration: client.delivery_generation,
-        baseEventSeq: dataAttachment.firstEventSeq,
-        basePtyOffset: dataAttachment.firstPtyOffset,
-        commitEventSeq: frame.eventSeq.toString(),
-        commitPtyOffset: frame.ptyOffset.toString(),
-      };
-    } else {
-      const snapshot = this.snapshots.published(payload.snapshotId);
-      if (snapshot === undefined) {
-        this.sendDeliveryBarrierResult(hostControl, frame, payload, {
-          status: "rejected",
-          reason: "snapshot-missing",
-          retryScope: "refresh-checkpoint",
-        });
-        return;
-      }
-      if (
-        snapshot.sessionId !== session.session_id ||
-        snapshot.sessionEpoch !== session.session_epoch ||
-        snapshot.engineId !== session.engine_id ||
-        BigInt(snapshot.cutEventSeq) > frame.eventSeq ||
-        BigInt(snapshot.nextPtyOffset) > frame.ptyOffset
-      ) {
-        this.sendDeliveryBarrierResult(hostControl, frame, payload, {
-          status: "rejected",
-          reason: "snapshot-metadata-mismatch",
-          retryScope: "refresh-checkpoint",
-        });
-        return;
-      }
-      if (
-        hasExactPin &&
-        (dataAttachment.firstEventSeq !== snapshot.cutEventSeq ||
-          dataAttachment.firstPtyOffset !== snapshot.nextPtyOffset)
-      ) {
-        this.failCurrentHost(hostAttachment, "snapshot barrier conflicts with pinned seed");
-        return;
-      }
-      nextAttachment = {
-        ...dataAttachment,
-        firstEventSeq: snapshot.cutEventSeq,
-        ackedEventSeq: snapshot.cutEventSeq,
-        sentEventSeq: snapshot.cutEventSeq,
-        firstPtyOffset: snapshot.nextPtyOffset,
-        ackedPtyOffset: snapshot.nextPtyOffset,
-        sentPtyOffset: snapshot.nextPtyOffset,
-        replayMode: "snapshot",
-        snapshotId: payload.snapshotId,
-        replayCommitEventSeq: frame.eventSeq.toString(),
-        replayCommitPtyOffset: frame.ptyOffset.toString(),
-      };
-      browserFrame = {
-        type: "snapshot-manifest",
-        snapshotId: snapshot.snapshotId,
-        engineId: snapshot.engineId,
-        sessionEpoch: snapshot.sessionEpoch,
-        streamId: client.stream_id,
-        deliveryGeneration: client.delivery_generation,
-        cutEventSeq: snapshot.cutEventSeq,
-        nextPtyOffset: snapshot.nextPtyOffset,
-        commitEventSeq: frame.eventSeq.toString(),
-        commitPtyOffset: frame.ptyOffset.toString(),
-        compression: snapshot.compression,
-        compressedLength: snapshot.compressedLength,
-        uncompressedLength: snapshot.uncompressedLength,
-        sha256: snapshot.sha256,
-        downloadPath: `/api/v1/sessions/${session.session_id}/snapshots/${snapshot.snapshotId}`,
-        restoreThrough: "finish",
-      };
-    }
-
-    if (hasNoPin) {
-      writeAttachment(browserData, nextAttachment);
-      if (nextAttachment.snapshotId !== null) this.snapshotUploads.scheduleMaintenance();
-    }
-    if (!this.sendBrowserControl(browserControl, browserFrame, "delivery start failed")) {
-      this.sendDeliveryBarrierResult(hostControl, frame, payload, {
-        status: "rejected",
-        reason: "browser-control-send-failed",
-        retryScope: "drop-client",
-      });
-      return;
-    }
-    this.sendDeliveryBarrierResult(hostControl, frame, payload, { status: "ready" });
-  }
-
-  private sendDeliveryBarrierResult(
-    webSocket: WebSocket,
-    frame: DataFrame,
-    payload: DeliveryBarrierPayload,
-    outcome:
-      | { status: "ready" }
-      | { status: "stale"; reason: "generation-fenced" | "client-gone" }
-      | {
-          status: "rejected";
-          reason: "missing-live-seed";
-          retryScope: "same-generation";
-        }
-      | {
-          status: "rejected";
-          reason: "snapshot-missing" | "snapshot-metadata-mismatch";
-          retryScope: "refresh-checkpoint";
-        }
-      | {
-          status: "rejected";
-          reason: "browser-control-send-failed";
-          retryScope: "drop-client";
-        },
-  ): void {
-    const supportsOutcomeDetails = readAttachment(webSocket)?.relayCapabilities.includes(
-      RelayCapability.deliveryBarrierOutcomeV1,
-    );
-    const common = {
-      type: "delivery-barrier-result" as const,
-      ...(supportsOutcomeDetails ? outcome : { status: outcome.status }),
-      connectionId: payload.connectionId,
-      streamId: frame.streamId,
-      deliveryGeneration: frame.deliveryGeneration.toString(),
-      commitEventSeq: frame.eventSeq.toString(),
-      commitPtyOffset: frame.ptyOffset.toString(),
-    };
-    this.sendHostControl(
-      webSocket,
-      payload.mode === "warm"
-        ? { ...common, mode: "warm" }
-        : { ...common, mode: "snapshot", snapshotId: payload.snapshotId },
-      "delivery barrier result delivery failed",
-    );
   }
 
   private async handleBrowserControl(
@@ -1379,22 +880,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     attachment: SocketAttachment,
     message: string,
   ): Promise<void> {
-    if (attachment.recoveryStrategy === "v3" && !this.recoveryV3Enabled) {
-      this.failRecoveryBrowser(attachment, "Recovery v3 is disabled");
-      return;
-    }
-    let frame: ClientControlFrame | ClientControlFrameV3;
+    let frame: ClientControlFrame;
     try {
-      frame =
-        attachment.recoveryStrategy === "v3"
-          ? decodeClientControlFrame(message, "v3")
-          : decodeClientControlFrame(message, "v2");
+      frame = decodeClientControlFrame(message);
     } catch {
-      if (attachment.recoveryStrategy === "v3") {
-        this.failRecoveryBrowser(attachment, "invalid browser recovery control frame");
-      } else {
-        closeProtocol(webSocket, "invalid browser control frame");
-      }
+      this.failBrowser(attachment, "invalid browser control frame");
       return;
     }
     if (attachment.clientId === null) {
@@ -1411,7 +901,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       frame.type === "replica-applied" ||
       frame.type === "recovery-adopted"
     ) {
-      this.handleRecoveryBrowserProgress(webSocket, attachment, frame);
+      this.handleBrowserProgress(webSocket, attachment, frame);
       return;
     }
     if (
@@ -1445,18 +935,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         },
         "writer lease status delivery failed",
       );
-      return;
-    }
-    if (frame.type === "ack") {
-      const client = this.clientById(attachment.clientId);
-      if (
-        !this.isExactActiveBrowserControl(webSocket, attachment) ||
-        this.currentHostControl() === undefined ||
-        client?.delivery_generation !== frame.deliveryGeneration
-      ) {
-        return;
-      }
-      this.acknowledgeBrowser(webSocket, attachment, frame);
       return;
     }
     if (!this.isExactActiveBrowserControl(webSocket, attachment)) {
@@ -1518,103 +996,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     attachment: SocketAttachment,
     frame: Extract<ClientControlFrame, { type: "attach" }>,
   ): Promise<void> {
-    if (attachment.recoveryStrategy === "v3") {
-      await this.attachRecoveryBrowser(webSocket, attachment, frame);
-      return;
-    }
-    const initialResult = this.resolveBrowserAttachContext(webSocket, attachment, frame);
-    if (!initialResult.ok) {
-      this.rejectBrowserAttach(webSocket, initialResult);
-      return;
-    }
-    const initial = initialResult.value;
-    const initialActivation = initial.controlAttachment.controlState === "awaiting-attach";
-    const lease =
-      initialActivation && attachment.role === "writer"
-        ? await this.acquireWriterLease(attachment.clientId!, Date.now())
-        : undefined;
-    const currentResult = this.resolveBrowserAttachContext(webSocket, attachment, frame);
-    if (!currentResult.ok) {
-      if (lease !== undefined) this.releaseWriterLease(attachment.clientId!, lease.fence);
-      return;
-    }
-    const current = currentResult.value;
-
-    const { type: _type, deliveryGeneration: _deliveryGeneration, ...attachPayload } = frame;
-    const activeAttachment = SocketAttachmentSchema.parse({
-      ...current.controlAttachment,
-      deliveryGeneration: current.client.delivery_generation,
-      leaseFence: lease?.fence ?? current.controlAttachment.leaseFence,
-      controlState: "active",
-    });
-    if (initialActivation) writeAttachment(webSocket, activeAttachment);
-    const baselineEventSeq = frame.hasLiveReplica ? frame.lastEventSeq : null;
-    const baselinePtyOffset = frame.hasLiveReplica ? frame.nextPtyOffset : null;
-    writeAttachment(current.dataSocket, {
-      ...current.dataAttachment,
-      dataState: "catching-up",
-      firstEventSeq: baselineEventSeq,
-      ackedEventSeq: baselineEventSeq,
-      sentEventSeq: baselineEventSeq,
-      firstPtyOffset: baselinePtyOffset,
-      ackedPtyOffset: baselinePtyOffset,
-      sentPtyOffset: baselinePtyOffset,
-      replayMode: null,
-      snapshotId: null,
-      replayCommitEventSeq: null,
-      replayCommitPtyOffset: null,
-    });
-    if (
-      initialActivation &&
-      !this.sendBrowserControl(
-        webSocket,
-        {
-          type: "welcome",
-          connectionId: current.controlAttachment.connectionId,
-          streamId: current.client.stream_id,
-          ...(lease === undefined ? {} : { writerLease: lease.token }),
-          engineId: current.session.engine_id,
-          sessionEpoch: current.session.session_epoch,
-          deliveryGeneration: current.client.delivery_generation,
-          headEventSeq: current.session.head_event_seq,
-          nextPtyOffset: current.session.next_pty_offset,
-        },
-        "welcome delivery failed",
-      )
-    ) {
-      return;
-    }
-
-    const host = this.currentHostControl();
-    if (host === undefined) {
-      this.sendBrowserControl(webSocket, { type: "host-offline" }, "host status delivery failed");
-      return;
-    }
-    this.sendHostControl(
-      host,
-      {
-        type: "attach-request",
-        connectionId: current.controlAttachment.connectionId,
-        streamId: current.client.stream_id,
-        deliveryGeneration: current.client.delivery_generation,
-        ...attachPayload,
-      },
-      "browser attach request delivery failed",
-    );
-  }
-
-  private async attachRecoveryBrowser(
-    webSocket: WebSocket,
-    attachment: SocketAttachment,
-    frame: Extract<ClientControlFrame, { type: "attach" }>,
-  ): Promise<void> {
-    if (!this.recoveryV3Enabled) {
-      this.failRecoveryBrowser(attachment, "Recovery v3 is disabled");
-      return;
-    }
-    const initial = this.resolveRecoveryBrowserAttachContext(webSocket, attachment, frame);
+    const initial = this.resolveBrowserAttachContext(webSocket, attachment, frame);
     if (initial === undefined) {
-      this.failRecoveryBrowser(attachment, "invalid Recovery v3 attach identity");
+      this.failBrowser(attachment, "invalid recovery attach identity");
       return;
     }
     const initialActivation = initial.controlAttachment.recoveryLookupKey === null;
@@ -1623,10 +1007,10 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         ? await this.acquireRecoveryWriterLease(attachment.clientId!, Date.now())
         : undefined;
     if (initialActivation && attachment.role === "writer" && lease === undefined) {
-      this.failRecoveryBrowser(attachment, "Recovery v3 writer lease is unavailable");
+      this.failBrowser(attachment, "recovery writer lease is unavailable");
       return;
     }
-    const current = this.resolveRecoveryBrowserAttachContext(webSocket, attachment, frame);
+    const current = this.resolveBrowserAttachContext(webSocket, attachment, frame);
     if (current === undefined) {
       if (lease !== undefined)
         this.releaseWriterLeaseTransaction(attachment.clientId!, lease.fence);
@@ -1639,14 +1023,14 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       current.client.stream_id,
       current.client.delivery_generation,
     );
-    let prepare: RecoveryV3HostPrepare;
+    let prepare: RecoveryHostPrepare;
     if (existing !== undefined) {
       try {
-        prepare = RecoveryV3HostPrepareSchema.parse(JSON.parse(existing.prepare_json) as unknown);
+        prepare = RecoveryHostPrepareSchema.parse(JSON.parse(existing.prepare_json) as unknown);
       } catch {
         if (lease !== undefined)
           this.releaseWriterLeaseTransaction(attachment.clientId!, lease.fence);
-        this.failRecoveryBrowser(attachment, "invalid durable Recovery v3 prepare");
+        this.failBrowser(attachment, "invalid durable recovery prepare");
         return;
       }
       const expectedBase: AuthorityCursor | undefined = frame.hasLiveReplica
@@ -1675,12 +1059,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       ) {
         if (lease !== undefined)
           this.releaseWriterLeaseTransaction(attachment.clientId!, lease.fence);
-        this.failRecoveryBrowser(attachment, "Recovery v3 attach retry diverged");
+        this.failBrowser(attachment, "recovery attach retry diverged");
         return;
       }
     } else {
       let base: AuthorityCursor;
-      let source: RecoveryV3HostPrepare["source"];
+      let source: RecoveryHostPrepare["source"];
       if (frame.hasLiveReplica) {
         base = {
           sessionEpoch: frame.lastSessionEpoch,
@@ -1699,7 +1083,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         ) {
           if (lease !== undefined)
             this.releaseWriterLeaseTransaction(attachment.clientId!, lease.fence);
-          this.failRecoveryBrowser(attachment, "Recovery v3 snapshot is unavailable");
+          this.failBrowser(attachment, "recovery snapshot is unavailable");
           return;
         }
         base = {
@@ -1709,7 +1093,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         };
         source = { kind: "snapshot", snapshotId: snapshot.snapshotId };
       }
-      prepare = RecoveryV3HostPrepareSchema.parse({
+      prepare = RecoveryHostPrepareSchema.parse({
         type: "recovery-prepare",
         recoveryId: randomId(18),
         connectionId: current.controlAttachment.connectionId,
@@ -1744,17 +1128,17 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       } catch {
         if (lease !== undefined)
           this.releaseWriterLeaseTransaction(attachment.clientId!, lease.fence);
-        this.failRecoveryBrowser(attachment, "Recovery v3 delivery capacity could not reconcile");
+        this.failBrowser(attachment, "recovery delivery capacity could not reconcile");
         return;
       }
       if (result === undefined || !result.ok) {
         if (lease !== undefined)
           this.releaseWriterLeaseTransaction(attachment.clientId!, lease.fence);
-        this.failRecoveryBrowser(attachment, "Recovery v3 prepare could not start");
+        this.failBrowser(attachment, "recovery prepare could not start");
         return;
       }
       for (const victim of capacityVictims) {
-        this.isolateRecoveryAttempt(victim, "Recovery v3 delivery capacity reserved for writer");
+        this.isolateRecoveryAttempt(victim, "recovery delivery capacity reserved for writer");
       }
       if (capacityVictims.length > 0) this.afterRecoveryTransition();
       else {
@@ -1767,6 +1151,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       ...current.controlAttachment,
       leaseFence: lease?.fence ?? current.controlAttachment.leaseFence,
       recoveryLookupKey: prepare.recoveryId,
+      ready: true,
     });
     const activeData = SocketAttachmentSchema.parse({
       ...current.dataAttachment,
@@ -1787,7 +1172,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
           headEventSeq: current.session.head_event_seq,
           nextPtyOffset: current.session.next_pty_offset,
         },
-        "Recovery v3 welcome delivery failed",
+        "recovery welcome delivery failed",
       )
     ) {
       // The Welcome failed before the attachment could durably reference the
@@ -1807,16 +1192,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     this.scheduleRecoveryOutboxDrain();
   }
 
-  private resolveRecoveryBrowserAttachContext(
+  private resolveBrowserAttachContext(
     webSocket: WebSocket,
     attachment: SocketAttachment,
     frame: Extract<ClientControlFrame, { type: "attach" }>,
-  ): RecoveryBrowserAttachContext | undefined {
-    if (
-      attachment.version !== 3 ||
-      attachment.recoveryStrategy !== "v3" ||
-      attachment.clientId === null
-    ) {
+  ): BrowserAttachContext | undefined {
+    if (attachment.clientId === null) {
       return undefined;
     }
     const session = this.session();
@@ -1830,22 +1211,17 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       session === undefined ||
       client === undefined ||
       client.registered_at === null ||
-      client.recovery_strategy !== "v3" ||
       client.delivery_generation !== attachment.deliveryGeneration ||
       client.stream_id !== attachment.streamId ||
       frame.deliveryGeneration !== client.delivery_generation ||
       frame.engineId !== session.engine_id ||
       webSocket.readyState !== WebSocket.OPEN ||
       this.activeBrowserControl(client.client_id) !== webSocket ||
-      controlAttachment?.version !== 3 ||
-      controlAttachment.recoveryStrategy !== "v3" ||
-      controlAttachment.clientId !== client.client_id ||
+      controlAttachment?.clientId !== client.client_id ||
       controlAttachment.connectionSetId !== attachment.connectionSetId ||
       controlAttachment.connectionId !== attachment.connectionId ||
       dataSocket === undefined ||
-      dataAttachment?.version !== 3 ||
-      dataAttachment.recoveryStrategy !== "v3" ||
-      dataAttachment.clientId !== client.client_id ||
+      dataAttachment?.clientId !== client.client_id ||
       dataAttachment.connectionSetId !== attachment.connectionSetId ||
       dataAttachment.connectionId !== attachment.connectionId ||
       dataAttachment.streamId !== client.stream_id ||
@@ -1853,7 +1229,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       hostControl === undefined ||
       hostAttachment === undefined ||
       hostAttachment.hostFence === null ||
-      !this.isRecoveryV3Host(hostAttachment)
+      !hostAttachment.ready
     ) {
       return undefined;
     }
@@ -1883,185 +1259,18 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     };
   }
 
-  private resolveBrowserAttachContext(
+  private handleBrowserProgress(
     webSocket: WebSocket,
     attachment: SocketAttachment,
-    frame: Extract<ClientControlFrame, { type: "attach" }>,
-  ): BrowserAttachContextResult {
-    if (attachment.clientId === null) return { ok: false, reason: "session-missing" };
-    const session = this.session();
-    const client = this.clientById(attachment.clientId);
-    if (session === undefined || client === undefined) {
-      return { ok: false, reason: "session-missing" };
-    }
-    if (frame.deliveryGeneration !== client.delivery_generation) {
-      return { ok: false, client, reason: "stale-delivery" };
-    }
-    const controlAttachment = readAttachment(webSocket);
-    if (
-      webSocket.readyState !== WebSocket.OPEN ||
-      controlAttachment?.clientId !== attachment.clientId ||
-      controlAttachment.connectionId !== attachment.connectionId ||
-      controlAttachment.connectionSetId !== attachment.connectionSetId ||
-      this.activeBrowserControl(attachment.clientId) !== webSocket
-    ) {
-      return { ok: false, client, reason: "stale-control" };
-    }
-    if (
-      (controlAttachment.controlState !== "awaiting-attach" &&
-        controlAttachment.controlState !== "active") ||
-      controlAttachment.deliveryGeneration !== client.delivery_generation
-    ) {
-      return { ok: false, client, reason: "stale-control" };
-    }
-    const dataSocket = this.browserDataByClient(attachment.clientId);
-    const dataAttachment = dataSocket === undefined ? undefined : readAttachment(dataSocket);
-    if (
-      dataSocket === undefined ||
-      dataAttachment?.connectionId !== attachment.connectionId ||
-      dataAttachment.connectionSetId !== attachment.connectionSetId ||
-      dataAttachment.deliveryGeneration !== client.delivery_generation
-    ) {
-      return {
-        ok: false,
-        client,
-        reason:
-          controlAttachment.controlState === "awaiting-attach" ? "data-missing" : "stale-delivery",
-      };
-    }
-    if (dataAttachment.dataState !== "awaiting-attach") {
-      return { ok: false, client, reason: "already-attached" };
-    }
-    if (frame.engineId !== session.engine_id) {
-      return { ok: false, client, reason: "engine-mismatch" };
-    }
-    if (frame.hasLiveReplica && frame.lastSessionEpoch !== session.session_epoch) {
-      return { ok: false, client, reason: "epoch-changed" };
-    }
-    if (
-      frame.hasLiveReplica &&
-      (BigInt(frame.lastEventSeq) > BigInt(session.head_event_seq) ||
-        BigInt(frame.nextPtyOffset) > BigInt(session.next_pty_offset))
-    ) {
-      return { ok: false, client, reason: "cursor-ahead" };
-    }
-    return {
-      ok: true,
-      value: { client, controlAttachment, dataAttachment, dataSocket, session },
-    };
-  }
-
-  private rejectBrowserAttach(
-    webSocket: WebSocket,
-    result: Extract<BrowserAttachContextResult, { ok: false }>,
+    frame: RecoveryProgressFrame,
   ): void {
-    if (result.reason === "stale-control" || result.reason === "stale-delivery") return;
-    if (result.reason === "already-attached") {
-      const attachment = readAttachment(webSocket);
-      if (attachment === undefined) closeProtocol(webSocket, "delivery is already attached");
-      else this.isolateBrowserConnection(webSocket, attachment, "delivery is already attached");
-      return;
-    }
-    if (
-      result.client !== undefined &&
-      (result.reason === "engine-mismatch" || result.reason === "epoch-changed")
-    ) {
-      this.sendBrowserControl(
-        webSocket,
-        {
-          type: "resync-required",
-          deliveryGeneration: result.client.delivery_generation,
-          reason: result.reason,
-        },
-        "resync notification failed",
-      );
-      return;
-    }
-    closeProtocol(
-      webSocket,
-      result.reason === "cursor-ahead"
-        ? "replica cursor exceeds host head"
-        : "matching session data channel required before attach",
-    );
-  }
-
-  private acknowledgeBrowser(
-    webSocket: WebSocket,
-    attachment: SocketAttachment,
-    frame: Extract<ClientControlFrame, { type: "ack" }>,
-  ): void {
-    if (attachment.clientId === null) return;
-    const session = this.session();
-    const client = this.clientById(attachment.clientId);
-    if (session === undefined || client === undefined) return;
-    if (frame.deliveryGeneration !== client.delivery_generation) return;
-    if (frame.sessionEpoch !== session.session_epoch) {
-      this.sendBrowserControl(
-        webSocket,
-        {
-          type: "resync-required",
-          deliveryGeneration: client.delivery_generation,
-          reason: "epoch-changed",
-        },
-        "resync notification failed",
-      );
-      return;
-    }
-
-    const eventSeq = BigInt(frame.eventSeq);
-    const ptyOffset = BigInt(frame.nextPtyOffset);
-    if (eventSeq > BigInt(session.head_event_seq) || ptyOffset > BigInt(session.next_pty_offset)) {
-      closeProtocol(webSocket, "invalid acknowledgement cursor");
-      return;
-    }
-
-    const dataSocket = this.browserDataByClient(attachment.clientId);
-    const dataAttachment = dataSocket === undefined ? undefined : readAttachment(dataSocket);
-    if (
-      dataSocket === undefined ||
-      dataAttachment === undefined ||
-      dataAttachment.deliveryGeneration !== frame.deliveryGeneration ||
-      dataAttachment.sentEventSeq === null ||
-      dataAttachment.sentPtyOffset === null
-    ) {
-      closeProtocol(webSocket, "acknowledgement has no delivered data cursor");
-      return;
-    }
-    const sentEventSeq = BigInt(dataAttachment.sentEventSeq);
-    const sentPtyOffset = BigInt(dataAttachment.sentPtyOffset);
-    const ackedEventSeq =
-      dataAttachment.ackedEventSeq === null ? undefined : BigInt(dataAttachment.ackedEventSeq);
-    const ackedPtyOffset =
-      dataAttachment.ackedPtyOffset === null ? undefined : BigInt(dataAttachment.ackedPtyOffset);
-    if (
-      eventSeq > sentEventSeq ||
-      ptyOffset > sentPtyOffset ||
-      (ackedEventSeq !== undefined && eventSeq < ackedEventSeq) ||
-      (ackedPtyOffset !== undefined && ptyOffset < ackedPtyOffset)
-    ) {
-      closeProtocol(webSocket, "acknowledgement exceeds delivered cursor");
-      return;
-    }
-    if (eventSeq === ackedEventSeq && ptyOffset === ackedPtyOffset) return;
-    writeAttachment(dataSocket, {
-      ...dataAttachment,
-      ackedEventSeq: frame.eventSeq,
-      ackedPtyOffset: frame.nextPtyOffset,
-    });
-  }
-
-  private handleRecoveryBrowserProgress(
-    webSocket: WebSocket,
-    attachment: SocketAttachment,
-    frame: RecoveryV3ClientControlFrame,
-  ): void {
-    const attempt = this.recoveryAttemptForBrowser(
+    const attempt = this.browserAttempt(
       webSocket,
       attachment,
       frame.type === "recovery-adopted" ? frame.recoveryId : undefined,
     );
     if (attempt === undefined) {
-      this.failRecoveryBrowser(attachment, "Recovery v3 progress identity is stale");
+      this.failBrowser(attachment, "recovery progress identity is stale");
       return;
     }
 
@@ -2088,7 +1297,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       }
     });
     if (result === undefined || !result.ok) {
-      this.failRecoveryBrowser(attachment, "invalid Recovery v3 progress");
+      this.failBrowser(attachment, "invalid recovery progress");
       return;
     }
     if (result.changed) {
@@ -2101,7 +1310,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   private handleRecoveryPrepareRejected(
     webSocket: WebSocket,
     hostAttachment: SocketAttachment,
-    frame: RecoveryV3HostPrepareRejected,
+    frame: RecoveryHostPrepareRejected,
   ): void {
     const attempt = this.recoveries.attemptByDeliveryIdentity(
       frame.streamId,
@@ -2113,20 +1322,20 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       attempt.host_fence !== hostAttachment.hostFence ||
       this.currentHostControl() !== webSocket
     ) {
-      this.failCurrentHost(hostAttachment, "Recovery v3 prepare rejection identity mismatch");
+      this.failCurrentHost(hostAttachment, "recovery prepare rejection identity mismatch");
       return;
     }
     this.resetAndIsolateRecovery(
       attempt,
       frame.reason === "client-gone" ? "pair-fenced" : "generation-reset",
-      "Recovery v3 source rejected",
+      "recovery source rejected",
     );
   }
 
   private handleRecoverySourceClosed(
     webSocket: WebSocket,
     hostAttachment: SocketAttachment,
-    frame: RecoveryV3HostSourceClosed,
+    frame: RecoveryHostSourceClosed,
   ): void {
     const attempt = this.recoveries.attemptByDeliveryIdentity(
       frame.streamId,
@@ -2138,7 +1347,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       attempt.host_fence !== hostAttachment.hostFence ||
       this.currentHostControl() !== webSocket
     ) {
-      this.failCurrentHost(hostAttachment, "Recovery v3 source closure identity mismatch");
+      this.failCurrentHost(hostAttachment, "recovery source closure identity mismatch");
       return;
     }
     const now = Date.now();
@@ -2150,11 +1359,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       }
     });
     if (result === undefined || !result.ok) {
-      this.resetAndIsolateRecovery(
-        attempt,
-        "generation-reset",
-        "invalid Recovery v3 source closure",
-      );
+      this.resetAndIsolateRecovery(attempt, "generation-reset", "invalid recovery source closure");
       return;
     }
     this.afterRecoveryTransition();
@@ -2176,12 +1381,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       attempt.host_fence !== hostAttachment.hostFence ||
       this.currentHostData() !== webSocket
     ) {
-      this.failCurrentHost(hostAttachment, "Recovery v3 start fence identity mismatch");
+      this.failCurrentHost(hostAttachment, "recovery start fence identity mismatch");
       return;
     }
-    const browser = this.recoveryBrowserSockets(attempt);
+    const browser = this.browserSockets(attempt);
     if (browser === undefined) {
-      this.resetAndIsolateRecovery(attempt, "generation-reset", "Recovery v3 Browser is gone");
+      this.resetAndIsolateRecovery(attempt, "generation-reset", "recovery browser is gone");
       return;
     }
 
@@ -2193,7 +1398,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         deliveryGeneration: fence.deliveryGeneration,
         streamId: fence.streamId,
         engineId: fence.engineId,
-        authorityDataVersion: 2,
+        authorityDataFormat: 1,
         base: fence.base,
         source: { kind: "warm" },
         committedThrough: fence.committedThrough,
@@ -2211,7 +1416,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         this.resetAndIsolateRecovery(
           attempt,
           "generation-reset",
-          "Recovery v3 snapshot changed before start",
+          "recovery snapshot changed before start",
         );
         return;
       }
@@ -2221,7 +1426,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         deliveryGeneration: fence.deliveryGeneration,
         streamId: fence.streamId,
         engineId: fence.engineId,
-        authorityDataVersion: 2,
+        authorityDataFormat: 1,
         base: fence.base,
         source: {
           kind: "snapshot",
@@ -2257,9 +1462,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       }
     });
     if (result === undefined || !result.ok) {
-      this.resetAndIsolateRecovery(attempt, "generation-reset", "Recovery v3 start fence rejected");
+      this.resetAndIsolateRecovery(attempt, "generation-reset", "recovery start fence rejected");
       if (result?.reason === "head-mismatch" || result?.reason === "identity-mismatch") {
-        this.failCurrentHost(hostAttachment, "Recovery v3 start fence conflicts with authority");
+        this.failCurrentHost(hostAttachment, "recovery start fence conflicts with authority");
       }
       return;
     }
@@ -2270,10 +1475,10 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     webSocket: WebSocket,
     hostAttachment: SocketAttachment,
     encoded: Uint8Array,
-    envelope: ReturnType<typeof decodeDeliveryEnvelopeV3>,
+    envelope: ReturnType<typeof decodeDeliveryEnvelope>,
   ): void {
     if (envelope.lane !== "recovery") {
-      this.failCurrentHost(hostAttachment, "Host cannot inject a Recovery v3 live envelope");
+      this.failCurrentHost(hostAttachment, "host cannot inject a live recovery envelope");
       return;
     }
     const attempt = this.recoveries.attemptByDeliveryIdentity(
@@ -2287,12 +1492,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       attempt.stream_id !== envelope.streamId ||
       attempt.delivery_generation !== envelope.deliveryGeneration.toString()
     ) {
-      this.failCurrentHost(hostAttachment, "Recovery v3 envelope identity mismatch");
+      this.failCurrentHost(hostAttachment, "recovery envelope identity mismatch");
       return;
     }
-    const browser = this.recoveryBrowserSockets(attempt);
+    const browser = this.browserSockets(attempt);
     if (browser === undefined) {
-      this.resetAndIsolateRecovery(attempt, "generation-reset", "Recovery v3 Browser is gone");
+      this.resetAndIsolateRecovery(attempt, "generation-reset", "recovery browser is gone");
       return;
     }
 
@@ -2311,7 +1516,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       plan = this.recoveryDataQueuePlan(attempt, enqueued.record);
     });
     if (plan === undefined) {
-      this.isolateRecoveryAttempt(attempt, "invalid or repeated Recovery v3 envelope");
+      this.isolateRecoveryAttempt(attempt, "invalid or repeated recovery envelope");
       this.afterRecoveryTransition();
       return;
     }
@@ -2329,8 +1534,8 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   ): Promise<void> {
     if (webSocket.readyState !== WebSocket.OPEN || !this.isCurrentHost(attachment)) return;
     const connection = connectionSockets(this.ctx, attachment);
-    if (connection.data !== webSocket) return;
     if (
+      connection.data !== webSocket ||
       connection.phase !== "ready" ||
       connection.control !== this.currentHostControl() ||
       this.currentHostData() !== webSocket
@@ -2339,23 +1544,19 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       return;
     }
 
-    if (this.isRecoveryV3Host(attachment)) {
-      try {
-        const fence = decodeRecoveryStartFence(encoded);
-        this.handleRecoveryStartFence(webSocket, attachment, fence);
-        return;
-      } catch {
-        // A normal canonical v2 frame and a v3 envelope are both expected to
-        // fail this strict marker decoder; dispatch continues below.
-      }
-      try {
-        const envelope = decodeDeliveryEnvelopeV3(encoded);
-        this.handleRecoveryEnvelope(webSocket, attachment, encoded, envelope);
-        return;
-      } catch {
-        // Fall through to the shared canonical v2 decoder. Unknown encodings
-        // will fail there and fence the Host pair.
-      }
+    try {
+      const fence = decodeRecoveryStartFence(encoded);
+      this.handleRecoveryStartFence(webSocket, attachment, fence);
+      return;
+    } catch {
+      // Envelopes have their own magic; recovery fences and canonical data use strict frame kinds.
+    }
+    try {
+      const envelope = decodeDeliveryEnvelope(encoded);
+      this.handleRecoveryEnvelope(webSocket, attachment, encoded, envelope);
+      return;
+    } catch {
+      // Fall through to the canonical data decoder.
     }
 
     let frame: DataFrame;
@@ -2370,119 +1571,20 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.failCurrentHost(attachment, "host session epoch mismatch");
       return;
     }
-
-    if (frame.kind === DataFrameKind.DeliveryBarrier) {
-      this.handleDeliveryBarrier(webSocket, attachment, session, frame);
-      return;
-    }
-
-    if (frame.streamId === 0) {
-      if (
-        frame.deliveryGeneration !== 0n ||
-        this.hasPinnedDeliveryInProgress() ||
-        !this.isNextCanonicalFrame(session, frame)
-      ) {
-        this.failCurrentHost(attachment, "canonical data sequence gap");
-        return;
-      }
-      const recoveryPlans = this.commitCanonicalAndPlanRecovery(session, frame, encoded);
-      if (recoveryPlans === undefined) {
-        this.failCurrentHost(attachment, "canonical data sequence gap");
-        return;
-      }
-      this.queueLiveCanonicalAfterCommit(recoveryPlans, encoded);
-      const pendingResets: Promise<void>[] = [];
-      for (const browserData of this.browserDataSockets()) {
-        const browserAttachment = readAttachment(browserData);
-        if (
-          browserAttachment?.recoveryStrategy === "v2" &&
-          browserAttachment.dataState === "synced"
-        ) {
-          const result = this.deliverToBrowser(browserData, browserAttachment, encoded, frame);
-          if (result === "sequence-error") {
-            if (browserAttachment.clientId !== null) {
-              pendingResets.push(
-                this.resetBrowserDelivery(browserAttachment.clientId, "journal-gap", false),
-              );
-            }
-          } else if (result !== undefined) {
-            pendingResets.push(result);
-          }
-        }
-      }
-      await Promise.all(pendingResets);
-      return;
-    }
-
-    const client = this.clientByStream(frame.streamId);
-    if (client === undefined || frame.deliveryGeneration !== BigInt(client.delivery_generation)) {
-      return;
-    }
-    const browserData = this.browserDataByClient(client.client_id);
-    const browserAttachment = browserData === undefined ? undefined : readAttachment(browserData);
     if (
-      browserData !== undefined &&
-      browserAttachment !== undefined &&
-      frame.kind === DataFrameKind.Reset
+      frame.streamId !== 0 ||
+      frame.deliveryGeneration !== 0n ||
+      !this.isNextCanonicalFrame(session, frame)
     ) {
-      this.failCurrentHost(attachment, "directed reset is not supported");
+      this.failCurrentHost(attachment, "canonical data sequence gap");
       return;
     }
-    if (
-      browserData === undefined ||
-      browserAttachment === undefined ||
-      browserAttachment.deliveryGeneration !== client.delivery_generation ||
-      browserAttachment.dataState === "synced"
-    ) {
+    const recoveryPlans = this.commitCanonicalAndPlanRecovery(session, frame, encoded);
+    if (recoveryPlans === undefined) {
+      this.failCurrentHost(attachment, "canonical data sequence gap");
       return;
     }
-    if (!this.isDirectedFrameWithinPinnedCommit(browserAttachment, frame)) {
-      this.failCurrentHost(attachment, "directed replay exceeds pinned commit");
-      return;
-    }
-    const result = this.deliverToBrowser(browserData, browserAttachment, encoded, frame);
-    if (result === "sequence-error") {
-      this.failCurrentHost(attachment, "directed replay sequence gap");
-    } else {
-      await result;
-    }
-  }
-
-  private isDirectedFrameWithinPinnedCommit(
-    attachment: SocketAttachment,
-    frame: DataFrame,
-  ): boolean {
-    if (
-      attachment.replayMode === null ||
-      attachment.replayCommitEventSeq === null ||
-      attachment.replayCommitPtyOffset === null
-    ) {
-      return false;
-    }
-    const commitEventSeq = BigInt(attachment.replayCommitEventSeq);
-    const commitPtyOffset = BigInt(attachment.replayCommitPtyOffset);
-    if (frame.kind === DataFrameKind.Reset) return false;
-    if (frame.kind === DataFrameKind.ReplayCommit) {
-      return frame.eventSeq === commitEventSeq && frame.ptyOffset === commitPtyOffset;
-    }
-    if (frame.eventSeq > commitEventSeq || frame.ptyOffset > commitPtyOffset) return false;
-    if (frame.kind === DataFrameKind.ResizeApplied) return true;
-    return (
-      frame.kind === DataFrameKind.PtyOutput &&
-      frame.ptyOffset <= MAX_U64 - BigInt(frame.payload.byteLength) &&
-      frame.ptyOffset + BigInt(frame.payload.byteLength) <= commitPtyOffset
-    );
-  }
-
-  private hasPinnedDeliveryInProgress(): boolean {
-    return this.browserDataSockets().some((socket) => {
-      const attachment = readAttachment(socket);
-      return (
-        attachment?.dataState === "catching-up" &&
-        attachment.replayCommitEventSeq !== null &&
-        attachment.replayCommitPtyOffset !== null
-      );
-    });
+    this.queueLiveCanonicalAfterCommit(recoveryPlans, encoded);
   }
 
   private isNextCanonicalFrame(session: SessionRow, frame: DataFrame): boolean {
@@ -2513,11 +1615,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       )
       .toArray() as unknown as RecoveryAttemptRow[];
     if (attempts.length > MAX_RECOVERY_ATTEMPTS) {
-      throw new Error("durable Recovery v3 attempt bound exceeded");
+      throw new Error("durable recovery attempt bound exceeded");
     }
-    const sockets = new Map<string, RecoveryBrowserSockets | undefined>();
+    const sockets = new Map<string, BrowserSockets | undefined>();
     for (const attempt of attempts) {
-      sockets.set(attempt.recovery_id, this.recoveryBrowserSockets(attempt));
+      sockets.set(attempt.recovery_id, this.browserSockets(attempt));
     }
 
     const nextPtyOffset =
@@ -2574,13 +1676,13 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
             .filter((record) => record.lane === "live")
             .at(-1);
           const encodedBytes =
-            BigInt(DELIVERY_ENVELOPE_V3_HEADER_BYTES) + BigInt(canonical.byteLength);
+            BigInt(DELIVERY_ENVELOPE_HEADER_BYTES) + BigInt(canonical.byteLength);
           const previousOrdinal = BigInt(tail?.delivery_ordinal ?? live.sent_delivery_ordinal);
           const previousCumulative = BigInt(
             tail?.cumulative_encoded_bytes ?? live.sent_cumulative_encoded_bytes,
           );
           if (previousCumulative > MAX_U64 - encodedBytes) throw new Error("delivery overflow");
-          envelope = encodeDeliveryEnvelopeV3({
+          envelope = encodeDeliveryEnvelope({
             lane: "live",
             deliveryGeneration: BigInt(attempt.delivery_generation),
             deliveryOrdinal: previousOrdinal + 1n,
@@ -2608,57 +1710,10 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     });
     if (!committed) return undefined;
     for (const attempt of isolated) {
-      this.isolateRecoveryAttempt(attempt, "Recovery v3 generation reset");
+      this.isolateRecoveryAttempt(attempt, "recovery generation reset");
     }
     if (isolated.length > 0) this.afterRecoveryTransition();
     return plans;
-  }
-
-  private deliverToBrowser(
-    webSocket: WebSocket,
-    attachment: SocketAttachment,
-    encoded: Uint8Array,
-    frame: DataFrame,
-  ): Promise<void> | "sequence-error" | undefined {
-    if (attachment.clientId === null || webSocket.readyState !== WebSocket.OPEN) return;
-    const client = this.clientById(attachment.clientId);
-    if (
-      client === undefined ||
-      client.stream_id !== attachment.streamId ||
-      client.delivery_generation !== attachment.deliveryGeneration
-    ) {
-      return;
-    }
-    const cursor = advanceDeliveryCursor(attachment, frame);
-    if (cursor.kind === "sequence-error") return "sequence-error";
-    if (cursor.kind === "credit-exceeded") {
-      return this.resetBrowserDelivery(attachment.clientId, "slow-client", true);
-    }
-
-    const rewritten = rewriteDelivery(
-      encoded,
-      BigInt(client.delivery_generation),
-      client.stream_id,
-    );
-    try {
-      webSocket.send(rewritten);
-    } catch {
-      return this.resetBrowserAfterDataSendFailure(webSocket, attachment);
-    }
-    writeAttachment(webSocket, {
-      ...attachment,
-      ...cursor.nextState,
-    });
-  }
-
-  private resetBrowserAfterDataSendFailure(
-    webSocket: WebSocket,
-    attachment: SocketAttachment,
-  ): Promise<void> | undefined {
-    if (attachment.clientId === null) return;
-    return this.resetBrowserDelivery(attachment.clientId, "data-disconnected", false).catch(() => {
-      this.isolateBrowserConnection(webSocket, attachment, "browser data delivery failed");
-    });
   }
 
   private rejectInput(
@@ -2680,132 +1735,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     );
   }
 
-  private async resetBrowserDelivery(
-    clientId: string,
-    reason:
-      | "journal-gap"
-      | "slow-client"
-      | "engine-mismatch"
-      | "epoch-changed"
-      | "data-disconnected"
-      | "host-reconnect",
-    notifyHost: boolean,
-    expectedHost?: { webSocket: WebSocket; hostFence: string },
-  ): Promise<void> {
-    const client = this.clientById(clientId);
-    if (client === undefined) return;
-    const issuingControl = this.activeBrowserControl(clientId);
-    const issuingAttachment =
-      issuingControl === undefined ? undefined : readAttachment(issuingControl);
-    if (
-      issuingControl === undefined ||
-      issuingAttachment?.clientId !== clientId ||
-      issuingAttachment.controlState !== "active"
-    ) {
-      return;
-    }
-    const nextGeneration = (BigInt(client.delivery_generation) + 1n).toString();
-    if (BigInt(nextGeneration) > MAX_U64) {
-      throw new Error("delivery generation space exhausted");
-    }
-    const dataTicket = randomId(32);
-    const ticketDigest = await sha256Hex(dataTicket);
-    const currentClient = this.clientById(clientId);
-    const currentControlAttachment = readAttachment(issuingControl);
-    const currentHostAttachment =
-      expectedHost === undefined ? undefined : readAttachment(expectedHost.webSocket);
-    if (
-      issuingControl.readyState !== WebSocket.OPEN ||
-      this.activeBrowserControl(clientId) !== issuingControl ||
-      currentClient?.delivery_generation !== client.delivery_generation ||
-      currentControlAttachment?.clientId !== clientId ||
-      currentControlAttachment.controlState !== "active" ||
-      currentControlAttachment.connectionId !== issuingAttachment.connectionId ||
-      currentControlAttachment.connectionSetId !== issuingAttachment.connectionSetId ||
-      (expectedHost !== undefined &&
-        (expectedHost.webSocket.readyState !== WebSocket.OPEN ||
-          currentHostAttachment?.hostFence !== expectedHost.hostFence ||
-          this.currentHostControl() !== expectedHost.webSocket))
-    ) {
-      return;
-    }
-
-    const expiresAt = Date.now() + TICKET_LIFETIME_MS;
-    if (
-      !this.connections.replaceBrowserDelivery({
-        clientId,
-        connectionId: currentControlAttachment.connectionId,
-        connectionSetId: currentControlAttachment.connectionSetId,
-        currentGeneration: client.delivery_generation,
-        expiresAt,
-        nextGeneration,
-        relayCapabilitiesJson: JSON.stringify(currentControlAttachment.relayCapabilities),
-        role: currentControlAttachment.role,
-        streamId: currentClient.stream_id,
-        subject: currentControlAttachment.subject,
-        ticketDigest,
-      })
-    ) {
-      return;
-    }
-
-    this.closeSockets(
-      (attachment) => {
-        return (
-          attachment.peer === "browser" &&
-          attachment.channel === "data" &&
-          attachment.clientId === clientId
-        );
-      },
-      undefined,
-      reason === "slow-client" ? SLOW_CLIENT : SOCKET_REPLACED,
-      reason,
-    );
-    const resetAttachment = SocketAttachmentSchema.parse({
-      ...currentControlAttachment,
-      deliveryGeneration: nextGeneration,
-      controlState: "active",
-    });
-    writeAttachment(issuingControl, resetAttachment);
-    if (
-      !this.sendBrowserControl(
-        issuingControl,
-        {
-          type: "resync-required",
-          deliveryGeneration: nextGeneration,
-          reason,
-          dataTicket,
-          expiresAt,
-        },
-        "browser delivery reset failed",
-      )
-    ) {
-      return;
-    }
-
-    if (!notifyHost || reason !== "slow-client") return;
-    const host = this.currentHostControl();
-    if (host !== undefined) {
-      this.sendHostControl(
-        host,
-        {
-          type: "delivery-reset",
-          connectionId: resetAttachment.connectionId,
-          streamId: client.stream_id,
-          deliveryGeneration: nextGeneration,
-          reason: "slow-client",
-        },
-        "browser delivery reset notification failed",
-      );
-    }
-  }
-
-  private isRecoveryV3Host(attachment: SocketAttachment): boolean {
-    if (!this.recoveryV3Enabled || attachment.peer !== "host") return false;
-    const selected = new Set(attachment.relayCapabilities);
-    return HOST_RECOVERY_V3_CAPABILITIES.every((capability) => selected.has(capability));
-  }
-
   private isExactRecoveryIdentity(
     attempt: RecoveryAttemptRow,
     identity: {
@@ -2823,12 +1752,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     );
   }
 
-  private recoveryBrowserSockets(attempt: RecoveryAttemptRow): RecoveryBrowserSockets | undefined {
+  private browserSockets(attempt: RecoveryAttemptRow): BrowserSockets | undefined {
     const client = this.clientById(attempt.client_id);
     if (
       client === undefined ||
       client.registered_at === null ||
-      client.recovery_strategy !== "v3" ||
       client.stream_id !== attempt.stream_id ||
       client.delivery_generation !== attempt.delivery_generation
     ) {
@@ -2840,9 +1768,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       if (socket.readyState !== WebSocket.OPEN) continue;
       const attachment = readAttachment(socket);
       if (
-        attachment?.version !== 3 ||
-        attachment.recoveryStrategy !== "v3" ||
-        attachment.clientId !== attempt.client_id ||
+        attachment?.clientId !== attempt.client_id ||
         attachment.connectionId !== attempt.connection_id ||
         attachment.streamId !== attempt.stream_id ||
         attachment.deliveryGeneration !== attempt.delivery_generation
@@ -2871,16 +1797,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     };
   }
 
-  private recoveryAttemptForBrowser(
+  private browserAttempt(
     webSocket: WebSocket,
     attachment: SocketAttachment,
     explicitRecoveryId?: string,
   ): RecoveryAttemptRow | undefined {
-    if (
-      attachment.version !== 3 ||
-      attachment.recoveryStrategy !== "v3" ||
-      attachment.clientId === null
-    ) {
+    if (attachment.clientId === null) {
       return undefined;
     }
     const recoveryId = attachment.recoveryLookupKey ?? explicitRecoveryId;
@@ -2903,7 +1825,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     ) {
       return undefined;
     }
-    const browser = this.recoveryBrowserSockets(attempt);
+    const browser = this.browserSockets(attempt);
     return browser?.control === webSocket ? attempt : undefined;
   }
 
@@ -2912,7 +1834,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     record: RecoveryDeliveryRecordIdentity,
   ): RecoveryDataQueuePlan {
     const writer = this.clientById(attempt.client_id)?.role === "writer";
-    const deliveryClass: RelayV3DeliveryClass =
+    const deliveryClass: RelayDeliveryClass =
       record.lane === "live"
         ? writer
           ? "writer-live"
@@ -2942,12 +1864,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (!retained.ok) {
       this.fenceQueuedRecoveryDeliveries(
         [plan],
-        `Recovery v3 delivery ring rejected recovery payload: ${retained.reason}`,
+        `delivery ring rejected recovery payload: ${retained.reason}`,
       );
       return;
     }
     if (!this.enqueueRecoveryDeliveryRef(plan, retained.ref)) {
-      this.fenceQueuedRecoveryDeliveries([plan], "Recovery v3 scheduler rejected recovery payload");
+      this.fenceQueuedRecoveryDeliveries([plan], "scheduler rejected recovery payload");
     }
   }
 
@@ -2971,7 +1893,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     });
     const encodedBytes = ordered[0]!.record.encodedBytes;
     if (ordered.some((plan) => plan.record.encodedBytes !== encodedBytes)) {
-      this.fenceQueuedRecoveryDeliveries(ordered, "Recovery v3 live fanout encoded sizes diverged");
+      this.fenceQueuedRecoveryDeliveries(ordered, "live fanout encoded sizes diverged");
       return;
     }
     const retained = this.recoveryDeliveryRing.retainLiveCanonical(
@@ -2982,7 +1904,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (!retained.ok) {
       this.fenceQueuedRecoveryDeliveries(
         ordered,
-        `Recovery v3 delivery ring rejected live fanout: ${retained.reason}`,
+        `delivery ring rejected live fanout: ${retained.reason}`,
       );
       return;
     }
@@ -2994,14 +1916,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       if (!this.enqueueRecoveryDeliveryRef(plan, ref)) rejected.push(plan);
     }
     if (rejected.length > 0) {
-      this.fenceQueuedRecoveryDeliveries(rejected, "Recovery v3 scheduler rejected live fanout");
+      this.fenceQueuedRecoveryDeliveries(rejected, "scheduler rejected live fanout");
     }
   }
 
-  private enqueueRecoveryDeliveryRef(
-    plan: RecoveryDataQueuePlan,
-    ref: RelayV3DeliveryRef,
-  ): boolean {
+  private enqueueRecoveryDeliveryRef(plan: RecoveryDataQueuePlan, ref: RelayDeliveryRef): boolean {
     this.recoveryDeliveryRefRecords.set(ref, {
       generation: plan.identity,
       record: plan.record,
@@ -3045,7 +1964,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     this.afterRecoveryTransition();
   }
 
-  private sendScheduledRecoveryDelivery(turn: RelayV3DeliverySendTurn): RelayV3DeliverySendResult {
+  private sendScheduledRecoveryDelivery(turn: RelayDeliverySendTurn): RelayDeliverySendResult {
     const owner = this.recoveryDeliveryRefRecords.get(turn.ref);
     if (owner === undefined) return "stale";
     if (!this.sameScheduledDeliveryOwner(owner, turn)) {
@@ -3058,7 +1977,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.recoveryDeliveryRefRecords.delete(turn.ref);
       return "stale";
     }
-    const browser = this.recoveryBrowserSockets(attempt);
+    const browser = this.browserSockets(attempt);
     if (browser === undefined || browser.data.readyState !== WebSocket.OPEN) return "fatal";
 
     let encoded: Uint8Array;
@@ -3085,7 +2004,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       return "fatal";
     }
 
-    const exactBrowser = this.recoveryBrowserSockets(attempt);
+    const exactBrowser = this.browserSockets(attempt);
     if (
       exactBrowser?.data !== browser.data ||
       browser.data.readyState !== WebSocket.OPEN ||
@@ -3115,9 +2034,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     return "sent";
   }
 
-  private encodedScheduledDelivery(turn: RelayV3DeliverySendTurn): Uint8Array {
+  private encodedScheduledDelivery(turn: RelayDeliverySendTurn): Uint8Array {
     if (turn.identity.lane === "live") {
-      const encoded = encodeDeliveryEnvelopeV3({
+      const encoded = encodeDeliveryEnvelope({
         lane: "live",
         deliveryGeneration: BigInt(turn.identity.deliveryGeneration),
         deliveryOrdinal: BigInt(turn.identity.deliveryOrdinal),
@@ -3134,7 +2053,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (turn.payload.byteLength !== turn.encodedBytes) {
       throw new Error("scheduled recovery delivery size diverged");
     }
-    const envelope = decodeDeliveryEnvelopeV3(turn.payload);
+    const envelope = decodeDeliveryEnvelope(turn.payload);
     if (
       envelope.lane !== "recovery" ||
       envelope.streamId !== turn.identity.streamId ||
@@ -3149,7 +2068,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
 
   private sameScheduledDeliveryOwner(
     owner: RecoveryDeliveryRefRecord,
-    turn: RelayV3DeliveryJobView,
+    turn: RelayDeliveryJobView,
   ): boolean {
     return (
       owner.generation.recoveryId === turn.identity.recoveryId &&
@@ -3167,7 +2086,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
 
   private isExactScheduledAttempt(
     attempt: RecoveryAttemptRow | undefined,
-    identity: RelayV3DeliveryRefIdentity,
+    identity: RelayDeliveryRefIdentity,
   ): attempt is RecoveryAttemptRow {
     return (
       attempt !== undefined &&
@@ -3180,7 +2099,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     );
   }
 
-  private failScheduledRecoveryDelivery(job: RelayV3DeliveryJobView): void {
+  private failScheduledRecoveryDelivery(job: RelayDeliveryJobView): void {
     const owner = this.recoveryDeliveryRefRecords.get(job.ref);
     this.recoveryDeliveryRefRecords.delete(job.ref);
     const attempt = this.recoveries.attempt(job.identity.recoveryId);
@@ -3200,11 +2119,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         this.recoveries.resetUndeliverableDeliveryOwner(attempt.recovery_id, now);
       }
     });
-    this.isolateRecoveryAttempt(attempt, "Recovery v3 data send outcome is uncertain");
+    this.isolateRecoveryAttempt(attempt, "recovery data send outcome is uncertain");
     this.afterRecoveryTransition();
   }
 
-  private cancelRecoveryDeliveryGeneration(identity: RelayV3DeliveryGenerationIdentity): void {
+  private cancelRecoveryDeliveryGeneration(identity: RelayDeliveryGenerationIdentity): void {
     this.recoveryDeliveryScheduler.forgetGeneration(identity);
     for (const [ref, owner] of this.recoveryDeliveryRefRecords) {
       if (
@@ -3223,7 +2142,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   }
 
   private cancelRecoveryDeliveriesByRecoveryId(recoveryId: string): void {
-    const generations = new Map<string, RelayV3DeliveryGenerationIdentity>();
+    const generations = new Map<string, RelayDeliveryGenerationIdentity>();
     for (const owner of this.recoveryDeliveryRefRecords.values()) {
       if (owner.generation.recoveryId !== recoveryId) continue;
       generations.set(JSON.stringify(owner.generation), owner.generation);
@@ -3243,7 +2162,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       )
       .toArray() as unknown as RecoveryAttemptRow[];
     if (attempts.length > MAX_RECOVERY_ATTEMPTS) {
-      throw new Error("durable Recovery v3 attempt bound exceeded during wake reconciliation");
+      throw new Error("durable recovery attempt bound exceeded during wake reconciliation");
     }
 
     const isolate = new Map<string, RecoveryAttemptRow>();
@@ -3259,7 +2178,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         (attempt.state === "installed" ||
           attempt.state === "assembling" ||
           attempt.state === "complete") &&
-        this.recoveryBrowserSockets(attempt) === undefined
+        this.browserSockets(attempt) === undefined
       ) {
         undeliverable.add(attempt.recovery_id);
       }
@@ -3288,14 +2207,14 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     });
 
     for (const attempt of isolate.values()) {
-      this.isolateRecoveryAttempt(attempt, "Recovery v3 delivery owner fenced after wake");
+      this.isolateRecoveryAttempt(attempt, "recovery delivery owner fenced after wake");
     }
     if (isolate.size > 0) this.snapshotUploads.scheduleMaintenance();
   }
 
   private resetAndIsolateRecovery(
     attempt: RecoveryAttemptRow,
-    reason: RecoveryV3HostSourceReset["reason"],
+    reason: RecoveryHostSourceReset["reason"],
     closeReason: string,
   ): void {
     const current = this.recoveries.attempt(attempt.recovery_id);
@@ -3313,7 +2232,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     this.afterRecoveryTransition();
   }
 
-  private failRecoveryBrowser(attachment: SocketAttachment, reason: string): void {
+  private failBrowser(attachment: SocketAttachment, reason: string): void {
     if (attachment.clientId === null) {
       this.closeSockets(
         (candidate) =>
@@ -3372,8 +2291,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         const client = this.clientById(attempt.client_id);
         const lease = this.writerLease();
         if (
-          client?.recovery_strategy === "v3" &&
-          client.role === "writer" &&
+          client?.role === "writer" &&
           client.stream_id === attempt.stream_id &&
           client.delivery_generation === attempt.delivery_generation &&
           lease?.client_id === attempt.client_id
@@ -3399,7 +2317,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
   }
 
   private scheduleRecoveryOutboxDrain(): void {
-    if (!this.recoveryV3Enabled) return;
     if (this.recoveryOutboxDrainScheduled) return;
     this.recoveryOutboxDrainScheduled = true;
     this.ctx.waitUntil(
@@ -3429,7 +2346,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       const attempt = this.recoveries.attempt(entry.recovery_id);
       if (attempt === undefined) continue;
       if (attempt.state === "resetting") {
-        this.isolateRecoveryAttempt(attempt, "Recovery v3 generation reset");
+        this.isolateRecoveryAttempt(attempt, "recovery generation reset");
       }
       if (
         entry.destination === "host"
@@ -3452,14 +2369,14 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     entry: RecoveryControlOutboxRow,
     attempt: RecoveryAttemptRow,
   ): boolean {
-    let frame: ReturnType<typeof decodeRelayToHostControlFrame<"v3">>;
+    let frame: ReturnType<typeof decodeRelayToHostControlFrame>;
     try {
-      frame = decodeRelayToHostControlFrame(entry.payload_json, "v3");
+      frame = decodeRelayToHostControlFrame(entry.payload_json);
     } catch {
       this.resetAndIsolateRecovery(
         attempt,
         "generation-reset",
-        "invalid durable Recovery v3 Host outbox",
+        "invalid durable recovery Host outbox",
       );
       return true;
     }
@@ -3470,13 +2387,13 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         frame.type !== "recovery-source-received" &&
         frame.type !== "recovery-source-reset") ||
       frame.type !== entry.kind ||
-      !RecoveryV3CloudToHostControlFrameSchema.safeParse(frame).success ||
+      !RecoveryCloudToHostControlFrameSchema.safeParse(frame).success ||
       !this.isExactRecoveryIdentity(attempt, frame)
     ) {
       this.resetAndIsolateRecovery(
         attempt,
         "generation-reset",
-        "Recovery v3 Host outbox identity diverged",
+        "recovery Host outbox identity diverged",
       );
       return true;
     }
@@ -3488,12 +2405,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const host = this.currentHostControl();
     const hostAttachment = host === undefined ? undefined : readAttachment(host);
     if (host === undefined || hostAttachment === undefined) return false;
-    if (!this.isRecoveryV3Host(hostAttachment)) {
-      this.failCurrentHost(hostAttachment, "Recovery v3 Host capability was rolled back");
-      return true;
-    }
     if (
       host.readyState !== WebSocket.OPEN ||
+      !hostAttachment.ready ||
       hostAttachment.hostFence !== attempt.host_fence ||
       this.currentHostControl() !== host
     ) {
@@ -3502,7 +2416,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     try {
       host.send(entry.payload_json);
     } catch {
-      this.failCurrentHost(hostAttachment, "Recovery v3 Host control send outcome is uncertain");
+      this.failCurrentHost(hostAttachment, "recovery Host control send outcome is uncertain");
       return true;
     }
     return this.acknowledgeRecoveryOutbox(entry);
@@ -3515,22 +2429,21 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const client = this.clientById(attempt.client_id);
     if (
       client === undefined ||
-      client.recovery_strategy !== "v3" ||
       client.delivery_generation !== attempt.delivery_generation ||
       client.stream_id !== attempt.stream_id
     ) {
       return this.acknowledgeRecoveryOutbox(entry);
     }
-    const browser = this.recoveryBrowserSockets(attempt);
+    const browser = this.browserSockets(attempt);
     if (browser === undefined) return false;
-    let frame: ReturnType<typeof decodeServerControlFrame<"v3">>;
+    let frame: ReturnType<typeof decodeServerControlFrame>;
     try {
-      frame = decodeServerControlFrame(entry.payload_json, "v3");
+      frame = decodeServerControlFrame(entry.payload_json);
     } catch {
       this.resetAndIsolateRecovery(
         attempt,
         "generation-reset",
-        "invalid durable Recovery v3 Browser outbox",
+        "invalid durable recovery Browser outbox",
       );
       return true;
     }
@@ -3547,12 +2460,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (
       !identityMatches ||
       frame.type !== entry.kind ||
-      !RecoveryV3ServerControlFrameSchema.safeParse(frame).success
+      !RecoveryServerControlFrameSchema.safeParse(frame).success
     ) {
       this.resetAndIsolateRecovery(
         attempt,
         "generation-reset",
-        "Recovery v3 Browser outbox identity diverged",
+        "recovery Browser outbox identity diverged",
       );
       return true;
     }
@@ -3564,13 +2477,13 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         this.resetAndIsolateRecovery(
           attempt,
           "ack-outcome-uncertain",
-          "Recovery v3 Browser control send failed",
+          "recovery Browser control send failed",
         );
       } else {
         this.resetAndIsolateRecovery(
           attempt,
           "ack-outcome-uncertain",
-          "Recovery v3 Browser control send outcome is uncertain",
+          "recovery Browser control send outcome is uncertain",
         );
       }
       return true;
@@ -3595,45 +2508,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     this.snapshotUploads.scheduleMaintenance();
     this.ctx.waitUntil(this.recoveryMaintenance.refresh());
     this.scheduleRecoveryOutboxDrain();
-  }
-
-  private fenceDisabledRecoveryV3(): void {
-    const attempts = this.sql
-      .exec(
-        `SELECT * FROM recovery_attempt
-         WHERE state IN ('preparing', 'installed', 'assembling', 'complete')
-         ORDER BY created_at, recovery_id LIMIT ?`,
-        MAX_RECOVERY_ATTEMPTS,
-      )
-      .toArray() as unknown as RecoveryAttemptRow[];
-    const now = Date.now();
-    this.ctx.storage.transactionSync(() => {
-      for (const attempt of attempts) {
-        if (attempt.state === "complete") {
-          this.recoveries.resetUndeliverableDeliveryOwner(attempt.recovery_id, now);
-        } else {
-          this.recoveries.reset(attempt.recovery_id, "generation-reset", now);
-        }
-      }
-    });
-
-    const isolatedConnections = new Set<string>();
-    for (const attempt of attempts) {
-      isolatedConnections.add(attempt.connection_id);
-      this.isolateRecoveryAttempt(attempt, "Recovery v3 is disabled");
-    }
-    for (const socket of this.browserControlSockets()) {
-      const attachment = readAttachment(socket);
-      if (
-        attachment?.version === 3 &&
-        attachment.recoveryStrategy === "v3" &&
-        !isolatedConnections.has(attachment.connectionId)
-      ) {
-        this.isolateBrowserConnection(socket, attachment, "Recovery v3 is disabled");
-      }
-    }
-    this.snapshotUploads.scheduleMaintenance();
-    this.ctx.waitUntil(this.recoveryMaintenance.refresh());
   }
 
   private async acquireRecoveryWriterLease(
@@ -3783,7 +2657,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       return (
         attachment?.channel === "control" &&
         attachment.hostFence === session.host_fence &&
-        attachment.controlState === "active"
+        attachment.ready
       );
     });
   }
@@ -3817,13 +2691,12 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       attachment.peer !== "browser" ||
       attachment.channel !== "control" ||
       attachment.clientId === null ||
+      !attachment.ready ||
       this.activeBrowserControl(attachment.clientId) !== webSocket
     ) {
       return false;
     }
-    if (attachment.recoveryStrategy === "v2") return attachment.controlState === "active";
     if (
-      attachment.version !== 3 ||
       attachment.recoveryLookupKey === null ||
       (attachment.role === "writer" && attachment.leaseFence === null)
     ) {
@@ -3841,7 +2714,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     ) {
       return false;
     }
-    const pair = this.recoveryBrowserSockets(attempt);
+    const pair = this.browserSockets(attempt);
     return (
       pair?.control === webSocket &&
       pair.controlAttachment.recoveryLookupKey === attempt.recovery_id &&
@@ -3874,26 +2747,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     return this.ctx.getWebSockets("peer:browser").filter((socket) => {
       return socket.readyState === WebSocket.OPEN && readAttachment(socket)?.channel === "control";
     });
-  }
-
-  private browserDataSockets(): WebSocket[] {
-    return this.ctx.getWebSockets("peer:browser").filter((socket) => {
-      return socket.readyState === WebSocket.OPEN && readAttachment(socket)?.channel === "data";
-    });
-  }
-
-  private markBrowserDataCatchingUp(): void {
-    for (const socket of this.browserDataSockets()) {
-      const attachment = readAttachment(socket);
-      // Recovery v3 progress is durable in recovery_lane; its strict
-      // attachment deliberately has no legacy replay cursor/state fields.
-      if (attachment !== undefined && attachment.recoveryStrategy === "v2") {
-        writeAttachment(socket, {
-          ...attachment,
-          dataState: attachment.dataState === "awaiting-attach" ? "awaiting-attach" : "catching-up",
-        });
-      }
-    }
   }
 
   private sendHostControl(
@@ -3956,8 +2809,8 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const fence = attachment.hostFence;
     const matchingControl = matchingSocket(this.ctx, attachment, "control");
     const wasReady =
-      (attachment.channel === "control" && attachment.controlState === "active") ||
-      (matchingControl !== undefined && readAttachment(matchingControl)?.controlState === "active");
+      (attachment.channel === "control" && attachment.ready) ||
+      (matchingControl !== undefined && readAttachment(matchingControl)?.ready === true);
     if (!this.connections.invalidateHostConnection(attachment.connectionSetId, fence)) return;
     this.closeSockets(
       (candidate) =>
@@ -3970,7 +2823,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     );
     if (wasReady) {
       this.broadcastBrowserControl({ type: "host-offline" });
-      this.markBrowserDataCatchingUp();
     }
   }
 
@@ -3984,16 +2836,14 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       return;
     }
     const recoveryAttempt =
-      attachment.recoveryStrategy === "v3"
-        ? attachment.recoveryLookupKey === null
-          ? this.recoveries.attemptByConnectionIdentity(
-              attachment.clientId,
-              attachment.connectionId,
-              attachment.streamId,
-              attachment.deliveryGeneration,
-            )
-          : this.recoveries.attempt(attachment.recoveryLookupKey)
-        : undefined;
+      attachment.recoveryLookupKey === null
+        ? this.recoveries.attemptByConnectionIdentity(
+            attachment.clientId,
+            attachment.connectionId,
+            attachment.streamId,
+            attachment.deliveryGeneration,
+          )
+        : this.recoveries.attempt(attachment.recoveryLookupKey);
     if (recoveryAttempt !== undefined) {
       this.cancelRecoveryDeliveryGeneration({
         recoveryId: recoveryAttempt.recovery_id,
@@ -4043,42 +2893,24 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     code = SOCKET_REPLACED,
     reason = "connection replaced",
   ): void {
-    let releasedSnapshotPin = false;
     for (const socket of this.ctx.getWebSockets()) {
       if (socket === except || socket.readyState >= WebSocket.CLOSING) continue;
       const attachment = readAttachment(socket);
       if (attachment !== undefined && predicate(attachment)) {
-        if (
-          attachment.peer === "browser" &&
-          attachment.channel === "data" &&
-          attachment.snapshotId !== null
-        ) {
-          releasedSnapshotPin = true;
-        }
         socket.close(code, reason);
       }
     }
-    if (releasedSnapshotPin) this.snapshotUploads.scheduleMaintenance();
   }
 
   private pinnedSnapshotIds(): ReadonlySet<string> {
-    const pinned = new Set<string>();
-    for (const socket of this.ctx.getWebSockets("peer:browser")) {
-      if (socket.readyState !== WebSocket.OPEN) continue;
-      const attachment = readAttachment(socket);
-      if (attachment?.channel === "data" && attachment.snapshotId !== null) {
-        pinned.add(attachment.snapshotId);
-      }
-    }
-    for (const snapshotId of this.recoveries.pinnedSnapshotIds()) pinned.add(snapshotId);
-    return pinned;
+    return this.recoveries.pinnedSnapshotIds();
   }
 
   private recoveriesFenced(scope: RecoveryFenceScope): void {
     // The durable fence transition commits before this callback. Its explicit
-    // scope prevents an unrelated client activation from closing a paired v3
+    // scope prevents an unrelated client activation from closing a paired
     // socket that has not sent Attach yet.
-    const scheduledGenerations = new Map<string, RelayV3DeliveryGenerationIdentity>();
+    const scheduledGenerations = new Map<string, RelayDeliveryGenerationIdentity>();
     for (const owner of this.recoveryDeliveryRefRecords.values()) {
       const attempt = this.recoveries.attempt(owner.generation.recoveryId);
       const fenced =
@@ -4101,11 +2933,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const stale = new Map<string, { attachment: SocketAttachment; socket: WebSocket }>();
     for (const socket of this.browserControlSockets()) {
       const attachment = readAttachment(socket);
-      if (
-        attachment?.version !== 3 ||
-        attachment.recoveryStrategy !== "v3" ||
-        attachment.clientId === null
-      ) {
+      if (attachment?.clientId === null || attachment?.peer !== "browser") {
         continue;
       }
       let fenced = false;
@@ -4134,7 +2962,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       }
     }
     for (const { attachment, socket } of stale.values()) {
-      this.isolateBrowserConnection(socket, attachment, "Recovery v3 generation fenced");
+      this.isolateBrowserConnection(socket, attachment, "recovery generation fenced");
     }
     this.snapshotUploads.scheduleMaintenance();
     this.ctx.waitUntil(this.recoveryMaintenance.refresh());

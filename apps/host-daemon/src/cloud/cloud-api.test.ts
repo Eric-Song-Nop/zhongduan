@@ -1,10 +1,4 @@
-import {
-  RELAY_CAPABILITIES_HEADER,
-  SNAPSHOT_MEDIA_TYPE,
-  SnapshotHeader,
-  RelayCapability,
-  type SnapshotMetadata,
-} from "@zhongduan/protocol";
+import { SNAPSHOT_MEDIA_TYPE, SnapshotHeader, type SnapshotMetadata } from "@zhongduan/protocol";
 import { describe, expect, it, vi } from "vitest";
 
 import { CloudApiClient, CloudApiError, CloudTransportError } from "./cloud-api";
@@ -79,59 +73,7 @@ describe("CloudApiClient", () => {
     });
   });
 
-  it("advertises only the implemented Host capabilities and decodes a confirmed selection", async () => {
-    const response = {
-      ...hostConnection,
-      negotiatedCapabilities: [
-        RelayCapability.capabilityNegotiationV1,
-        RelayCapability.authorityDataV2,
-        RelayCapability.deliveryBarrierOutcomeV1,
-      ],
-    };
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
-      jsonResponse(response),
-    );
-    const api = new CloudApiClient("https://cloud.example", {
-      fetch: fetchMock as unknown as typeof fetch,
-    });
-
-    await expect(api.createConnectionSet("session_AAAAAAAAA", "host-cap")).resolves.toEqual(
-      response,
-    );
-    const [, init] = fetchMock.mock.calls[0]!;
-    expect(JSON.parse(init?.body as string)).toEqual({});
-    expect(new Headers(init?.headers).get(RELAY_CAPABILITIES_HEADER)).toBe(
-      "capability-negotiation-v1,authority-data-v2,delivery-barrier-outcome-v1",
-    );
-  });
-
-  it("offers an explicitly injected Host-v3 capability set without changing the default", async () => {
-    const relayCapabilities = [
-      RelayCapability.capabilityNegotiationV1,
-      RelayCapability.authorityDataV2,
-      RelayCapability.deliveryBarrierOutcomeV1,
-      RelayCapability.wireEndpointV3,
-      RelayCapability.recoveryV3GapFillV1,
-    ] as const;
-    const response = { ...hostConnection, negotiatedCapabilities: [...relayCapabilities] };
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
-      jsonResponse(response),
-    );
-    const api = new CloudApiClient("https://cloud.example", {
-      fetch: fetchMock as unknown as typeof fetch,
-      relayCapabilities,
-    });
-
-    await expect(api.createConnectionSet("session_AAAAAAAAA", "host-cap")).resolves.toEqual(
-      response,
-    );
-    const [, init] = fetchMock.mock.calls[0]!;
-    expect(new Headers(init?.headers).get(RELAY_CAPABILITIES_HEADER)).toBe(
-      relayCapabilities.join(","),
-    );
-  });
-
-  it("keeps negotiation unconfirmed when an old Cloud omits the response field", async () => {
+  it("creates a canonical Host connection set", async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
       jsonResponse(hostConnection),
     );
@@ -143,25 +85,8 @@ describe("CloudApiClient", () => {
       hostConnection,
     );
     const [, init] = fetchMock.mock.calls[0]!;
-    expect(new Headers(init?.headers).get(RELAY_CAPABILITIES_HEADER)).toBe(
-      "capability-negotiation-v1,authority-data-v2,delivery-barrier-outcome-v1",
-    );
-  });
-
-  it("does not confirm a selection that omits the negotiation bootstrap", async () => {
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
-      jsonResponse({
-        ...hostConnection,
-        negotiatedCapabilities: [RelayCapability.authorityDataV2],
-      }),
-    );
-    const api = new CloudApiClient("https://cloud.example", {
-      fetch: fetchMock as unknown as typeof fetch,
-    });
-
-    await expect(
-      api.createConnectionSet("session_AAAAAAAAA", "host-cap"),
-    ).resolves.not.toHaveProperty("negotiatedCapabilities");
+    expect(JSON.parse(init?.body as string)).toEqual({});
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer host-cap");
   });
 
   it("uploads the immutable snapshot body with the complete metadata contract", async () => {
