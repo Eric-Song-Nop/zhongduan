@@ -206,25 +206,11 @@ const writerLeaseStatus = z
   .refine((frame) => frame.active === (frame.expiresAt !== undefined), {
     message: "active writer lease status requires expiresAt",
   });
-const resyncRequired = z.strictObject({
-  type: z.literal("resync-required"),
-  deliveryGeneration: u64,
-  reason: z.enum([
-    "journal-gap",
-    "slow-client",
-    "engine-mismatch",
-    "epoch-changed",
-    "data-disconnected",
-    "host-reconnect",
-  ]),
-});
-
 export const ServerControlFrameSchema = z.union([
   welcome,
   InputAcknowledgementFrameSchema,
   hostOffline,
   writerLeaseStatus,
-  resyncRequired,
   RecoveryServerControlFrameSchema,
 ]);
 export type ServerControlFrame = z.infer<typeof ServerControlFrameSchema>;
