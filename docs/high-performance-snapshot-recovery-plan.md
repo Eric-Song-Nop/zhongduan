@@ -72,7 +72,7 @@ Snapshot capture在authority actor barrier内完成；metadata绑定session epoc
 压缩和immutable object key。Cloud只发布finalized对象，retention union所有active recovery pin。Browser restore
 必须使用匹配artifact的passive engine并在tail连续后才adopt。
 
-第一版继续使用full snapshot。Rolling/delta snapshot只有在以下gate同时满足后进入实现：immutable cut、
+当前实现继续使用full snapshot。Rolling/delta snapshot只有在以下gate同时满足后进入实现：immutable cut、
 content integrity、bounded chain、cancellation、GC pin、restore reference model和真实enginecontinuity。
 
 ## 测试证据

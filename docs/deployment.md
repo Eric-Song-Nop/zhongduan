@@ -117,8 +117,8 @@ pnpm --filter "@zhongduan/terminal-cloud" exec wrangler deploy
 ```
 
 当前代码只有一套 Recovery wire和runtime，不执行协议协商、策略选择、降级或混合generation。
-Phase 2 已完成 Browser assembler、Host source owner、Cloud durable state、receipt/closure/fairness，以及本地
-three-owner continuity、committed-WASM Ghostty continuation与WTerm adoption correctness gates；这些仍只是
+当前 correctness gates 已覆盖 Browser assembler、Host source owner、Cloud durable state、receipt/closure/
+fairness，以及本地 three-owner continuity、committed-WASM Ghostty continuation与WTerm adoption；这些仍只是
 本地证据，不代表production Cloudflare/R2、真实跨进程网络、性能或上线批准。
 
 本次切换发生在MVP发布前，不提供旧开发态协议或Durable Object schema的向后兼容。对象发现非当前
