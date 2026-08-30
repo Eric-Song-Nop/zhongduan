@@ -499,26 +499,6 @@ describe("TerminalSession", () => {
     session.close();
   });
 
-  it("reconnects the complete pair on a higher-generation resync", async () => {
-    const opened = await openSession();
-    opened.control.message(
-      JSON.stringify({
-        type: "resync-required",
-        deliveryGeneration: "4",
-        reason: "host-reconnect",
-      }),
-    );
-
-    await vi.waitFor(() => expect(opened.control.readyState).toBe(3));
-    expect(opened.data.readyState).toBe(3);
-    expect(opened.session.snapshot).toMatchObject({
-      controlConnected: false,
-      dataConnected: false,
-      phase: "reconnecting",
-    });
-    opened.session.close();
-  });
-
   it("renews an active writer lease and stops renewing immediately after lease loss", async () => {
     const timers = new ManualTimers();
     const opened = await openSession({
@@ -612,64 +592,20 @@ describe("TerminalSession", () => {
     opened.session.close();
   });
 
-  it.each(["resync", "close"] as const)(
-    "cancels a pending data open on %s and fences its late callbacks",
-    async (cause) => {
-      const timers = new ManualTimers();
-      const opened = await openControlWithPendingData({
-        responses: [connectionSet(), connectionSet(4n)],
-        timers,
-      });
+  it("cancels a pending data open on close and fences its late callbacks", async () => {
+    const opened = await openControlWithPendingData();
 
-      if (cause === "resync") {
-        opened.control.message(
-          JSON.stringify({
-            type: "resync-required",
-            deliveryGeneration: "4",
-            reason: "host-reconnect",
-          }),
-        );
-      } else {
-        opened.session.close();
-      }
-      await flushMicrotasks();
+    opened.session.close();
+    await flushMicrotasks();
 
-      expect(opened.control.readyState).toBe(3);
-      expect(opened.pendingData.readyState).toBe(3);
-      opened.pendingData.dispatchEvent(new Event("open"));
-      opened.pendingData.message(new ArrayBuffer(1));
-      await flushMicrotasks();
-      expect(opened.session.snapshot.dataConnected).toBe(false);
-
-      if (cause === "close") {
-        expect(opened.sockets).toHaveLength(2);
-        expect(opened.session.snapshot.phase).toBe("closed");
-        return;
-      }
-
-      await timers.advanceBy(200);
-      await vi.waitFor(() => expect(opened.sockets).toHaveLength(3));
-      const replacementControl = opened.sockets[2]!;
-      replacementControl.open();
-      await vi.waitFor(() => expect(opened.sockets).toHaveLength(4));
-      const replacementData = opened.sockets[3]!;
-      replacementData.open();
-      await vi.waitFor(() => expect(opened.session.snapshot.dataConnected).toBe(true));
-
-      opened.pendingData.dispatchEvent(new Event("open"));
-      opened.pendingData.message(new ArrayBuffer(1));
-      await flushMicrotasks();
-      expect(opened.session.snapshot).toMatchObject({
-        controlConnected: true,
-        dataConnected: true,
-        phase: "attaching",
-      });
-      expect(
-        controlFrames(replacementControl).find((frame) => frame.type === "attach"),
-      ).toMatchObject({ deliveryGeneration: "4" });
-      opened.session.close();
-    },
-  );
+    expect(opened.control.readyState).toBe(3);
+    expect(opened.pendingData.readyState).toBe(3);
+    opened.pendingData.dispatchEvent(new Event("open"));
+    opened.pendingData.message(new ArrayBuffer(1));
+    await flushMicrotasks();
+    expect(opened.sockets).toHaveLength(2);
+    expect(opened.session.snapshot).toMatchObject({ dataConnected: false, phase: "closed" });
+  });
 
   it("cancels a pending data open on protocol failure and retries a fresh connection set", async () => {
     const timers = new ManualTimers();

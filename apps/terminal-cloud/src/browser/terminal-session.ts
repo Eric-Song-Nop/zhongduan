@@ -555,9 +555,6 @@ export class TerminalSession {
       case "host-offline":
         this.#update({ hostOnline: false, phase: "offline" });
         return;
-      case "resync-required":
-        this.#handleResyncRequired(frame);
-        return;
       case "recovery-start": {
         const runtime = this.#recoveryRuntime;
         if (runtime === null || !runtime.acceptStart(frame)) {
@@ -626,21 +623,6 @@ export class TerminalSession {
     this.#stopWriterLeaseRenewal();
     this.#attachInputTransport();
     this.#update({ controlOwnership: "waiting" });
-  }
-
-  #handleResyncRequired(frame: Extract<ServerControlFrame, { type: "resync-required" }>): void {
-    if (frame.reason === "engine-mismatch") {
-      this.#terminalFailure("engine");
-      return;
-    }
-    const generation = BigInt(frame.deliveryGeneration);
-    if (this.#generation === null || generation <= this.#generation) {
-      this.#protocolFailure();
-      return;
-    }
-    this.#input.setReplicaCurrent(false);
-    this.#invalidateFullConnection();
-    this.#scheduleReconnect();
   }
 
   #sendProgressControl(frame: RecoveryProgressFrame): boolean {
