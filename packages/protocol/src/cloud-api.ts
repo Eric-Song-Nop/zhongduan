@@ -2,30 +2,12 @@ import { z } from "zod";
 
 import { DecimalU64Schema, PositiveDecimalU64Schema } from "./scalars";
 import { SnapshotMetadataSchema } from "./snapshot";
-import { RelayCapabilitySchema } from "./wire-capabilities";
-
-export {
-  RELAY_CAPABILITIES_HEADER,
-  RelayCapability,
-  RelayCapabilitySchema,
-  RecoveryStrategySchema,
-  confirmedRelayCapabilities,
-  selectRecoveryStrategy,
-  selectRelayCapabilities,
-  type RecoveryStrategy,
-} from "./wire-capabilities";
 
 export const CloudResourceIdSchema = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/);
 export const CapabilityRoleSchema = z.enum(["host", "writer", "observer"]);
 export const BrowserCapabilityRoleSchema = z.enum(["writer", "observer"]);
 const engineId = z.string().min(1).max(512);
 const capability = z.string().min(1).max(4_096);
-const relayCapabilities = z
-  .array(RelayCapabilitySchema)
-  .max(16)
-  .refine((capabilities) => new Set(capabilities).size === capabilities.length, {
-    message: "relay capabilities must be unique",
-  });
 
 export const CreateSessionRequestSchema = z.strictObject({
   sessionId: CloudResourceIdSchema,
@@ -49,22 +31,32 @@ export const ConnectionSetRequestSchema = z.strictObject({
   clientId: CloudResourceIdSchema.optional(),
 });
 
-export const ConnectionSetResponseSchema = z.strictObject({
+const connectionSetResponseBase = {
   connectionSetId: CloudResourceIdSchema,
   connectionId: CloudResourceIdSchema,
-  clientId: CloudResourceIdSchema.nullable(),
-  streamId: z.number().int().min(0).max(0xffff_ffff),
-  deliveryGeneration: DecimalU64Schema,
   expiresAt: z.number().int().positive(),
   controlTicket: CloudResourceIdSchema,
   dataTicket: CloudResourceIdSchema,
-  // Absence is the rolling-compatible v2 strategy. Only activated v3 reservations opt in.
-  recoveryStrategy: z.literal("v3").optional(),
-  // Decode-only rolling shim for Durable Objects that still echo the selected intersection.
-  selectedCapabilities: relayCapabilities.optional(),
-  // Emitted only after the caller offers capability-negotiation-v1.
-  negotiatedCapabilities: relayCapabilities.optional(),
+};
+
+export const BrowserConnectionSetResponseSchema = z.strictObject({
+  ...connectionSetResponseBase,
+  clientId: CloudResourceIdSchema,
+  streamId: z.number().int().min(1).max(0xffff_ffff),
+  deliveryGeneration: PositiveDecimalU64Schema,
 });
+
+export const HostConnectionSetResponseSchema = z.strictObject({
+  ...connectionSetResponseBase,
+  clientId: z.null(),
+  streamId: z.literal(0),
+  deliveryGeneration: DecimalU64Schema.refine((value) => value === "0"),
+});
+
+export const ConnectionSetResponseSchema = z.union([
+  BrowserConnectionSetResponseSchema,
+  HostConnectionSetResponseSchema,
+]);
 
 export const CapabilityMintRequestSchema = z.strictObject({
   role: BrowserCapabilityRoleSchema,
@@ -94,5 +86,7 @@ export type CreateSessionRequest = z.infer<typeof CreateSessionRequestSchema>;
 export type CreateSessionResponse = z.infer<typeof CreateSessionResponseSchema>;
 export type ConnectionSetRequest = z.infer<typeof ConnectionSetRequestSchema>;
 export type ConnectionSetResponse = z.infer<typeof ConnectionSetResponseSchema>;
+export type BrowserConnectionSetResponse = z.infer<typeof BrowserConnectionSetResponseSchema>;
+export type HostConnectionSetResponse = z.infer<typeof HostConnectionSetResponseSchema>;
 export type CapabilityResponse = z.infer<typeof CapabilityResponseSchema>;
 export type SnapshotUploadResponse = z.infer<typeof SnapshotUploadResponseSchema>;

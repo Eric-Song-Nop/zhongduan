@@ -239,7 +239,7 @@ describe("TerminalSession", () => {
     expect(lateEvents).toEqual([2n]);
   });
 
-  it("rejects replay from a different session epoch", () => {
+  it("rejects canonical subscription from a different session epoch", () => {
     const pty = new ManualPty();
     const session = new TerminalSession({
       authority: new FakeTerminalAuthority(),
@@ -254,12 +254,6 @@ describe("TerminalSession", () => {
         lastEventSeq: 0n,
         nextPtyOffset: 0n,
       }),
-    ).toEqual({ status: "gap" });
-    expect(
-      session.planReplayThrough(
-        { sessionEpoch: 1n, lastEventSeq: 0n, nextPtyOffset: 0n },
-        { sessionEpoch: 2n, lastEventSeq: 0n, nextPtyOffset: 0n },
-      ),
     ).toEqual({ status: "gap" });
   });
 
@@ -604,35 +598,6 @@ describe("TerminalSession", () => {
       message: "focus encoder failed after entry",
     });
     expect(pty.writes).toEqual([]);
-  });
-
-  it("runs the snapshot fence before draining reentrant PTY output", async () => {
-    const pty = new ManualPty();
-    const order: string[] = [];
-    const authority = new (class extends FakeTerminalAuthority {
-      override encodeSnapshot(): Uint8Array {
-        const bytes = super.encodeSnapshot();
-        pty.emit(Uint8Array.of(0x42));
-        return bytes;
-      }
-    })();
-    const session = new TerminalSession({
-      authority,
-      journal: new EventJournal(),
-      pty,
-      sessionEpoch: 1n,
-    });
-    session.subscribe((encoded) => order.push(`event:${decodeDataFrame(encoded).eventSeq}`));
-    pty.emit(Uint8Array.of(0x41));
-
-    const snapshot = await session.captureSnapshotWithFence((capture) => {
-      order.push(`fence:${capture.cutEventSeq}`);
-      session.writeRawInput(Uint8Array.of(0x03));
-    });
-
-    expect(snapshot.cutEventSeq).toBe(1n);
-    expect(order).toEqual(["event:1", "fence:1", "event:2"]);
-    expect(pty.writes).toEqual([Uint8Array.of(0x03)]);
   });
 
   it("prepares an owned gap and commits its H fence before reentrant H+1", async () => {

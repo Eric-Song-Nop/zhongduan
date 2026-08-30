@@ -2,7 +2,7 @@ import {
   MAX_SNAPSHOT_COMPRESSED_BYTES,
   MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
 } from "@zhongduan/protocol";
-import type { SnapshotManifest } from "@zhongduan/session-client";
+import type { SnapshotRestoreSource } from "@zhongduan/session-client";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -13,17 +13,14 @@ import {
 } from "./snapshot-worker-contract";
 import { WorkerSnapshotTransport } from "./worker-snapshot-transport";
 
-const MANIFEST: SnapshotManifest = {
-  type: "snapshot-manifest",
+const SOURCE: SnapshotRestoreSource = {
+  kind: "snapshot",
+  sessionId: "session_123456789",
   snapshotId: "snapshot_12345678",
   engineId: "ghostty:test",
   sessionEpoch: "1",
-  streamId: 7,
-  deliveryGeneration: "2",
   cutEventSeq: "10",
   nextPtyOffset: "20",
-  commitEventSeq: "10",
-  commitPtyOffset: "20",
   compression: "none",
   compressedLength: "3",
   uncompressedLength: "3",
@@ -102,7 +99,7 @@ describe("WorkerSnapshotTransport", () => {
         getCapability: () => "secret-capability",
       });
       const abort = new AbortController();
-      const loading = transport.load(MANIFEST, abort.signal);
+      const loading = transport.load(SOURCE, abort.signal);
       abort.abort(new DOMException("cancelled", "AbortError"));
 
       await expect(loading).rejects.toMatchObject({ name: "AbortError" });
@@ -119,9 +116,9 @@ describe("WorkerSnapshotTransport", () => {
       createWorker: () => worker,
       getCapability: () => "secret-capability",
     });
-    const loading = transport.load(MANIFEST, new AbortController().signal);
+    const loading = transport.load(SOURCE, new AbortController().signal);
     expect(worker.requests).toEqual([
-      { type: "load", capability: "secret-capability", manifest: MANIFEST },
+      { type: "load", capability: "secret-capability", source: SOURCE },
     ]);
     const bytes = Uint8Array.from([1, 2, 3]);
     worker.loaded(bytes.buffer);
@@ -140,7 +137,7 @@ describe("WorkerSnapshotTransport", () => {
       clearTimer: timers.clearTimer,
     });
     const abort = new AbortController();
-    const loading = transport.load(MANIFEST, abort.signal);
+    const loading = transport.load(SOURCE, abort.signal);
     abort.abort(new DOMException("cancelled", "AbortError"));
     await expect(loading).rejects.toMatchObject({ name: "AbortError" });
     expect(worker.terminate).toHaveBeenCalledOnce();
@@ -153,7 +150,7 @@ describe("WorkerSnapshotTransport", () => {
     });
     const legalLarge = legalLargeTransport.load(
       {
-        ...MANIFEST,
+        ...SOURCE,
         compression: "zstd",
         compressedLength: MAX_SNAPSHOT_COMPRESSED_BYTES.toString(),
         uncompressedLength: (MAX_SNAPSHOT_COMPRESSED_BYTES + 1).toString(),
@@ -166,7 +163,7 @@ describe("WorkerSnapshotTransport", () => {
     expect(() =>
       transport.load(
         {
-          ...MANIFEST,
+          ...SOURCE,
           compression: "zstd",
           compressedLength: (MAX_SNAPSHOT_COMPRESSED_BYTES + 1).toString(),
         },
@@ -176,7 +173,7 @@ describe("WorkerSnapshotTransport", () => {
     expect(() =>
       transport.load(
         {
-          ...MANIFEST,
+          ...SOURCE,
           compression: "zstd",
           uncompressedLength: (MAX_SNAPSHOT_UNCOMPRESSED_BYTES + 1).toString(),
         },
@@ -191,7 +188,7 @@ describe("WorkerSnapshotTransport", () => {
       createWorker: () => worker,
       getCapability: () => "secret-capability",
     });
-    const loading = transport.load(MANIFEST, new AbortController().signal);
+    const loading = transport.load(SOURCE, new AbortController().signal);
 
     worker.fail();
     worker.loaded(Uint8Array.from([1, 2, 3]).buffer);
@@ -210,7 +207,7 @@ describe("WorkerSnapshotTransport", () => {
       setTimer,
       clearTimer: timers.clearTimer,
     });
-    const loading = transport.load(MANIFEST, new AbortController().signal);
+    const loading = transport.load(SOURCE, new AbortController().signal);
 
     expect(setTimer).toHaveBeenCalledWith(expect.any(Function), SNAPSHOT_LOAD_TIMEOUT_MS);
     timers.runOnly();

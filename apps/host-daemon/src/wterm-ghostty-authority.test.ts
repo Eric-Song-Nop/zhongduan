@@ -350,7 +350,7 @@ describe("WtermGhosttyAuthority", () => {
     }
   });
 
-  it("writes a Kitty key release once and skips the empty legacy encoding", async () => {
+  it("writes a Kitty key release once and skips an empty encoded byte sequence", async () => {
     const authority = await WtermGhosttyAuthority.create(dimensions);
     const pty = new RecordingPty();
     const session = new TerminalSession({

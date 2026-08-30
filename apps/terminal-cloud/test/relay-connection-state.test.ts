@@ -5,15 +5,14 @@ describe("connection lifecycle", () => {
   it.each([
     [undefined, false, true, "reserved"],
     [undefined, false, false, "closed"],
-    [null, false, false, "control-open"],
+    [false, false, false, "control-open"],
     [undefined, true, false, "data-open"],
-    [null, true, false, "paired"],
-    ["awaiting-attach", true, false, "paired"],
-    ["active", true, false, "ready"],
+    [false, true, false, "paired"],
+    [true, true, false, "ready"],
   ] as const)(
-    "maps control=%s data=%s reserved=%s to %s",
-    (controlState, dataOpen, reserved, expected) => {
-      expect(deriveConnectionPhase(controlState, dataOpen, reserved)).toBe(expected);
+    "maps controlReady=%s data=%s reserved=%s to %s",
+    (controlReady, dataOpen, reserved, expected) => {
+      expect(deriveConnectionPhase(controlReady, dataOpen, reserved)).toBe(expected);
     },
   );
 });

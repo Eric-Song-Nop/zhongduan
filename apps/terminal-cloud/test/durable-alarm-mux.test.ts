@@ -1,5 +1,5 @@
-import { env, exports as workerExports } from "cloudflare:workers";
-import { evictDurableObject, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
   DURABLE_ALARM_FAILURE_RETRY_MS,
@@ -8,36 +8,12 @@ import {
   DurableAlarmMux,
 } from "../src/worker/durable-alarm-mux";
 
-const ALARM_FACTS_KEY = "terminal-session:alarm-mux:v1";
-const origin = "https://terminal.example.test";
-let sessionCounter = 0;
+const ALARM_FACTS_KEY = "terminal-session:alarm-mux";
 
 function alarmMuxStub(name: string) {
   return env.TERMINAL_SESSIONS.get(
     env.TERMINAL_SESSIONS.idFromName(`durable-alarm-mux-test:${name}`),
   );
-}
-
-async function createSession(): Promise<string> {
-  sessionCounter += 1;
-  const sessionId = `session_alarm_mux_${sessionCounter.toString().padStart(16, "0")}`;
-  const response = await workerExports.default.fetch(
-    new Request(`${origin}/api/v1/sessions`, {
-      method: "POST",
-      headers: {
-        authorization: "Bearer test-bootstrap-token-with-at-least-32-bytes",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        engineId: "ghostty:test+snapshot-v1+wterm:test",
-        sessionEpoch: "7",
-        sessionId,
-      }),
-    }),
-  );
-  expect(response.status).toBe(201);
-  await response.body?.cancel();
-  return sessionId;
 }
 
 describe("durable alarm mux", () => {
@@ -175,111 +151,17 @@ describe("durable alarm mux", () => {
     });
   });
 
-  it("adopts a pre-mux platform alarm as the legacy snapshot deadline", async () => {
-    await runInDurableObject(alarmMuxStub("legacy-platform-alarm"), async (_instance, durable) => {
-      const legacyDue = Date.now() + 30_000;
-      let snapshotRuns = 0;
+  it("deletes a platform alarm that has no current component fact", async () => {
+    await runInDurableObject(alarmMuxStub("unowned-platform-alarm"), async (_instance, durable) => {
+      const due = Date.now() + 30_000;
       await durable.storage.delete(ALARM_FACTS_KEY);
-      await durable.storage.setAlarm(legacyDue);
-      const mux = new DurableAlarmMux(
-        durable,
-        {
-          async [DurableAlarmComponent.snapshot]() {
-            snapshotRuns += 1;
-          },
-        },
-        () => legacyDue,
-      );
+      await durable.storage.setAlarm(due);
 
+      const mux = new DurableAlarmMux(durable, {}, () => due);
       await mux.initialize();
-      expect(await durable.storage.getAlarm()).toBe(legacyDue);
-      await expect(mux.alarm()).resolves.toBe(DurableAlarmDispatch.dispatched);
-      expect({ alarm: await durable.storage.getAlarm(), snapshotRuns }).toEqual({
-        alarm: null,
-        snapshotRuns: 1,
-      });
-    });
-  });
 
-  it("adopts an earlier legacy alarm before component initialization schedules a later deadline", async () => {
-    await runInDurableObject(
-      alarmMuxStub("legacy-before-component-init"),
-      async (_instance, durable) => {
-        const legacyDue = Date.now() + 30_000;
-        const laterSnapshotDue = legacyDue + 30_000;
-        await durable.storage.delete(ALARM_FACTS_KEY);
-        await durable.storage.setAlarm(legacyDue);
-        const mux = new DurableAlarmMux(durable, {});
-
-        await mux.initialize();
-        await mux.schedule(DurableAlarmComponent.snapshot, laterSnapshotDue);
-
-        expect(await durable.storage.getAlarm()).toBe(legacyDue);
-        await mux.clear(DurableAlarmComponent.snapshot);
-      },
-    );
-  });
-
-  it("adopts the legacy alarm before Terminal snapshot initialization schedules maintenance", async () => {
-    const sessionId = await createSession();
-    const stub = env.TERMINAL_SESSIONS.get(env.TERMINAL_SESSIONS.idFromName(`v1:${sessionId}`));
-    const legacyDue = Date.now() + 10_000;
-
-    await runInDurableObject(stub, async (_instance, durable) => {
-      durable.storage.sql.exec(
-        "UPDATE session_state SET snapshot_retention_backlog = 1 WHERE singleton = 1",
-      );
-      await durable.storage.delete(ALARM_FACTS_KEY);
-      await durable.storage.setAlarm(legacyDue);
-    });
-    await evictDurableObject(stub);
-
-    await runInDurableObject(stub, async (_instance, durable) => {
-      expect(await durable.storage.getAlarm()).toBe(legacyDue);
-    });
-  });
-
-  it("does not re-adopt a stale platform alarm after the one-time migration is empty", async () => {
-    await runInDurableObject(alarmMuxStub("legacy-marker-empty"), async (_instance, durable) => {
-      const legacyDue = Date.now() + 30_000;
-      await durable.storage.delete(ALARM_FACTS_KEY);
-      await durable.storage.setAlarm(legacyDue);
-      const first = new DurableAlarmMux(durable, {}, () => legacyDue);
-      await first.initialize();
-      await first.clear(DurableAlarmComponent.snapshot);
       expect(await durable.storage.getAlarm()).toBeNull();
-
-      let snapshotRuns = 0;
-      await durable.storage.setAlarm(legacyDue + 1);
-      const rebuilt = new DurableAlarmMux(
-        durable,
-        {
-          async [DurableAlarmComponent.snapshot]() {
-            snapshotRuns += 1;
-          },
-        },
-        () => legacyDue + 1,
-      );
-      await rebuilt.initialize();
-      expect(await durable.storage.getAlarm()).toBeNull();
-      await expect(rebuilt.alarm()).resolves.toBe(DurableAlarmDispatch.empty);
-      expect(snapshotRuns).toBe(0);
-    });
-  });
-
-  it("persists the migration marker when the first initialization has no alarm", async () => {
-    await runInDurableObject(alarmMuxStub("empty-migration-marker"), async (_instance, durable) => {
-      const now = Date.now();
-      await durable.storage.delete(ALARM_FACTS_KEY);
-      const first = new DurableAlarmMux(durable, {}, () => now);
-      await first.initialize();
-      expect(await durable.storage.getAlarm()).toBeNull();
-
-      await durable.storage.setAlarm(now + 1);
-      const rebuilt = new DurableAlarmMux(durable, {}, () => now + 1);
-      await rebuilt.initialize();
-      expect(await durable.storage.getAlarm()).toBeNull();
-      await expect(rebuilt.alarm()).resolves.toBe(DurableAlarmDispatch.empty);
+      await expect(mux.alarm()).resolves.toBe(DurableAlarmDispatch.empty);
     });
   });
 

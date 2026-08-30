@@ -39,10 +39,7 @@ class ManualPty implements PtyProcess {
   }
 }
 
-function harness(
-  canInterruptRecovery = false,
-  yieldIo: () => Promise<void> = () => Promise.resolve(),
-) {
+function harness(yieldIo: () => Promise<void> = () => Promise.resolve()) {
   const pty = new ManualPty();
   const journal = new EventJournal();
   const session = new TerminalSession({
@@ -53,21 +50,13 @@ function harness(
   });
   const sent: Uint8Array[] = [];
   const failures: string[] = [];
-  let pressure = 0;
-  let publisher: CanonicalPublisher;
-  publisher = new CanonicalPublisher({
-    canInterruptRecovery: () => canInterruptRecovery,
+  const publisher = new CanonicalPublisher({
     onFailure: (reason) => failures.push(reason),
-    onIngress: () => {},
-    onRecoveryPressure: () => {
-      pressure += 1;
-      publisher.resume();
-    },
     sendData: (frame) => sent.push(frame.slice()),
     session,
     yieldIo,
   });
-  return { failures, journal, pressure: () => pressure, pty, publisher, sent, session };
+  return { failures, journal, pty, publisher, sent, session };
 }
 
 function recoveryStartFence(cursor: ReplayCursor, identity = "AAAAAAAAAAA"): Uint8Array {
@@ -96,7 +85,7 @@ function recoveryStartFence(cursor: ReplayCursor, identity = "AAAAAAAAAAA"): Uin
 function deliveryOrder(frames: readonly Uint8Array[]): string[] {
   return frames.map((encoded) => {
     const frame = decodeDataFrame(encoded);
-    return frame.kind === DataFrameKind.DeliveryBarrier
+    return frame.kind === DataFrameKind.RecoveryStartFence
       ? `fence:${decodeRecoveryStartFence(encoded).recoveryId}`
       : `event:${frame.eventSeq}`;
   });
@@ -123,23 +112,6 @@ describe("CanonicalPublisher", () => {
     ).toThrow(/does not match/);
     target.publisher.activate(baseline);
     expect(target.sent.map((frame) => decodeDataFrame(frame).eventSeq)).toEqual([1n]);
-  });
-
-  it("flushes exactly through a paused cut and holds C+1 until resume", async () => {
-    const target = harness();
-    target.publisher.activate(target.publisher.prepare());
-    target.pty.emit(Uint8Array.of(0x41));
-    await target.publisher.pause();
-    target.pty.emit(Uint8Array.of(0x42));
-    target.pty.emit(Uint8Array.of(0x43));
-    const commit = target.session.cursor;
-
-    await target.publisher.flushThrough(commit);
-    target.pty.emit(Uint8Array.of(0x44));
-    expect(target.sent.map((frame) => decodeDataFrame(frame).eventSeq)).toEqual([1n, 2n, 3n]);
-
-    target.publisher.resume();
-    expect(target.sent.map((frame) => decodeDataFrame(frame).eventSeq)).toEqual([1n, 2n, 3n, 4n]);
   });
 
   it("inserts a queued recovery fence exactly between H and H+1", () => {
@@ -203,34 +175,12 @@ describe("CanonicalPublisher", () => {
     ]);
   });
 
-  it("flushes markers at H without consuming a canonical cursor", async () => {
-    const target = harness();
-    target.publisher.activate(target.publisher.prepare());
-    await target.publisher.pause();
-    target.pty.emit(Uint8Array.of(0x41));
-    const committedThrough = target.session.cursor;
-    expect(
-      target.publisher.tryEnqueueRecoveryStartFence(recoveryStartFence(committedThrough)),
-    ).toBe(true);
-    target.pty.emit(Uint8Array.of(0x42));
-
-    await target.publisher.flushThrough(committedThrough);
-    expect(deliveryOrder(target.sent)).toEqual(["event:1", "fence:recovery_AAAAAAAAAAA"]);
-
-    target.publisher.resume();
-    expect(deliveryOrder(target.sent)).toEqual([
-      "event:1",
-      "fence:recovery_AAAAAAAAAAA",
-      "event:2",
-    ]);
-  });
-
   it("retains marker ordering while the pump is yielding", async () => {
     let releaseYield!: () => void;
     const yielded = new Promise<void>((resolve) => {
       releaseYield = resolve;
     });
-    const target = harness(false, () => yielded);
+    const target = harness(() => yielded);
     target.publisher.activate(target.publisher.prepare());
     for (let index = 0; index < 65; index += 1) {
       target.pty.emit(Uint8Array.of(index));
@@ -253,7 +203,7 @@ describe("CanonicalPublisher", () => {
     ]);
   });
 
-  it("rejects malformed, mismatched, and over-budget recovery fences without failing v2", () => {
+  it("rejects malformed, mismatched, and over-budget recovery fences without stopping", () => {
     const target = harness();
     target.publisher.prepare();
     target.pty.emit(Uint8Array.of(0x41));
@@ -282,10 +232,9 @@ describe("CanonicalPublisher", () => {
     expect(target.failures).toEqual([]);
   });
 
-  it("fails closed at the 1024-frame ingress bound without a safe pre-marker interrupt", async () => {
+  it("fails closed at the 1024-frame ingress bound before host-ready", () => {
     const target = harness();
-    target.publisher.activate(target.publisher.prepare());
-    await target.publisher.pause();
+    target.publisher.prepare();
 
     for (let index = 0; index < HOST_CANONICAL_QUEUE_LIMITS.maxFrames + 1; index += 1) {
       target.pty.emit(Uint8Array.of(index & 0xff));
@@ -293,20 +242,5 @@ describe("CanonicalPublisher", () => {
 
     expect(target.failures).toEqual(["canonical publisher queue exceeded"]);
     expect(target.sent).toEqual([]);
-  });
-
-  it("accepts one pressure frame when a pre-marker recovery resumes the pump", async () => {
-    const target = harness(true);
-    target.publisher.activate(target.publisher.prepare());
-    await target.publisher.pause();
-
-    for (let index = 0; index < HOST_CANONICAL_QUEUE_LIMITS.maxFrames + 1; index += 1) {
-      target.pty.emit(Uint8Array.of(index & 0xff));
-    }
-    await settle();
-
-    expect(target.pressure()).toBe(1);
-    expect(target.failures).toEqual([]);
-    expect(target.sent).toHaveLength(HOST_CANONICAL_QUEUE_LIMITS.maxFrames + 1);
   });
 });

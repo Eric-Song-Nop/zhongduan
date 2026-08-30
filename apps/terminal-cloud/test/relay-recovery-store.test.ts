@@ -3,17 +3,17 @@ import type {
   RecoveryAdopted,
   RecoveryStart,
   RecoveryStartFence,
-  RecoveryV3HostPrepare,
-  RecoveryV3HostSourceClosed,
+  RecoveryHostPrepare,
+  RecoveryHostSourceClosed,
 } from "@zhongduan/protocol";
 import {
   DataFrameFlag,
   DataFrameKind,
   encodeDataFrame,
-  encodeDeliveryEnvelopeV3,
+  encodeDeliveryEnvelope,
 } from "@zhongduan/protocol";
 import { env, exports as workerExports } from "cloudflare:workers";
-import { evictDurableObject, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
   RelayRecoveryStore,
@@ -89,7 +89,6 @@ function sessionStub(sessionId: string) {
 function seedClient(
   durable: DurableObjectState,
   fixture: SessionFixture,
-  strategy: "v2" | "v3",
   generation = "1",
   streamId = 1,
   role: "observer" | "writer" = "observer",
@@ -97,14 +96,13 @@ function seedClient(
   durable.storage.sql.exec(
     `INSERT INTO client_delivery
       (client_id, principal_id_hash, role, stream_id, delivery_generation,
-       updated_at, registered_at, reservation_expires_at, recovery_strategy)
-     VALUES (?, ?, ?, ?, ?, 1, 1, NULL, ?)`,
+       updated_at, registered_at, reservation_expires_at)
+     VALUES (?, ?, ?, ?, ?, 1, 1, NULL)`,
     fixture.clientId,
     `principal_${fixture.clientId}`,
     role,
     streamId,
     generation,
-    strategy,
   );
 }
 
@@ -168,7 +166,7 @@ function prepareFor(fixture: SessionFixture, generation = "1", streamId = 1) {
     engineId,
     base,
     source: { kind: "warm" },
-  } satisfies RecoveryV3HostPrepare;
+  } satisfies RecoveryHostPrepare;
 }
 
 function fenceFor(
@@ -207,7 +205,7 @@ function startFor(
     deliveryGeneration: generation,
     streamId,
     engineId,
-    authorityDataVersion: 2,
+    authorityDataFormat: 1,
     base,
     source: { kind: "warm" },
     committedThrough,
@@ -245,13 +243,13 @@ function deliveryEnvelope(
   cumulativeEncodedBytes: bigint,
   frame: {
     eventSeq: bigint;
-    kind: typeof DataFrameKind.PtyOutput | typeof DataFrameKind.ReplayCommit;
+    kind: typeof DataFrameKind.PtyOutput | typeof DataFrameKind.RecoveryDone;
     payload: Uint8Array;
     ptyOffset: bigint;
   },
   streamId = 1,
 ): Uint8Array {
-  return encodeDeliveryEnvelopeV3({
+  return encodeDeliveryEnvelope({
     lane,
     deliveryGeneration: 1n,
     deliveryOrdinal: ordinal,
@@ -274,7 +272,7 @@ describe("RelayRecoveryStore", () => {
   it("keeps the initial grant at zero until the exact start-ready ACK refills it atomically", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
       expect(transaction(durable, () => store.beginPreparing(beginInput(fixture)))).toEqual({
@@ -330,7 +328,7 @@ describe("RelayRecoveryStore", () => {
   it("uses floor reservation slots for every 1..87 byte remainder and admits an exact 88-byte record", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
       transaction(durable, () => store.beginPreparing(beginInput(fixture)));
@@ -401,10 +399,10 @@ describe("RelayRecoveryStore", () => {
         writerDeliveryReserveEncodedBytes: 90,
         writerDeliveryReserveRecords: 1,
       };
-      seedClient(durable, observer, "v3", "1", 1, "observer");
+      seedClient(durable, observer, "1", 1, "observer");
       // A registered writer does not activate the reserve until its exact
       // recovery attempt becomes a durable delivery owner.
-      seedClient(durable, writer, "v3", "1", 2, "writer");
+      seedClient(durable, writer, "1", 2, "writer");
       installAuthority(durable, committed);
       const store = recoveryStore(durable, boundedLimits);
       transaction(durable, () => store.beginPreparing(beginInput(observer)));
@@ -496,7 +494,7 @@ describe("RelayRecoveryStore", () => {
         [first, 1],
         [second, 2],
       ] as const) {
-        seedClient(durable, fixture, "v3", "1", streamId);
+        seedClient(durable, fixture, "1", streamId);
         transaction(durable, () =>
           store.beginPreparing({
             ...beginInput(fixture),
@@ -609,7 +607,7 @@ describe("RelayRecoveryStore", () => {
         [activeObserver, 2, "observer"],
         [completeObserver, 3, "observer"],
       ] as const) {
-        seedClient(durable, fixture, "v3", "1", streamId, role);
+        seedClient(durable, fixture, "1", streamId, role);
         expect(
           transaction(durable, () =>
             store.beginPreparing({
@@ -714,7 +712,7 @@ describe("RelayRecoveryStore", () => {
         writerRecords: 1,
       });
 
-      // Simulate a pre-budget legacy row. It is one byte larger than the
+      // Simulate a pre-existing over-budget row. It is one byte larger than the
       // active observer contribution so the deterministic victim is exact.
       durable.storage.sql.exec(
         "UPDATE recovery_attempt SET state = 'complete', updated_at = 250 WHERE recovery_id = ?",
@@ -765,7 +763,7 @@ describe("RelayRecoveryStore", () => {
   it("reports bounded session aggregate usage without double-charging recovery records", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
       transaction(durable, () => store.beginPreparing(beginInput(fixture)));
@@ -813,57 +811,10 @@ describe("RelayRecoveryStore", () => {
     });
   });
 
-  it("migrates an intact v6 relay through the bounded strict v9 ledger and keeps v2 defaulted", async () => {
-    const fixture = await createSession();
-    const stub = sessionStub(fixture.sessionId);
-    await runInDurableObject(stub, (_instance, durable) => {
-      seedClient(durable, fixture, "v2");
-      durable.storage.sql.exec("DROP TABLE recovery_control_outbox");
-      durable.storage.sql.exec("DROP TABLE recovery_delivery_lane");
-      durable.storage.sql.exec("DROP TABLE recovery_attempt");
-      durable.storage.kv.put("schema-version", 6);
-    });
-    await evictDurableObject(stub);
-
-    await runInDurableObject(stub, (_instance, durable) => {
-      const sql = durable.storage.sql;
-      expect(durable.storage.kv.get<number>("schema-version")).toBe(9);
-      expect(
-        sql
-          .exec(
-            `SELECT name, strict FROM pragma_table_list
-             WHERE name LIKE 'recovery_%' ORDER BY name`,
-          )
-          .toArray(),
-      ).toEqual([
-        { name: "recovery_attempt", strict: 1 },
-        { name: "recovery_control_outbox", strict: 1 },
-        { name: "recovery_delivery_lane", strict: 1 },
-        { name: "recovery_delivery_record", strict: 1 },
-      ]);
-      expect(
-        sql
-          .exec(
-            "SELECT recovery_strategy FROM client_delivery WHERE client_id = ?",
-            fixture.clientId,
-          )
-          .one(),
-      ).toEqual({ recovery_strategy: "v2" });
-      installAuthority(durable, committed);
-      const result = transaction(durable, () =>
-        recoveryStore(durable).beginPreparing(beginInput(fixture)),
-      );
-      expect(result).toEqual({ ok: false, reason: "client-v2" });
-      expect(sql.exec("SELECT COUNT(*) AS value FROM recovery_attempt").one()).toEqual({
-        value: 0,
-      });
-    });
-  });
-
   it("persists prepare before outbox, rejects divergence, and installs one exact fence", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
 
@@ -957,7 +908,7 @@ describe("RelayRecoveryStore", () => {
   it("locates attempts and outbox entries only by exact durable identity", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
       transaction(durable, () => store.beginPreparing(beginInput(fixture)));
@@ -1048,7 +999,7 @@ describe("RelayRecoveryStore", () => {
   it("keeps lane cursors independent and fails closed when a sent ordinal cannot be authenticated", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
       transaction(durable, () => store.beginPreparing(beginInput(fixture)));
@@ -1220,7 +1171,7 @@ describe("RelayRecoveryStore", () => {
             fixture.recoveryId,
             deliveryEnvelope("recovery", 4n, 360n, {
               eventSeq: 5n,
-              kind: DataFrameKind.ReplayCommit,
+              kind: DataFrameKind.RecoveryDone,
               payload: new Uint8Array(),
               ptyOffset: 12n,
             }),
@@ -1301,7 +1252,7 @@ describe("RelayRecoveryStore", () => {
   it("owns a staged multi-record window and releases only an exact sent prefix", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
       transaction(durable, () => store.beginPreparing(beginInput(fixture)));
@@ -1470,7 +1421,7 @@ describe("RelayRecoveryStore", () => {
   it("enforces literal aggregate record and encoded-byte caps across both lanes", async () => {
     const recordFixture = await createSession();
     await runInDurableObject(sessionStub(recordFixture.sessionId), (_instance, durable) => {
-      seedClient(durable, recordFixture, "v3");
+      seedClient(durable, recordFixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable, {
         ...limits,
@@ -1521,7 +1472,7 @@ describe("RelayRecoveryStore", () => {
 
     const literalRecordFixture = await createSession();
     await runInDurableObject(sessionStub(literalRecordFixture.sessionId), (_instance, durable) => {
-      seedClient(durable, literalRecordFixture, "v3");
+      seedClient(durable, literalRecordFixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
       transaction(durable, () => store.beginPreparing(beginInput(literalRecordFixture)));
@@ -1566,7 +1517,7 @@ describe("RelayRecoveryStore", () => {
 
     const capPlusOneFixture = await createSession();
     await runInDurableObject(sessionStub(capPlusOneFixture.sessionId), (_instance, durable) => {
-      seedClient(durable, capPlusOneFixture, "v3");
+      seedClient(durable, capPlusOneFixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable, {
         ...limits,
@@ -1622,7 +1573,7 @@ describe("RelayRecoveryStore", () => {
 
     const exactCapFixture = await createSession();
     await runInDurableObject(sessionStub(exactCapFixture.sessionId), (_instance, durable) => {
-      seedClient(durable, exactCapFixture, "v3");
+      seedClient(durable, exactCapFixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable, {
         ...limits,
@@ -1678,7 +1629,7 @@ describe("RelayRecoveryStore", () => {
   it("orders decimal ordinals numerically, rejects a missing sent prefix, and admits MAX_U64", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
       transaction(durable, () => store.beginPreparing(beginInput(fixture)));
@@ -1804,7 +1755,7 @@ describe("RelayRecoveryStore", () => {
     async ({ complete, phase, reset, sendsHostReset }) => {
       const fixture = await createSession();
       await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-        seedClient(durable, fixture, "v3");
+        seedClient(durable, fixture);
         installAuthority(durable, committed);
         const store = recoveryStore(durable);
         transaction(durable, () => store.beginPreparing(beginInput(fixture)));
@@ -1886,7 +1837,7 @@ describe("RelayRecoveryStore", () => {
     async (fence) => {
       const fixture = await createSession();
       await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-        seedClient(durable, fixture, "v3");
+        seedClient(durable, fixture);
         installAuthority(durable, committed);
         const store = recoveryStore(durable);
         transaction(durable, () => store.beginPreparing(beginInput(fixture)));
@@ -1933,7 +1884,7 @@ describe("RelayRecoveryStore", () => {
     async (order) => {
       const fixture = await createSession();
       await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-        seedClient(durable, fixture, "v3");
+        seedClient(durable, fixture);
         installAuthority(durable, committed);
         const store = recoveryStore(durable);
         transaction(durable, () => store.beginPreparing(beginInput(fixture)));
@@ -1976,7 +1927,7 @@ describe("RelayRecoveryStore", () => {
           }),
           deliveryEnvelope("recovery", 4n, 360n, {
             eventSeq: 5n,
-            kind: DataFrameKind.ReplayCommit,
+            kind: DataFrameKind.RecoveryDone,
             payload: new Uint8Array(),
             ptyOffset: 12n,
           }),
@@ -2076,7 +2027,7 @@ describe("RelayRecoveryStore", () => {
           deliveryGeneration: "1",
           throughRecoveryOrdinal: "4",
           throughRecoveryCumulativeEncodedBytes: "360",
-        } satisfies RecoveryV3HostSourceClosed;
+        } satisfies RecoveryHostSourceClosed;
         const first =
           order === "source-closed-first"
             ? () => store.markSourceClosed(closed, 240)
@@ -2178,7 +2129,7 @@ describe("RelayRecoveryStore", () => {
   it("keeps a current complete attempt as the live-lane owner only", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
       transaction(durable, () => store.beginPreparing(beginInput(fixture)));
@@ -2295,7 +2246,7 @@ describe("RelayRecoveryStore", () => {
   it("rejects new progress at the hard deadline without breaking exact scalar retries", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
       transaction(durable, () => store.beginPreparing(beginInput(fixture, 1_000)));
@@ -2335,7 +2286,7 @@ describe("RelayRecoveryStore", () => {
         }),
         deliveryEnvelope("recovery", 4n, 360n, {
           eventSeq: 5n,
-          kind: DataFrameKind.ReplayCommit,
+          kind: DataFrameKind.RecoveryDone,
           payload: new Uint8Array(),
           ptyOffset: 12n,
         }),
@@ -2398,7 +2349,7 @@ describe("RelayRecoveryStore", () => {
         deliveryGeneration: "1",
         throughRecoveryOrdinal: "4",
         throughRecoveryCumulativeEncodedBytes: "360",
-      } satisfies RecoveryV3HostSourceClosed;
+      } satisfies RecoveryHostSourceClosed;
       const atDeadline = 1_000;
 
       expect(
@@ -2488,7 +2439,7 @@ describe("RelayRecoveryStore", () => {
   it("treats the no-progress boundary as expired while retaining an exact grant retry", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
       transaction(durable, () =>
@@ -2530,7 +2481,7 @@ describe("RelayRecoveryStore", () => {
     async (changedFence) => {
       const fixture = await createSession();
       await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-        seedClient(durable, fixture, "v3");
+        seedClient(durable, fixture);
         installAuthority(durable, committed);
         const store = recoveryStore(durable);
         transaction(durable, () => store.beginPreparing(beginInput(fixture)));
@@ -2576,7 +2527,7 @@ describe("RelayRecoveryStore", () => {
   it("owns deadlines and snapshot pins and fences replaced hosts or removed clients", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const store = recoveryStore(durable);
       const snapshotId = "snapshot_recovery_0001";
@@ -2612,7 +2563,7 @@ describe("RelayRecoveryStore", () => {
         connectionId: `${fixture.connectionId}_removed`,
         recoveryId: `${fixture.recoveryId}_removed`,
       };
-      seedClient(durable, other, "v3", "1", 2);
+      seedClient(durable, other, "1", 2);
       expect(
         transaction(durable, () =>
           store.beginPreparing({
@@ -2653,8 +2604,8 @@ describe("RelayRecoveryStore", () => {
         connectionId: `${fixture.connectionId}_second`,
         recoveryId: `${fixture.recoveryId}_second`,
       };
-      seedClient(durable, fixture, "v3");
-      seedClient(durable, second, "v3", "1", 2);
+      seedClient(durable, fixture);
+      seedClient(durable, second, "1", 2);
       installAuthority(durable, committed);
       const bounded = recoveryStore(durable, {
         ...limits,
@@ -2696,7 +2647,7 @@ describe("RelayRecoveryStore", () => {
   it("fences replaced generations and reports only deadline resets that fit the outbox", async () => {
     const fixture = await createSession();
     await runInDurableObject(sessionStub(fixture.sessionId), (_instance, durable) => {
-      seedClient(durable, fixture, "v3");
+      seedClient(durable, fixture);
       installAuthority(durable, committed);
       const bounded = recoveryStore(durable, {
         ...limits,
@@ -2726,7 +2677,7 @@ describe("RelayRecoveryStore", () => {
         connectionId: `${fixture.connectionId}_other`,
         recoveryId: `${fixture.recoveryId}_other`,
       };
-      seedClient(durable, other, "v3", "1", 2);
+      seedClient(durable, other, "1", 2);
       expect(
         transaction(durable, () =>
           bounded.beginPreparing({

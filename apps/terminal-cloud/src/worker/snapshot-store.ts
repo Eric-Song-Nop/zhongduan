@@ -2,7 +2,7 @@ import { SnapshotMetadataSchema, type SnapshotMetadata } from "@zhongduan/protoc
 import { randomId } from "./auth";
 import {
   FinalizedSnapshotSchema,
-  isSnapshotObjectKey,
+  isSnapshotAttemptObjectKey,
   snapshotAttemptObjectKey,
   type FinalizedSnapshot,
 } from "./snapshot-contract";
@@ -23,7 +23,6 @@ interface SnapshotRow {
   snapshot_id: string;
   state: "servable" | "retired";
   uncompressed_length: string;
-  upload_kind: FinalizedSnapshot["uploadKind"];
 }
 
 interface SnapshotScanRow {
@@ -132,7 +131,6 @@ function descriptor(row: SnapshotRow, sessionId: string): FinalizedSnapshot {
     objectKey: row.object_key,
     r2Version: row.r2_version,
     etag: row.etag,
-    uploadKind: row.upload_kind,
   });
 }
 
@@ -198,8 +196,7 @@ function exactSnapshot(row: SnapshotRow, snapshot: FinalizedSnapshot): boolean {
     exactSnapshotMetadata(row, metadataOf(snapshot)) &&
     row.object_key === snapshot.objectKey &&
     row.r2_version === snapshot.r2Version &&
-    row.etag === snapshot.etag &&
-    row.upload_kind === snapshot.uploadKind
+    row.etag === snapshot.etag
   );
 }
 
@@ -293,7 +290,11 @@ export class SnapshotStore {
       if (existingUpload !== undefined) {
         const exactUpload =
           existingUpload.metadata_json === metadataJson(snapshot) &&
-          isSnapshotObjectKey(existingUpload.object_key, snapshot.sessionId, snapshot.snapshotId);
+          isSnapshotAttemptObjectKey(
+            existingUpload.object_key,
+            snapshot.sessionId,
+            snapshot.snapshotId,
+          );
         if (
           (existingUpload.state === "preparing" || existingUpload.state === "retired") &&
           exactUpload
@@ -518,7 +519,6 @@ export class SnapshotStore {
       objectKey: upload.object_key,
       r2Version: upload.r2_version,
       etag: upload.etag,
-      uploadKind: "multipart-verified",
     });
   }
 
@@ -632,36 +632,6 @@ export class SnapshotStore {
           `UPDATE snapshot_upload SET state = 'retired'
            WHERE snapshot_id = ? AND object_key = ?
              AND state IN ('preparing', 'completed')`,
-          upload.snapshot_id,
-          upload.object_key,
-        );
-      }
-
-      const remaining = transitionLimit - expired.length;
-      if (remaining <= 0) return;
-      const uploadCount = this.#boundedRowCount(
-        ["snapshot_upload"],
-        SNAPSHOT_UPLOAD_RESERVATION_LIMIT + remaining,
-      );
-      const overflow = Math.min(
-        remaining,
-        Math.max(0, uploadCount - SNAPSHOT_UPLOAD_RESERVATION_LIMIT),
-      );
-      if (overflow === 0) return;
-      const legacyOverflow = this.sql
-        .exec(
-          `SELECT snapshot_id, object_key FROM snapshot_upload
-           WHERE state = 'preparing'${inactiveClause}
-           ORDER BY rowid ASC
-           LIMIT ?`,
-          ...activeIds,
-          overflow,
-        )
-        .toArray() as unknown as Pick<SnapshotUploadRecord, "object_key" | "snapshot_id">[];
-      for (const upload of legacyOverflow) {
-        this.sql.exec(
-          `UPDATE snapshot_upload SET state = 'retired'
-           WHERE snapshot_id = ? AND object_key = ? AND state = 'preparing'`,
           upload.snapshot_id,
           upload.object_key,
         );
@@ -783,7 +753,7 @@ export class SnapshotStore {
         session.session_id !== snapshot.sessionId ||
         session.session_epoch !== snapshot.sessionEpoch ||
         session.engine_id !== snapshot.engineId ||
-        !isSnapshotObjectKey(snapshot.objectKey, snapshot.sessionId, snapshot.snapshotId)
+        !isSnapshotAttemptObjectKey(snapshot.objectKey, snapshot.sessionId, snapshot.snapshotId)
       ) {
         result = { ok: false, reason: "session-mismatch" };
         return;
@@ -825,11 +795,7 @@ export class SnapshotStore {
         upload.object_key === snapshot.objectKey &&
         upload.r2_version === snapshot.r2Version &&
         upload.etag === snapshot.etag;
-      if (
-        upload.state !== "completed" ||
-        snapshot.uploadKind !== "multipart-verified" ||
-        !exactUpload
-      ) {
+      if (upload.state !== "completed" || !exactUpload) {
         result = { ok: false, reason: "attempt-changed" };
         return;
       }
@@ -839,8 +805,8 @@ export class SnapshotStore {
         `INSERT INTO snapshot
             (snapshot_id, session_epoch, cut_event_seq, next_pty_offset, engine_id,
              object_key, r2_version, etag, sha256, compressed_length,
-             uncompressed_length, compression, state, created_at, upload_kind)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'servable', ?, ?)`,
+             uncompressed_length, compression, state, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'servable', ?)`,
         snapshot.snapshotId,
         snapshot.sessionEpoch,
         snapshot.cutEventSeq,
@@ -854,7 +820,6 @@ export class SnapshotStore {
         snapshot.uncompressedLength,
         snapshot.compression,
         createdAt,
-        snapshot.uploadKind,
       );
       this.sql.exec(
         "DELETE FROM snapshot_upload WHERE snapshot_id = ? AND state = 'completed'",
@@ -890,7 +855,7 @@ export class SnapshotStore {
     pinnedSnapshotIds: ReadonlySet<string>,
     limit = SNAPSHOT_MAINTENANCE_BATCH_LIMIT,
   ): ReconcileSnapshotRetentionResult {
-    if (!this.#ensureRecentGrace(session, pinnedSnapshotIds, limit)) return { retired: [] };
+    if (!this.#ensureRecentGrace(session, pinnedSnapshotIds)) return { retired: [] };
     const currentSession = this.relayStore.session();
     if (currentSession === undefined) return { retired: [] };
     const candidates = this.#retentionCandidates(currentSession, pinnedSnapshotIds, limit);
@@ -963,19 +928,11 @@ export class SnapshotStore {
     }));
   }
 
-  #ensureRecentGrace(
-    session: SessionRow,
-    pinnedSnapshotIds: ReadonlySet<string>,
-    limit: number,
-  ): boolean {
-    if (session.snapshot_retention_backlog !== 0) {
-      return this.#ensureMigrationRecentGrace(session, pinnedSnapshotIds, limit);
-    }
+  #ensureRecentGrace(session: SessionRow, pinnedSnapshotIds: ReadonlySet<string>): boolean {
     if (this.#boundedRowCount(["snapshot", "snapshot_upload"], this.rowLimit + 1) > this.rowLimit) {
       this.sql.exec(
         `UPDATE session_state
-         SET snapshot_retention_backlog = 1, snapshot_recent_scan_before = NULL,
-             snapshot_recent_scan_done = 0
+         SET snapshot_retention_backlog = 1, snapshot_recent_scan_done = 0
          WHERE singleton = 1`,
       );
       return false;
@@ -1016,87 +973,13 @@ export class SnapshotStore {
     this.sql.exec(
       `UPDATE session_state
        SET recent_snapshot_id_1 = ?, recent_snapshot_id_2 = ?,
-           snapshot_recent_candidates_json = ?, snapshot_recent_scan_before = NULL,
-           snapshot_recent_scan_done = 1
+           snapshot_recent_candidates_json = ?, snapshot_recent_scan_done = 1
        WHERE singleton = 1`,
       recentIds[0] ?? null,
       recentIds[1] ?? null,
       JSON.stringify(retainedCandidates),
     );
     return true;
-  }
-
-  #ensureMigrationRecentGrace(
-    session: SessionRow,
-    pinnedSnapshotIds: ReadonlySet<string>,
-    limit: number,
-  ): boolean {
-    const candidateIds = this.#recentCandidates(session).filter(
-      (snapshotId) => this.#row(snapshotId)?.state === "servable",
-    );
-    const protectedIds = new Set(pinnedSnapshotIds);
-    if (session.latest_snapshot_id !== null) protectedIds.add(session.latest_snapshot_id);
-    for (const snapshotId of protectedIds) {
-      if (!candidateIds.includes(snapshotId) && this.#row(snapshotId)?.state === "servable") {
-        candidateIds.push(snapshotId);
-      }
-    }
-
-    let recentIds = candidateIds
-      .filter((snapshotId) => !protectedIds.has(snapshotId))
-      .slice(0, SNAPSHOT_RECENT_GRACE_LIMIT);
-    let nextCursor = session.snapshot_recent_scan_before;
-    let done = recentIds.length >= SNAPSHOT_RECENT_GRACE_LIMIT || nextCursor === 0;
-    if (!done && nextCursor !== 0) {
-      const rows = (nextCursor === null
-        ? this.sql.exec(
-            `SELECT rowid AS scan_rowid, snapshot_id, state
-             FROM snapshot
-             ORDER BY rowid DESC
-             LIMIT ?`,
-            limit,
-          )
-        : this.sql.exec(
-            `SELECT rowid AS scan_rowid, snapshot_id, state
-             FROM snapshot
-             WHERE rowid < ?
-             ORDER BY rowid DESC
-             LIMIT ?`,
-            nextCursor,
-            limit,
-          )
-      ).toArray() as unknown as SnapshotScanRow[];
-      for (const row of rows) {
-        if (row.state !== "servable" || candidateIds.includes(row.snapshot_id)) {
-          continue;
-        }
-        candidateIds.push(row.snapshot_id);
-      }
-      recentIds = candidateIds
-        .filter((snapshotId) => !protectedIds.has(snapshotId))
-        .slice(0, SNAPSHOT_RECENT_GRACE_LIMIT);
-      const exhausted = rows.length < limit;
-      done = recentIds.length >= SNAPSHOT_RECENT_GRACE_LIMIT || exhausted;
-      nextCursor = exhausted ? 0 : (rows.at(-1)?.scan_rowid ?? 0);
-    }
-
-    const retainedIds = new Set([...protectedIds, ...recentIds]);
-    const retainedCandidates = candidateIds
-      .filter((snapshotId) => retainedIds.has(snapshotId))
-      .slice(0, this.#recentCandidateLimit);
-    this.sql.exec(
-      `UPDATE session_state
-       SET recent_snapshot_id_1 = ?, recent_snapshot_id_2 = ?,
-           snapshot_recent_candidates_json = ?, snapshot_recent_scan_before = ?,
-           snapshot_recent_scan_done = ?
-       WHERE singleton = 1`,
-      recentIds[0] ?? null,
-      recentIds[1] ?? null,
-      JSON.stringify(retainedCandidates),
-      nextCursor,
-      done ? 1 : 0,
-    );
-    return done;
   }
 
   #recentGraceNeedsRefresh(session: SessionRow, pinnedSnapshotIds: ReadonlySet<string>): boolean {
@@ -1148,8 +1031,7 @@ export class SnapshotStore {
     }
     this.sql.exec(
       `UPDATE session_state
-       SET snapshot_retention_backlog = 0, snapshot_recent_scan_before = NULL,
-           snapshot_recent_scan_done = 1
+       SET snapshot_retention_backlog = 0, snapshot_recent_scan_done = 1
        WHERE singleton = 1`,
     );
   }

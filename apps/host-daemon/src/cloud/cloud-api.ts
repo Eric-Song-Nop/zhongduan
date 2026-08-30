@@ -2,18 +2,14 @@ import {
   CapabilityResponseSchema,
   ConnectionSetResponseSchema,
   CreateSessionResponseSchema,
-  RELAY_CAPABILITIES_HEADER,
-  RelayCapability,
   SNAPSHOT_MEDIA_TYPE,
   SnapshotHeader,
   SnapshotMetadataSchema,
   SnapshotUploadResponseSchema,
-  confirmedRelayCapabilities,
   type CapabilityResponse,
   type ConnectionSetRequest,
   type ConnectionSetResponse,
   type CreateSessionResponse,
-  type RelayCapability as RelayCapabilityValue,
   type SnapshotMetadata,
   type SnapshotUploadResponse,
 } from "@zhongduan/protocol";
@@ -21,12 +17,6 @@ import {
 interface Schema<T> {
   parse(input: unknown): T;
 }
-
-const HOST_RELAY_CAPABILITIES = [
-  RelayCapability.capabilityNegotiationV1,
-  RelayCapability.authorityDataV2,
-  RelayCapability.deliveryBarrierOutcomeV1,
-] as const;
 
 export type CloudFetch = typeof fetch;
 
@@ -49,14 +39,12 @@ export class CloudTransportError extends Error {
 
 export interface CloudApiClientOptions {
   fetch?: CloudFetch;
-  relayCapabilities?: readonly RelayCapabilityValue[];
 }
 
 export class CloudApiClient {
   readonly #basePath: string;
   readonly #baseUrl: URL;
   readonly #fetch: CloudFetch;
-  readonly #relayCapabilities: readonly RelayCapabilityValue[];
 
   constructor(baseUrl: string | URL, options: CloudApiClientOptions = {}) {
     const parsed = new URL(baseUrl);
@@ -74,9 +62,6 @@ export class CloudApiClient {
     parsed.pathname = this.#basePath === "" ? "/" : this.#basePath;
     this.#baseUrl = parsed;
     this.#fetch = options.fetch ?? fetch;
-    this.#relayCapabilities = Object.freeze([
-      ...(options.relayCapabilities ?? HOST_RELAY_CAPABILITIES),
-    ]);
   }
 
   async createSession(
@@ -109,20 +94,13 @@ export class CloudApiClient {
     request: ConnectionSetRequest = {},
     signal?: AbortSignal,
   ): Promise<ConnectionSetResponse> {
-    const connection = await this.#postJson(
+    return this.#postJson(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/connection-sets`,
       capability,
       request,
       ConnectionSetResponseSchema,
       signal,
-      {
-        [RELAY_CAPABILITIES_HEADER]: this.#relayCapabilities.join(","),
-      },
     );
-    const confirmed = confirmedRelayCapabilities(connection, this.#relayCapabilities);
-    if (confirmed.length === 0) delete connection.negotiatedCapabilities;
-    else connection.negotiatedCapabilities = confirmed;
-    return connection;
   }
 
   refreshCapability(
@@ -217,7 +195,6 @@ export class CloudApiClient {
     body: object,
     schema: Schema<T>,
     signal?: AbortSignal,
-    extraHeaders: Record<string, string> = {},
   ): Promise<T> {
     const response = await this.#request(this.#url(pathname), {
       method: "POST",
@@ -226,7 +203,6 @@ export class CloudApiClient {
         authorization: `Bearer ${bearer}`,
         "cache-control": "no-store",
         "content-type": "application/json",
-        ...extraHeaders,
       },
       body: JSON.stringify(body),
       ...(signal === undefined ? {} : { signal }),

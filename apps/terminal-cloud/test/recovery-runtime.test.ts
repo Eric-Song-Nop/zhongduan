@@ -1,30 +1,29 @@
 import {
   DATA_HEADER_BYTES,
-  DELIVERY_ENVELOPE_V3_HEADER_BYTES,
+  DELIVERY_ENVELOPE_HEADER_BYTES,
   DataFrameFlag,
   DataFrameKind,
-  RELAY_CAPABILITIES_HEADER,
-  RelayCapability,
   decodeDataFrame,
-  decodeDeliveryEnvelopeV3,
+  decodeDeliveryEnvelope,
   decodeRelayToHostControlFrame,
   decodeServerControlFrame,
   encodeDataFrame,
-  encodeDeliveryEnvelopeV3,
+  encodeDeliveryEnvelope,
   encodeRecoveryStartFence,
   type RecoveryStart,
-  type RecoveryV3HostPrepare,
-  type RecoveryV3HostSourceGrant,
-  type RecoveryV3HostStartReady,
+  type RecoveryHostPrepare,
+  type RecoveryHostSourceGrant,
+  type RecoveryHostStartReady,
 } from "@zhongduan/protocol";
 import { env, exports as workerExports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
 import { RelayRecoveryStore } from "../src/worker/relay-recovery-store";
 import { RelayStore } from "../src/worker/relay-store";
-import { SocketAttachmentV2Schema, SocketAttachmentV3Schema } from "../src/worker/relay-socket";
-import { RelayV3DeliveryRing } from "../src/worker/relay-v3-delivery-ring";
-import { RelayV3DeliveryScheduler } from "../src/worker/relay-v3-delivery-scheduler";
+import { SocketAttachmentSchema } from "../src/worker/relay-socket";
+import { RelayDeliveryRing } from "../src/worker/relay-delivery-ring";
+import { RelayDeliveryScheduler } from "../src/worker/relay-delivery-scheduler";
+import { snapshotAttemptObjectKey } from "../src/worker/snapshot-contract";
 
 interface CreatedSession {
   hostCapability: string;
@@ -40,7 +39,6 @@ interface ConnectionSet {
   controlTicket: string;
   dataTicket: string;
   deliveryGeneration: string;
-  recoveryStrategy?: "v3";
   streamId: number;
 }
 
@@ -54,9 +52,9 @@ interface RecoveryBrowser {
   connection: ConnectionSet & { clientId: string };
   control: WebSocket;
   data: WebSocket;
-  prepare: RecoveryV3HostPrepare;
+  prepare: RecoveryHostPrepare;
   sessionId: string;
-  welcome: Extract<ReturnType<typeof decodeServerControlFrame<"v3">>, { type: "welcome" }>;
+  welcome: Extract<ReturnType<typeof decodeServerControlFrame>, { type: "welcome" }>;
 }
 
 interface DeliveryYieldGate {
@@ -64,25 +62,10 @@ interface DeliveryYieldGate {
   releases: Array<() => void>;
 }
 
-type RecoveryHostControlFrame = ReturnType<typeof decodeRelayToHostControlFrame<"v3">>;
+type RecoveryHostControlFrame = ReturnType<typeof decodeRelayToHostControlFrame>;
 
 const origin = "https://terminal.example.test";
 const engineId = "ghostty:test+snapshot-v1+wterm:test";
-const recoveryV3HostCapabilities = [
-  RelayCapability.capabilityNegotiationV1,
-  RelayCapability.authorityDataV2,
-  RelayCapability.wireEndpointV3,
-  RelayCapability.recoveryV3GapFillV1,
-] as const;
-const recoveryV3BrowserCapabilities = [
-  RelayCapability.capabilityNegotiationV1,
-  RelayCapability.authorityDataV2,
-  RelayCapability.wireEndpointV3,
-  RelayCapability.deliveryEnvelopeV3,
-  RelayCapability.deliveryReceiveCreditV1,
-  RelayCapability.authorityApplyProgressV1,
-  RelayCapability.recoveryV3GapFillV1,
-] as const;
 const sockets = new Set<WebSocket>();
 const sessions = new Set<string>();
 let sessionCounter = 0;
@@ -116,7 +99,6 @@ async function createSession(): Promise<CreatedSession> {
 async function createConnectionSet(
   sessionId: string,
   capability: string,
-  relayCapabilities: readonly string[],
   clientId?: string,
 ): Promise<ConnectionSet> {
   const response = await workerExports.default.fetch(
@@ -125,9 +107,6 @@ async function createConnectionSet(
       headers: {
         authorization: `Bearer ${capability}`,
         "content-type": "application/json",
-        ...(relayCapabilities.length === 0
-          ? {}
-          : { [RELAY_CAPABILITIES_HEADER]: relayCapabilities.join(",") }),
       },
       body: JSON.stringify(clientId === undefined ? {} : { clientId }),
     }),
@@ -264,7 +243,7 @@ function nextHostControlFrame(
       if (typeof event.data !== "string") return;
       let frame: RecoveryHostControlFrame;
       try {
-        frame = decodeRelayToHostControlFrame(event.data, "v3");
+        frame = decodeRelayToHostControlFrame(event.data);
       } catch {
         return;
       }
@@ -274,6 +253,37 @@ function nextHostControlFrame(
     };
     socket.addEventListener("message", onMessage);
     socket.addEventListener("error", () => reject(new Error("WebSocket failed")), { once: true });
+  });
+}
+
+async function drainSession(sessionId: string): Promise<void> {
+  await runInDurableObject(sessionStub(sessionId), () => undefined);
+}
+
+async function injectSocketSendFailure(
+  sessionId: string,
+  peer: "browser" | "host",
+  channel: "control" | "data",
+  clientId?: string,
+): Promise<void> {
+  await runInDurableObject(sessionStub(sessionId), (_instance, state) => {
+    const socket = state.getWebSockets(`peer:${peer}`).find((candidate) => {
+      const attachment = candidate.deserializeAttachment() as {
+        channel?: unknown;
+        clientId?: unknown;
+      };
+      return (
+        attachment.channel === channel &&
+        (clientId === undefined || attachment.clientId === clientId)
+      );
+    });
+    if (socket === undefined) throw new Error(`${peer} ${channel} socket is missing`);
+    Object.defineProperty(socket, "send", {
+      configurable: true,
+      value() {
+        throw new Error(`injected ${peer} ${channel} send failure`);
+      },
+    });
   });
 }
 
@@ -295,11 +305,7 @@ async function openReadyHost(
     nextPtyOffset: "0",
   },
 ): Promise<ReadyHost> {
-  const connection = await createConnectionSet(
-    session.sessionId,
-    session.hostCapability,
-    recoveryV3HostCapabilities,
-  );
+  const connection = await createConnectionSet(session.sessionId, session.hostCapability);
   const control = await upgrade(session.sessionId, "control", connection.controlTicket);
   const data = await upgrade(session.sessionId, "data", connection.dataTicket);
   const acknowledgement = nextText(control);
@@ -312,7 +318,7 @@ async function openReadyHost(
       nextPtyOffset: authority.nextPtyOffset,
     }),
   );
-  expect(decodeRelayToHostControlFrame(await acknowledgement, "v3")).toMatchObject({
+  expect(decodeRelayToHostControlFrame(await acknowledgement)).toMatchObject({
     type: "host-ready-ack",
   });
   return { connection, control, data };
@@ -328,7 +334,7 @@ async function publishSnapshot(session: CreatedSession, snapshotId: string): Pro
        VALUES (?, '7', '0', '0', ?, ?, 'r2-version', 'etag', ?, 1, '1', 'none', 'servable', ?)`,
       snapshotId,
       engineId,
-      `sessions/${session.sessionId}/snapshots/${snapshotId}`,
+      snapshotAttemptObjectKey(session.sessionId, snapshotId, "runtime_attempt_0001"),
       "0".repeat(64),
       Date.now(),
     );
@@ -348,10 +354,8 @@ async function openRecoveryBrowser(
   const connection = await createConnectionSet(
     session.sessionId,
     role === "writer" ? session.writerCapability : session.observerCapability,
-    recoveryV3BrowserCapabilities,
     clientId,
   );
-  expect(connection.recoveryStrategy).toBe("v3");
   if (connection.clientId === null) throw new Error("browser connection lacks client identity");
   const browserConnection = { ...connection, clientId: connection.clientId };
   const control = await upgrade(session.sessionId, "control", connection.controlTicket);
@@ -372,9 +376,9 @@ async function openRecoveryBrowser(
       nextPtyOffset: "0",
     }),
   );
-  const welcome = decodeServerControlFrame(await welcomeMessage, "v3");
+  const welcome = decodeServerControlFrame(await welcomeMessage);
   const prepare = await prepareFrame;
-  if (welcome.type !== "welcome") throw new Error("expected Recovery v3 Welcome");
+  if (welcome.type !== "welcome") throw new Error("expected recovery Welcome");
   if (prepare.type !== "recovery-prepare") throw new Error("expected recovery-prepare");
   expect(prepare).toMatchObject({
     connectionId: connection.connectionId,
@@ -400,8 +404,8 @@ async function installRecovery(
     liveFloor?: { nextEventSeq: string; nextPtyOffset: string; sessionEpoch: string };
   } = {},
 ): Promise<{
-  grant: RecoveryV3HostSourceGrant;
-  ready: RecoveryV3HostStartReady;
+  grant: RecoveryHostSourceGrant;
+  ready: RecoveryHostStartReady;
   start: RecoveryStart;
 }> {
   const startMessage = nextText(browser.control);
@@ -409,9 +413,9 @@ async function installRecovery(
   const onHostMessage = (event: MessageEvent) => {
     if (typeof event.data !== "string") return;
     try {
-      hostFrames.push(decodeRelayToHostControlFrame(event.data, "v3"));
+      hostFrames.push(decodeRelayToHostControlFrame(event.data));
     } catch {
-      // The exact runtime gate below only consumes valid Recovery v3 Host frames.
+      // The exact runtime gate below only consumes valid recovery Host frames.
     }
   };
   host.control.addEventListener("message", onHostMessage);
@@ -437,7 +441,7 @@ async function installRecovery(
       },
     }),
   );
-  const start = decodeServerControlFrame(await startMessage, "v3");
+  const start = decodeServerControlFrame(await startMessage);
   if (start.type !== "recovery-start") throw new Error("expected recovery-start");
   await waitForCondition(async () => {
     const outboxCount = await runInDurableObject(
@@ -459,15 +463,15 @@ async function installRecovery(
         frame.type === "recovery-source-grant" && frame.recoveryId === browser.prepare.recoveryId,
     );
     return outboxCount === 0 && hasReady && hasGrant;
-  }, "Recovery v3 start-ready ACK and first grant drain");
+  }, "recovery start-ready ACK and first grant drain");
   await scheduler.wait(0);
   host.control.removeEventListener("message", onHostMessage);
   const ready = hostFrames.find(
-    (frame): frame is RecoveryV3HostStartReady =>
+    (frame): frame is RecoveryHostStartReady =>
       frame.type === "recovery-start-ready" && frame.recoveryId === browser.prepare.recoveryId,
   );
   const grant = hostFrames.find(
-    (frame): frame is RecoveryV3HostSourceGrant =>
+    (frame): frame is RecoveryHostSourceGrant =>
       frame.type === "recovery-source-grant" && frame.recoveryId === browser.prepare.recoveryId,
   );
   if (ready === undefined) throw new Error("expected recovery-start-ready");
@@ -487,7 +491,7 @@ async function completeRecoveryAdoptedBeforeClose(
   await installRecovery(host, browser);
   const recoveryMessage = nextBinary(browser.data);
   host.data.send(recoveryDone(browser));
-  const recovery = decodeDeliveryEnvelopeV3(await recoveryMessage);
+  const recovery = decodeDeliveryEnvelope(await recoveryMessage);
   const sourceReceivedMessage = nextText(host.control);
   browser.control.send(
     JSON.stringify({
@@ -498,7 +502,7 @@ async function completeRecoveryAdoptedBeforeClose(
       cumulativeEncodedBytes: recovery.cumulativeEncodedBytes.toString(),
     }),
   );
-  expect(decodeRelayToHostControlFrame(await sourceReceivedMessage, "v3")).toMatchObject({
+  expect(decodeRelayToHostControlFrame(await sourceReceivedMessage)).toMatchObject({
     type: "recovery-source-received",
     recoveryId: browser.prepare.recoveryId,
   });
@@ -530,43 +534,10 @@ async function completeRecoveryAdoptedBeforeClose(
       throughRecoveryCumulativeEncodedBytes: recovery.cumulativeEncodedBytes.toString(),
     }),
   );
-  expect(decodeServerControlFrame(await sourceClosedMessage, "v3")).toMatchObject({
+  expect(decodeServerControlFrame(await sourceClosedMessage)).toMatchObject({
     type: "recovery-source-closed",
     recoveryId: browser.prepare.recoveryId,
   });
-}
-
-async function openSyncedV2Browser(session: CreatedSession): Promise<{
-  connection: ConnectionSet & { clientId: string };
-  control: WebSocket;
-  data: WebSocket;
-}> {
-  const connection = await createConnectionSet(session.sessionId, session.observerCapability, []);
-  if (connection.clientId === null) throw new Error("v2 browser lacks client identity");
-  const control = await upgrade(session.sessionId, "control", connection.controlTicket);
-  const data = await upgrade(session.sessionId, "data", connection.dataTicket);
-  await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
-    for (const server of state.getWebSockets(`client:${connection.clientId}`)) {
-      const attachment = SocketAttachmentV2Schema.parse(server.deserializeAttachment());
-      server.serializeAttachment(
-        SocketAttachmentV2Schema.parse(
-          attachment.channel === "control"
-            ? { ...attachment, controlState: "active" }
-            : {
-                ...attachment,
-                dataState: "synced",
-                firstEventSeq: "0",
-                ackedEventSeq: "0",
-                sentEventSeq: "0",
-                firstPtyOffset: "0",
-                ackedPtyOffset: "0",
-                sentPtyOffset: "0",
-              },
-        ),
-      );
-    }
-  });
-  return { connection: { ...connection, clientId: connection.clientId }, control, data };
 }
 
 function canonicalPty(eventSeq: bigint, ptyOffset: bigint, payload: Uint8Array): Uint8Array {
@@ -584,7 +555,7 @@ function canonicalPty(eventSeq: bigint, ptyOffset: bigint, payload: Uint8Array):
 
 function recoveryDone(browser: RecoveryBrowser): Uint8Array {
   const payload = encodeDataFrame({
-    kind: DataFrameKind.ReplayCommit,
+    kind: DataFrameKind.RecoveryDone,
     flags: DataFrameFlag.None,
     sessionEpoch: 7n,
     deliveryGeneration: 0n,
@@ -593,11 +564,11 @@ function recoveryDone(browser: RecoveryBrowser): Uint8Array {
     streamId: 0,
     payload: new Uint8Array(),
   });
-  return encodeDeliveryEnvelopeV3({
+  return encodeDeliveryEnvelope({
     lane: "recovery",
     deliveryGeneration: BigInt(browser.connection.deliveryGeneration),
     deliveryOrdinal: 1n,
-    cumulativeEncodedBytes: BigInt(DELIVERY_ENVELOPE_V3_HEADER_BYTES + payload.byteLength),
+    cumulativeEncodedBytes: BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + payload.byteLength),
     streamId: browser.connection.streamId,
     payload,
   });
@@ -610,10 +581,10 @@ function recoveryDelivery(
   payload: Uint8Array,
 ): { cumulativeEncodedBytes: bigint; encoded: Uint8Array } {
   const cumulativeEncodedBytes =
-    previousCumulativeEncodedBytes + BigInt(DELIVERY_ENVELOPE_V3_HEADER_BYTES + payload.byteLength);
+    previousCumulativeEncodedBytes + BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + payload.byteLength);
   return {
     cumulativeEncodedBytes,
-    encoded: encodeDeliveryEnvelopeV3({
+    encoded: encodeDeliveryEnvelope({
       lane: "recovery",
       deliveryGeneration: BigInt(browser.connection.deliveryGeneration),
       deliveryOrdinal,
@@ -631,17 +602,16 @@ function runtimeRecoveryStore(state: DurableObjectState): RelayRecoveryStore {
     maxAttemptLiveRecords: 64,
     maxDeliveryEncodedBytes: 2 * 1024 * 1024,
     maxDeliveryRecords: 1_024,
-    maxDeliveryEnvelopeEncodedBytes:
-      DELIVERY_ENVELOPE_V3_HEADER_BYTES + DATA_HEADER_BYTES + 16 * 1024,
+    maxDeliveryEnvelopeEncodedBytes: DELIVERY_ENVELOPE_HEADER_BYTES + DATA_HEADER_BYTES + 16 * 1024,
     maxOutboxEntries: 112,
     maxRecoveryGrantWindowEncodedBytes: 96 * 1024,
     maxSessionDeliveryEncodedBytes: 2 * 1024 * 1024,
     maxSessionDeliveryRecords: 1_024,
     maxSessionRecoveryEncodedBytes: 1_536 * 1024,
     maxSessionRecoveryRecords: 1_008,
-    minDeliveryEnvelopeEncodedBytes: DELIVERY_ENVELOPE_V3_HEADER_BYTES + DATA_HEADER_BYTES,
+    minDeliveryEnvelopeEncodedBytes: DELIVERY_ENVELOPE_HEADER_BYTES + DATA_HEADER_BYTES,
     writerDeliveryReserveEncodedBytes:
-      DELIVERY_ENVELOPE_V3_HEADER_BYTES + DATA_HEADER_BYTES + 16 * 1024,
+      DELIVERY_ENVELOPE_HEADER_BYTES + DATA_HEADER_BYTES + 16 * 1024,
     writerDeliveryReserveRecords: 1,
   });
 }
@@ -655,8 +625,8 @@ async function recoveryDeliveryMemoryUsage(sessionId: string): Promise<{
     const ring = Reflect.get(instance, "recoveryDeliveryRing");
     const deliveryScheduler = Reflect.get(instance, "recoveryDeliveryScheduler");
     const refRecords = Reflect.get(instance, "recoveryDeliveryRefRecords");
-    if (!(ring instanceof RelayV3DeliveryRing)) throw new Error("runtime delivery ring is missing");
-    if (!(deliveryScheduler instanceof RelayV3DeliveryScheduler)) {
+    if (!(ring instanceof RelayDeliveryRing)) throw new Error("runtime delivery ring is missing");
+    if (!(deliveryScheduler instanceof RelayDeliveryScheduler)) {
       throw new Error("runtime delivery scheduler is missing");
     }
     if (!(refRecords instanceof Map)) throw new Error("runtime delivery ref owner map is missing");
@@ -676,7 +646,7 @@ afterEach(async () => {
     [...sessions].map((sessionId) =>
       runInDurableObject(sessionStub(sessionId), async (instance) => {
         const deliveryScheduler = Reflect.get(instance, "recoveryDeliveryScheduler");
-        if (deliveryScheduler instanceof RelayV3DeliveryScheduler) {
+        if (deliveryScheduler instanceof RelayDeliveryScheduler) {
           await deliveryScheduler.whenIdle();
         }
       }),
@@ -686,7 +656,7 @@ afterEach(async () => {
   sessions.clear();
 });
 
-describe("Recovery v3 Durable Object runtime", () => {
+describe("recovery Durable Object runtime", () => {
   it("commits H/fence/H+1, rehydrates exact outbox routing, and advances both lanes", async () => {
     const session = await createSession();
     const host = await openReadyHost(session);
@@ -741,13 +711,13 @@ describe("Recovery v3 Durable Object runtime", () => {
     const canonical = canonicalPty(1n, 0n, new Uint8Array([65, 66]));
     host.data.send(canonical);
 
-    const start = decodeServerControlFrame(await startMessage, "v3");
+    const start = decodeServerControlFrame(await startMessage);
     const [readyMessage, grantMessage] = await installHostMessages;
     if (readyMessage === undefined || grantMessage === undefined) {
       throw new Error("expected start-ready and first grant");
     }
-    const ready = decodeRelayToHostControlFrame(readyMessage, "v3");
-    const grant = decodeRelayToHostControlFrame(grantMessage, "v3");
+    const ready = decodeRelayToHostControlFrame(readyMessage);
+    const grant = decodeRelayToHostControlFrame(grantMessage);
     expect(start).toMatchObject({
       type: "recovery-start",
       recoveryId: browser.prepare.recoveryId,
@@ -760,12 +730,12 @@ describe("Recovery v3 Durable Object runtime", () => {
     expect(grant).toMatchObject({
       type: "recovery-source-grant",
       cumulativeGrantedEncodedBytes: (
-        DELIVERY_ENVELOPE_V3_HEADER_BYTES +
+        DELIVERY_ENVELOPE_HEADER_BYTES +
         DATA_HEADER_BYTES +
         16 * 1024
       ).toString(),
     });
-    const live = decodeDeliveryEnvelopeV3(await liveMessage);
+    const live = decodeDeliveryEnvelope(await liveMessage);
     expect(live).toMatchObject({
       lane: "live",
       deliveryGeneration: BigInt(browser.connection.deliveryGeneration),
@@ -791,7 +761,7 @@ describe("Recovery v3 Durable Object runtime", () => {
 
     const recoveryMessage = nextBinary(browser.data);
     host.data.send(recoveryDone(browser));
-    const recovery = decodeDeliveryEnvelopeV3(await recoveryMessage);
+    const recovery = decodeDeliveryEnvelope(await recoveryMessage);
     expect(recovery.lane).toBe("recovery");
     const sourceReceivedMessage = nextText(host.control);
     browser.control.send(
@@ -803,7 +773,7 @@ describe("Recovery v3 Durable Object runtime", () => {
         cumulativeEncodedBytes: recovery.cumulativeEncodedBytes.toString(),
       }),
     );
-    expect(decodeRelayToHostControlFrame(await sourceReceivedMessage, "v3")).toMatchObject({
+    expect(decodeRelayToHostControlFrame(await sourceReceivedMessage)).toMatchObject({
       type: "recovery-source-received",
       recoveryId: browser.prepare.recoveryId,
       contiguousDeliveryOrdinal: "1",
@@ -821,7 +791,7 @@ describe("Recovery v3 Durable Object runtime", () => {
         throughRecoveryCumulativeEncodedBytes: recovery.cumulativeEncodedBytes.toString(),
       }),
     );
-    expect(decodeServerControlFrame(await sourceClosedMessage, "v3")).toMatchObject({
+    expect(decodeServerControlFrame(await sourceClosedMessage)).toMatchObject({
       type: "recovery-source-closed",
       recoveryId: browser.prepare.recoveryId,
     });
@@ -900,22 +870,15 @@ describe("Recovery v3 Durable Object runtime", () => {
     const host = await openReadyHost(session);
     await publishSnapshot(session, "snapshot_recovery_runtime_0002");
     const browser = await openRecoveryBrowser(session, host);
-    const legacy = await openSyncedV2Browser(session);
     await installRecovery(host, browser);
 
-    const v3Messages = nextBinaries(browser.data, 3);
-    const legacyMessages = nextBinaries(legacy.data, 3);
+    const messages = nextBinaries(browser.data, 3);
     host.data.send(canonicalPty(1n, 0n, new Uint8Array([1])));
     host.data.send(canonicalPty(2n, 1n, new Uint8Array([2])));
     host.data.send(canonicalPty(3n, 2n, new Uint8Array([3])));
-    const envelopes = (await v3Messages).map((message) => decodeDeliveryEnvelopeV3(message));
+    const envelopes = (await messages).map((message) => decodeDeliveryEnvelope(message));
     expect(envelopes.map(({ deliveryOrdinal }) => deliveryOrdinal)).toEqual([1n, 2n, 3n]);
     expect(envelopes.map(({ payload }) => decodeDataFrame(payload).eventSeq)).toEqual([1n, 2n, 3n]);
-    expect((await legacyMessages).map((message) => decodeDataFrame(message).eventSeq)).toEqual([
-      1n,
-      2n,
-      3n,
-    ]);
 
     const beforeReceipt = await runInDurableObject(
       sessionStub(session.sessionId),
@@ -975,10 +938,9 @@ describe("Recovery v3 Durable Object runtime", () => {
     });
     expect(host.control.readyState).toBe(WebSocket.OPEN);
     expect(browser.control.readyState).toBe(WebSocket.OPEN);
-    expect(legacy.control.readyState).toBe(WebSocket.OPEN);
   });
 
-  it("isolates one failing observer while writer, healthy observer, V2, and Host continue", async () => {
+  it("isolates one failing observer while writer, healthy observer, and Host continue", async () => {
     const session = await createSession();
     const host = await openReadyHost(session);
     await publishSnapshot(session, "snapshot_recovery_runtime_0017");
@@ -988,14 +950,13 @@ describe("Recovery v3 Durable Object runtime", () => {
     await installRecovery(host, slowObserver);
     const healthyObserver = await openRecoveryBrowser(session, host);
     await installRecovery(host, healthyObserver);
-    const legacy = await openSyncedV2Browser(session);
 
     await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
       const serverData = state
         .getWebSockets(`client:${slowObserver.connection.clientId}`)
         .find(
           (socket) =>
-            SocketAttachmentV3Schema.parse(socket.deserializeAttachment()).channel === "data",
+            SocketAttachmentSchema.parse(socket.deserializeAttachment()).channel === "data",
         );
       if (serverData === undefined) throw new Error("slow observer data socket is missing");
       Object.defineProperty(serverData, "send", {
@@ -1008,7 +969,6 @@ describe("Recovery v3 Durable Object runtime", () => {
 
     const writerAtOne = nextBinary(writer.data);
     const healthyAtOne = nextBinary(healthyObserver.data);
-    const legacyAtOne = nextBinary(legacy.data);
     const slowControlClosed = nextClose(slowObserver.control);
     const slowDataClosed = nextClose(slowObserver.data);
     const slowReset = nextHostControlFrame(
@@ -1019,15 +979,14 @@ describe("Recovery v3 Durable Object runtime", () => {
     );
     host.data.send(canonicalPty(1n, 0n, new Uint8Array([1])));
 
-    expect(decodeDeliveryEnvelopeV3(await writerAtOne)).toMatchObject({
+    expect(decodeDeliveryEnvelope(await writerAtOne)).toMatchObject({
       deliveryOrdinal: 1n,
       lane: "live",
     });
-    expect(decodeDeliveryEnvelopeV3(await healthyAtOne)).toMatchObject({
+    expect(decodeDeliveryEnvelope(await healthyAtOne)).toMatchObject({
       deliveryOrdinal: 1n,
       lane: "live",
     });
-    expect(decodeDataFrame(await legacyAtOne).eventSeq).toBe(1n);
     await expect(slowControlClosed).resolves.toMatchObject({ code: 4400 });
     await expect(slowDataClosed).resolves.toMatchObject({ code: 4400 });
     await expect(slowReset).resolves.toMatchObject({
@@ -1043,11 +1002,9 @@ describe("Recovery v3 Durable Object runtime", () => {
 
     const writerAtTwo = nextBinary(writer.data);
     const healthyAtTwo = nextBinary(healthyObserver.data);
-    const legacyAtTwo = nextBinary(legacy.data);
     host.data.send(canonicalPty(2n, 1n, new Uint8Array([2])));
-    expect(decodeDeliveryEnvelopeV3(await writerAtTwo).deliveryOrdinal).toBe(2n);
-    expect(decodeDeliveryEnvelopeV3(await healthyAtTwo).deliveryOrdinal).toBe(2n);
-    expect(decodeDataFrame(await legacyAtTwo).eventSeq).toBe(2n);
+    expect(decodeDeliveryEnvelope(await writerAtTwo).deliveryOrdinal).toBe(2n);
+    expect(decodeDeliveryEnvelope(await healthyAtTwo).deliveryOrdinal).toBe(2n);
     const durableIsolation = await runInDurableObject(
       sessionStub(session.sessionId),
       (_instance, state) => ({
@@ -1081,7 +1038,6 @@ describe("Recovery v3 Durable Object runtime", () => {
     expect(host.control.readyState).toBe(WebSocket.OPEN);
     expect(writer.control.readyState).toBe(WebSocket.OPEN);
     expect(healthyObserver.control.readyState).toBe(WebSocket.OPEN);
-    expect(legacy.control.readyState).toBe(WebSocket.OPEN);
   }, 10_000);
 
   it("yields once before every queued send and confirms only after that yield resolves", async () => {
@@ -1155,7 +1111,7 @@ describe("Recovery v3 Durable Object runtime", () => {
         if (release === undefined) throw new Error("delivery yield release is missing");
         release();
       });
-      expect(decodeDeliveryEnvelopeV3(await delivered).deliveryOrdinal).toBe(BigInt(ordinal));
+      expect(decodeDeliveryEnvelope(await delivered).deliveryOrdinal).toBe(BigInt(ordinal));
       await waitForCondition(
         async () => (await recoveryDeliveryMemoryUsage(session.sessionId)).queuedRecords === 0,
         `delivery confirmation ${ordinal}`,
@@ -1234,7 +1190,7 @@ describe("Recovery v3 Durable Object runtime", () => {
       6n,
       recoveryCumulative,
       encodeDataFrame({
-        kind: DataFrameKind.ReplayCommit,
+        kind: DataFrameKind.RecoveryDone,
         flags: DataFrameFlag.None,
         sessionEpoch: 7n,
         deliveryGeneration: 0n,
@@ -1285,7 +1241,7 @@ describe("Recovery v3 Durable Object runtime", () => {
         release();
       });
     }
-    const lanes = (await delivered).map((message) => decodeDeliveryEnvelopeV3(message).lane);
+    const lanes = (await delivered).map((message) => decodeDeliveryEnvelope(message).lane);
     expect(lanes.filter((lane) => lane === "live")).toHaveLength(6);
     expect(lanes.filter((lane) => lane === "recovery")).toHaveLength(6);
     let longestRun = 0;
@@ -1323,7 +1279,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     }
 
     const payloadBytes = 16 * 1024;
-    const encodedBytes = DELIVERY_ENVELOPE_V3_HEADER_BYTES + DATA_HEADER_BYTES + payloadBytes;
+    const encodedBytes = DELIVERY_ENVELOPE_HEADER_BYTES + DATA_HEADER_BYTES + payloadBytes;
     const seededUsage = await runInDurableObject(
       sessionStub(session.sessionId),
       (instance, state) => {
@@ -1344,7 +1300,7 @@ describe("Recovery v3 Durable Object runtime", () => {
               cumulativeEncodedBytes += BigInt(encodedBytes);
               const enqueued = store.enqueueValidatedLaneDelivery(
                 browser.prepare.recoveryId,
-                encodeDeliveryEnvelopeV3({
+                encodeDeliveryEnvelope({
                   lane: "live",
                   deliveryGeneration: BigInt(browser.connection.deliveryGeneration),
                   deliveryOrdinal: BigInt(ordinal),
@@ -1390,7 +1346,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     host.control.addEventListener("message", (event) => {
       if (typeof event.data !== "string") return;
       try {
-        if (decodeRelayToHostControlFrame(event.data, "v3").type === "recovery-source-reset") {
+        if (decodeRelayToHostControlFrame(event.data).type === "recovery-source-reset") {
           hostResetCount += 1;
         }
       } catch {
@@ -1453,7 +1409,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     });
     const writerDelivery = nextBinary(writer.data);
     host.data.send(canonicalPty(32n, BigInt(31 * payloadBytes), new Uint8Array([32])));
-    expect(decodeDeliveryEnvelopeV3(await writerDelivery)).toMatchObject({
+    expect(decodeDeliveryEnvelope(await writerDelivery)).toMatchObject({
       deliveryOrdinal: 1n,
       lane: "live",
     });
@@ -1475,11 +1431,11 @@ describe("Recovery v3 Durable Object runtime", () => {
     const browserDataClosed = nextClose(browser.data);
     const canonical = canonicalPty(1n, 0n, new Uint8Array([1]));
     host.data.send(
-      encodeDeliveryEnvelopeV3({
+      encodeDeliveryEnvelope({
         lane: "live",
         deliveryGeneration: BigInt(browser.connection.deliveryGeneration),
         deliveryOrdinal: 1n,
-        cumulativeEncodedBytes: BigInt(DELIVERY_ENVELOPE_V3_HEADER_BYTES + canonical.byteLength),
+        cumulativeEncodedBytes: BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + canonical.byteLength),
         streamId: browser.connection.streamId,
         payload: canonical,
       }),
@@ -1506,15 +1462,11 @@ describe("Recovery v3 Durable Object runtime", () => {
     expect(durable).toEqual({ activeAttempts: 0, hostFence: "2" });
   });
 
-  it("scopes client activation fences but closes pre-Attach v3 pairs on a Host fence", async () => {
+  it("scopes client activation fences but closes pre-Attach pairs on a Host fence", async () => {
     const session = await createSession();
     const firstHost = await openReadyHost(session);
     await publishSnapshot(session, "snapshot_recovery_runtime_0005");
-    const paired = await createConnectionSet(
-      session.sessionId,
-      session.observerCapability,
-      recoveryV3BrowserCapabilities,
-    );
+    const paired = await createConnectionSet(session.sessionId, session.observerCapability);
     if (paired.clientId === null) throw new Error("paired browser lacks client identity");
     const pairedControl = await upgrade(session.sessionId, "control", paired.controlTicket);
     const pairedData = await upgrade(session.sessionId, "data", paired.dataTicket);
@@ -1635,7 +1587,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     expect(host.control.readyState).toBe(WebSocket.OPEN);
   });
 
-  it("uses a v3 writer token for renew, semantic input, and Host input acknowledgement", async () => {
+  it("uses a writer token for renew, semantic input, and Host input acknowledgement", async () => {
     const session = await createSession();
     const host = await openReadyHost(session);
     await publishSnapshot(session, "snapshot_recovery_runtime_0004");
@@ -1646,7 +1598,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     browser.control.send(
       JSON.stringify({ type: "writer-lease-renew", writerLease: browser.welcome.writerLease }),
     );
-    expect(decodeServerControlFrame(await leaseStatusMessage, "v3")).toMatchObject({
+    expect(decodeServerControlFrame(await leaseStatusMessage)).toMatchObject({
       type: "writer-lease-status",
       active: true,
     });
@@ -1661,7 +1613,7 @@ describe("Recovery v3 Durable Object runtime", () => {
         data: "x",
       }),
     );
-    const forwarded = decodeRelayToHostControlFrame(await forwardedMessage, "v3");
+    const forwarded = decodeRelayToHostControlFrame(await forwardedMessage);
     expect(forwarded).toMatchObject({
       type: "text",
       connectionId: browser.connection.connectionId,
@@ -1689,7 +1641,7 @@ describe("Recovery v3 Durable Object runtime", () => {
         authorityEventSeq: "0",
       }),
     );
-    expect(decodeServerControlFrame(await inputAckMessage, "v3")).toMatchObject({
+    expect(decodeServerControlFrame(await inputAckMessage)).toMatchObject({
       type: "input-ack",
       inputEpoch: "1",
       clientInputSeq: "1",
@@ -1701,11 +1653,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     const session = await createSession();
     const host = await openReadyHost(session);
     await publishSnapshot(session, "snapshot_recovery_runtime_0006");
-    const connection = await createConnectionSet(
-      session.sessionId,
-      session.writerCapability,
-      recoveryV3BrowserCapabilities,
-    );
+    const connection = await createConnectionSet(session.sessionId, session.writerCapability);
     if (connection.clientId === null) throw new Error("writer connection lacks client identity");
     const clientId = connection.clientId;
     const control = await upgrade(session.sessionId, "control", connection.controlTicket);
@@ -1720,7 +1668,7 @@ describe("Recovery v3 Durable Object runtime", () => {
       engineId,
       base: { sessionEpoch: "7", eventSeq: "0", nextPtyOffset: "0" },
       source: { kind: "warm" },
-    } satisfies RecoveryV3HostPrepare;
+    } satisfies RecoveryHostPrepare;
     const seeded = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
       const now = Date.now();
       const store = runtimeRecoveryStore(state);
@@ -1759,8 +1707,8 @@ describe("Recovery v3 Durable Object runtime", () => {
       nextPtyOffset: "0",
     } as const;
     control.send(JSON.stringify(attach));
-    const firstWelcome = decodeServerControlFrame(await firstWelcomeMessage, "v3");
-    expect(decodeRelayToHostControlFrame(await prepareMessage, "v3")).toMatchObject({
+    const firstWelcome = decodeServerControlFrame(await firstWelcomeMessage);
+    expect(decodeRelayToHostControlFrame(await prepareMessage)).toMatchObject({
       type: "recovery-prepare",
       recoveryId,
     });
@@ -1775,7 +1723,7 @@ describe("Recovery v3 Durable Object runtime", () => {
           .one().fence,
         keys: state
           .getWebSockets(`client:${clientId}`)
-          .map((socket) => SocketAttachmentV3Schema.parse(socket.deserializeAttachment()))
+          .map((socket) => SocketAttachmentSchema.parse(socket.deserializeAttachment()))
           .map(({ recoveryLookupKey }) => recoveryLookupKey),
       }),
     );
@@ -1785,15 +1733,15 @@ describe("Recovery v3 Durable Object runtime", () => {
     // write became the reconnect witness.
     await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
       for (const socket of state.getWebSockets(`client:${clientId}`)) {
-        const attachment = SocketAttachmentV3Schema.parse(socket.deserializeAttachment());
+        const attachment = SocketAttachmentSchema.parse(socket.deserializeAttachment());
         socket.serializeAttachment(
-          SocketAttachmentV3Schema.parse({ ...attachment, recoveryLookupKey: null }),
+          SocketAttachmentSchema.parse({ ...attachment, recoveryLookupKey: null }),
         );
       }
     });
     const secondWelcomeMessage = nextText(control);
     control.send(JSON.stringify(attach));
-    const secondWelcome = decodeServerControlFrame(await secondWelcomeMessage, "v3");
+    const secondWelcome = decodeServerControlFrame(await secondWelcomeMessage);
     if (secondWelcome.type !== "welcome" || secondWelcome.writerLease === undefined) {
       throw new Error("second retry did not mint a writer token");
     }
@@ -1806,7 +1754,7 @@ describe("Recovery v3 Durable Object runtime", () => {
           .one().fence,
         keys: state
           .getWebSockets(`client:${clientId}`)
-          .map((socket) => SocketAttachmentV3Schema.parse(socket.deserializeAttachment()))
+          .map((socket) => SocketAttachmentSchema.parse(socket.deserializeAttachment()))
           .map(({ recoveryLookupKey }) => recoveryLookupKey),
       }),
     );
@@ -1816,7 +1764,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     control.send(
       JSON.stringify({ type: "writer-lease-renew", writerLease: firstWelcome.writerLease }),
     );
-    expect(decodeServerControlFrame(await staleStatusMessage, "v3")).toMatchObject({
+    expect(decodeServerControlFrame(await staleStatusMessage)).toMatchObject({
       type: "writer-lease-status",
       active: false,
     });
@@ -1824,7 +1772,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     control.send(
       JSON.stringify({ type: "writer-lease-renew", writerLease: secondWelcome.writerLease }),
     );
-    expect(decodeServerControlFrame(await currentStatusMessage, "v3")).toMatchObject({
+    expect(decodeServerControlFrame(await currentStatusMessage)).toMatchObject({
       type: "writer-lease-status",
       active: true,
     });
@@ -1858,18 +1806,18 @@ describe("Recovery v3 Durable Object runtime", () => {
 
     await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
       for (const socket of state.getWebSockets(`client:${browser.connection.clientId}`)) {
-        const attachment = SocketAttachmentV3Schema.parse(socket.deserializeAttachment());
+        const attachment = SocketAttachmentSchema.parse(socket.deserializeAttachment());
         if (attachment.channel === "data") {
           socket.serializeAttachment(
-            SocketAttachmentV3Schema.parse({ ...attachment, recoveryLookupKey: null }),
+            SocketAttachmentSchema.parse({ ...attachment, recoveryLookupKey: null }),
           );
         }
       }
       for (const socket of state.getWebSockets("peer:host")) {
-        const attachment = SocketAttachmentV2Schema.parse(socket.deserializeAttachment());
+        const attachment = SocketAttachmentSchema.parse(socket.deserializeAttachment());
         if (attachment.channel === "control") {
           socket.serializeAttachment(
-            SocketAttachmentV2Schema.parse({ ...attachment, hostFence: "0" }),
+            SocketAttachmentSchema.parse({ ...attachment, hostFence: "0" }),
           );
         }
       }
@@ -1893,10 +1841,10 @@ describe("Recovery v3 Durable Object runtime", () => {
 
     await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
       for (const socket of state.getWebSockets("peer:host")) {
-        const attachment = SocketAttachmentV2Schema.parse(socket.deserializeAttachment());
+        const attachment = SocketAttachmentSchema.parse(socket.deserializeAttachment());
         if (attachment.channel === "control") {
           socket.serializeAttachment(
-            SocketAttachmentV2Schema.parse({ ...attachment, hostFence: "1" }),
+            SocketAttachmentSchema.parse({ ...attachment, hostFence: "1" }),
           );
         }
       }
@@ -1914,7 +1862,7 @@ describe("Recovery v3 Durable Object runtime", () => {
         progressed,
       };
     });
-    expect(decodeRelayToHostControlFrame(await readyMessage, "v3")).toMatchObject({
+    expect(decodeRelayToHostControlFrame(await readyMessage)).toMatchObject({
       type: "recovery-start-ready",
     });
     expect(hostOnly).toEqual({
@@ -1958,10 +1906,10 @@ describe("Recovery v3 Durable Object runtime", () => {
 
     await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
       for (const socket of state.getWebSockets(`client:${browser.connection.clientId}`)) {
-        const attachment = SocketAttachmentV3Schema.parse(socket.deserializeAttachment());
+        const attachment = SocketAttachmentSchema.parse(socket.deserializeAttachment());
         if (attachment.channel === "data") {
           socket.serializeAttachment(
-            SocketAttachmentV3Schema.parse({
+            SocketAttachmentSchema.parse({
               ...attachment,
               recoveryLookupKey: browser.prepare.recoveryId,
             }),
@@ -1984,7 +1932,7 @@ describe("Recovery v3 Durable Object runtime", () => {
         };
       },
     );
-    expect(decodeServerControlFrame(await startMessage, "v3")).toMatchObject({
+    expect(decodeServerControlFrame(await startMessage)).toMatchObject({
       type: "recovery-start",
       recoveryId: browser.prepare.recoveryId,
     });
@@ -2015,7 +1963,7 @@ describe("Recovery v3 Durable Object runtime", () => {
           engineId,
           base: { sessionEpoch: "7", eventSeq: "0", nextPtyOffset: "0" },
           source: { kind: "warm" },
-        } satisfies RecoveryV3HostPrepare;
+        } satisfies RecoveryHostPrepare;
         state.storage.sql.exec(
           `INSERT INTO recovery_attempt
             (recovery_id, client_id, connection_id, host_fence, stream_id,
@@ -2101,7 +2049,7 @@ describe("Recovery v3 Durable Object runtime", () => {
       };
     });
     expect(drained).toEqual({ outboxCount: 16, progressed: true, reachableRows: 0 });
-    expect(decodeRelayToHostControlFrame(await prepareMessage, "v3")).toMatchObject({
+    expect(decodeRelayToHostControlFrame(await prepareMessage)).toMatchObject({
       type: "recovery-prepare",
       recoveryId: browser.prepare.recoveryId,
     });
@@ -2199,7 +2147,7 @@ describe("Recovery v3 Durable Object runtime", () => {
       expect(sendingDataClosed).resolves.toMatchObject({ code: 4400 }),
     ]);
     const resets = (await resetMessages)
-      .map((message) => decodeRelayToHostControlFrame(message, "v3"))
+      .map((message) => decodeRelayToHostControlFrame(message))
       .map((frame) => {
         if (frame.type !== "recovery-source-reset") throw new Error("expected source reset");
         return { reason: frame.reason, recoveryId: frame.recoveryId };
@@ -2249,7 +2197,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     });
     const recoveryMessage = nextBinary(browser.data);
     host.data.send(recoveryDone(browser));
-    const delivered = decodeDeliveryEnvelopeV3(await recoveryMessage);
+    const delivered = decodeDeliveryEnvelope(await recoveryMessage);
     expect(binaryMessages).toBe(1);
     const beforeWake = await runInDurableObject(
       sessionStub(session.sessionId),
@@ -2326,10 +2274,10 @@ describe("Recovery v3 Durable Object runtime", () => {
     await recoveryMessage;
     await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
       for (const socket of state.getWebSockets(`client:${browser.connection.clientId}`)) {
-        const attachment = SocketAttachmentV3Schema.parse(socket.deserializeAttachment());
+        const attachment = SocketAttachmentSchema.parse(socket.deserializeAttachment());
         if (attachment.channel === "data") {
           socket.serializeAttachment(
-            SocketAttachmentV3Schema.parse({ ...attachment, recoveryLookupKey: null }),
+            SocketAttachmentSchema.parse({ ...attachment, recoveryLookupKey: null }),
           );
         }
       }
@@ -2342,7 +2290,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     await runInDurableObject(sessionStub(session.sessionId), () => undefined);
     await expect(controlClosed).resolves.toMatchObject({ code: 4400 });
     await expect(dataClosed).resolves.toMatchObject({ code: 4400 });
-    expect(decodeRelayToHostControlFrame(await resetMessage, "v3")).toMatchObject({
+    expect(decodeRelayToHostControlFrame(await resetMessage)).toMatchObject({
       type: "recovery-source-reset",
       recoveryId: browser.prepare.recoveryId,
       reason: "generation-reset",
@@ -2379,10 +2327,10 @@ describe("Recovery v3 Durable Object runtime", () => {
     await completeRecoveryAdoptedBeforeClose(host, browser);
     await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
       for (const socket of state.getWebSockets(`client:${browser.connection.clientId}`)) {
-        const attachment = SocketAttachmentV3Schema.parse(socket.deserializeAttachment());
+        const attachment = SocketAttachmentSchema.parse(socket.deserializeAttachment());
         if (attachment.channel === "control") {
           socket.serializeAttachment(
-            SocketAttachmentV3Schema.parse({ ...attachment, channel: "data" }),
+            SocketAttachmentSchema.parse({ ...attachment, channel: "data" }),
           );
         }
       }
@@ -2392,7 +2340,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     host.control.addEventListener("message", (event) => {
       if (
         typeof event.data === "string" &&
-        decodeRelayToHostControlFrame(event.data, "v3").type === "recovery-source-reset"
+        decodeRelayToHostControlFrame(event.data).type === "recovery-source-reset"
       ) {
         hostResetCount += 1;
       }
@@ -2467,7 +2415,7 @@ describe("Recovery v3 Durable Object runtime", () => {
         .getWebSockets(`client:${uncertain.connection.clientId}`)
         .find(
           (socket) =>
-            SocketAttachmentV3Schema.parse(socket.deserializeAttachment()).channel === "data",
+            SocketAttachmentSchema.parse(socket.deserializeAttachment()).channel === "data",
         );
       if (serverData === undefined) throw new Error("uncertain Browser data socket is missing");
       Object.defineProperty(serverData, "send", {
@@ -2495,7 +2443,7 @@ describe("Recovery v3 Durable Object runtime", () => {
 
     const survivorMessage = nextBinary(survivor.data);
     host.data.send(canonicalPty(1n, 0n, new Uint8Array([9])));
-    expect(decodeDeliveryEnvelopeV3(await survivorMessage)).toMatchObject({
+    expect(decodeDeliveryEnvelope(await survivorMessage)).toMatchObject({
       lane: "live",
       deliveryOrdinal: 1n,
     });
@@ -2558,87 +2506,11 @@ describe("Recovery v3 Durable Object runtime", () => {
     expect(next.prepare.connectionId).toBe(next.connection.connectionId);
   }, 10_000);
 
-  it("sends zero pending v3 outbox frames once the kill switch is closed", async () => {
-    const session = await createSession();
-    const host = await openReadyHost(session);
-    await publishSnapshot(session, "snapshot_recovery_runtime_0010");
-    const connection = await createConnectionSet(
-      session.sessionId,
-      session.observerCapability,
-      recoveryV3BrowserCapabilities,
-    );
-    if (connection.clientId === null) throw new Error("kill-switch Browser lacks client identity");
-    const control = await upgrade(session.sessionId, "control", connection.controlTicket);
-    const data = await upgrade(session.sessionId, "data", connection.dataTicket);
-    await runInDurableObject(sessionStub(session.sessionId), (instance) => {
-      Reflect.set(instance, "recoveryOutboxDrainScheduled", true);
-    });
-    let hostRecoveryMessages = 0;
-    host.control.addEventListener("message", () => {
-      hostRecoveryMessages += 1;
-    });
-    const welcomeMessage = nextText(control);
-    control.send(
-      JSON.stringify({
-        type: "attach",
-        engineId,
-        deliveryGeneration: connection.deliveryGeneration,
-        hasLiveReplica: true,
-        lastSessionEpoch: "7",
-        lastEventSeq: "0",
-        nextPtyOffset: "0",
-      }),
-    );
-    expect(decodeServerControlFrame(await welcomeMessage, "v3")).toMatchObject({
-      type: "welcome",
-    });
-    const pending = await runInDurableObject(
-      sessionStub(session.sessionId),
-      (_instance, state) =>
-        state.storage.sql.exec<{ kind: string }>("SELECT kind FROM recovery_control_outbox").one()
-          .kind,
-    );
-    expect(pending).toBe("recovery-prepare");
-
-    const controlClosed = nextClose(control);
-    const dataClosed = nextClose(data);
-    await runInDurableObject(sessionStub(session.sessionId), (instance) => {
-      Reflect.set(instance, "recoveryV3Enabled", false);
-      Reflect.set(instance, "recoveryOutboxDrainScheduled", false);
-      const schedule = Reflect.get(instance, "scheduleRecoveryOutboxDrain");
-      const fence = Reflect.get(instance, "fenceDisabledRecoveryV3");
-      if (typeof schedule !== "function" || typeof fence !== "function") {
-        throw new Error("kill-switch recovery gates are missing");
-      }
-      Reflect.apply(schedule, instance, []);
-      Reflect.apply(fence, instance, []);
-    });
-    await expect(controlClosed).resolves.toMatchObject({ code: 4400 });
-    await expect(dataClosed).resolves.toMatchObject({ code: 4400 });
-    await runInDurableObject(sessionStub(session.sessionId), () => undefined);
-    expect(hostRecoveryMessages).toBe(0);
-    const durable = await runInDurableObject(
-      sessionStub(session.sessionId),
-      (_instance, state) => ({
-        kind: state.storage.sql
-          .exec<{ kind: string }>("SELECT kind FROM recovery_control_outbox")
-          .one().kind,
-        state: state.storage.sql.exec<{ state: string }>("SELECT state FROM recovery_attempt").one()
-          .state,
-      }),
-    );
-    expect(durable).toEqual({ kind: "recovery-source-reset", state: "resetting" });
-  });
-
   it("replaces an undrained prepare with an exact reset when the Browser disappears", async () => {
     const session = await createSession();
     const host = await openReadyHost(session);
     await publishSnapshot(session, "snapshot_recovery_runtime_0011");
-    const connection = await createConnectionSet(
-      session.sessionId,
-      session.observerCapability,
-      recoveryV3BrowserCapabilities,
-    );
+    const connection = await createConnectionSet(session.sessionId, session.observerCapability);
     if (connection.clientId === null) throw new Error("reset Browser lacks client identity");
     const control = await upgrade(session.sessionId, "control", connection.controlTicket);
     const data = await upgrade(session.sessionId, "data", connection.dataTicket);
@@ -2657,7 +2529,7 @@ describe("Recovery v3 Durable Object runtime", () => {
         nextPtyOffset: "0",
       }),
     );
-    expect(decodeServerControlFrame(await welcomeMessage, "v3")).toMatchObject({ type: "welcome" });
+    expect(decodeServerControlFrame(await welcomeMessage)).toMatchObject({ type: "welcome" });
     const prepare = await runInDurableObject(
       sessionStub(session.sessionId),
       (_instance, state) =>
@@ -2667,14 +2539,14 @@ describe("Recovery v3 Durable Object runtime", () => {
               "SELECT payload_json FROM recovery_control_outbox WHERE kind = 'recovery-prepare'",
             )
             .one().payload_json,
-        ) as RecoveryV3HostPrepare,
+        ) as RecoveryHostPrepare,
     );
     await runInDurableObject(sessionStub(session.sessionId), (instance) => {
       Reflect.set(instance, "recoveryOutboxDrainScheduled", false);
     });
     const resetMessage = nextText(host.control);
     data.close(1000, "simulate Browser disappearance");
-    expect(decodeRelayToHostControlFrame(await resetMessage, "v3")).toMatchObject({
+    expect(decodeRelayToHostControlFrame(await resetMessage)).toMatchObject({
       type: "recovery-source-reset",
       recoveryId: prepare.recoveryId,
       connectionId: connection.connectionId,
@@ -2696,5 +2568,432 @@ describe("Recovery v3 Durable Object runtime", () => {
       }),
     );
     expect(durable).toEqual({ prepareCount: 0, state: "resetting" });
+  });
+
+  it("rejects Host readiness until the same fenced pair has an open data channel", async () => {
+    const session = await createSession();
+    const connection = await createConnectionSet(session.sessionId, session.hostCapability);
+    const control = await upgrade(session.sessionId, "control", connection.controlTicket);
+    const closed = nextClose(control);
+    control.send(
+      JSON.stringify({
+        type: "host-ready",
+        engineId,
+        sessionEpoch: "7",
+        headEventSeq: "0",
+        nextPtyOffset: "0",
+      }),
+    );
+    expect(await closed).toMatchObject({ code: 4400 });
+  });
+
+  it("fails the current Host pair when data arrives before its readiness acknowledgement", async () => {
+    const session = await createSession();
+    const connection = await createConnectionSet(session.sessionId, session.hostCapability);
+    const control = await upgrade(session.sessionId, "control", connection.controlTicket);
+    const data = await upgrade(session.sessionId, "data", connection.dataTicket);
+    const controlClosed = nextClose(control);
+    const dataClosed = nextClose(data);
+    data.send(canonicalPty(1n, 0n, new TextEncoder().encode("early")));
+    const closed = await Promise.all([controlClosed, dataClosed]);
+    expect(closed.map(({ code }) => code)).toEqual([4400, 4400]);
+  });
+
+  it("accepts consecutive canonical Host data only after readiness acknowledgement", async () => {
+    const session = await createSession();
+    const host = await openReadyHost(session);
+    const encoder = new TextEncoder();
+    host.data.send(canonicalPty(1n, 0n, encoder.encode("a")));
+    host.data.send(canonicalPty(2n, 1n, encoder.encode("b")));
+    await drainSession(session.sessionId);
+
+    const authority = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) =>
+      state.storage.sql
+        .exec<{ head_event_seq: string; next_pty_offset: string }>(
+          "SELECT head_event_seq, next_pty_offset FROM session_state WHERE singleton = 1",
+        )
+        .one(),
+    );
+    expect(authority).toEqual({ head_event_seq: "2", next_pty_offset: "2" });
+    expect(host.control.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("fails an oversized Host frame before queueing and isolates oversized Browser control", async () => {
+    const hostSession = await createSession();
+    const oversizedHost = await openReadyHost(hostSession);
+    const hostControlClosed = nextClose(oversizedHost.control);
+    const hostDataClosed = nextClose(oversizedHost.data);
+    oversizedHost.data.send(
+      new Uint8Array(DELIVERY_ENVELOPE_HEADER_BYTES + DATA_HEADER_BYTES + 16 * 1024 + 1),
+    );
+    expect(
+      (await Promise.all([hostControlClosed, hostDataClosed])).map(({ code }) => code),
+    ).toEqual([4400, 4400]);
+
+    const browserSession = await createSession();
+    const readyHost = await openReadyHost(browserSession);
+    await publishSnapshot(browserSession, "snapshot_recovery_oversize_01");
+    const connection = await createConnectionSet(
+      browserSession.sessionId,
+      browserSession.observerCapability,
+    );
+    const control = await upgrade(browserSession.sessionId, "control", connection.controlTicket);
+    const data = await upgrade(browserSession.sessionId, "data", connection.dataTicket);
+    const controlClosed = nextClose(control);
+    const dataClosed = nextClose(data);
+    control.send("x".repeat(6 * 1024 * 1024 + 4_097));
+    expect((await Promise.all([controlClosed, dataClosed])).map(({ code }) => code)).toEqual([
+      4400, 4400,
+    ]);
+    expect(readyHost.control.readyState).toBe(WebSocket.OPEN);
+    expect(readyHost.data.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("closes the exact same-fence Host pair when either pre-ready channel ends", async () => {
+    for (const closingChannel of ["control", "data"] as const) {
+      const session = await createSession();
+      const connection = await createConnectionSet(session.sessionId, session.hostCapability);
+      const control = await upgrade(session.sessionId, "control", connection.controlTicket);
+      const data = await upgrade(session.sessionId, "data", connection.dataTicket);
+      const peer = closingChannel === "control" ? data : control;
+      const peerClosed = nextClose(peer);
+      (closingChannel === "control" ? control : data).close(1000, `${closingChannel} ended`);
+      expect(await peerClosed).toMatchObject({ code: 4400 });
+    }
+  });
+
+  it("drops stale Host fences and fails closed on a current canonical sequence gap", async () => {
+    const session = await createSession();
+    const staleHost = await openReadyHost(session);
+    await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      state.storage.sql.exec("UPDATE session_state SET host_fence = '2' WHERE singleton = 1");
+    });
+    staleHost.data.send(canonicalPty(1n, 0n, new TextEncoder().encode("stale")));
+    await drainSession(session.sessionId);
+    const staleHead = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) =>
+        state.storage.sql
+          .exec<{ head_event_seq: string }>(
+            "SELECT head_event_seq FROM session_state WHERE singleton = 1",
+          )
+          .one().head_event_seq,
+    );
+    expect(staleHead).toBe("0");
+
+    const currentHost = await openReadyHost(session);
+    const controlClosed = nextClose(currentHost.control);
+    const dataClosed = nextClose(currentHost.data);
+    currentHost.data.send(canonicalPty(2n, 0n, new TextEncoder().encode("gap")));
+    expect((await Promise.all([controlClosed, dataClosed])).map(({ code }) => code)).toEqual([
+      4400, 4400,
+    ]);
+  });
+
+  it("forwards structured text, focus, and mouse input with one increasing writer fence", async () => {
+    const session = await createSession();
+    const host = await openReadyHost(session);
+    await publishSnapshot(session, "snapshot_recovery_inputs_001");
+    const browser = await openRecoveryBrowser(session, host, "writer");
+    const writerLease = browser.welcome.writerLease;
+    if (writerLease === undefined) throw new Error("writer Welcome lacks lease");
+
+    const inputs = [
+      {
+        type: "text",
+        writerLease,
+        inputEpoch: "structured_input",
+        clientInputSeq: "1",
+        data: "你好, terminal",
+      },
+      {
+        type: "focus",
+        writerLease,
+        inputEpoch: "structured_input",
+        clientInputSeq: "2",
+        focused: false,
+      },
+      {
+        type: "mouse",
+        writerLease,
+        inputEpoch: "structured_input",
+        clientInputSeq: "3",
+        action: "wheel",
+        button: null,
+        buttons: 0,
+        modifiers: 3,
+        altGraph: true,
+        surface: { x: 120, y: 48 },
+        deltaX: 0,
+        deltaY: -12.5,
+        deltaMode: "pixel",
+      },
+    ] as const;
+
+    const forwarded: RecoveryHostControlFrame[] = [];
+    for (const input of inputs) {
+      const message = nextText(host.control);
+      browser.control.send(JSON.stringify(input));
+      forwarded.push(decodeRelayToHostControlFrame(await message));
+    }
+    expect(forwarded).toEqual(
+      inputs.map((input) => ({
+        ...input,
+        connectionId: browser.connection.connectionId,
+        clientId: browser.connection.clientId,
+        writerFence: "1",
+      })),
+    );
+  });
+
+  it("isolates malformed mouse input without affecting Host authority", async () => {
+    const session = await createSession();
+    const host = await openReadyHost(session);
+    await publishSnapshot(session, "snapshot_recovery_mouse_0001");
+    const browser = await openRecoveryBrowser(session, host);
+    const controlClosed = nextClose(browser.control);
+    const dataClosed = nextClose(browser.data);
+    browser.control.send(
+      JSON.stringify({
+        type: "mouse",
+        writerLease: "invalid_observer_lease",
+        inputEpoch: "malformed_mouse",
+        clientInputSeq: "1",
+        action: "move",
+        button: null,
+        buttons: 0,
+        modifiers: 0,
+        altGraph: false,
+        surface: { x: 1, y: 2 },
+        deltaY: 1,
+      }),
+    );
+    expect((await Promise.all([controlClosed, dataClosed])).map(({ code }) => code)).toEqual([
+      4400, 4400,
+    ]);
+    expect(host.control.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("isolates pre-Attach data loss, missing data, and repeated Attach exactly", async () => {
+    const disconnectedSession = await createSession();
+    const disconnectedHost = await openReadyHost(disconnectedSession);
+    await publishSnapshot(disconnectedSession, "snapshot_pre_attach_data_01");
+    const disconnected = await createConnectionSet(
+      disconnectedSession.sessionId,
+      disconnectedSession.writerCapability,
+    );
+    const disconnectedControl = await upgrade(
+      disconnectedSession.sessionId,
+      "control",
+      disconnected.controlTicket,
+    );
+    const disconnectedData = await upgrade(
+      disconnectedSession.sessionId,
+      "data",
+      disconnected.dataTicket,
+    );
+    const disconnectedControlClosed = nextClose(disconnectedControl);
+    disconnectedData.close(1000, "data ended before Attach");
+    expect(await disconnectedControlClosed).toMatchObject({ code: 4400 });
+    expect(disconnectedHost.control.readyState).toBe(WebSocket.OPEN);
+
+    const missingSession = await createSession();
+    const missingHost = await openReadyHost(missingSession);
+    await publishSnapshot(missingSession, "snapshot_pre_attach_none_01");
+    const missing = await createConnectionSet(
+      missingSession.sessionId,
+      missingSession.writerCapability,
+    );
+    const missingControl = await upgrade(
+      missingSession.sessionId,
+      "control",
+      missing.controlTicket,
+    );
+    const missingControlClosed = nextClose(missingControl);
+    missingControl.send(
+      JSON.stringify({
+        type: "attach",
+        engineId,
+        deliveryGeneration: missing.deliveryGeneration,
+        hasLiveReplica: true,
+        lastSessionEpoch: "7",
+        lastEventSeq: "0",
+        nextPtyOffset: "0",
+      }),
+    );
+    expect(await missingControlClosed).toMatchObject({ code: 4400 });
+    expect(missingHost.control.readyState).toBe(WebSocket.OPEN);
+
+    const repeatedSession = await createSession();
+    const repeatedHost = await openReadyHost(repeatedSession);
+    await publishSnapshot(repeatedSession, "snapshot_repeat_attach_0001");
+    const repeated = await openRecoveryBrowser(repeatedSession, repeatedHost);
+    const repeatedControlClosed = nextClose(repeated.control);
+    const repeatedDataClosed = nextClose(repeated.data);
+    repeated.control.send(
+      JSON.stringify({
+        type: "attach",
+        engineId,
+        deliveryGeneration: repeated.connection.deliveryGeneration,
+        hasLiveReplica: true,
+        lastSessionEpoch: "7",
+        lastEventSeq: "0",
+        nextPtyOffset: "0",
+      }),
+    );
+    expect(
+      (await Promise.all([repeatedControlClosed, repeatedDataClosed])).map(({ code }) => code),
+    ).toEqual([4400, 4400]);
+    expect(repeatedHost.control.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("fails closed instead of wrapping an exhausted writer fence", async () => {
+    const session = await createSession();
+    const host = await openReadyHost(session);
+    await publishSnapshot(session, "snapshot_writer_exhaust_001");
+    const first = await openRecoveryBrowser(session, host, "writer");
+    first.control.close(1000, "first writer ended");
+    first.data.close(1000, "first writer ended");
+    await drainSession(session.sessionId);
+    await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE writer_lease SET fence = '18446744073709551615', expires_at = 0 WHERE singleton = 1",
+      );
+    });
+
+    const next = await createConnectionSet(session.sessionId, session.writerCapability);
+    const control = await upgrade(session.sessionId, "control", next.controlTicket);
+    const data = await upgrade(session.sessionId, "data", next.dataTicket);
+    const controlClosed = nextClose(control);
+    const dataClosed = nextClose(data);
+    control.send(
+      JSON.stringify({
+        type: "attach",
+        engineId,
+        deliveryGeneration: next.deliveryGeneration,
+        hasLiveReplica: true,
+        lastSessionEpoch: "7",
+        lastEventSeq: "0",
+        nextPtyOffset: "0",
+      }),
+    );
+    expect((await Promise.all([controlClosed, dataClosed])).map(({ code }) => code)).toEqual([
+      4400, 4400,
+    ]);
+    const lease = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) =>
+      state.storage.sql
+        .exec<{ expires_at: number; fence: string }>(
+          "SELECT fence, expires_at FROM writer_lease WHERE singleton = 1",
+        )
+        .one(),
+    );
+    expect(lease).toEqual({ fence: "18446744073709551615", expires_at: 0 });
+    expect(host.control.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("fails only the exact pair when an open Host or Browser data socket errors", async () => {
+    const hostSession = await createSession();
+    const failedHost = await openReadyHost(hostSession);
+    const hostControlClosed = nextClose(failedHost.control);
+    const hostDataClosed = nextClose(failedHost.data);
+    await runInDurableObject(sessionStub(hostSession.sessionId), async (instance, state) => {
+      const data = state.getWebSockets("peer:host").find((socket) => {
+        return (socket.deserializeAttachment() as { channel?: unknown }).channel === "data";
+      });
+      if (data === undefined) throw new Error("Host data socket is missing");
+      await instance.webSocketError(data, new Error("injected Host data error"));
+    });
+    expect(
+      (await Promise.all([hostControlClosed, hostDataClosed])).map(({ code }) => code),
+    ).toEqual([4400, 4400]);
+
+    const browserSession = await createSession();
+    const healthyHost = await openReadyHost(browserSession);
+    await publishSnapshot(browserSession, "snapshot_socket_error_0001");
+    const failedBrowser = await openRecoveryBrowser(browserSession, healthyHost);
+    const browserControlClosed = nextClose(failedBrowser.control);
+    const browserDataClosed = nextClose(failedBrowser.data);
+    await runInDurableObject(sessionStub(browserSession.sessionId), async (instance, state) => {
+      const data = state
+        .getWebSockets(`client:${failedBrowser.connection.clientId}`)
+        .find((socket) => {
+          return (socket.deserializeAttachment() as { channel?: unknown }).channel === "data";
+        });
+      if (data === undefined) throw new Error("Browser data socket is missing");
+      await instance.webSocketError(data, new Error("injected Browser data error"));
+    });
+    expect(
+      (await Promise.all([browserControlClosed, browserDataClosed])).map(({ code }) => code),
+    ).toEqual([4400, 4400]);
+    expect(healthyHost.control.readyState).toBe(WebSocket.OPEN);
+    expect(healthyHost.data.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("isolates a throwing Browser control sink without failing the Host", async () => {
+    const session = await createSession();
+    const host = await openReadyHost(session);
+    await publishSnapshot(session, "snapshot_browser_sink_0001");
+    const browser = await openRecoveryBrowser(session, host);
+    await injectSocketSendFailure(
+      session.sessionId,
+      "browser",
+      "control",
+      browser.connection.clientId,
+    );
+    const controlClosed = nextClose(browser.control);
+    const dataClosed = nextClose(browser.data);
+    host.control.send(
+      JSON.stringify({
+        type: "input-ack",
+        connectionId: browser.connection.connectionId,
+        inputEpoch: "sink_failure",
+        clientInputSeq: "1",
+        status: "written",
+        authorityEventSeq: "0",
+      }),
+    );
+    expect((await Promise.all([controlClosed, dataClosed])).map(({ code }) => code)).toEqual([
+      4400, 4400,
+    ]);
+    expect(host.control.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("fences a throwing Host control sink and reports semantic input uncertainty", async () => {
+    const session = await createSession();
+    const host = await openReadyHost(session);
+    await publishSnapshot(session, "snapshot_host_sink_000001");
+    const browser = await openRecoveryBrowser(session, host, "writer");
+    const writerLease = browser.welcome.writerLease;
+    if (writerLease === undefined) throw new Error("writer Welcome lacks lease");
+    await injectSocketSendFailure(session.sessionId, "host", "control");
+
+    const hostControlClosed = nextClose(host.control);
+    const hostDataClosed = nextClose(host.data);
+    const browserMessages = nextTexts(browser.control, 2);
+    browser.control.send(
+      JSON.stringify({
+        type: "text",
+        inputEpoch: "uncertain_input",
+        clientInputSeq: "1",
+        writerLease,
+        data: "x",
+      }),
+    );
+    expect(
+      (await Promise.all([hostControlClosed, hostDataClosed])).map(({ code }) => code),
+    ).toEqual([4400, 4400]);
+    const frames = (await browserMessages).map((message) => decodeServerControlFrame(message));
+    expect(frames).toEqual([
+      { type: "host-offline" },
+      {
+        type: "input-ack",
+        inputEpoch: "uncertain_input",
+        clientInputSeq: "1",
+        status: "uncertain",
+      },
+    ]);
   });
 });

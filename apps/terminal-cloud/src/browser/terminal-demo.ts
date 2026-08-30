@@ -1,6 +1,6 @@
 import { GhosttyCore } from "@wterm/ghostty";
 import type { ReplicaCursor } from "@zhongduan/protocol";
-import type { SnapshotManifest } from "@zhongduan/session-client";
+import type { SnapshotRestoreSource } from "@zhongduan/session-client";
 
 import type { WTermReplicaHost } from "./replica-host";
 
@@ -56,17 +56,14 @@ async function adoptDemoSnapshot(host: WTermReplicaHost): Promise<void> {
   );
   const snapshot = authority.encodeSnapshot();
   authority.dispose();
-  const manifest: SnapshotManifest = {
-    type: "snapshot-manifest",
+  const source: SnapshotRestoreSource = {
+    kind: "snapshot",
+    sessionId: "session_demo_0001",
     snapshotId: "snapshot_demo_0001",
     engineId: host.engineId,
     sessionEpoch: "1",
-    streamId: 1,
-    deliveryGeneration: "1",
     cutEventSeq: "1",
     nextPtyOffset: "1",
-    commitEventSeq: "2",
-    commitPtyOffset: "2",
     compression: "none",
     compressedLength: snapshot.byteLength.toString(),
     uncompressedLength: snapshot.byteLength.toString(),
@@ -75,7 +72,7 @@ async function adoptDemoSnapshot(host: WTermReplicaHost): Promise<void> {
     restoreThrough: "finish",
   };
   const abort = new AbortController();
-  const candidate = await host.restore(snapshot, manifest, abort.signal);
+  const candidate = await host.restore(snapshot, source, abort.signal);
   candidate.writePty(encoder.encode("\x1b[38;5;214mecho adopted\x1b[0m\r\nadopted\r\n"));
   const cursor: ReplicaCursor = {
     sessionEpoch: 1n,

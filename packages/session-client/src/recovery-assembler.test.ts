@@ -1,7 +1,8 @@
 import {
+  DELIVERY_ENVELOPE_HEADER_BYTES,
   DataFrameKind,
   encodeDataFrame,
-  encodeDeliveryEnvelopeV3,
+  encodeDeliveryEnvelope,
   encodeResizePayload,
   type AuthorityCursor,
   type DeliveryLane,
@@ -20,7 +21,7 @@ import {
 } from "./recovery-assembler";
 import type { ReplicaSink } from "./types";
 
-const ENGINE_ID = "engine-recovery-v3";
+const ENGINE_ID = "engine-recovery";
 const RECOVERY_ID = "recovery_AAAAAAAAAAA";
 const DELIVERY_GENERATION = 3n;
 const STREAM_ID = 42;
@@ -129,7 +130,7 @@ function warmStart(overrides: Partial<RecoveryStart> = {}): RecoveryStart {
     deliveryGeneration: DELIVERY_GENERATION.toString(),
     streamId: STREAM_ID,
     engineId: ENGINE_ID,
-    authorityDataVersion: 2,
+    authorityDataFormat: 1,
     base: { ...BASE },
     source: { kind: "warm" },
     committedThrough: { ...COMMITTED },
@@ -174,7 +175,7 @@ function canonicalMutation(spec: MutationSpec): Uint8Array {
 
 function canonicalDone(eventSeq = 12n, ptyOffset = 102n): Uint8Array {
   return encodeDataFrame({
-    kind: DataFrameKind.ReplayCommit,
+    kind: DataFrameKind.RecoveryDone,
     flags: 0,
     sessionEpoch: 7n,
     deliveryGeneration: 0n,
@@ -192,9 +193,9 @@ function recordsForLane(
   let cumulativeEncodedBytes = 0n;
   return entries.map((entry, index) => {
     const payload = entry === "done" ? canonicalDone() : canonicalMutation(entry);
-    // The public v3 wire header is exactly 40 bytes. Keep this oracle literal independent from
+    // The public wire header is exactly 40 bytes. Keep this oracle literal independent from
     // the assembler's accounting and cursor helpers.
-    cumulativeEncodedBytes += 40n + BigInt(payload.byteLength);
+    cumulativeEncodedBytes += BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + payload.byteLength);
     const deliveryOrdinal = BigInt(index + 1);
     return {
       lane,
@@ -202,7 +203,7 @@ function recordsForLane(
       cumulativeEncodedBytes,
       type: entry === "done" ? "done" : "mutation",
       ...(entry === "done" ? {} : { mutation: entry }),
-      raw: encodeDeliveryEnvelopeV3({
+      raw: encodeDeliveryEnvelope({
         lane,
         deliveryGeneration: DELIVERY_GENERATION,
         deliveryOrdinal,
@@ -568,9 +569,9 @@ describe("RecoveryAssembler", () => {
     expect(exactStart.replica.effects).toEqual([]);
 
     const payload = canonicalMutation(RECOVERY_MUTATIONS[0]!);
-    const encodedBytes = 40n + BigInt(payload.byteLength);
+    const encodedBytes = BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + payload.byteLength);
     const invalidEnvelopes = [
-      encodeDeliveryEnvelopeV3({
+      encodeDeliveryEnvelope({
         lane: "recovery",
         deliveryGeneration: DELIVERY_GENERATION + 1n,
         deliveryOrdinal: 1n,
@@ -578,7 +579,7 @@ describe("RecoveryAssembler", () => {
         streamId: STREAM_ID,
         payload,
       }),
-      encodeDeliveryEnvelopeV3({
+      encodeDeliveryEnvelope({
         lane: "recovery",
         deliveryGeneration: DELIVERY_GENERATION,
         deliveryOrdinal: 1n,
@@ -586,7 +587,7 @@ describe("RecoveryAssembler", () => {
         streamId: STREAM_ID + 1,
         payload,
       }),
-      encodeDeliveryEnvelopeV3({
+      encodeDeliveryEnvelope({
         lane: "recovery",
         deliveryGeneration: DELIVERY_GENERATION,
         deliveryOrdinal: 2n,
@@ -603,12 +604,14 @@ describe("RecoveryAssembler", () => {
 
     const first = recordsForLane("recovery", [RECOVERY_MUTATIONS[0]!])[0]!;
     const secondPayload = canonicalMutation(RECOVERY_MUTATIONS[1]!);
-    const invalidCumulativeBytes = encodeDeliveryEnvelopeV3({
+    const invalidCumulativeBytes = encodeDeliveryEnvelope({
       lane: "recovery",
       deliveryGeneration: DELIVERY_GENERATION,
       deliveryOrdinal: 2n,
       cumulativeEncodedBytes:
-        first.cumulativeEncodedBytes + 40n + BigInt(secondPayload.byteLength) + 1n,
+        first.cumulativeEncodedBytes +
+        BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + secondPayload.byteLength) +
+        1n,
       streamId: STREAM_ID,
       payload: secondPayload,
     });

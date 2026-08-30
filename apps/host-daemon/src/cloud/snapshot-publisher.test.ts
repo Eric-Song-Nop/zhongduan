@@ -399,7 +399,7 @@ describe("SnapshotPublisher", () => {
     expect(requestBodies[1]).toBe(requestBodies[0]);
   });
 
-  it("keeps a generic legacy conflict rolling-safe until exact success", async () => {
+  it("keeps an untyped conflict rolling-safe until exact success", async () => {
     let now = 0;
     const ids: string[] = [];
     const uploadSnapshot = vi.fn(async (metadata: SnapshotMetadata) => {

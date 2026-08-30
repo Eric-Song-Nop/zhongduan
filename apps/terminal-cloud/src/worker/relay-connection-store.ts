@@ -1,5 +1,6 @@
-import { MAX_U64, type RecoveryStrategy } from "@zhongduan/protocol";
+import { MAX_U64 } from "@zhongduan/protocol";
 import type { CapabilityRole } from "./auth";
+import { readSocketAttachment } from "./relay-socket";
 import { RelayStore, type ClientRow, type TicketRow } from "./relay-store";
 
 export interface ConnectionSetReservation {
@@ -12,25 +13,9 @@ export interface ConnectionSetReservation {
   now: number;
   peer: "host" | "browser";
   principalIdHash: string | undefined;
-  recoveryHostFence: string | null;
-  recoveryStrategy: RecoveryStrategy;
-  relayCapabilitiesJson: string;
+  hostFenceWitness: string | null;
   role: CapabilityRole;
   subject: string;
-}
-
-export interface BrowserDeliveryReplacement {
-  clientId: string;
-  connectionId: string;
-  connectionSetId: string;
-  currentGeneration: string;
-  expiresAt: number;
-  nextGeneration: string;
-  relayCapabilitiesJson: string;
-  role: CapabilityRole;
-  streamId: number;
-  subject: string;
-  ticketDigest: string;
 }
 
 export type ConnectionSetReservationResult =
@@ -38,7 +23,6 @@ export type ConnectionSetReservationResult =
       client: ClientRow | undefined;
       deliveryGeneration: string;
       ok: true;
-      recoveryStrategy: RecoveryStrategy;
     }
   | {
       ok: false;
@@ -76,12 +60,10 @@ export class RelayConnectionStore {
   ) {}
 
   reserveConnectionSet(input: ConnectionSetReservation): ConnectionSetReservationResult {
-    if (
-      (input.recoveryStrategy === "v3") !== (input.recoveryHostFence !== null) ||
-      (input.peer === "host" && input.recoveryStrategy !== "v2")
-    ) {
-      throw new Error("invalid recovery strategy reservation witness");
+    if ((input.peer === "browser") !== (input.hostFenceWitness !== null)) {
+      throw new Error("invalid recovery reservation witness");
     }
+    const activeClientIds = this.#activeBrowserClientIds();
     let result: ConnectionSetReservationResult | undefined;
     let recoveryFenceScope: RecoveryFenceScope | undefined;
     this.state.storage.transactionSync(() => {
@@ -126,6 +108,7 @@ export class RelayConnectionStore {
           input.role,
           input.expiresAt,
           input.now,
+          activeClientIds,
           (scope) => {
             recoveryFenceScope = scope;
           },
@@ -147,8 +130,8 @@ export class RelayConnectionStore {
           `INSERT INTO connection_ticket
             (ticket_digest, connection_set_id, connection_id, peer, channel,
              client_id, subject, role, stream_id, delivery_generation, host_fence,
-             expires_at, relay_capabilities_json, recovery_strategy)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           ticketDigest,
           input.connectionSetId,
           input.connectionId,
@@ -159,17 +142,14 @@ export class RelayConnectionStore {
           input.role,
           streamId,
           deliveryGeneration,
-          input.recoveryHostFence,
+          input.hostFenceWitness,
           input.expiresAt,
-          input.relayCapabilitiesJson,
-          input.recoveryStrategy,
         );
       }
       result = {
         client,
         deliveryGeneration,
         ok: true,
-        recoveryStrategy: input.recoveryStrategy,
       };
     });
     if (recoveryFenceScope !== undefined) this.onRecoveriesFenced(recoveryFenceScope);
@@ -177,11 +157,7 @@ export class RelayConnectionStore {
     return result;
   }
 
-  claimBrowserControl(
-    ticket: TicketRow,
-    currentReadyHostFence?: string,
-    recoveryV3Enabled = false,
-  ): TicketRow | undefined {
+  claimBrowserControl(ticket: TicketRow, currentReadyHostFence: string): TicketRow | undefined {
     if (ticket.client_id === null || ticket.channel !== "control") return undefined;
     let claimed: TicketRow | undefined;
     let recoveryFenceScope: RecoveryFenceScope | undefined;
@@ -213,9 +189,7 @@ export class RelayConnectionStore {
         currentTicket.role !== ticket.role ||
         currentTicket.stream_id !== ticket.stream_id ||
         currentTicket.delivery_generation !== ticket.delivery_generation ||
-        currentTicket.recovery_strategy !== ticket.recovery_strategy ||
         currentTicket.host_fence !== ticket.host_fence ||
-        currentTicket.relay_capabilities_json !== ticket.relay_capabilities_json ||
         pairedDataTickets.length !== 1 ||
         pairedDataTicket === undefined ||
         pairedDataTicket.peer !== currentTicket.peer ||
@@ -225,22 +199,14 @@ export class RelayConnectionStore {
         pairedDataTicket.role !== currentTicket.role ||
         pairedDataTicket.stream_id !== currentTicket.stream_id ||
         pairedDataTicket.delivery_generation !== currentTicket.delivery_generation ||
-        pairedDataTicket.recovery_strategy !== currentTicket.recovery_strategy ||
         pairedDataTicket.host_fence !== currentTicket.host_fence ||
-        pairedDataTicket.relay_capabilities_json !== currentTicket.relay_capabilities_json ||
         client.role !== currentTicket.role ||
         client.stream_id !== currentTicket.stream_id ||
         clientCount.value > this.maxBrowserClients
       ) {
         return;
       }
-      if (
-        currentTicket.recovery_strategy === "v3"
-          ? !recoveryV3Enabled ||
-            currentTicket.host_fence === null ||
-            currentReadyHostFence !== currentTicket.host_fence
-          : currentTicket.host_fence !== null
-      ) {
+      if (currentTicket.host_fence === null || currentReadyHostFence !== currentTicket.host_fence) {
         return;
       }
       const currentGeneration = BigInt(client.delivery_generation);
@@ -253,11 +219,10 @@ export class RelayConnectionStore {
       this.sql.exec(
         `UPDATE client_delivery
          SET delivery_generation = ?, registered_at = COALESCE(registered_at, ?),
-             reservation_expires_at = NULL, recovery_strategy = ?, updated_at = ?
+             reservation_expires_at = NULL, updated_at = ?
          WHERE client_id = ? AND delivery_generation = ? AND ${registrationPredicate}`,
         currentTicket.delivery_generation,
         now,
-        currentTicket.recovery_strategy,
         now,
         ticket.client_id,
         client.delivery_generation,
@@ -265,8 +230,7 @@ export class RelayConnectionStore {
       const activatedClient = this.store.clientById(ticket.client_id!);
       if (
         activatedClient?.registered_at !== null &&
-        activatedClient?.delivery_generation === currentTicket.delivery_generation &&
-        activatedClient?.recovery_strategy === currentTicket.recovery_strategy
+        activatedClient?.delivery_generation === currentTicket.delivery_generation
       ) {
         this.recoveries.fenceClientGeneration(
           activatedClient.client_id,
@@ -374,71 +338,13 @@ export class RelayConnectionStore {
     return invalidated;
   }
 
-  replaceBrowserDelivery(input: BrowserDeliveryReplacement): boolean {
-    let replaced = false;
-    let recoveryFenceScope: RecoveryFenceScope | undefined;
-    this.state.storage.transactionSync(() => {
-      const now = Date.now();
-      const client = this.store.clientById(input.clientId);
-      if (
-        client === undefined ||
-        client.delivery_generation !== input.currentGeneration ||
-        client.stream_id !== input.streamId ||
-        client.role !== input.role ||
-        client.recovery_strategy !== "v2"
-      ) {
-        return;
-      }
-      this.sql.exec(
-        `UPDATE client_delivery SET delivery_generation = ?, updated_at = ?
-         WHERE client_id = ? AND delivery_generation = ?`,
-        input.nextGeneration,
-        now,
-        input.clientId,
-        input.currentGeneration,
-      );
-      this.sql.exec(
-        `DELETE FROM connection_ticket
-         WHERE peer = 'browser' AND client_id = ?`,
-        input.clientId,
-      );
-      this.sql.exec(
-        `INSERT INTO connection_ticket
-          (ticket_digest, connection_set_id, connection_id, peer, channel,
-           client_id, subject, role, stream_id, delivery_generation, host_fence,
-           expires_at, relay_capabilities_json, recovery_strategy)
-         VALUES (?, ?, ?, 'browser', 'data', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        input.ticketDigest,
-        input.connectionSetId,
-        input.connectionId,
-        input.clientId,
-        input.subject,
-        input.role,
-        input.streamId,
-        input.nextGeneration,
-        null,
-        input.expiresAt,
-        input.relayCapabilitiesJson,
-        "v2",
-      );
-      this.recoveries.fenceClientGeneration(input.clientId, input.nextGeneration, now);
-      recoveryFenceScope = {
-        kind: "client-generation",
-        clientId: input.clientId,
-        currentGeneration: input.nextGeneration,
-      };
-      replaced = true;
-    });
-    if (recoveryFenceScope !== undefined) this.onRecoveriesFenced(recoveryFenceScope);
-    return replaced;
-  }
-
   #reserveClient(
     clientId: string,
     principalIdHash: string,
     role: "writer" | "observer",
     expiresAt: number,
     now: number,
+    activeClientIds: ReadonlySet<string>,
     onRecoveriesFenced: (scope: RecoveryFenceScope) => void,
   ): ClientReservationResult {
     const existing = this.store.clientById(clientId);
@@ -463,7 +369,7 @@ export class RelayConnectionStore {
     };
     if (
       clientCount.value >= this.maxBrowserClients &&
-      this.#evictInactiveClient(now, onRecoveriesFenced)
+      this.#evictInactiveClient(now, activeClientIds, onRecoveriesFenced)
     ) {
       clientCount = this.sql.exec("SELECT COUNT(*) AS value FROM client_delivery").one() as {
         value: number;
@@ -515,16 +421,14 @@ export class RelayConnectionStore {
 
   #evictInactiveClient(
     now: number,
+    activeClientIds: ReadonlySet<string>,
     onRecoveriesFenced: (scope: RecoveryFenceScope) => void,
   ): boolean {
     const candidates = this.sql
       .exec("SELECT * FROM client_delivery ORDER BY updated_at ASC")
       .toArray() as unknown as ClientRow[];
     for (const candidate of candidates) {
-      const hasSocket = this.state
-        .getWebSockets(`client:${candidate.client_id}`)
-        .some((socket) => socket.readyState < WebSocket.CLOSING);
-      if (hasSocket) continue;
+      if (activeClientIds.has(candidate.client_id)) continue;
       const pendingTicket = this.sql
         .exec(
           "SELECT 1 AS value FROM connection_ticket WHERE client_id = ? LIMIT 1",
@@ -554,6 +458,18 @@ export class RelayConnectionStore {
       }
     }
     return false;
+  }
+
+  #activeBrowserClientIds(): ReadonlySet<string> {
+    const activeClientIds = new Set<string>();
+    for (const socket of this.state.getWebSockets()) {
+      if (socket.readyState >= WebSocket.CLOSING) continue;
+      const attachment = readSocketAttachment(socket);
+      if (attachment?.peer === "browser" && attachment.clientId !== null) {
+        activeClientIds.add(attachment.clientId);
+      }
+    }
+    return activeClientIds;
   }
 
   #cleanupExpired(now: number): void {

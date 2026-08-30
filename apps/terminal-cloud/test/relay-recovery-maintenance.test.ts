@@ -1,4 +1,4 @@
-import type { RecoveryV3HostPrepare } from "@zhongduan/protocol";
+import type { RecoveryHostPrepare } from "@zhongduan/protocol";
 import { env, exports as workerExports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
@@ -32,49 +32,9 @@ function sessionStub(sessionId: string) {
   return env.TERMINAL_SESSIONS.get(env.TERMINAL_SESSIONS.idFromName(`v1:${sessionId}`));
 }
 
-function terminalPinnedSnapshotIds(instance: object, v2SnapshotId?: string): Set<string> {
+function terminalPinnedSnapshotIds(instance: object): Set<string> {
   const pinnedSnapshotIds = Reflect.get(instance, "pinnedSnapshotIds") as () => ReadonlySet<string>;
-  if (v2SnapshotId === undefined) return new Set(pinnedSnapshotIds.call(instance));
-
-  const originalContext = Reflect.get(instance, "ctx");
-  const v2DataSocket = {
-    deserializeAttachment: () => ({
-      version: 2,
-      peer: "browser",
-      channel: "data",
-      connectionSetId: "connection_set_pin_union_0001",
-      connectionId: "connection_pin_union_000001",
-      subject: "subject_pin_union_00000001",
-      clientId: "client_pin_union_000000001",
-      role: "observer",
-      streamId: 9,
-      deliveryGeneration: "1",
-      hostFence: null,
-      leaseFence: null,
-      controlState: null,
-      dataState: "catching-up",
-      firstEventSeq: "0",
-      ackedEventSeq: "0",
-      sentEventSeq: "0",
-      firstPtyOffset: "0",
-      ackedPtyOffset: "0",
-      sentPtyOffset: "0",
-      replayMode: "snapshot",
-      snapshotId: v2SnapshotId,
-      replayCommitEventSeq: "0",
-      replayCommitPtyOffset: "0",
-      relayCapabilities: [],
-    }),
-    readyState: WebSocket.OPEN,
-  } as unknown as WebSocket;
-  Reflect.set(instance, "ctx", {
-    getWebSockets: (tag?: string) => (tag === "peer:browser" ? [v2DataSocket] : []),
-  });
-  try {
-    return new Set(pinnedSnapshotIds.call(instance));
-  } finally {
-    Reflect.set(instance, "ctx", originalContext);
-  }
+  return new Set(pinnedSnapshotIds.call(instance));
 }
 
 class FakeRecoveryStore {
@@ -218,15 +178,14 @@ describe("RelayRecoveryMaintenance", () => {
     const connectionId = "connection_recovery_maintenance_01";
     const recoveryId = "recovery_maintenance_attempt_0001";
     const snapshotId = "snapshot_recovery_maintenance_01";
-    const v2SnapshotId = "snapshot_v2_pin_maintenance_01";
     const deadline = Date.now() + 10_000;
 
     await runInDurableObject(stub, async (instance, durable) => {
       durable.storage.sql.exec(
         `INSERT INTO client_delivery
           (client_id, principal_id_hash, role, stream_id, delivery_generation,
-           updated_at, registered_at, reservation_expires_at, recovery_strategy)
-         VALUES (?, 'principal_recovery_maintenance', 'observer', 1, '1', 1, 1, NULL, 'v3')`,
+           updated_at, registered_at, reservation_expires_at)
+         VALUES (?, 'principal_recovery_maintenance', 'observer', 1, '1', 1, 1, NULL)`,
         clientId,
       );
       durable.storage.sql.exec(
@@ -243,7 +202,7 @@ describe("RelayRecoveryMaintenance", () => {
         engineId,
         base: { sessionEpoch: "7", eventSeq: "5", nextPtyOffset: "12" },
         source: { kind: "snapshot", snapshotId },
-      } satisfies RecoveryV3HostPrepare;
+      } satisfies RecoveryHostPrepare;
       const recoveries = Reflect.get(instance, "recoveries") as RelayRecoveryStore;
       const maintenance = Reflect.get(instance, "recoveryMaintenance") as RelayRecoveryMaintenance;
       expect(
@@ -271,9 +230,7 @@ describe("RelayRecoveryMaintenance", () => {
       await maintenance.refresh();
       expect(await durable.storage.getAlarm()).toBe(deadline);
       expect([...recoveries.pinnedSnapshotIds()]).toEqual([snapshotId]);
-      expect([...terminalPinnedSnapshotIds(instance, v2SnapshotId)].sort()).toEqual(
-        [snapshotId, v2SnapshotId].sort(),
-      );
+      expect([...terminalPinnedSnapshotIds(instance)]).toEqual([snapshotId]);
 
       // Remove the mux fact but retain SQL ownership so cold initialization
       // must rebuild the component deadline from recovery_attempt.
@@ -289,9 +246,7 @@ describe("RelayRecoveryMaintenance", () => {
       const maintenance = Reflect.get(instance, "recoveryMaintenance") as RelayRecoveryMaintenance;
       expect(recoveries.attempt(recoveryId)).toMatchObject({ state: "preparing" });
       expect([...recoveries.pinnedSnapshotIds()]).toEqual([snapshotId]);
-      expect([...terminalPinnedSnapshotIds(instance, v2SnapshotId)].sort()).toEqual(
-        [snapshotId, v2SnapshotId].sort(),
-      );
+      expect([...terminalPinnedSnapshotIds(instance)]).toEqual([snapshotId]);
       expect(await durable.storage.getAlarm()).toBe(deadline);
       Reflect.set(mux, "now", () => deadline);
       Reflect.set(maintenance, "now", () => deadline);
@@ -305,7 +260,7 @@ describe("RelayRecoveryMaintenance", () => {
         { kind: "recovery-source-reset", recovery_id: recoveryId },
       ]);
       expect(recoveries.pinnedSnapshotIds().size).toBe(0);
-      expect([...terminalPinnedSnapshotIds(instance, v2SnapshotId)]).toEqual([v2SnapshotId]);
+      expect([...terminalPinnedSnapshotIds(instance)]).toEqual([]);
 
       await instance.alarm();
       expect(

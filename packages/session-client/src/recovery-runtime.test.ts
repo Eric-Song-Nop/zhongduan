@@ -1,18 +1,19 @@
 import {
+  DELIVERY_ENVELOPE_HEADER_BYTES,
   DataFrameKind,
   encodeDataFrame,
-  encodeDeliveryEnvelopeV3,
+  encodeDeliveryEnvelope,
   type AuthorityCursor,
   type DeliveryLane,
   type RecoverySourceClosed,
   type RecoveryStart,
-  type RecoveryV3ClientControlFrame,
+  type RecoveryProgressFrame,
   type ReplicaCursor,
 } from "@zhongduan/protocol";
 import { describe, expect, it, vi } from "vitest";
 
 import { RecoveryRuntime, type RecoveryRuntimeOptions } from "./recovery-runtime";
-import type { ReplicaHost, ReplicaSink, SnapshotManifest, SnapshotTransport } from "./types";
+import type { ReplicaHost, ReplicaSink, SnapshotRestoreSource, SnapshotTransport } from "./types";
 
 const ENGINE_ID = "ghostty:recovery-runtime";
 const RECOVERY_ID = "recovery_runtime_0001";
@@ -71,7 +72,7 @@ function start(source: "warm" | "snapshot" = "warm"): RecoveryStart {
     deliveryGeneration: GENERATION.toString(),
     streamId: STREAM_ID,
     engineId: ENGINE_ID,
-    authorityDataVersion: 2,
+    authorityDataFormat: 1,
     base: { ...BASE },
     source:
       source === "warm"
@@ -111,7 +112,7 @@ function canonicalMutation(eventSeq: bigint, ptyOffset: bigint, payload: number[
 
 function canonicalDone(eventSeq = 11n, ptyOffset = 21n): Uint8Array {
   return encodeDataFrame({
-    kind: DataFrameKind.ReplayCommit,
+    kind: DataFrameKind.RecoveryDone,
     flags: 0,
     sessionEpoch: 1n,
     deliveryGeneration: 0n,
@@ -135,11 +136,11 @@ function record(
   payload: Uint8Array,
   generation = GENERATION,
 ): RecordFixture {
-  const bytes = previousBytes + 40n + BigInt(payload.byteLength);
+  const bytes = previousBytes + BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + payload.byteLength);
   return {
     bytes,
     ordinal,
-    raw: encodeDeliveryEnvelopeV3({
+    raw: encodeDeliveryEnvelope({
       lane,
       deliveryGeneration: generation,
       deliveryOrdinal: ordinal,
@@ -170,7 +171,7 @@ function sourceClosed(done: RecordFixture): RecoverySourceClosed {
 
 function options(
   host: ReplicaHost,
-  progress: RecoveryV3ClientControlFrame[],
+  progress: RecoveryProgressFrame[],
   overrides: Partial<RecoveryRuntimeOptions> & { cold?: boolean } = {},
 ): RecoveryRuntimeOptions {
   const { cold = false, ...runtimeOverrides } = overrides;
@@ -205,7 +206,7 @@ describe("RecoveryRuntime", () => {
   it("bounds pre-start data, publishes distinct progress, and atomically hands warm ownership to live", () => {
     const active = new FakeReplica();
     const host = new FakeHost(active);
-    const progress: RecoveryV3ClientControlFrame[] = [];
+    const progress: RecoveryProgressFrame[] = [];
     const runtime = new RecoveryRuntime(options(host, progress));
     const records = fixture();
 
@@ -244,7 +245,7 @@ describe("RecoveryRuntime", () => {
     const host = new FakeHost(oldVisible);
     host.restore.mockResolvedValue(candidate);
     const load = vi.fn<SnapshotTransport["load"]>().mockResolvedValue(Uint8Array.of(9));
-    const progress: RecoveryV3ClientControlFrame[] = [];
+    const progress: RecoveryProgressFrame[] = [];
     const runtime = new RecoveryRuntime(
       options(host, progress, { cold: true, snapshots: { load } }),
     );
@@ -257,15 +258,15 @@ describe("RecoveryRuntime", () => {
     expect(runtime.acceptSourceClosed(sourceClosed(records.done))).toBe(true);
 
     await vi.waitFor(() => expect(runtime.state).toBe("live"));
-    const manifest = load.mock.calls[0]![0] as SnapshotManifest;
-    expect(manifest).toMatchObject({
+    const source = load.mock.calls[0]![0] as SnapshotRestoreSource;
+    expect(source).toMatchObject({
+      kind: "snapshot",
+      sessionId: "session_runtime_0001",
       snapshotId: "snapshot_runtime_001",
-      deliveryGeneration: "3",
       cutEventSeq: "10",
-      commitEventSeq: "11",
       restoreThrough: "finish",
     });
-    expect(host.restore).toHaveBeenCalledWith(Uint8Array.of(9), manifest, expect.any(AbortSignal));
+    expect(host.restore).toHaveBeenCalledWith(Uint8Array.of(9), source, expect.any(AbortSignal));
     expect(host.adopt).toHaveBeenCalledOnce();
     expect(host.active).toBe(candidate);
     expect(candidate.writes).toEqual([[65], [66]]);

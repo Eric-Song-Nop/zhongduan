@@ -2,7 +2,7 @@ import {
   MAX_SNAPSHOT_COMPRESSED_BYTES,
   MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
 } from "@zhongduan/protocol";
-import type { SnapshotManifest, SnapshotTransport } from "@zhongduan/session-client";
+import type { SnapshotRestoreSource, SnapshotTransport } from "@zhongduan/session-client";
 
 import {
   SNAPSHOT_LOAD_TIMEOUT_MS,
@@ -34,10 +34,10 @@ function defaultWorker(): SnapshotWorker {
   });
 }
 
-function assertProtocolLimit(manifest: SnapshotManifest): void {
+function assertProtocolLimit(source: SnapshotRestoreSource): void {
   if (
-    BigInt(manifest.compressedLength) > BigInt(MAX_SNAPSHOT_COMPRESSED_BYTES) ||
-    BigInt(manifest.uncompressedLength) > BigInt(MAX_SNAPSHOT_UNCOMPRESSED_BYTES)
+    BigInt(source.compressedLength) > BigInt(MAX_SNAPSHOT_COMPRESSED_BYTES) ||
+    BigInt(source.uncompressedLength) > BigInt(MAX_SNAPSHOT_UNCOMPRESSED_BYTES)
   ) {
     throw new Error("snapshot exceeds the protocol limit");
   }
@@ -57,9 +57,9 @@ export class WorkerSnapshotTransport implements SnapshotTransport {
     this.#clearTimer = options.clearTimer ?? ((timer) => globalThis.clearTimeout(timer));
   }
 
-  load(manifest: SnapshotManifest, signal: AbortSignal): Promise<Uint8Array> {
+  load(source: SnapshotRestoreSource, signal: AbortSignal): Promise<Uint8Array> {
     signal.throwIfAborted();
-    assertProtocolLimit(manifest);
+    assertProtocolLimit(source);
     const worker = this.#createWorker();
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -98,7 +98,7 @@ export class WorkerSnapshotTransport implements SnapshotTransport {
         worker.postMessage({
           type: "load",
           capability: this.#getCapability(),
-          manifest,
+          source,
         });
       } catch {
         finish({ error: new Error("snapshot worker failed") });

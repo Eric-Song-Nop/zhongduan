@@ -20,6 +20,7 @@ import {
   SnapshotCheckpointManager,
   type SnapshotPublisherLike,
 } from "./snapshot-checkpoint-manager";
+import { SnapshotRefreshOwner } from "./snapshot-refresh-owner";
 
 export type HostCloudApi = HostConnectionApi & SnapshotUploadApi;
 
@@ -45,6 +46,8 @@ export interface HostCloudRelayOptions {
   session: TerminalSession;
   sessionId: string;
   snapshotPublisher?: SnapshotPublisherLike;
+  snapshotRefreshIntervalMs?: number;
+  snapshotRetryIntervalMs?: number;
   stableConnectionMs?: number;
   webSocketFactory?: RelayWebSocketFactory;
 }
@@ -60,7 +63,7 @@ export class HostCloudRelay {
   readonly #recoverySourceManager: RecoverySourceManager;
   readonly #session: TerminalSession;
   readonly #sessionId: string;
-  readonly #snapshotCheckpointManager: SnapshotCheckpointManager;
+  readonly #snapshotRefreshOwner: SnapshotRefreshOwner;
   readonly #stableConnectionMs: number;
   readonly #stopController = new AbortController();
   readonly #webSocketFactory: RelayWebSocketFactory | undefined;
@@ -108,11 +111,20 @@ export class HostCloudRelay {
         monotonicNow: this.#monotonicNow,
         sessionId: options.sessionId,
       });
-    this.#snapshotCheckpointManager = new SnapshotCheckpointManager({
-      monotonicNow: this.#monotonicNow,
+    const snapshotCheckpointManager = new SnapshotCheckpointManager({
       publisher: snapshotPublisher,
       session: this.#session,
       sessionId: this.#sessionId,
+    });
+    this.#snapshotRefreshOwner = new SnapshotRefreshOwner({
+      checkpointManager: snapshotCheckpointManager,
+      ...(options.snapshotRefreshIntervalMs === undefined
+        ? {}
+        : { refreshIntervalMs: options.snapshotRefreshIntervalMs }),
+      ...(options.snapshotRetryIntervalMs === undefined
+        ? {}
+        : { retryIntervalMs: options.snapshotRetryIntervalMs }),
+      session: this.#session,
     });
     this.#stableConnectionMs = options.stableConnectionMs ?? 30_000;
     if (!Number.isInteger(this.#stableConnectionMs) || this.#stableConnectionMs <= 0) {
@@ -123,6 +135,7 @@ export class HostCloudRelay {
 
   start(): Promise<void> {
     if (this.#runPromise !== undefined) return this.#firstReady!;
+    this.#snapshotRefreshOwner.start();
     this.#firstReady = new Promise((resolve, reject) => {
       this.#resolveFirstReady = resolve;
       this.#rejectFirstReady = reject;
@@ -152,7 +165,7 @@ export class HostCloudRelay {
       await this.#runPromise;
     } finally {
       try {
-        this.#snapshotCheckpointManager.dispose(reason);
+        this.#snapshotRefreshOwner.dispose(reason);
       } finally {
         this.#recoverySourceManager.dispose();
       }
@@ -182,7 +195,6 @@ export class HostCloudRelay {
           pair,
           recoverySourceManager: this.#recoverySourceManager,
           session: this.#session,
-          snapshotCheckpointManager: this.#snapshotCheckpointManager,
         });
         this.#connection = connection;
         await connection.start();

@@ -1,13 +1,10 @@
 import {
   DataFrameKind,
   HostControlFrameSchema,
-  RecoveryV3HostToCloudControlFrameSchema,
-  RelayCapability,
   decodeControlFrame,
   decodeDataFrame,
-  decodeDeliveryEnvelopeV3,
+  decodeDeliveryEnvelope,
   decodeRecoveryStartFence,
-  decodeDeliveryBarrierPayload,
   type ConnectionSetResponse,
   type ResizePayload,
 } from "@zhongduan/protocol";
@@ -16,17 +13,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeTerminalAuthority } from "../fake-terminal-authority";
 import { EventJournal } from "../journal";
 import type { PtyProcess } from "../pty-process";
-import { TerminalSession, type SnapshotCapture } from "../session";
+import { TerminalSession } from "../session";
 import type { SemanticMouse } from "../terminal-authority";
 import { HostRelayConnection, HOST_CONTROL_QUEUE_LIMITS } from "./host-relay-connection";
 import type { HostSocketPair } from "./paired-websocket";
 import { RecoverySourceManager, type RecoverySourceManagerLimits } from "./recovery-source-manager";
 import { HOST_RECOVERY_DATA_HIGH_WATER_BYTES } from "./recovery-source-scheduler";
-import type { PublishedSnapshot } from "./snapshot-publisher";
-import {
-  SnapshotCheckpointManager,
-  type SnapshotPublisherLike,
-} from "./snapshot-checkpoint-manager";
 
 class FakeWebSocket extends EventTarget {
   static readonly CONNECTING = 0;
@@ -112,14 +104,6 @@ const connectionSet: ConnectionSetResponse = {
   dataTicket: "data_ticket_AAAA",
 };
 
-const HOST_V3_CAPABILITIES = [
-  RelayCapability.capabilityNegotiationV1,
-  RelayCapability.authorityDataV2,
-  RelayCapability.deliveryBarrierOutcomeV1,
-  RelayCapability.wireEndpointV3,
-  RelayCapability.recoveryV3GapFillV1,
-] as const;
-
 const RECOVERY_LIMITS: RecoverySourceManagerLimits = {
   maxCanonicalBytesPerSource: 256 * 1024,
   maxCanonicalFramesPerSource: 512,
@@ -140,7 +124,6 @@ function createRelayHarness(options: {
   recoveryLimits?: RecoverySourceManagerLimits;
   recoverySourceManager?: RecoverySourceManager;
   session: TerminalSession;
-  snapshotCheckpointManager: SnapshotCheckpointManager;
 }) {
   const control = new FakeWebSocket();
   const data = new FakeWebSocket();
@@ -175,7 +158,6 @@ function createRelayHarness(options: {
       : { recoveryDeadlineTickMs: options.recoveryDeadlineTickMs }),
     recoverySourceManager,
     session: options.session,
-    snapshotCheckpointManager: options.snapshotCheckpointManager,
   });
   return { control, data, pair, recoverySourceManager, relay, session: options.session };
 }
@@ -199,31 +181,9 @@ function createHarness(
     pty,
     sessionEpoch: 1n,
   });
-  const snapshotPublisher: SnapshotPublisherLike = {
-    publish: async (snapshot) => ({
-      metadata: {
-        sessionId: "session_AAAAAAAAA",
-        snapshotId: "snapshot_AAAAAAAA",
-        engineId: snapshot.engineId,
-        sessionEpoch: snapshot.sessionEpoch.toString(),
-        cutEventSeq: snapshot.cutEventSeq.toString(),
-        nextPtyOffset: snapshot.nextPtyOffset.toString(),
-        compression: "zstd",
-        compressedLength: "1",
-        uncompressedLength: snapshot.bytes.byteLength.toString(),
-        sha256: "0".repeat(64),
-      },
-    }),
-  };
-  const snapshotCheckpointManager = new SnapshotCheckpointManager({
-    publisher: snapshotPublisher,
-    session,
-    sessionId: "session_AAAAAAAAA",
-  });
   const relayHarness = createRelayHarness({
     ...options,
     session,
-    snapshotCheckpointManager,
   });
   return { ...relayHarness, pty };
 }
@@ -265,12 +225,6 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, reject, resolve };
-}
-
-function sentDataFrames(socket: FakeWebSocket) {
-  return socket.sent.flatMap((encoded) =>
-    encoded instanceof Uint8Array ? [decodeDataFrame(encoded)] : [],
-  );
 }
 
 function recoveryPrepare(session: TerminalSession, deliveryGeneration = "1") {
@@ -325,41 +279,16 @@ describe("HostRelayConnection", () => {
     harness.session.dispose();
   });
 
-  it("keeps Recovery v3 unreachable unless the complete Host capability set was confirmed", async () => {
-    const harness = createHarness({
-      connection: {
-        ...connectionSet,
-        negotiatedCapabilities: HOST_V3_CAPABILITIES.filter(
-          (capability) => capability !== RelayCapability.recoveryV3GapFillV1,
-        ),
-      },
-    });
-    await acknowledgeReady(harness);
+  it("strictly handles a recovery source through ordered fence, bounded Done, and exact close", async () => {
+    const target = createHarness();
+    await acknowledgeReady(target);
+    const prepare = recoveryPrepare(target.session);
+    const beforePrepareControl = target.control.sent.length;
 
-    harness.control.message(JSON.stringify(recoveryPrepare(harness.session)));
-    await settle();
-
-    expect(harness.control.readyState).toBe(FakeWebSocket.CLOSED);
-    expect(harness.data.readyState).toBe(FakeWebSocket.CLOSED);
-    expect(harness.recoverySourceManager.counters).toMatchObject({ sources: 0 });
-    harness.session.dispose();
-  });
-
-  it("strictly handles a confirmed Recovery v3 source through ordered fence, bounded Done, and exact close", async () => {
-    const v3 = createHarness({
-      connection: {
-        ...connectionSet,
-        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
-      },
-    });
-    await acknowledgeReady(v3);
-    const prepare = recoveryPrepare(v3.session);
-    const beforePrepareControl = v3.control.sent.length;
-
-    v3.control.message(JSON.stringify(prepare));
-    await vi.waitFor(() => expect(v3.data.sent).toHaveLength(1));
-    expect(v3.control.sent).toHaveLength(beforePrepareControl);
-    expect(decodeRecoveryStartFence(v3.data.sent[0] as Uint8Array)).toMatchObject({
+    target.control.message(JSON.stringify(prepare));
+    await vi.waitFor(() => expect(target.data.sent).toHaveLength(1));
+    expect(target.control.sent).toHaveLength(beforePrepareControl);
+    expect(decodeRecoveryStartFence(target.data.sent[0] as Uint8Array)).toMatchObject({
       recoveryId: prepare.recoveryId,
       connectionId: prepare.connectionId,
       streamId: prepare.streamId,
@@ -368,7 +297,7 @@ describe("HostRelayConnection", () => {
       committedThrough: prepare.base,
     });
 
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-start-ready",
         recoveryId: prepare.recoveryId,
@@ -379,8 +308,8 @@ describe("HostRelayConnection", () => {
         cumulativeGrantedEncodedBytes: "88",
       }),
     );
-    await vi.waitFor(() => expect(v3.data.sent).toHaveLength(2));
-    const done = decodeDeliveryEnvelopeV3(v3.data.sent[1] as Uint8Array);
+    await vi.waitFor(() => expect(target.data.sent).toHaveLength(2));
+    const done = decodeDeliveryEnvelope(target.data.sent[1] as Uint8Array);
     expect(done).toMatchObject({
       lane: "recovery",
       deliveryGeneration: 1n,
@@ -388,9 +317,9 @@ describe("HostRelayConnection", () => {
       cumulativeEncodedBytes: 88n,
       streamId: 1,
     });
-    expect(decodeDataFrame(done.payload)).toMatchObject({ kind: DataFrameKind.ReplayCommit });
+    expect(decodeDataFrame(done.payload)).toMatchObject({ kind: DataFrameKind.RecoveryDone });
 
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-received",
         recoveryId: prepare.recoveryId,
@@ -402,9 +331,9 @@ describe("HostRelayConnection", () => {
         cumulativeEncodedBytes: "88",
       }),
     );
-    await vi.waitFor(() => expect(v3.control.sent).toHaveLength(beforePrepareControl + 1));
+    await vi.waitFor(() => expect(target.control.sent).toHaveLength(beforePrepareControl + 1));
     expect(
-      decodeControlFrame(v3.control.sent.at(-1) as string, RecoveryV3HostToCloudControlFrameSchema),
+      decodeControlFrame(target.control.sent.at(-1) as string, HostControlFrameSchema),
     ).toEqual({
       type: "recovery-source-closed",
       recoveryId: prepare.recoveryId,
@@ -414,27 +343,22 @@ describe("HostRelayConnection", () => {
       throughRecoveryOrdinal: "1",
       throughRecoveryCumulativeEncodedBytes: "88",
     });
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
-    v3.relay.close();
-    v3.session.dispose();
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
+    target.relay.close();
+    target.session.dispose();
   });
 
   it("sends multiple granted records across fair data turns before an intermediate receipt", async () => {
-    const v3 = createHarness({
-      connection: {
-        ...connectionSet,
-        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
-      },
-    });
-    await acknowledgeReady(v3);
-    v3.pty.emit(Uint8Array.of(0x41));
-    await vi.waitFor(() => expect(v3.data.sent).toHaveLength(1));
-    const prepare = recoveryPrepare(v3.session);
-    v3.control.message(JSON.stringify(prepare));
-    await vi.waitFor(() => expect(v3.data.sent).toHaveLength(2));
-    const fence = decodeRecoveryStartFence(v3.data.sent[1] as Uint8Array);
+    const target = createHarness();
+    await acknowledgeReady(target);
+    target.pty.emit(Uint8Array.of(0x41));
+    await vi.waitFor(() => expect(target.data.sent).toHaveLength(1));
+    const prepare = recoveryPrepare(target.session);
+    target.control.message(JSON.stringify(prepare));
+    await vi.waitFor(() => expect(target.data.sent).toHaveLength(2));
+    const fence = decodeRecoveryStartFence(target.data.sent[1] as Uint8Array);
 
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-start-ready",
         recoveryId: prepare.recoveryId,
@@ -445,14 +369,14 @@ describe("HostRelayConnection", () => {
         cumulativeGrantedEncodedBytes: "177",
       }),
     );
-    await vi.waitFor(() => expect(v3.data.sent).toHaveLength(4));
-    const first = decodeDeliveryEnvelopeV3(v3.data.sent[2] as Uint8Array);
+    await vi.waitFor(() => expect(target.data.sent).toHaveLength(4));
+    const first = decodeDeliveryEnvelope(target.data.sent[2] as Uint8Array);
     expect(first).toMatchObject({ deliveryOrdinal: 1n, cumulativeEncodedBytes: 89n });
-    const done = decodeDeliveryEnvelopeV3(v3.data.sent[3] as Uint8Array);
+    const done = decodeDeliveryEnvelope(target.data.sent[3] as Uint8Array);
     expect(done).toMatchObject({ deliveryOrdinal: 2n, cumulativeEncodedBytes: 177n });
-    expect(decodeDataFrame(done.payload)).toMatchObject({ kind: DataFrameKind.ReplayCommit });
+    expect(decodeDataFrame(done.payload)).toMatchObject({ kind: DataFrameKind.RecoveryDone });
 
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-received",
         recoveryId: prepare.recoveryId,
@@ -465,10 +389,10 @@ describe("HostRelayConnection", () => {
       }),
     );
     await settle();
-    expect(v3.data.sent).toHaveLength(4);
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.data.sent).toHaveLength(4);
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
 
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-received",
         recoveryId: prepare.recoveryId,
@@ -480,32 +404,27 @@ describe("HostRelayConnection", () => {
         cumulativeEncodedBytes: "177",
       }),
     );
-    await vi.waitFor(() => expect(v3.control.sent).toHaveLength(2));
+    await vi.waitFor(() => expect(target.control.sent).toHaveLength(2));
     expect(
-      decodeControlFrame(v3.control.sent[1] as string, RecoveryV3HostToCloudControlFrameSchema),
+      decodeControlFrame(target.control.sent[1] as string, HostControlFrameSchema),
     ).toMatchObject({ type: "recovery-source-closed", throughRecoveryOrdinal: "2" });
-    v3.relay.close();
-    v3.session.dispose();
+    target.relay.close();
+    target.session.dispose();
   });
 
-  it("returns exact prepare rejection but fails the pair for an invalid v3 source identity", async () => {
-    const v3 = createHarness({
-      connection: {
-        ...connectionSet,
-        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
-      },
-    });
-    await acknowledgeReady(v3);
-    const prepare = recoveryPrepare(v3.session);
+  it("returns exact prepare rejection but fails the pair for an invalid source identity", async () => {
+    const target = createHarness();
+    await acknowledgeReady(target);
+    const prepare = recoveryPrepare(target.session);
 
-    v3.control.message(JSON.stringify({ ...prepare, engineId: "wrong-engine/v1" }));
-    await vi.waitFor(() => expect(v3.control.sent).toHaveLength(2));
+    target.control.message(JSON.stringify({ ...prepare, engineId: "wrong-engine/v1" }));
+    await vi.waitFor(() => expect(target.control.sent).toHaveLength(2));
     expect(
-      decodeControlFrame(v3.control.sent[1] as string, RecoveryV3HostToCloudControlFrameSchema),
+      decodeControlFrame(target.control.sent[1] as string, HostControlFrameSchema),
     ).toMatchObject({ type: "recovery-prepare-rejected", reason: "engine-mismatch" });
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
 
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-received",
         recoveryId: prepare.recoveryId,
@@ -518,23 +437,18 @@ describe("HostRelayConnection", () => {
       }),
     );
     await settle();
-    expect(v3.control.readyState).toBe(FakeWebSocket.CLOSED);
-    expect(v3.data.readyState).toBe(FakeWebSocket.CLOSED);
-    v3.session.dispose();
+    expect(target.control.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(target.data.readyState).toBe(FakeWebSocket.CLOSED);
+    target.session.dispose();
   });
 
   it("accepts an exact source reset before prepare without closing the Host pair", async () => {
-    const v3 = createHarness({
-      connection: {
-        ...connectionSet,
-        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
-      },
-    });
-    await acknowledgeReady(v3);
-    const prepare = recoveryPrepare(v3.session);
-    const beforeResetControl = v3.control.sent.length;
+    const target = createHarness();
+    await acknowledgeReady(target);
+    const prepare = recoveryPrepare(target.session);
+    const beforeResetControl = target.control.sent.length;
 
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-reset",
         recoveryId: prepare.recoveryId,
@@ -546,44 +460,39 @@ describe("HostRelayConnection", () => {
     );
     await settle();
 
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.recoverySourceManager.counters).toMatchObject({
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.data.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.recoverySourceManager.counters).toMatchObject({
       ownedRecords: 0,
       sources: 1,
     });
 
-    v3.control.message(JSON.stringify(prepare));
-    await vi.waitFor(() => expect(v3.control.sent).toHaveLength(beforeResetControl + 1));
+    target.control.message(JSON.stringify(prepare));
+    await vi.waitFor(() => expect(target.control.sent).toHaveLength(beforeResetControl + 1));
     expect(
-      decodeControlFrame(v3.control.sent.at(-1) as string, RecoveryV3HostToCloudControlFrameSchema),
+      decodeControlFrame(target.control.sent.at(-1) as string, HostControlFrameSchema),
     ).toMatchObject({
       type: "recovery-prepare-rejected",
       recoveryId: prepare.recoveryId,
       reason: "generation-fenced",
     });
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
-    v3.relay.close();
-    v3.session.dispose();
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.data.readyState).toBe(FakeWebSocket.OPEN);
+    target.relay.close();
+    target.session.dispose();
   });
 
   it("fences a replaced generation across late control and an already-scheduled data turn", async () => {
     vi.useFakeTimers();
-    const v3 = createHarness({
-      connection: {
-        ...connectionSet,
-        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
-      },
-    });
-    await acknowledgeReady(v3);
-    const generationOne = recoveryPrepare(v3.session, "1");
-    const generationTwo = recoveryPrepare(v3.session, "2");
+    const target = createHarness();
+    await acknowledgeReady(target);
+    const generationOne = recoveryPrepare(target.session, "1");
+    const generationTwo = recoveryPrepare(target.session, "2");
 
-    v3.control.message(JSON.stringify(generationOne));
+    target.control.message(JSON.stringify(generationOne));
     await settleMicrotasks();
-    expect(v3.data.sent).toHaveLength(1);
-    v3.control.message(
+    expect(target.data.sent).toHaveLength(1);
+    target.control.message(
       JSON.stringify({
         type: "recovery-start-ready",
         recoveryId: generationOne.recoveryId,
@@ -595,17 +504,17 @@ describe("HostRelayConnection", () => {
       }),
     );
     await settleMicrotasks();
-    expect(v3.data.sent).toHaveLength(1);
+    expect(target.data.sent).toHaveLength(1);
 
-    v3.control.message(JSON.stringify(generationTwo));
+    target.control.message(JSON.stringify(generationTwo));
     await settleMicrotasks();
     await settleMicrotasks();
-    expect(v3.data.sent).toHaveLength(2);
-    expect(decodeRecoveryStartFence(v3.data.sent[1] as Uint8Array)).toMatchObject({
+    expect(target.data.sent).toHaveLength(2);
+    expect(decodeRecoveryStartFence(target.data.sent[1] as Uint8Array)).toMatchObject({
       deliveryGeneration: "2",
     });
 
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-start-ready",
         recoveryId: generationTwo.recoveryId,
@@ -616,7 +525,7 @@ describe("HostRelayConnection", () => {
         cumulativeGrantedEncodedBytes: "88",
       }),
     );
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-grant",
         recoveryId: generationOne.recoveryId,
@@ -626,7 +535,7 @@ describe("HostRelayConnection", () => {
         cumulativeGrantedEncodedBytes: "88",
       }),
     );
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-received",
         recoveryId: generationOne.recoveryId,
@@ -638,7 +547,7 @@ describe("HostRelayConnection", () => {
         cumulativeEncodedBytes: "88",
       }),
     );
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-reset",
         recoveryId: generationOne.recoveryId,
@@ -650,18 +559,18 @@ describe("HostRelayConnection", () => {
     );
     await settleMicrotasks();
     await settleMicrotasks();
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.data.readyState).toBe(FakeWebSocket.OPEN);
 
     await vi.advanceTimersByTimeAsync(0);
-    expect(v3.data.sent).toHaveLength(3);
-    expect(decodeDeliveryEnvelopeV3(v3.data.sent[2] as Uint8Array)).toMatchObject({
+    expect(target.data.sent).toHaveLength(3);
+    expect(decodeDeliveryEnvelope(target.data.sent[2] as Uint8Array)).toMatchObject({
       deliveryGeneration: 2n,
       deliveryOrdinal: 1n,
     });
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
 
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-grant",
         recoveryId: "recovery-host-divergent",
@@ -672,25 +581,20 @@ describe("HostRelayConnection", () => {
       }),
     );
     await settleMicrotasks();
-    expect(v3.control.readyState).toBe(FakeWebSocket.CLOSED);
-    expect(v3.data.readyState).toBe(FakeWebSocket.CLOSED);
-    v3.session.dispose();
+    expect(target.control.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(target.data.readyState).toBe(FakeWebSocket.CLOSED);
+    target.session.dispose();
   });
 
-  it("fences the v3 owner on a recovery data send throw before later grants can reuse the pair", async () => {
-    const v3 = createHarness({
-      connection: {
-        ...connectionSet,
-        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
-      },
-    });
-    await acknowledgeReady(v3);
-    const prepare = recoveryPrepare(v3.session);
-    v3.control.message(JSON.stringify(prepare));
-    await vi.waitFor(() => expect(v3.data.sent).toHaveLength(1));
-    v3.data.throwOnBinarySend = true;
+  it("fences the owner on a recovery data send throw before later grants can reuse the pair", async () => {
+    const target = createHarness();
+    await acknowledgeReady(target);
+    const prepare = recoveryPrepare(target.session);
+    target.control.message(JSON.stringify(prepare));
+    await vi.waitFor(() => expect(target.data.sent).toHaveLength(1));
+    target.data.throwOnBinarySend = true;
 
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-start-ready",
         recoveryId: prepare.recoveryId,
@@ -701,16 +605,16 @@ describe("HostRelayConnection", () => {
         cumulativeGrantedEncodedBytes: "88",
       }),
     );
-    await vi.waitFor(() => expect(v3.control.readyState).toBe(FakeWebSocket.CLOSED));
-    expect(v3.control.closeReason).toContain("injected binary send failure");
-    expect(v3.recoverySourceManager.counters).toEqual({
+    await vi.waitFor(() => expect(target.control.readyState).toBe(FakeWebSocket.CLOSED));
+    expect(target.control.closeReason).toContain("injected binary send failure");
+    expect(target.recoverySourceManager.counters).toEqual({
       ownedRecords: 0,
       ownedWireBytes: 0,
       pendingSources: 0,
       sources: 0,
     });
-    const sentBeforeLateGrant = v3.data.sent.length;
-    v3.control.message(
+    const sentBeforeLateGrant = target.data.sent.length;
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-grant",
         recoveryId: prepare.recoveryId,
@@ -721,19 +625,14 @@ describe("HostRelayConnection", () => {
       }),
     );
     await settle();
-    expect(v3.data.sent).toHaveLength(sentBeforeLateGrant);
-    v3.session.dispose();
+    expect(target.data.sent).toHaveLength(sentBeforeLateGrant);
+    target.session.dispose();
   });
 
   it("yields recovery at shared data backpressure while canonical traffic stays live", async () => {
     vi.useFakeTimers();
     const open = async () => {
-      const harness = createHarness({
-        connection: {
-          ...connectionSet,
-          negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
-        },
-      });
+      const harness = createHarness();
       await acknowledgeReady(harness);
       const prepare = recoveryPrepare(harness.session);
       harness.control.message(JSON.stringify(prepare));
@@ -773,7 +672,7 @@ describe("HostRelayConnection", () => {
     blocked.harness.data.bufferedAmount = HOST_RECOVERY_DATA_HIGH_WATER_BYTES - 88;
     await vi.advanceTimersByTimeAsync(10);
     expect(blocked.harness.data.sent).toHaveLength(3);
-    expect(decodeDeliveryEnvelopeV3(blocked.harness.data.sent[2] as Uint8Array)).toMatchObject({
+    expect(decodeDeliveryEnvelope(blocked.harness.data.sent[2] as Uint8Array)).toMatchObject({
       lane: "recovery",
       deliveryOrdinal: 1n,
     });
@@ -796,11 +695,7 @@ describe("HostRelayConnection", () => {
   it("retires only an expired source and ignores its late exact control on the healthy pair", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
-    const v3 = createHarness({
-      connection: {
-        ...connectionSet,
-        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
-      },
+    const target = createHarness({
       monotonicNow: () => Date.now(),
       recoveryDeadlineTickMs: 10,
       recoveryLimits: {
@@ -809,18 +704,18 @@ describe("HostRelayConnection", () => {
         recoveryDeadlineMs: 100,
       },
     });
-    await acknowledgeReady(v3);
-    const prepare = recoveryPrepare(v3.session);
-    v3.control.message(JSON.stringify(prepare));
+    await acknowledgeReady(target);
+    const prepare = recoveryPrepare(target.session);
+    target.control.message(JSON.stringify(prepare));
     await settleMicrotasks();
-    expect(v3.data.sent).toHaveLength(1);
+    expect(target.data.sent).toHaveLength(1);
 
     await vi.advanceTimersByTimeAsync(10);
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.recoverySourceManager.counters).toMatchObject({ ownedRecords: 0, sources: 1 });
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.data.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.recoverySourceManager.counters).toMatchObject({ ownedRecords: 0, sources: 1 });
 
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-grant",
         recoveryId: prepare.recoveryId,
@@ -830,7 +725,7 @@ describe("HostRelayConnection", () => {
         cumulativeGrantedEncodedBytes: "88",
       }),
     );
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-received",
         recoveryId: prepare.recoveryId,
@@ -843,20 +738,16 @@ describe("HostRelayConnection", () => {
       }),
     );
     await settleMicrotasks();
-    expect(v3.control.closeReason).toBeUndefined();
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
-    v3.session.dispose();
+    expect(target.control.closeReason).toBeUndefined();
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.data.readyState).toBe(FakeWebSocket.OPEN);
+    target.session.dispose();
   });
 
   it("keeps the pair live when a pending prepare crosses its exact deadline", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
-    const v3 = createHarness({
-      connection: {
-        ...connectionSet,
-        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
-      },
+    const target = createHarness({
       monotonicNow: () => Date.now(),
       recoveryDeadlineTickMs: 10,
       recoveryLimits: {
@@ -866,35 +757,31 @@ describe("HostRelayConnection", () => {
       },
     });
     const pending = deferred<Awaited<ReturnType<TerminalSession["prepareRecoveryGap"]>>>();
-    vi.spyOn(v3.session, "prepareRecoveryGap").mockReturnValue(pending.promise);
-    await acknowledgeReady(v3);
-    const prepare = recoveryPrepare(v3.session);
+    vi.spyOn(target.session, "prepareRecoveryGap").mockReturnValue(pending.promise);
+    await acknowledgeReady(target);
+    const prepare = recoveryPrepare(target.session);
 
-    v3.control.message(JSON.stringify(prepare));
+    target.control.message(JSON.stringify(prepare));
     await settleMicrotasks();
-    expect(v3.recoverySourceManager.counters).toMatchObject({ pendingSources: 1 });
+    expect(target.recoverySourceManager.counters).toMatchObject({ pendingSources: 1 });
 
     await vi.advanceTimersByTimeAsync(10);
-    expect(v3.recoverySourceManager.counters).toMatchObject({ pendingSources: 0, sources: 1 });
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.recoverySourceManager.counters).toMatchObject({ pendingSources: 0, sources: 1 });
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.data.readyState).toBe(FakeWebSocket.OPEN);
 
     pending.resolve({ status: "unavailable", reason: "fence-unavailable" });
     await settleMicrotasks();
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
-    v3.relay.close();
-    v3.session.dispose();
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.data.readyState).toBe(FakeWebSocket.OPEN);
+    target.relay.close();
+    target.session.dispose();
   });
 
   it("lets a live source continue after another source on the same pair expires", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
-    const v3 = createHarness({
-      connection: {
-        ...connectionSet,
-        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
-      },
+    const target = createHarness({
       monotonicNow: () => Date.now(),
       recoveryDeadlineTickMs: 10,
       recoveryLimits: {
@@ -903,10 +790,10 @@ describe("HostRelayConnection", () => {
         recoveryDeadlineMs: 100,
       },
     });
-    await acknowledgeReady(v3);
-    v3.pty.emit(Uint8Array.of(0x41));
+    await acknowledgeReady(target);
+    target.pty.emit(Uint8Array.of(0x41));
     await settleMicrotasks();
-    const expired = recoveryPrepare(v3.session);
+    const expired = recoveryPrepare(target.session);
     const live = {
       ...expired,
       recoveryId: "recovery-host-00000002",
@@ -914,14 +801,14 @@ describe("HostRelayConnection", () => {
       streamId: 2,
     };
 
-    v3.control.message(JSON.stringify(expired));
-    v3.control.message(JSON.stringify(live));
+    target.control.message(JSON.stringify(expired));
+    target.control.message(JSON.stringify(live));
     await settleMicrotasks();
     await vi.advanceTimersByTimeAsync(0);
-    expect(v3.data.sent).toHaveLength(3);
-    const liveFence = decodeRecoveryStartFence(v3.data.sent[2] as Uint8Array);
+    expect(target.data.sent).toHaveLength(3);
+    const liveFence = decodeRecoveryStartFence(target.data.sent[2] as Uint8Array);
 
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-start-ready",
         recoveryId: live.recoveryId,
@@ -933,14 +820,14 @@ describe("HostRelayConnection", () => {
       }),
     );
     await vi.advanceTimersByTimeAsync(0);
-    expect(decodeDeliveryEnvelopeV3(v3.data.sent[3] as Uint8Array)).toMatchObject({
+    expect(decodeDeliveryEnvelope(target.data.sent[3] as Uint8Array)).toMatchObject({
       streamId: 2,
       deliveryOrdinal: 1n,
     });
 
     await vi.advanceTimersByTimeAsync(5);
-    v3.data.bufferedAmount = HOST_RECOVERY_DATA_HIGH_WATER_BYTES;
-    v3.control.message(
+    target.data.bufferedAmount = HOST_RECOVERY_DATA_HIGH_WATER_BYTES;
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-received",
         recoveryId: live.recoveryId,
@@ -952,7 +839,7 @@ describe("HostRelayConnection", () => {
         cumulativeEncodedBytes: "89",
       }),
     );
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-grant",
         recoveryId: live.recoveryId,
@@ -963,33 +850,29 @@ describe("HostRelayConnection", () => {
       }),
     );
     await vi.advanceTimersByTimeAsync(0);
-    expect(v3.data.sent).toHaveLength(4);
+    expect(target.data.sent).toHaveLength(4);
 
     await vi.advanceTimersByTimeAsync(5);
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.recoverySourceManager.counters).toMatchObject({ sources: 2 });
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.recoverySourceManager.counters).toMatchObject({ sources: 2 });
 
-    v3.data.bufferedAmount = HOST_RECOVERY_DATA_HIGH_WATER_BYTES - 88;
+    target.data.bufferedAmount = HOST_RECOVERY_DATA_HIGH_WATER_BYTES - 88;
     await vi.advanceTimersByTimeAsync(5);
-    expect(decodeDeliveryEnvelopeV3(v3.data.sent[4] as Uint8Array)).toMatchObject({
+    expect(decodeDeliveryEnvelope(target.data.sent[4] as Uint8Array)).toMatchObject({
       streamId: 2,
       deliveryOrdinal: 2n,
       cumulativeEncodedBytes: 177n,
     });
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
-    v3.relay.close();
-    v3.session.dispose();
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.data.readyState).toBe(FakeWebSocket.OPEN);
+    target.relay.close();
+    target.session.dispose();
   });
 
   it("does not expire a terminally closed recovery source or close its healthy pair", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
-    const v3 = createHarness({
-      connection: {
-        ...connectionSet,
-        negotiatedCapabilities: [...HOST_V3_CAPABILITIES],
-      },
+    const target = createHarness({
       monotonicNow: () => Date.now(),
       recoveryDeadlineTickMs: 10,
       recoveryLimits: {
@@ -998,11 +881,11 @@ describe("HostRelayConnection", () => {
         recoveryDeadlineMs: 20,
       },
     });
-    await acknowledgeReady(v3);
-    const prepare = recoveryPrepare(v3.session);
-    v3.control.message(JSON.stringify(prepare));
+    await acknowledgeReady(target);
+    const prepare = recoveryPrepare(target.session);
+    target.control.message(JSON.stringify(prepare));
     await settleMicrotasks();
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-start-ready",
         recoveryId: prepare.recoveryId,
@@ -1014,7 +897,7 @@ describe("HostRelayConnection", () => {
       }),
     );
     await vi.advanceTimersByTimeAsync(0);
-    v3.control.message(
+    target.control.message(
       JSON.stringify({
         type: "recovery-source-received",
         recoveryId: prepare.recoveryId,
@@ -1027,156 +910,14 @@ describe("HostRelayConnection", () => {
       }),
     );
     await settleMicrotasks();
-    expect(v3.control.sent).toHaveLength(2);
+    expect(target.control.sent).toHaveLength(2);
 
     await vi.advanceTimersByTimeAsync(100);
-    expect(v3.control.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.data.readyState).toBe(FakeWebSocket.OPEN);
-    expect(v3.recoverySourceManager.counters).toMatchObject({ ownedRecords: 0, sources: 1 });
-    v3.relay.close();
-    v3.session.dispose();
-  });
-
-  it("hands an unresolved session refresh to a replacement connection without duplicating work", async () => {
-    const authority = new FakeTerminalAuthority();
-    const encodeSnapshot = vi.spyOn(authority, "encodeSnapshot");
-    const pty = new ManualPty();
-    const session = new TerminalSession({
-      authority,
-      journal: new EventJournal(),
-      pty,
-      sessionEpoch: 1n,
-    });
-    const publishStarted = deferred<SnapshotCapture>();
-    const upload = deferred<PublishedSnapshot>();
-    let commonPublisherSignal: AbortSignal | undefined;
-    const publish = vi.fn((snapshot: SnapshotCapture, signal?: AbortSignal) => {
-      commonPublisherSignal = signal;
-      publishStarted.resolve(snapshot);
-      return upload.promise;
-    });
-    const snapshotCheckpointManager = new SnapshotCheckpointManager({
-      publisher: { publish },
-      session,
-      sessionId: "session_AAAAAAAAA",
-    });
-    const refresh = vi.spyOn(snapshotCheckpointManager, "refresh");
-    const original = createRelayHarness({ session, snapshotCheckpointManager });
-    await acknowledgeReady(original);
-
-    original.control.message(
-      JSON.stringify({
-        type: "attach-request",
-        connectionId: "connection_browser_A",
-        streamId: 1,
-        deliveryGeneration: "1",
-        engineId: session.engineId,
-        hasLiveReplica: false,
-      }),
-    );
-    const snapshot = await publishStarted.promise;
-    expect(refresh).toHaveBeenCalledOnce();
-    const originalWaiterSignal = refresh.mock.calls[0]?.[0].signal;
-    expect(originalWaiterSignal?.aborted).toBe(false);
-    expect(commonPublisherSignal?.aborted).toBe(false);
-
-    original.relay.close();
-    await original.relay.waitClosed();
-    expect(originalWaiterSignal?.aborted).toBe(true);
-    expect(commonPublisherSignal?.aborted).toBe(false);
-
-    const replacement = createRelayHarness({
-      connection: {
-        ...connectionSet,
-        connectionSetId: "connection_set_BB",
-        connectionId: "connection_BBBBB",
-        controlTicket: "control_ticket_B",
-        dataTicket: "data_ticket_BBBB",
-      },
-      session,
-      snapshotCheckpointManager,
-    });
-    await acknowledgeReady(replacement);
-    replacement.control.message(
-      JSON.stringify({
-        type: "attach-request",
-        connectionId: "connection_browser_B",
-        streamId: 2,
-        deliveryGeneration: "1",
-        engineId: session.engineId,
-        hasLiveReplica: false,
-      }),
-    );
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
-    expect(refresh.mock.calls[1]?.[0].signal?.aborted).toBe(false);
-    expect(encodeSnapshot).toHaveBeenCalledOnce();
-    expect(publish).toHaveBeenCalledOnce();
-    expect(commonPublisherSignal?.aborted).toBe(false);
-
-    upload.resolve({
-      metadata: {
-        sessionId: "session_AAAAAAAAA",
-        snapshotId: "snapshot_RECONNECT_A",
-        engineId: snapshot.engineId,
-        sessionEpoch: snapshot.sessionEpoch.toString(),
-        cutEventSeq: snapshot.cutEventSeq.toString(),
-        nextPtyOffset: snapshot.nextPtyOffset.toString(),
-        compression: "zstd",
-        compressedLength: "1",
-        uncompressedLength: snapshot.bytes.byteLength.toString(),
-        sha256: "0".repeat(64),
-      },
-    });
-    await vi.waitFor(() =>
-      expect(
-        sentDataFrames(replacement.data).filter(
-          (frame) => frame.kind === DataFrameKind.DeliveryBarrier,
-        ),
-      ).toHaveLength(1),
-    );
-
-    const replacementFrames = sentDataFrames(replacement.data);
-    const barrier = replacementFrames.find((frame) => frame.kind === DataFrameKind.DeliveryBarrier);
-    if (barrier === undefined) throw new Error("expected replacement delivery barrier");
-    const barrierPayload = decodeDeliveryBarrierPayload(barrier.payload);
-    if (barrierPayload.mode !== "snapshot") throw new Error("expected snapshot barrier");
-    replacement.control.message(
-      JSON.stringify({
-        type: "delivery-barrier-result",
-        status: "ready",
-        mode: "snapshot",
-        connectionId: barrierPayload.connectionId,
-        snapshotId: barrierPayload.snapshotId,
-        streamId: barrier.streamId,
-        deliveryGeneration: barrier.deliveryGeneration.toString(),
-        commitEventSeq: barrier.eventSeq.toString(),
-        commitPtyOffset: barrier.ptyOffset.toString(),
-      }),
-    );
-    await vi.waitFor(() =>
-      expect(
-        sentDataFrames(replacement.data).filter(
-          (frame) => frame.kind === DataFrameKind.ReplayCommit,
-        ),
-      ).toHaveLength(1),
-    );
-
-    expect(
-      sentDataFrames(original.data).filter(
-        (frame) =>
-          frame.kind === DataFrameKind.DeliveryBarrier || frame.kind === DataFrameKind.ReplayCommit,
-      ),
-    ).toEqual([]);
-    expect(sentDataFrames(replacement.data).map((frame) => frame.kind)).toEqual([
-      DataFrameKind.DeliveryBarrier,
-      DataFrameKind.ReplayCommit,
-    ]);
-    expect(encodeSnapshot).toHaveBeenCalledOnce();
-    expect(publish).toHaveBeenCalledOnce();
-
-    replacement.relay.close();
-    snapshotCheckpointManager.dispose();
-    session.dispose();
+    expect(target.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.data.readyState).toBe(FakeWebSocket.OPEN);
+    expect(target.recoverySourceManager.counters).toMatchObject({ ownedRecords: 0, sources: 1 });
+    target.relay.close();
+    target.session.dispose();
   });
 
   it("returns exact duplicate ACKs and fences an ACK if the pair closes during PTY write", async () => {

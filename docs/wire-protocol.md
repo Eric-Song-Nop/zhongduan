@@ -1,82 +1,55 @@
-# Wire Protocol V2
+# Wire protocol
 
-> 本文只描述当前已实现的 v2 wire behavior。协议长期不变量、三逻辑平面和 Recovery v3 / 输入
-> sideband 的目标设计见[终端协议架构](terminal-protocol-architecture.md)，Recovery v3 的版本化
-> envelope 与协商契约见[Recovery v3 Wire Contract](recovery-v3-wire.md)。在完整 v3 handoff 取代
-> barrier 之前，v2 的 global canonical pause 与 pinned commit 仍是 correctness 条件，不能单独删除。
+Zhongduan 只有一套终端 wire protocol。恢复状态机见 [Recovery 协议](recovery-protocol.md)，更高层 owner
+边界见[终端协议架构](terminal-protocol-architecture.md)。历史协议只记录在
+[Recovery 实现沿革](recovery-history.md)，不是兼容契约。
 
-## 通道
+## Control channel
 
-每个参与者建立两条 WebSocket：
+Control channel 使用 strict JSON object。每个方向都有独立 schema，unknown type、unknown field、方向错误或
+身份不完整都视为 protocol error：
 
-- `control`：UTF-8 JSON，承载 attach、writer lease、语义 input、ACK、host 状态和 resync。
-- `data`：一条 WebSocket message 对应一个二进制 frame，承载 PTY output、resize、replay
-  commit，以及 Host 到 relay 的 recovery barrier。
-- `snapshot`：受权 HTTP response 从私有 R2 对象直接流向浏览器，不经过 DO WebSocket。
+- Browser → Cloud：attach、writer lease renew、semantic input、delivery receipt、replica apply progress、
+  recovery adopted；
+- Cloud → Browser：welcome、input acknowledgement、Host/status/resync、recovery start、source closed；
+- Host → Cloud：host ready、input acknowledgement、source rejected、source closed；
+- Cloud → Host：host ready acknowledgement、forwarded input、prepare、start-ready、grant、receipt、reset。
 
-所有重建 Host authority 所必需的 terminal mutation 必须在 data 通道内排序并消耗 `eventSeq`；当前只有
-`PTY_OUTPUT` 与 `RESIZE_APPLIED`。input ACK、writer lease 和其他临时交互 metadata 不属于 terminal
-mutation，不能推进 replica cursor。control 消息不能直接改变 replica。
+控制消息只能影响 socket attachment 与 SQL 都证明的 exact current owner。裸 recovery id、client id 或
+connection id 不能单独授权状态变更。
 
-## Data Header
+## Canonical data frame
 
-所有整数除 magic 外均为 little-endian。固定 header 为 48 bytes。
+Host authority 输出固定长度 header 加 bounded payload。Header 包含 magic、format、kind、session epoch、
+event sequence、PTY offset，以及仅 start-fence 使用的 routing identity。普通 canonical mutation 的 routing
+字段必须为零。
 
-| Offset | Size | 字段                                           |
-| -----: | ---: | ---------------------------------------------- |
-|      0 |    4 | ASCII `ZTRM` magic，以 network order 读取      |
-|      4 |    1 | protocol version，当前为 2                     |
-|      5 |    1 | frame kind                                     |
-|      6 |    2 | flags                                          |
-|      8 |    8 | `sessionEpoch`                                 |
-|     16 |    8 | `deliveryGeneration`                           |
-|     24 |    8 | `eventSeq`                                     |
-|     32 |    8 | PTY `startOffset` 或当前 `nextPtyOffset`       |
-|     40 |    4 | relay 分配的 `streamId`，0 表示 live broadcast |
-|     44 |    4 | payload length                                 |
+当前 kind：
 
-Kinds：
+- `PtyOutput`：payload 是 exact PTY bytes；offset 按 payload 长度连续；
+- `ResizeApplied`：payload 是 strict rows/columns；
+- `RecoveryDone`：只允许 recovery lane，payload 为空；
+- `RecoveryStartFence`：只允许 Host ordered stream，payload 是 strict fence identity。
 
-```text
-1 PTY_OUTPUT
-2 RESIZE_APPLIED
-3 REPLAY_COMMIT
-4 RESET
-5 DELIVERY_BARRIER
-```
+Flags 必须为零。未知 format、kind、flags、长度或 cursor gap 都 fail closed。
 
-`DELIVERY_BARRIER` 由 Host 发给 relay，用于在目标 browser delivery 上固定 warm replay 或
-snapshot recovery 的 commit watermark。relay 接受 barrier 后才发送 `replay-start` 或
-`snapshot-manifest`，并在 `REPLAY_COMMIT` 到达前阻止该 delivery 越过固定 commit。
+## Delivery envelope
 
-`PTY_OUTPUT` 与 `RESIZE_APPLIED` 的 `eventSeq` 必须严格加一。两者的 `ptyOffset` 都必须等于客户端当前 `nextPtyOffset`；只有 `PTY_OUTPUT` 会按 payload 长度推进 offset。这样 resize 在 PTY byte stream 中的位置可被确定且验证。
+Cloud→Browser data 消息始终是 delivery envelope，而不是裸 canonical frame。Envelope header 包含 magic、
+format、lane、delivery generation、ordinal、cumulative encoded bytes、stream 和 payload length。Payload 是
+完整、未重写的 canonical frame。
 
-## Epoch 与 Generation
+每条 lane 独立连续；首条 ordinal 为 1，首条累计字节等于该 envelope 的完整 wire bytes。Receipt 必须命中
+Cloud durable sent ledger 中的 exact prefix。
 
-`sessionEpoch` 标识同一个 PTY/child process 生命周期。daemon 无法继续原进程时必须创建新 epoch。
+## Recovery start fence
 
-`deliveryGeneration` 属于单个浏览器 data delivery。慢客户端、gap 或 restore 失败只增加该连接的 generation；旧 data WebSocket 上残留的 frame 会被拒绝，不影响其他客户端。
+Start fence 与 canonical data 共用 Host data socket和同一个 per-socket FIFO。它必须出现在 canonical `H`
+之后、`H+1` 之前。Cloud 只有在 durable authority head 恰好为 `H` 时才能安装 start；事务提交后才允许
+处理后续 canonical frame。
 
-## 输入幂等
+## Limits
 
-key、text、paste、resize request、focus 与 mouse 共享 `(inputEpoch, clientInputSeq)` 序列。`inputEpoch` 由浏览器 controller 在一个输入序列开始时生成；data-only delivery reconnect 不改变它，但 control WebSocket replacement 会把 outstanding 输入标为 uncertain 并创建新 epoch。收到明确 ACK 后才能丢弃对应输入。DO 不信任客户端声明的身份，转发给 Host 时附加 capability 已认证的稳定 `clientId` 和单调 `writerFence`。Host 以 `(writerFence, clientId, inputEpoch, clientInputSeq)` 去重；更高 fence 会永久封住旧 writer，ACK 丢失后的同一 fence 重试不会再次写入 PTY。换 controller 或明确放弃 uncertain 输入时必须创建新的 `inputEpoch`。
-
-## Snapshot Cut
-
-control 通道的 snapshot manifest 声明：
-
-- snapshot 和精确 `engineId`；
-- `cutSeq`，表示 snapshot 已包含所有 `eventSeq <= cutSeq` 的 mutation；
-- `nextPtyOffset`，表示 snapshot 已逻辑消费 `[0, nextPtyOffset)`；
-- compression、压缩前后长度、SHA-256 和受权下载路径。
-
-浏览器流式下载到有上限的 `Uint8Array`，校验声明长度与 SHA-256 后才交给 decoder。MVP 不把异步网络暴露成 Ghostty reader；临时 0-byte read 会被 decoder 解释成永久 EOF。
-
-snapshot continuation 是 parser 恢复材料，不是新的 PTY output。snapshot 后的第一条 PTY frame 必须从声明的 `nextPtyOffset` 开始。
-
-## 限制
-
-- 单 data payload 最大 16 MiB；Host 正常 PTY batch 目标为 16 KiB / 4 ms。
-- paste 最大 1 MiB；Host 在写入前再次执行会话策略限制。
-- control decoder 拒绝未知字段，所有 uint64 在 JSON 中用十进制字符串。
-- 任意 magic、version、长度、epoch、generation、seq 或 offset 错误都会终止当前 delivery，并请求新 generation。
+Frame、control JSON、socket message、queue、outbox、source、lane、generation 和 snapshot metadata 都有独立
+硬上限。编码器和解码器必须执行相同的长度与 scalar 范围检查；任何截断、额外字节或非 canonical decimal
+都不得进入 owner 状态机。

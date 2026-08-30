@@ -48,7 +48,7 @@ pnpm --filter "@zhongduan/terminal-cloud" exec wrangler r2 bucket create "zhongd
 ```
 
 不需要创建 D1，也不需要手工执行 SQL migration。首次部署会根据 Worker 配置声明创建
-SQLite-backed `TerminalSessionDO` namespace；每个对象的内部 schema 在实例启动时迁移。
+SQLite-backed `TerminalSessionDO` namespace；每个对象在首次启动时安装当前内部 schema。
 
 ## 3. 创建 Secrets
 
@@ -104,7 +104,8 @@ Wrangler 输出的 HTTPS origin 是下一步的 `CLOUD_URL`，通常形如：
 https://zhongduan-terminal-cloud.<account-subdomain>.workers.dev
 ```
 
-后续部署不需要重新创建 bucket。Cloudflare 会保留已配置的 secrets，因此常规升级只需：
+后续部署不需要重新创建 bucket。Cloudflare 会保留已配置的 secrets。MVP 前的构建不提供跨提交互通；
+停止旧 Host 后，从同一个提交验证、构建并部署 Cloud 与 Host：
 
 ```bash
 git pull --ff-only
@@ -115,30 +116,17 @@ pnpm exec vp run build-browser
 pnpm --filter "@zhongduan/terminal-cloud" exec wrangler deploy
 ```
 
-包含 `snapshot-cursor-ahead` 错误分类的版本必须先部署 Cloud，再滚动 Host。新 Cloud 只在 exact completed
-upload 与 R2 object 已验证、但 committed head 尚未追上 snapshot cut 时返回该错误；旧 Host 会把它保守地
-当作可重试失败。新 Host 在旧 Cloud 上仍把 generic `snapshot-conflict` 保留为结果不确定的 immutable body，
-不会猜测或释放，因此顺序错误不会破坏数据，但会让 bounded cursor-ahead 暂时退化为旧行为。该 HTTP 错误
-分类不改变 terminal WebSocket wire、SQLite schema 或 snapshot body。
-
-Recovery v3 的 capability/wire schema 采用 Cloud-first 滚动顺序。P2.0 Cloud 对 negotiation-aware request
-只确认已实现的 v2 能力；未提供 bootstrap token 的旧 Host/Browser 仍收到旧 connection-set response shape。
-新 Host/Browser 连接旧 Cloud 时看不到 `negotiatedCapabilities`，必须完整使用 v2。Durable Object 的 additive
-schema migration 把既有 session 固定为 authority data v2，并把既有 generation strategy 默认设为 v2。
+当前代码只有一套 Recovery wire和runtime，不执行协议协商、策略选择、降级或混合generation。
 Phase 2 已完成 Browser assembler、Host source owner、Cloud durable state、receipt/closure/fairness，以及本地
-three-owner continuity、committed-WASM Ghostty continuation 与 WTerm adoption correctness gates；这些仍只是
-stacked candidate 的本地证据，不代表 production Cloudflare/R2、真实跨进程网络、性能或 rollout 批准。
-当前 Wrangler `RECOVERY_V3_ENABLED="false"`，Host `CloudApiClient` 与 Browser `TerminalSession` 的默认
-capability offer 也只有 v2 baseline。
-在独立 production-like staging 与 rollout 审批完成前，生产 endpoint 不得 advertise v3 token，Cloud kill
-switch 必须保持关闭，也不得单独移除 v2 pause/barrier/pin。
-rollout 获批后，strategy 也只能在新的 Browser generation claim 时选择并持久化；已有 generation 不得原地
-从 v2 切到 v3 或把两套协议拼接。既有 v3 attempt 必须完成或被明确 reset/fence；关闭 kill switch 会阻止
-新 v3 generation，并在 attachment decode/outbox drain 前对已持久化的 v3 状态 fail closed，要求重连并建立
-新的 v2 generation，而不是原地降级。v2 pause/barrier/pin 要保留到独立 retirement gate。
-若回滚到不认识 negotiation token 的旧 DO 代码，已经用新 attachment 建立的 socket 会 fail closed，运维上应预期
-这些连接重连；additive SQLite facts 与 authority log 不因此回退或丢失。不要把“已有连接不断开”当作该回滚
-路径的保证。
+three-owner continuity、committed-WASM Ghostty continuation与WTerm adoption correctness gates；这些仍只是
+本地证据，不代表production Cloudflare/R2、真实跨进程网络、性能或上线批准。
+
+本次切换发生在MVP发布前，不提供旧开发态协议或Durable Object schema的向后兼容。对象发现非当前
+schema marker时会重建内部SQL/KV；旧socket、ticket、lease和generation不可续接。部署该变更前应接受
+开发环境session数据失效。R2中的开发态孤儿对象可以删除bucket后重建，或按运维策略清理。
+
+应用级回滚必须回退整个Host、Cloud和Browser构建，并重建开发态session；不能让不同提交的endpoint
+继续共享现有连接。正式上线后的发布契约属于MVP剩余工作，不能通过恢复已删除的实现来规避。
 
 部署前可用以下命令只验证生成的 Worker、Assets、DO 和 R2 binding，不上传：
 
@@ -218,15 +206,15 @@ pnpm --filter "@zhongduan/terminal-cloud" run dev -- --host "127.0.0.1" --port "
 另一个终端构建 Host，并将相同 bootstrap token 放入权限为 `0600` 的文件，然后使用
 `http://127.0.0.1:5173` 作为 `--url` 启动 Host。
 
-CURRENT recovery 的开发验收范围、状态机测试与局限见
-[Phase 0 验收契约](phase-0-acceptance-contract.md)。本地 gate-owner 回归套件使用：
+Recovery 的开发验收范围、状态机和证据边界见
+[Recovery 协议](recovery-protocol.md)与[高性能 Snapshot 与 Recovery 计划](high-performance-snapshot-recovery-plan.md)。
+本地完整回归使用：
 
 ```bash
-pnpm exec vp run verify-phase0
+pnpm exec vp run verify
 ```
 
-该命令运行 broad owner suite；总测试数量不是 Phase 0 完成证据。本地部署步骤和这组测试都不提供 E2E、
-性能或生产行为证明。
+测试数量本身不是正确性证据。本地部署步骤和这组测试也不提供真实跨进程网络、性能或生产行为证明。
 
 ## 8. 运维边界
 

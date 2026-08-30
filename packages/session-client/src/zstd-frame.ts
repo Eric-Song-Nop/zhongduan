@@ -79,7 +79,7 @@ function validateZstdFrameEnvelope(
       throw new Error("zstd frame content size exceeds configured limit");
     }
     if (contentSize !== BigInt(expectedLength)) {
-      throw new Error("zstd frame content size does not match manifest");
+      throw new Error("zstd frame content size does not match restore source");
     }
   }
 
@@ -154,7 +154,7 @@ export function decompressBoundedZstdFrame(
 
   if (!finished) throw new Error("zstd decoder did not finish the frame");
   if (outputOffset !== expectedLength) {
-    throw new Error("snapshot decompressed length does not match manifest");
+    throw new Error("snapshot decompressed length does not match restore source");
   }
   return output;
 }

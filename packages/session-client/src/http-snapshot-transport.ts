@@ -2,12 +2,12 @@ import {
   MAX_SNAPSHOT_COMPRESSED_BYTES,
   MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
   SNAPSHOT_MEDIA_TYPE,
-  ServerControlFrameSchema,
   SnapshotHeader,
+  SnapshotRecoverySourceSchema,
   SnapshotResourceIdSchema,
 } from "@zhongduan/protocol";
 
-import type { SnapshotManifest, SnapshotTransport } from "./types";
+import type { SnapshotRestoreSource, SnapshotTransport } from "./types";
 import { decompressBoundedZstdFrame } from "./zstd-frame";
 
 export interface HttpSnapshotTransportOptions {
@@ -59,17 +59,13 @@ async function cancelBody(body: ReadableStream<Uint8Array> | null, reason: unkno
   await body.cancel(reason).catch(() => undefined);
 }
 
-function parseSnapshotManifest(manifest: SnapshotManifest): SnapshotManifest {
-  const parsed = ServerControlFrameSchema.parse(manifest);
-  if (parsed.type !== "snapshot-manifest") {
-    throw new Error("expected a snapshot manifest");
-  }
-  return parsed;
+function parseSnapshotRestoreSource(source: SnapshotRestoreSource): SnapshotRestoreSource {
+  return SnapshotRecoverySourceSchema.parse(source);
 }
 
 function responseMetadataMismatch(
   response: Response,
-  manifest: SnapshotManifest,
+  source: SnapshotRestoreSource,
 ): string | undefined {
   if (response.headers.get("content-type") !== SNAPSHOT_MEDIA_TYPE) {
     return "snapshot content-type does not match protocol";
@@ -79,19 +75,19 @@ function responseMetadataMismatch(
   }
 
   const expectedHeaders: ReadonlyArray<readonly [string, string]> = [
-    ["content-length", manifest.compressedLength],
-    [SnapshotHeader.compression, manifest.compression],
-    [SnapshotHeader.engineId, manifest.engineId],
-    [SnapshotHeader.sessionEpoch, manifest.sessionEpoch],
-    [SnapshotHeader.cutEventSeq, manifest.cutEventSeq],
-    [SnapshotHeader.nextPtyOffset, manifest.nextPtyOffset],
-    [SnapshotHeader.sha256, manifest.sha256],
-    [SnapshotHeader.compressedLength, manifest.compressedLength],
-    [SnapshotHeader.uncompressedLength, manifest.uncompressedLength],
+    ["content-length", source.compressedLength],
+    [SnapshotHeader.compression, source.compression],
+    [SnapshotHeader.engineId, source.engineId],
+    [SnapshotHeader.sessionEpoch, source.sessionEpoch],
+    [SnapshotHeader.cutEventSeq, source.cutEventSeq],
+    [SnapshotHeader.nextPtyOffset, source.nextPtyOffset],
+    [SnapshotHeader.sha256, source.sha256],
+    [SnapshotHeader.compressedLength, source.compressedLength],
+    [SnapshotHeader.uncompressedLength, source.uncompressedLength],
   ];
   for (const [name, expected] of expectedHeaders) {
     if (response.headers.get(name) !== expected) {
-      return `snapshot ${name} does not match manifest`;
+      return `snapshot ${name} does not match source`;
     }
   }
   return undefined;
@@ -123,9 +119,9 @@ export class HttpSnapshotTransport implements SnapshotTransport {
     this.#getHeaders = options.getHeaders;
   }
 
-  async load(manifest: SnapshotManifest, signal: AbortSignal): Promise<Uint8Array> {
+  async load(source: SnapshotRestoreSource, signal: AbortSignal): Promise<Uint8Array> {
     signal.throwIfAborted();
-    const expected = parseSnapshotManifest(manifest);
+    const expected = parseSnapshotRestoreSource(source);
     assertSessionSnapshotPath(expected.downloadPath, expected.snapshotId);
     const compressedLength = parseBoundedLength(
       expected.compressedLength,
@@ -177,8 +173,8 @@ export class HttpSnapshotTransport implements SnapshotTransport {
         if (done) break;
         const nextOffset = received + value.byteLength;
         if (nextOffset > compressedLength) {
-          await reader.cancel("snapshot exceeds manifest length");
-          throw new Error("snapshot exceeds manifest length");
+          await reader.cancel("snapshot exceeds source length");
+          throw new Error("snapshot exceeds source length");
         }
         compressed.set(value, received);
         received = nextOffset;
@@ -208,7 +204,7 @@ export class HttpSnapshotTransport implements SnapshotTransport {
       throw new Error("snapshot decompressed length exceeds configured limit");
     }
     if (snapshot.byteLength !== uncompressedLength) {
-      throw new Error("snapshot decompressed length does not match manifest");
+      throw new Error("snapshot decompressed length does not match source");
     }
     return snapshot;
   }

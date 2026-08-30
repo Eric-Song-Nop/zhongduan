@@ -1,28 +1,29 @@
 import {
+  DELIVERY_ENVELOPE_HEADER_BYTES,
   DataFrameFlag,
   DataFrameKind,
-  RecoveryV3HostPrepareRejectedSchema,
-  RecoveryV3HostPrepareSchema,
-  RecoveryV3HostRoutingIdentitySchema,
-  RecoveryV3HostSourceClosedSchema,
-  RecoveryV3HostSourceGrantSchema,
-  RecoveryV3HostSourceReceivedSchema,
-  RecoveryV3HostSourceResetSchema,
-  RecoveryV3HostStartReadySchema,
+  RecoveryHostPrepareRejectedSchema,
+  RecoveryHostPrepareSchema,
+  RecoveryHostRoutingIdentitySchema,
+  RecoveryHostSourceClosedSchema,
+  RecoveryHostSourceGrantSchema,
+  RecoveryHostSourceReceivedSchema,
+  RecoveryHostSourceResetSchema,
+  RecoveryHostStartReadySchema,
   decodeDataFrame,
   encodeDataFrame,
-  encodeDeliveryEnvelopeV3,
+  encodeDeliveryEnvelope,
   encodeRecoveryStartFence,
   successorBoundary,
   type AuthorityCursor,
-  type RecoveryV3HostPrepare,
-  type RecoveryV3HostPrepareRejected,
-  type RecoveryV3HostRoutingIdentity,
-  type RecoveryV3HostSourceClosed,
-  type RecoveryV3HostSourceGrant,
-  type RecoveryV3HostSourceReceived,
-  type RecoveryV3HostSourceReset,
-  type RecoveryV3HostStartReady,
+  type RecoveryHostPrepare,
+  type RecoveryHostPrepareRejected,
+  type RecoveryHostRoutingIdentity,
+  type RecoveryHostSourceClosed,
+  type RecoveryHostSourceGrant,
+  type RecoveryHostSourceReceived,
+  type RecoveryHostSourceReset,
+  type RecoveryHostStartReady,
 } from "@zhongduan/protocol";
 
 import type { PreparedRecoveryGap, ReplayCursor, TerminalSession } from "../session";
@@ -55,7 +56,7 @@ export type RecoverySourcePrepareResult =
     }
   | {
       readonly status: "rejected";
-      readonly rejection: RecoveryV3HostPrepareRejected;
+      readonly rejection: RecoveryHostPrepareRejected;
     }
   | {
       readonly status: "conflict";
@@ -86,7 +87,7 @@ export type RecoverySourceReceivedResult =
     }
   | {
       readonly status: "closed";
-      readonly closed: RecoveryV3HostSourceClosed;
+      readonly closed: RecoveryHostSourceClosed;
       readonly duplicate: boolean;
     }
   | {
@@ -96,7 +97,7 @@ export type RecoverySourceReceivedResult =
 
 export interface RecoverySourceDeadlineExpiration {
   readonly ownerToken: RecoverySourceOwnerToken;
-  readonly identity: RecoveryV3HostRoutingIdentity;
+  readonly identity: RecoveryHostRoutingIdentity;
   readonly reason: "prepare-deadline" | "no-progress-deadline" | "recovery-deadline";
 }
 
@@ -124,7 +125,7 @@ interface PendingPrepare {
     | "journal-gap"
     | null;
   readonly ownerToken: RecoverySourceOwnerToken;
-  readonly prepare: RecoveryV3HostPrepare;
+  readonly prepare: RecoveryHostPrepare;
   readonly promise: Promise<RecoverySourcePrepareResult>;
   readonly resolve: (result: RecoverySourcePrepareResult) => void;
   readonly startedAtMs: number;
@@ -132,7 +133,7 @@ interface PendingPrepare {
 }
 
 interface RecoverySource {
-  closed: RecoveryV3HostSourceClosed | null;
+  closed: RecoveryHostSourceClosed | null;
   cumulativeGrantedEncodedBytes: bigint;
   readonly committedThrough: AuthorityCursor;
   readonly finalCumulativeEncodedBytes: bigint;
@@ -143,10 +144,10 @@ interface RecoverySource {
   ownedRecords: number;
   ownedWireBytes: number;
   readonly ownerToken: RecoverySourceOwnerToken;
-  readonly prepare: RecoveryV3HostPrepare;
+  readonly prepare: RecoveryHostPrepare;
   readonly preparePromise: Promise<RecoverySourcePrepareResult>;
   readonly prepareResult: Extract<RecoverySourcePrepareResult, { status: "prepared" }>;
-  ready: RecoveryV3HostStartReady | null;
+  ready: RecoveryHostStartReady | null;
   readonly recordCumulativeEncodedBytes: readonly bigint[];
   records: Array<RetainedRecord | null> | null;
   sentCumulativeEncodedBytes: bigint;
@@ -157,7 +158,7 @@ interface RecoverySource {
 }
 
 interface RecoveryGenerationTombstone {
-  readonly identity: RecoveryV3HostRoutingIdentity;
+  readonly identity: RecoveryHostRoutingIdentity;
   readonly ownerToken: RecoverySourceOwnerToken;
 }
 
@@ -167,7 +168,7 @@ interface Deferred<T> {
 }
 
 /**
- * Pure, session-scoped owner for bounded Recovery v3 Host sources.
+ * Pure, session-scoped owner for bounded Host recovery sources.
  *
  * It deliberately owns no socket, scheduling policy, or timers. Callers supply an opaque owner
  * token, enqueue the ordered start fence from the TerminalSession actor commit, drive bounded
@@ -222,11 +223,11 @@ export class RecoverySourceManager {
 
   prepare(
     ownerToken: RecoverySourceOwnerToken,
-    input: RecoveryV3HostPrepare,
+    input: RecoveryHostPrepare,
     enqueueFence: EnqueueRecoveryStartFence,
   ): Promise<RecoverySourcePrepareResult> {
     assertOwnerToken(ownerToken);
-    const prepare = RecoveryV3HostPrepareSchema.parse(input);
+    const prepare = RecoveryHostPrepareSchema.parse(input);
     const nowMs = this.#recordNow();
 
     if (this.#disposed) return Promise.resolve({ status: "unavailable", reason: "disposed" });
@@ -315,9 +316,9 @@ export class RecoverySourceManager {
     return pending.promise;
   }
 
-  startReady(ownerToken: RecoverySourceOwnerToken, input: RecoveryV3HostStartReady): boolean {
+  startReady(ownerToken: RecoverySourceOwnerToken, input: RecoveryHostStartReady): boolean {
     assertOwnerToken(ownerToken);
-    const ready = RecoveryV3HostStartReadySchema.parse(input);
+    const ready = RecoveryHostStartReadySchema.parse(input);
     const nowMs = this.#recordNow();
     const source = this.#sourceFor(ownerToken, ready);
     if (source === null || source.closed !== null) return false;
@@ -333,9 +334,9 @@ export class RecoverySourceManager {
     return true;
   }
 
-  grant(ownerToken: RecoverySourceOwnerToken, input: RecoveryV3HostSourceGrant): boolean {
+  grant(ownerToken: RecoverySourceOwnerToken, input: RecoveryHostSourceGrant): boolean {
     assertOwnerToken(ownerToken);
-    const grant = RecoveryV3HostSourceGrantSchema.parse(input);
+    const grant = RecoveryHostSourceGrantSchema.parse(input);
     this.#recordNow();
     const source = this.#sourceFor(ownerToken, grant);
     if (source === null || source.ready === null || source.closed !== null) return false;
@@ -347,12 +348,12 @@ export class RecoverySourceManager {
 
   drainGranted(
     ownerToken: RecoverySourceOwnerToken,
-    identity: RecoveryV3HostRoutingIdentity,
+    identity: RecoveryHostRoutingIdentity,
     limits: RecoverySourceDrainLimits,
     send: (encoded: Uint8Array) => void,
   ): RecoverySourceDrainResult {
     assertOwnerToken(ownerToken);
-    const routing = RecoveryV3HostRoutingIdentitySchema.parse(identity);
+    const routing = RecoveryHostRoutingIdentitySchema.parse(identity);
     const maxRecords = nonNegativeSafeInteger(limits.maxRecords, "maxRecords");
     const maxWireBytes = nonNegativeSafeInteger(limits.maxWireBytes, "maxWireBytes");
     this.#recordNow();
@@ -393,10 +394,10 @@ export class RecoverySourceManager {
 
   received(
     ownerToken: RecoverySourceOwnerToken,
-    input: RecoveryV3HostSourceReceived,
+    input: RecoveryHostSourceReceived,
   ): RecoverySourceReceivedResult {
     assertOwnerToken(ownerToken);
-    const received = RecoveryV3HostSourceReceivedSchema.parse(input);
+    const received = RecoveryHostSourceReceivedSchema.parse(input);
     const nowMs = this.#recordNow();
     const source = this.#sourceFor(ownerToken, received);
     if (source === null) return { status: "invalid", reason: "unknown-source" };
@@ -441,7 +442,7 @@ export class RecoverySourceManager {
     }
 
     source.closed = Object.freeze(
-      RecoveryV3HostSourceClosedSchema.parse({
+      RecoveryHostSourceClosedSchema.parse({
         type: "recovery-source-closed",
         ...routingIdentity(source.prepare),
         throughRecoveryOrdinal: source.finalDeliveryOrdinal.toString(),
@@ -452,9 +453,9 @@ export class RecoverySourceManager {
     return { status: "closed", closed: source.closed, duplicate: false };
   }
 
-  reset(ownerToken: RecoverySourceOwnerToken, input: RecoveryV3HostSourceReset): boolean {
+  reset(ownerToken: RecoverySourceOwnerToken, input: RecoveryHostSourceReset): boolean {
     assertOwnerToken(ownerToken);
-    const reset = RecoveryV3HostSourceResetSchema.parse(input);
+    const reset = RecoveryHostSourceResetSchema.parse(input);
     this.#recordNow();
     if (this.#disposed || this.#staleOwners.has(ownerToken)) return false;
 
@@ -521,10 +522,10 @@ export class RecoverySourceManager {
 
   isRetiredIdentity(
     ownerToken: RecoverySourceOwnerToken,
-    identity: RecoveryV3HostRoutingIdentity,
+    identity: RecoveryHostRoutingIdentity,
   ): boolean {
     assertOwnerToken(ownerToken);
-    const routing = RecoveryV3HostRoutingIdentitySchema.parse(identity);
+    const routing = RecoveryHostRoutingIdentitySchema.parse(identity);
     const tombstones = this.#tombstonesByStream.get(routing.streamId);
     return (
       tombstones?.some(
@@ -585,7 +586,7 @@ export class RecoverySourceManager {
 
   #existingPrepare(
     ownerToken: RecoverySourceOwnerToken,
-    prepare: RecoveryV3HostPrepare,
+    prepare: RecoveryHostPrepare,
   ): Promise<RecoverySourcePrepareResult> | null {
     const generation = BigInt(prepare.deliveryGeneration);
     const pending = this.#pendingByStream.get(prepare.streamId);
@@ -760,7 +761,7 @@ export class RecoverySourceManager {
 
   #sourceFor(
     ownerToken: RecoverySourceOwnerToken,
-    identity: RecoveryV3HostRoutingIdentity,
+    identity: RecoveryHostRoutingIdentity,
   ): RecoverySource | null {
     if (this.#disposed || this.#staleOwners.has(ownerToken)) return null;
     const source = this.#sourcesByStream.get(identity.streamId);
@@ -773,7 +774,7 @@ export class RecoverySourceManager {
 
   #drainStatus(
     ownerToken: RecoverySourceOwnerToken,
-    identity: RecoveryV3HostRoutingIdentity,
+    identity: RecoveryHostRoutingIdentity,
     source: RecoverySource,
   ): RecoverySourceDrainResult["status"] {
     if (this.#sourceFor(ownerToken, identity) !== source || source.records === null) return "stale";
@@ -826,7 +827,7 @@ export class RecoverySourceManager {
 
   #installTombstone(
     ownerToken: RecoverySourceOwnerToken,
-    identity: RecoveryV3HostRoutingIdentity,
+    identity: RecoveryHostRoutingIdentity,
   ): boolean {
     const existing = this.#tombstonesByStream.get(identity.streamId) ?? [];
     if (existing.some((tombstone) => tombstone.ownerToken !== ownerToken)) return false;
@@ -885,12 +886,12 @@ export class RecoverySourceManager {
   }
 
   #rejected(
-    prepare: RecoveryV3HostPrepare,
-    reason: RecoveryV3HostPrepareRejected["reason"],
+    prepare: RecoveryHostPrepare,
+    reason: RecoveryHostPrepareRejected["reason"],
   ): Extract<RecoverySourcePrepareResult, { status: "rejected" }> {
     return {
       status: "rejected",
-      rejection: RecoveryV3HostPrepareRejectedSchema.parse({
+      rejection: RecoveryHostPrepareRejectedSchema.parse({
         type: "recovery-prepare-rejected",
         ...routingIdentity(prepare),
         reason,
@@ -907,7 +908,7 @@ export class RecoverySourceManager {
 }
 
 function buildRetainedRecords(
-  prepare: RecoveryV3HostPrepare,
+  prepare: RecoveryHostPrepare,
   gap: PreparedRecoveryGap,
 ): readonly RetainedRecord[] {
   if (
@@ -932,8 +933,8 @@ function buildRetainedRecords(
       throw new Error("prepared gap contains a non-canonical mutation");
     }
     deliveryOrdinal += 1n;
-    cumulativeEncodedBytes += 40n + BigInt(canonical.byteLength);
-    const bytes = encodeDeliveryEnvelopeV3({
+    cumulativeEncodedBytes += BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + canonical.byteLength);
+    const bytes = encodeDeliveryEnvelope({
       lane: "recovery",
       deliveryGeneration: BigInt(prepare.deliveryGeneration),
       deliveryOrdinal,
@@ -945,7 +946,7 @@ function buildRetainedRecords(
   }
 
   const done = encodeDataFrame({
-    kind: DataFrameKind.ReplayCommit,
+    kind: DataFrameKind.RecoveryDone,
     flags: DataFrameFlag.None,
     sessionEpoch: gap.committedThrough.sessionEpoch,
     deliveryGeneration: 0n,
@@ -955,10 +956,10 @@ function buildRetainedRecords(
     payload: new Uint8Array(),
   });
   deliveryOrdinal += 1n;
-  cumulativeEncodedBytes += 40n + BigInt(done.byteLength);
+  cumulativeEncodedBytes += BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + done.byteLength);
   records.push(
     Object.freeze({
-      bytes: encodeDeliveryEnvelopeV3({
+      bytes: encodeDeliveryEnvelope({
         lane: "recovery",
         deliveryGeneration: BigInt(prepare.deliveryGeneration),
         deliveryOrdinal,
@@ -989,7 +990,7 @@ function authorityCursor(cursor: ReplayCursor): AuthorityCursor {
   };
 }
 
-function routingIdentity(input: RecoveryV3HostRoutingIdentity): RecoveryV3HostRoutingIdentity {
+function routingIdentity(input: RecoveryHostRoutingIdentity): RecoveryHostRoutingIdentity {
   return {
     recoveryId: input.recoveryId,
     connectionId: input.connectionId,
@@ -999,8 +1000,8 @@ function routingIdentity(input: RecoveryV3HostRoutingIdentity): RecoveryV3HostRo
 }
 
 function sameRouting(
-  left: RecoveryV3HostRoutingIdentity,
-  right: RecoveryV3HostRoutingIdentity,
+  left: RecoveryHostRoutingIdentity,
+  right: RecoveryHostRoutingIdentity,
 ): boolean {
   return (
     left.recoveryId === right.recoveryId &&
@@ -1010,7 +1011,7 @@ function sameRouting(
   );
 }
 
-function samePrepare(left: RecoveryV3HostPrepare, right: RecoveryV3HostPrepare): boolean {
+function samePrepare(left: RecoveryHostPrepare, right: RecoveryHostPrepare): boolean {
   return (
     sameRouting(left, right) &&
     left.engineId === right.engineId &&
@@ -1021,7 +1022,7 @@ function samePrepare(left: RecoveryV3HostPrepare, right: RecoveryV3HostPrepare):
   );
 }
 
-function sameStartReady(left: RecoveryV3HostStartReady, right: RecoveryV3HostStartReady): boolean {
+function sameStartReady(left: RecoveryHostStartReady, right: RecoveryHostStartReady): boolean {
   return (
     sameRouting(left, right) &&
     sameAuthorityCursor(left.committedThrough, right.committedThrough) &&

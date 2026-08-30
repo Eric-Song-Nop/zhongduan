@@ -7,15 +7,15 @@ import {
   RecoveryAdoptedSchema,
   RecoveryStartFenceSchema,
   RecoveryStartSchema,
-  RecoveryV3HostPrepareSchema,
-  RecoveryV3HostSourceClosedSchema,
-  RecoveryV3HostSourceGrantSchema,
-  RecoveryV3HostSourceReceivedSchema,
-  RecoveryV3HostSourceResetSchema,
-  RecoveryV3HostStartReadySchema,
+  RecoveryHostPrepareSchema,
+  RecoveryHostSourceClosedSchema,
+  RecoveryHostSourceGrantSchema,
+  RecoveryHostSourceReceivedSchema,
+  RecoveryHostSourceResetSchema,
+  RecoveryHostStartReadySchema,
   advanceDeliveryLaneCursor,
   decodeDataFrame,
-  decodeDeliveryEnvelopeV3,
+  decodeDeliveryEnvelope,
   toBrowserRecoverySourceClosed,
   type AuthorityCursor,
   type DataFrame,
@@ -24,9 +24,9 @@ import {
   type RecoveryAdopted,
   type RecoveryStart,
   type RecoveryStartFence,
-  type RecoveryV3HostPrepare,
-  type RecoveryV3HostSourceClosed,
-  type RecoveryV3HostSourceReset,
+  type RecoveryHostPrepare,
+  type RecoveryHostSourceClosed,
+  type RecoveryHostSourceReset,
 } from "@zhongduan/protocol";
 import type { RelayStore } from "./relay-store";
 
@@ -71,7 +71,7 @@ export interface RecoveryAttemptRow {
   recovery_done_through_json: string | null;
   recovery_id: string;
   replica_applied_json: string;
-  reset_reason: RecoveryV3HostSourceReset["reason"] | null;
+  reset_reason: RecoveryHostSourceReset["reason"] | null;
   source_closed_json: string | null;
   start_json: string | null;
   state: RecoveryAttemptState;
@@ -168,7 +168,7 @@ export interface BeginPreparingInput {
   hostFence: string;
   noProgressTimeoutMs: number;
   now: number;
-  prepare: RecoveryV3HostPrepare;
+  prepare: RecoveryHostPrepare;
 }
 
 export interface InstallFenceInput {
@@ -187,7 +187,6 @@ export type RecoveryStoreRejectReason =
   | "attempt-capacity"
   | "attempt-resetting"
   | "client-missing"
-  | "client-v2"
   | "deadline-expired"
   | "delivery-capacity"
   | "generation-owned"
@@ -274,7 +273,7 @@ function isPositiveSafeInteger(value: number): boolean {
 }
 
 /**
- * Durable scalar owner for one relay's Recovery v3 attempts.
+ * Durable scalar owner for one relay's recovery attempts.
  *
  * Every mutating method is deliberately synchronous and does not open its own
  * transaction. The Durable Object owner must call it from the transactionSync
@@ -578,7 +577,7 @@ export class RelayRecoveryStore {
       .toArray() as unknown as { prepare_json: string; start_json: string | null }[];
     const pinned = new Set<string>();
     for (const row of rows) {
-      const prepare = RecoveryV3HostPrepareSchema.parse(JSON.parse(row.prepare_json) as unknown);
+      const prepare = RecoveryHostPrepareSchema.parse(JSON.parse(row.prepare_json) as unknown);
       if (prepare.source.kind === "snapshot") pinned.add(prepare.source.snapshotId);
       if (row.start_json === null) continue;
       const start = RecoveryStartSchema.parse(JSON.parse(row.start_json) as unknown);
@@ -596,7 +595,7 @@ export class RelayRecoveryStore {
   }
 
   beginPreparing(input: BeginPreparingInput): RecoveryStoreResult {
-    const prepare = RecoveryV3HostPrepareSchema.parse(input.prepare);
+    const prepare = RecoveryHostPrepareSchema.parse(input.prepare);
     const hostFence = DecimalU64Schema.parse(input.hostFence);
     this.#validateTime(input.now);
     this.#validateTime(input.hardDeadlineAt);
@@ -774,7 +773,7 @@ export class RelayRecoveryStore {
       fence.recoveryId,
     );
     this.#insertOutbox(fence.recoveryId, "recovery-start", "browser", startJson, input.now);
-    const ready = RecoveryV3HostStartReadySchema.parse({
+    const ready = RecoveryHostStartReadySchema.parse({
       type: "recovery-start-ready",
       recoveryId: fence.recoveryId,
       connectionId: fence.connectionId,
@@ -803,7 +802,7 @@ export class RelayRecoveryStore {
     encoded: ArrayBuffer | Uint8Array,
     now: number,
   ): RecoveryDeliveryEnqueueResult {
-    const envelope = decodeDeliveryEnvelopeV3(encoded);
+    const envelope = decodeDeliveryEnvelope(encoded);
     const frame = decodeDataFrame(envelope.payload);
     this.#validateTime(now);
     const encodedBytes = encoded.byteLength;
@@ -875,7 +874,7 @@ export class RelayRecoveryStore {
     ) {
       return rejected("invalid-progress");
     }
-    const isDone = frame.kind === DataFrameKind.ReplayCommit;
+    const isDone = frame.kind === DataFrameKind.RecoveryDone;
     if (
       isDone &&
       (envelope.lane !== "recovery" ||
@@ -1144,7 +1143,7 @@ export class RelayRecoveryStore {
     }
     this.#touchProgress(attempt, now);
     if (receipt.lane === "recovery") {
-      const routed = RecoveryV3HostSourceReceivedSchema.parse({
+      const routed = RecoveryHostSourceReceivedSchema.parse({
         type: "recovery-source-received",
         recoveryId: attempt.recovery_id,
         connectionId: attempt.connection_id,
@@ -1256,8 +1255,8 @@ export class RelayRecoveryStore {
     return ok(true);
   }
 
-  markSourceClosed(closedInput: RecoveryV3HostSourceClosed, now: number): RecoveryStoreResult {
-    const closed = RecoveryV3HostSourceClosedSchema.parse(closedInput);
+  markSourceClosed(closedInput: RecoveryHostSourceClosed, now: number): RecoveryStoreResult {
+    const closed = RecoveryHostSourceClosedSchema.parse(closedInput);
     this.#validateTime(now);
     const attempt = this.attempt(closed.recoveryId);
     if (attempt === undefined) return rejected("missing-attempt");
@@ -1333,7 +1332,7 @@ export class RelayRecoveryStore {
     if (!this.#hasOutboxCapacityFor(recoveryId, "recovery-source-grant")) {
       return rejected("outbox-capacity");
     }
-    const frame = RecoveryV3HostSourceGrantSchema.parse({
+    const frame = RecoveryHostSourceGrantSchema.parse({
       type: "recovery-source-grant",
       recoveryId: attempt.recovery_id,
       connectionId: attempt.connection_id,
@@ -1514,10 +1513,10 @@ export class RelayRecoveryStore {
 
   reset(
     recoveryId: string,
-    reasonInput: RecoveryV3HostSourceReset["reason"],
+    reasonInput: RecoveryHostSourceReset["reason"],
     now: number,
   ): RecoveryStoreResult {
-    const reason = RecoveryV3HostSourceResetSchema.shape.reason.parse(reasonInput);
+    const reason = RecoveryHostSourceResetSchema.shape.reason.parse(reasonInput);
     this.#validateTime(now);
     const attempt = this.attempt(recoveryId);
     if (attempt === undefined) return rejected("missing-attempt");
@@ -1547,7 +1546,7 @@ export class RelayRecoveryStore {
       now,
       recoveryId,
     );
-    const frame = RecoveryV3HostSourceResetSchema.parse({
+    const frame = RecoveryHostSourceResetSchema.parse({
       type: "recovery-source-reset",
       recoveryId: attempt.recovery_id,
       connectionId: attempt.connection_id,
@@ -1616,7 +1615,7 @@ export class RelayRecoveryStore {
   }
 
   /**
-   * Fences valid legacy rows until the session satisfies the aggregate budget.
+   * Fences excess attempts until the session satisfies the aggregate budget.
    * Victims are stable: observers first, then largest contribution, newest
    * update, and descending recovery id. Complete attempts are fenced locally
    * because no Host recovery source remains to reset.
@@ -1706,11 +1705,7 @@ export class RelayRecoveryStore {
     }
   }
 
-  #resetOrThrow(
-    recoveryId: string,
-    reason: RecoveryV3HostSourceReset["reason"],
-    now: number,
-  ): void {
+  #resetOrThrow(recoveryId: string, reason: RecoveryHostSourceReset["reason"], now: number): void {
     const result = this.reset(recoveryId, reason, now);
     if (!result.ok || !result.changed) {
       throw new Error(
@@ -1766,7 +1761,6 @@ export class RelayRecoveryStore {
   ): RecoveryStoreRejectReason | undefined {
     const client = this.relay.clientById(clientId);
     if (client === undefined || client.registered_at === null) return "client-missing";
-    if (client.recovery_strategy !== "v3") return "client-v2";
     if (client.stream_id !== streamId || client.delivery_generation !== generation) {
       return "identity-mismatch";
     }
@@ -1813,7 +1807,7 @@ export class RelayRecoveryStore {
     fence: RecoveryStartFence,
     start: RecoveryStart,
   ): boolean {
-    const prepare = RecoveryV3HostPrepareSchema.parse(JSON.parse(attempt.prepare_json) as unknown);
+    const prepare = RecoveryHostPrepareSchema.parse(JSON.parse(attempt.prepare_json) as unknown);
     const sourceMatches =
       prepare.source.kind === fence.source.kind &&
       fence.source.kind === start.source.kind &&
@@ -1828,7 +1822,7 @@ export class RelayRecoveryStore {
       fence.deliveryGeneration === start.deliveryGeneration &&
       fence.streamId === start.streamId &&
       fence.engineId === start.engineId &&
-      start.authorityDataVersion === 2 &&
+      start.authorityDataFormat === 1 &&
       sameCursor(prepare.base, fence.base) &&
       sameCursor(fence.base, start.base) &&
       sameCursor(fence.committedThrough, start.committedThrough) &&
@@ -1864,7 +1858,7 @@ export class RelayRecoveryStore {
       throw new Error("canonical authority identity changed");
     }
     const previousEvent = BigInt(previous.eventSeq);
-    if (frame.kind === DataFrameKind.ReplayCommit) {
+    if (frame.kind === DataFrameKind.RecoveryDone) {
       if (lane !== "recovery" || frame.eventSeq !== previousEvent) {
         throw new Error("RecoveryDone is not at the current authority cursor");
       }
@@ -2547,7 +2541,6 @@ export class RelayRecoveryStore {
     const client = this.relay.clientById(attempt.client_id);
     const stillOwned =
       client !== undefined &&
-      client.recovery_strategy === "v3" &&
       client.delivery_generation === attempt.delivery_generation &&
       client.stream_id === attempt.stream_id &&
       this.relay.session()?.host_fence === attempt.host_fence;

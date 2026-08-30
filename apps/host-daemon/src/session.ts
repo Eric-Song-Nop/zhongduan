@@ -6,7 +6,7 @@ import {
   type ResizePayload,
 } from "@zhongduan/protocol";
 
-import type { EventJournal, JournalCursor, JournalReplay, JournalReplayPlan } from "./journal";
+import type { EventJournal, JournalCursor, JournalRange, JournalRangePlan } from "./journal";
 import type { PtyProcess } from "./pty-process";
 import type { SemanticKey, SemanticMouse, TerminalAuthority } from "./terminal-authority";
 
@@ -30,7 +30,6 @@ type SessionMessage =
     }
   | {
       type: "snapshot";
-      fence?: (snapshot: SnapshotCapture) => void;
       resolve: (snapshot: SnapshotCapture) => void;
       reject: (error: unknown) => void;
     }
@@ -206,25 +205,11 @@ export class TerminalSession {
     };
   }
 
-  replayThrough(base: ReplayCursor, commit: ReplayCursor): JournalReplay {
-    if (base.sessionEpoch !== this.#sessionEpoch || commit.sessionEpoch !== this.#sessionEpoch) {
-      return { status: "gap" };
-    }
-    return this.#journal.replayThrough(base, commit);
-  }
-
-  planReplayThrough(base: ReplayCursor, commit: ReplayCursor): JournalReplayPlan {
-    if (base.sessionEpoch !== this.#sessionEpoch || commit.sessionEpoch !== this.#sessionEpoch) {
-      return { status: "gap" };
-    }
-    return this.#journal.planReplayThrough(base, commit);
-  }
-
   subscribe(subscriber: (frame: Uint8Array) => void, cursor?: ReplayCursor): SubscriptionResult {
     if (cursor !== undefined && cursor.sessionEpoch !== this.#sessionEpoch) {
       return { status: "gap" };
     }
-    const replay = cursor === undefined ? undefined : this.#journal.replayFrom(cursor);
+    const replay = cursor === undefined ? undefined : this.#journal.readFrom(cursor);
     if (replay?.status === "gap") return { status: "gap" };
 
     let replaying = replay !== undefined;
@@ -342,12 +327,6 @@ export class TerminalSession {
     });
   }
 
-  captureSnapshotWithFence(fence: (snapshot: SnapshotCapture) => void): Promise<SnapshotCapture> {
-    return new Promise((resolve, reject) => {
-      this.#enqueue({ type: "snapshot", fence, resolve, reject });
-    });
-  }
-
   prepareRecoveryGap(
     base: ReplayCursor,
     limits: RecoveryGapLimits,
@@ -423,7 +402,6 @@ export class TerminalSession {
           case "snapshot":
             try {
               const snapshot = this.#captureSnapshot();
-              next.fence?.(snapshot);
               next.resolve(snapshot);
             } catch (error) {
               next.reject(error);
@@ -608,9 +586,12 @@ export class TerminalSession {
     commit: (gap: PreparedRecoveryGap) => boolean,
   ): PrepareRecoveryGapResult {
     const committedThrough = this.cursor;
-    let plan: JournalReplayPlan;
+    let plan: JournalRangePlan;
     try {
-      plan = this.planReplayThrough(base, committedThrough);
+      plan =
+        base.sessionEpoch === this.#sessionEpoch
+          ? this.#journal.planRangeThrough(base, committedThrough)
+          : { status: "gap" };
     } catch {
       return { status: "unavailable", reason: "journal-gap" };
     }
@@ -621,7 +602,7 @@ export class TerminalSession {
       return { status: "unavailable", reason: "capacity" };
     }
 
-    let replay: JournalReplay;
+    let replay: JournalRange;
     try {
       replay = plan.materialize();
     } catch {

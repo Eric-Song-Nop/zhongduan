@@ -150,6 +150,7 @@ describe("cloud CLI startup lifecycle", () => {
   it("re-reads a rotated bootstrap token file while cloud creation is degraded", async () => {
     const authorizations: Array<string | undefined> = [];
     let connectionSetRequests = 0;
+    let snapshotUploadRequests = 0;
     const tokenPath = await bootstrapTokenPath("expired-bootstrap");
     const server = createServer(async (request, response) => {
       if (request.url === "/api/v1/sessions") {
@@ -190,7 +191,10 @@ describe("cloud CLI startup lifecycle", () => {
         );
         return;
       }
-      connectionSetRequests += 1;
+      if (request.url?.endsWith("/connection-sets")) connectionSetRequests += 1;
+      if (request.method === "PUT" && request.url?.includes("/snapshots/")) {
+        snapshotUploadRequests += 1;
+      }
     });
     const url = await listen(server);
     const infoPath = await sessionInfoPath();
@@ -213,6 +217,7 @@ describe("cloud CLI startup lifecycle", () => {
     expect(result).toBe(0);
     expect(authorizations).toEqual(["Bearer expired-bootstrap", "Bearer rotated-bootstrap"]);
     expect(connectionSetRequests).toBe(1);
+    expect(snapshotUploadRequests).toBe(1);
   });
 
   it("reuses one caller-generated session id after the create response is lost", async () => {

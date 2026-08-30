@@ -8,9 +8,9 @@ import {
 import { ProtocolError } from "./errors";
 import { MAX_U64 } from "./scalars";
 
-export const DELIVERY_ENVELOPE_V3_MAGIC = 0x5a454e56;
-export const DELIVERY_ENVELOPE_V3_VERSION = 3;
-export const DELIVERY_ENVELOPE_V3_HEADER_BYTES = 40;
+export const DELIVERY_ENVELOPE_MAGIC = 0x5a454e56;
+export const DELIVERY_ENVELOPE_FORMAT = 1;
+export const DELIVERY_ENVELOPE_HEADER_BYTES = 40;
 
 const MAX_DELIVERY_ENVELOPE_PAYLOAD_BYTES = DATA_HEADER_BYTES + MAX_DATA_PAYLOAD_BYTES;
 
@@ -21,7 +21,7 @@ const DeliveryLaneCode = {
 
 export type DeliveryLane = keyof typeof DeliveryLaneCode;
 
-export interface DeliveryEnvelopeV3 {
+export interface DeliveryEnvelope {
   readonly cumulativeEncodedBytes: bigint;
   readonly deliveryGeneration: bigint;
   readonly deliveryOrdinal: bigint;
@@ -79,7 +79,7 @@ function validateCanonicalPayload(lane: DeliveryLane, payload: Uint8Array): void
   }
   const frame = decodeDataFrame(payload);
   if (frame.deliveryGeneration !== 0n || frame.streamId !== 0 || frame.flags !== 0) {
-    throw new ProtocolError("BAD_PAYLOAD", "DeliveryEnvelope payload is not canonical data v2");
+    throw new ProtocolError("BAD_PAYLOAD", "DeliveryEnvelope payload is not canonical data");
   }
   if (frame.kind === DataFrameKind.ResizeApplied) {
     try {
@@ -97,7 +97,7 @@ function validateCanonicalPayload(lane: DeliveryLane, payload: Uint8Array): void
   }
   if (
     lane === "recovery" &&
-    frame.kind === DataFrameKind.ReplayCommit &&
+    frame.kind === DataFrameKind.RecoveryDone &&
     frame.payload.byteLength === 0
   ) {
     return;
@@ -105,14 +105,14 @@ function validateCanonicalPayload(lane: DeliveryLane, payload: Uint8Array): void
   throw new ProtocolError("BAD_KIND", "data kind is not valid for the DeliveryEnvelope lane");
 }
 
-function validateEnvelope(envelope: DeliveryEnvelopeV3): void {
+function validateEnvelope(envelope: DeliveryEnvelope): void {
   assertDeliveryLane(envelope.lane);
   assertPositiveU64(envelope.deliveryGeneration, "deliveryGeneration");
   assertPositiveU64(envelope.deliveryOrdinal, "deliveryOrdinal");
   assertPositiveU64(envelope.cumulativeEncodedBytes, "cumulativeEncodedBytes");
   assertU32(envelope.streamId, "streamId", true);
   validateCanonicalPayload(envelope.lane, envelope.payload);
-  const encodedBytes = BigInt(DELIVERY_ENVELOPE_V3_HEADER_BYTES + envelope.payload.byteLength);
+  const encodedBytes = BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + envelope.payload.byteLength);
   if (
     envelope.cumulativeEncodedBytes < encodedBytes ||
     (envelope.deliveryOrdinal === 1n && envelope.cumulativeEncodedBytes !== encodedBytes)
@@ -121,12 +121,12 @@ function validateEnvelope(envelope: DeliveryEnvelopeV3): void {
   }
 }
 
-export function encodeDeliveryEnvelopeV3(envelope: DeliveryEnvelopeV3): Uint8Array {
+export function encodeDeliveryEnvelope(envelope: DeliveryEnvelope): Uint8Array {
   validateEnvelope(envelope);
-  const encoded = new Uint8Array(DELIVERY_ENVELOPE_V3_HEADER_BYTES + envelope.payload.byteLength);
+  const encoded = new Uint8Array(DELIVERY_ENVELOPE_HEADER_BYTES + envelope.payload.byteLength);
   const view = new DataView(encoded.buffer);
-  view.setUint32(0, DELIVERY_ENVELOPE_V3_MAGIC, false);
-  view.setUint8(4, DELIVERY_ENVELOPE_V3_VERSION);
+  view.setUint32(0, DELIVERY_ENVELOPE_MAGIC, false);
+  view.setUint8(4, DELIVERY_ENVELOPE_FORMAT);
   view.setUint8(5, DeliveryLaneCode[envelope.lane]);
   view.setUint16(6, 0, true);
   view.setBigUint64(8, envelope.deliveryGeneration, true);
@@ -134,21 +134,21 @@ export function encodeDeliveryEnvelopeV3(envelope: DeliveryEnvelopeV3): Uint8Arr
   view.setBigUint64(24, envelope.cumulativeEncodedBytes, true);
   view.setUint32(32, envelope.streamId, true);
   view.setUint32(36, envelope.payload.byteLength, true);
-  encoded.set(envelope.payload, DELIVERY_ENVELOPE_V3_HEADER_BYTES);
+  encoded.set(envelope.payload, DELIVERY_ENVELOPE_HEADER_BYTES);
   return encoded;
 }
 
-export function decodeDeliveryEnvelopeV3(input: ArrayBuffer | Uint8Array): DeliveryEnvelopeV3 {
+export function decodeDeliveryEnvelope(input: ArrayBuffer | Uint8Array): DeliveryEnvelope {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-  if (bytes.byteLength < DELIVERY_ENVELOPE_V3_HEADER_BYTES) {
+  if (bytes.byteLength < DELIVERY_ENVELOPE_HEADER_BYTES) {
     throw new ProtocolError("BAD_LENGTH", "DeliveryEnvelope header is truncated");
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (view.getUint32(0, false) !== DELIVERY_ENVELOPE_V3_MAGIC) {
+  if (view.getUint32(0, false) !== DELIVERY_ENVELOPE_MAGIC) {
     throw new ProtocolError("BAD_MAGIC", "invalid DeliveryEnvelope magic");
   }
-  if (view.getUint8(4) !== DELIVERY_ENVELOPE_V3_VERSION) {
-    throw new ProtocolError("BAD_VERSION", "unsupported DeliveryEnvelope version");
+  if (view.getUint8(4) !== DELIVERY_ENVELOPE_FORMAT) {
+    throw new ProtocolError("BAD_FORMAT", "unsupported DeliveryEnvelope format");
   }
   if (view.getUint16(6, true) !== 0) {
     throw new ProtocolError("BAD_FLAGS", "DeliveryEnvelope flags must be zero");
@@ -156,17 +156,17 @@ export function decodeDeliveryEnvelopeV3(input: ArrayBuffer | Uint8Array): Deliv
   const payloadLength = view.getUint32(36, true);
   if (
     payloadLength > MAX_DELIVERY_ENVELOPE_PAYLOAD_BYTES ||
-    bytes.byteLength !== DELIVERY_ENVELOPE_V3_HEADER_BYTES + payloadLength
+    bytes.byteLength !== DELIVERY_ENVELOPE_HEADER_BYTES + payloadLength
   ) {
     throw new ProtocolError("BAD_LENGTH", "DeliveryEnvelope payload length mismatch");
   }
-  const envelope: DeliveryEnvelopeV3 = {
+  const envelope: DeliveryEnvelope = {
     lane: laneForCode(view.getUint8(5)),
     deliveryGeneration: view.getBigUint64(8, true),
     deliveryOrdinal: view.getBigUint64(16, true),
     cumulativeEncodedBytes: view.getBigUint64(24, true),
     streamId: view.getUint32(32, true),
-    payload: bytes.subarray(DELIVERY_ENVELOPE_V3_HEADER_BYTES),
+    payload: bytes.subarray(DELIVERY_ENVELOPE_HEADER_BYTES),
   };
   validateEnvelope(envelope);
   return envelope;
@@ -175,7 +175,7 @@ export function decodeDeliveryEnvelopeV3(input: ArrayBuffer | Uint8Array): Deliv
 /** Validates cumulative progress for one exact generation, lane, and stream. */
 export function advanceDeliveryLaneCursor(
   previous: DeliveryLaneCursor,
-  envelope: DeliveryEnvelopeV3,
+  envelope: DeliveryEnvelope,
 ): DeliveryLaneCursor {
   if (
     previous.deliveryOrdinal < 0n ||
@@ -201,7 +201,7 @@ export function advanceDeliveryLaneCursor(
   if (envelope.deliveryOrdinal !== previous.deliveryOrdinal + 1n) {
     throw new ProtocolError("EVENT_GAP", "delivery lane ordinal is not contiguous");
   }
-  const encodedBytes = BigInt(DELIVERY_ENVELOPE_V3_HEADER_BYTES + envelope.payload.byteLength);
+  const encodedBytes = BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + envelope.payload.byteLength);
   if (
     previous.cumulativeEncodedBytes > MAX_U64 - encodedBytes ||
     envelope.cumulativeEncodedBytes !== previous.cumulativeEncodedBytes + encodedBytes
