@@ -1,4 +1,4 @@
-import { decodeDeliveryEnvelopeV3, decodeRecoveryStartFence } from "@zhongduan/protocol";
+import { decodeDeliveryEnvelope, decodeRecoveryStartFence } from "@zhongduan/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -10,7 +10,7 @@ import {
   sinkOracle,
   waitForCondition,
   type OpenRawRecoveryBrowser,
-} from "./recovery-v3-three-owner-harness";
+} from "./recovery-three-owner-harness";
 
 let harness: ThreeOwnerHarness | undefined;
 
@@ -19,7 +19,7 @@ afterEach(async () => {
   harness = undefined;
 });
 
-describe("Recovery v3 deterministic three-owner continuity", () => {
+describe("deterministic three-owner recovery continuity", () => {
   it("converges Host, durable Cloud, and Browser across cross-channel reorder and stable progress retries", async () => {
     harness = await ThreeOwnerHarness.create();
     const base = seededMutations(0x26_5c_2000, 3);
@@ -181,7 +181,7 @@ describe("Recovery v3 deterministic three-owner continuity", () => {
             // Recovery envelopes are held below; other data is forwarded.
           }
           try {
-            decodeDeliveryEnvelopeV3(data);
+            decodeDeliveryEnvelope(data);
             heldRecoveryFrames.push(data.slice());
             return;
           } catch {

@@ -8,7 +8,7 @@ import {
 import { DataFrameFlag, DataFrameKind, decodeDataFrame, encodeDataFrame } from "./data-frame";
 import { ProtocolError } from "./errors";
 import { PositiveDecimalU64Schema } from "./scalars";
-import { RecoveryResourceIdSchema } from "./recovery-v3-control";
+import { RecoveryResourceIdSchema } from "./recovery-control";
 import { SnapshotResourceIdSchema } from "./snapshot";
 
 const MAX_RECOVERY_START_FENCE_PAYLOAD_BYTES = 2_048;
@@ -26,7 +26,6 @@ const StartFenceSourceSchema = z.discriminatedUnion("kind", [
 ]);
 
 const RecoveryStartFencePayloadSchema = z.strictObject({
-  mode: z.literal("recovery-v3"),
   recoveryId: RecoveryResourceIdSchema,
   connectionId: RecoveryResourceIdSchema,
   engineId,
@@ -89,7 +88,6 @@ export function encodeRecoveryStartFence(input: RecoveryStartFence): Uint8Array 
   const fence = RecoveryStartFenceSchema.parse(input);
   const payload = textEncoder.encode(
     JSON.stringify({
-      mode: "recovery-v3",
       recoveryId: fence.recoveryId,
       connectionId: fence.connectionId,
       engineId: fence.engineId,
@@ -102,7 +100,7 @@ export function encodeRecoveryStartFence(input: RecoveryStartFence): Uint8Array 
     throw new ProtocolError("BAD_LENGTH", "RecoveryStartFence payload is too large");
   }
   return encodeDataFrame({
-    kind: DataFrameKind.DeliveryBarrier,
+    kind: DataFrameKind.RecoveryStartFence,
     flags: DataFrameFlag.None,
     sessionEpoch: BigInt(fence.committedThrough.sessionEpoch),
     deliveryGeneration: BigInt(fence.deliveryGeneration),
@@ -116,7 +114,7 @@ export function encodeRecoveryStartFence(input: RecoveryStartFence): Uint8Array 
 export function decodeRecoveryStartFence(input: ArrayBuffer | Uint8Array): RecoveryStartFence {
   const frame = decodeDataFrame(input);
   if (
-    frame.kind !== DataFrameKind.DeliveryBarrier ||
+    frame.kind !== DataFrameKind.RecoveryStartFence ||
     frame.deliveryGeneration === 0n ||
     frame.streamId === 0
   ) {

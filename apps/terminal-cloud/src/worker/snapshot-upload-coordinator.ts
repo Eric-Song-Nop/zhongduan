@@ -71,13 +71,7 @@ function r2ErrorCode(error: unknown): number | undefined {
 }
 
 function publicSnapshot(snapshot: FinalizedSnapshot): SnapshotMetadata {
-  const {
-    objectKey: _objectKey,
-    r2Version: _r2Version,
-    etag: _etag,
-    uploadKind: _uploadKind,
-    ...metadata
-  } = snapshot;
+  const { objectKey: _objectKey, r2Version: _r2Version, etag: _etag, ...metadata } = snapshot;
   return metadata;
 }
 
@@ -221,7 +215,7 @@ export class SnapshotUploadCoordinator {
       object === null ||
       object.version !== snapshot.r2Version ||
       object.etag !== snapshot.etag ||
-      !matchesSnapshotObject(object, snapshot, snapshot.uploadKind)
+      !matchesSnapshotObject(object, snapshot)
     ) {
       return json({ error: "snapshot-unavailable" }, 503);
     }
@@ -295,7 +289,7 @@ export class SnapshotUploadCoordinator {
           contentType: SNAPSHOT_MEDIA_TYPE,
           cacheControl: "private, no-store",
         },
-        customMetadata: snapshotCustomMetadata(metadata, "multipart-verified"),
+        customMetadata: snapshotCustomMetadata(metadata),
       }),
     );
     if (creating.kind !== "fulfilled") {
@@ -345,7 +339,7 @@ export class SnapshotUploadCoordinator {
       object === null ||
       object.version !== snapshot.r2Version ||
       object.etag !== snapshot.etag ||
-      !matchesSnapshotObject(object, snapshot, snapshot.uploadKind)
+      !matchesSnapshotObject(object, snapshot)
     ) {
       return json({ error: "snapshot-unavailable" }, 503);
     }
@@ -383,7 +377,7 @@ export class SnapshotUploadCoordinator {
         return failed();
       }
       const object = heading.value;
-      if (object === null || !matchesSnapshotObject(object, metadata, "multipart-verified")) {
+      if (object === null || !matchesSnapshotObject(object, metadata)) {
         return failed();
       }
       const completed = this.snapshots.recordMultipartCompleted(
@@ -421,7 +415,7 @@ export class SnapshotUploadCoordinator {
       if (
         upload.state !== "completing" ||
         object === null ||
-        !matchesSnapshotObject(object, metadata, "multipart-verified")
+        !matchesSnapshotObject(object, metadata)
       ) {
         this.snapshots.recordMultipartUncertain(
           upload.snapshot_id,
@@ -588,7 +582,7 @@ export class SnapshotUploadCoordinator {
       object === null ||
       object.version !== completedObject.version ||
       object.etag !== completedObject.etag ||
-      !matchesSnapshotObject(object, metadata, "multipart-verified")
+      !matchesSnapshotObject(object, metadata)
     ) {
       return json({ error: "snapshot-upload-failed" }, 503);
     }
@@ -718,7 +712,7 @@ export class SnapshotUploadCoordinator {
       if (
         upload.state !== "completing" ||
         object === null ||
-        !matchesSnapshotObject(object, upload.metadata, "multipart-verified")
+        !matchesSnapshotObject(object, upload.metadata)
       ) {
         return this.snapshots.recordMultipartUncertain(
           upload.snapshotId,

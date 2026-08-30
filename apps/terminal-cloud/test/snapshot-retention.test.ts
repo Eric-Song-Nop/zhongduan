@@ -5,8 +5,8 @@ import { describe, expect, it } from "vitest";
 import { DURABLE_ALARM_FAILURE_RETRY_MS } from "../src/worker/durable-alarm-mux";
 import {
   hexToBytes,
+  snapshotAttemptObjectKey,
   snapshotCustomMetadata,
-  snapshotObjectKey,
   type FinalizedSnapshot,
 } from "../src/worker/snapshot-contract";
 import { RelayStore } from "../src/worker/relay-store";
@@ -25,6 +25,7 @@ import {
   overrideSnapshotBucket,
   sessionStub,
   sha256Hex,
+  snapshotObjectKeys,
   storedSnapshotKey,
   uploadSnapshot,
   within,
@@ -91,7 +92,6 @@ describe("snapshot multipart retention", () => {
           objectKey: reserved.upload.object_key,
           r2Version: `version-${snapshotId}`,
           etag: `etag-${snapshotId}`,
-          uploadKind: "multipart-verified",
         };
         const uploadId = `upload-${snapshotId}`;
         expect(snapshots.recordMultipartUpload(snapshotId, snapshot.objectKey, uploadId)).toBe(
@@ -200,12 +200,12 @@ describe("snapshot multipart retention", () => {
           `INSERT INTO snapshot
             (snapshot_id, session_epoch, cut_event_seq, next_pty_offset, engine_id,
              object_key, r2_version, etag, sha256, compressed_length,
-             uncompressed_length, compression, state, created_at, upload_kind)
+             uncompressed_length, compression, state, created_at)
            VALUES (?, '7', '0', '0', ?, ?, ?, ?, ?, 1, '1', 'none',
-                   'servable', ?, 'single-put-verified')`,
+                   'servable', ?)`,
           snapshotId,
           engineId,
-          snapshotObjectKey(session.sessionId, snapshotId),
+          snapshotAttemptObjectKey(session.sessionId, snapshotId, "retention_seed_0001"),
           `version-${index}`,
           `etag-${index}`,
           "a".repeat(64),
@@ -267,14 +267,14 @@ describe("snapshot multipart retention", () => {
           `INSERT INTO snapshot
             (snapshot_id, session_epoch, cut_event_seq, next_pty_offset, engine_id,
              object_key, r2_version, etag, sha256, compressed_length,
-             uncompressed_length, compression, state, created_at, upload_kind)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'servable', ?, 'single-put-verified')`,
+             uncompressed_length, compression, state, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'servable', ?)`,
           snapshot.snapshotId,
           snapshot.sessionEpoch,
           snapshot.cutEventSeq,
           snapshot.nextPtyOffset,
           snapshot.engineId,
-          snapshotObjectKey(snapshot.sessionId, snapshot.snapshotId),
+          snapshotAttemptObjectKey(snapshot.sessionId, snapshot.snapshotId, "retention_seed_0002"),
           `version-${index}`,
           `etag-${index}`,
           snapshot.sha256,
@@ -365,7 +365,7 @@ describe("snapshot multipart retention", () => {
     const rejected = await uploadSnapshot(session, rejectedId);
     expect(rejected.status).toBe(503);
     expect(await rejected.json()).toEqual({ error: "snapshot-reservation-failed" });
-    expect(await env.SNAPSHOTS.head(snapshotObjectKey(session.sessionId, rejectedId))).toBeNull();
+    expect(await snapshotObjectKeys(session.sessionId, rejectedId)).toEqual([]);
     expect({ createCalls, headCalls }).toEqual({ createCalls: 4, headCalls: 4 });
     const uploads = await runInDurableObject(sessionStub(session.sessionId), (_instance, durable) =>
       durable.storage.sql
@@ -410,7 +410,7 @@ describe("snapshot multipart retention", () => {
         contentType: SNAPSHOT_MEDIA_TYPE,
         cacheControl: "private, no-store",
       },
-      customMetadata: snapshotCustomMetadata(metadata, "multipart-verified"),
+      customMetadata: snapshotCustomMetadata(metadata),
     });
     await runInDurableObject(sessionStub(session.sessionId), (_instance, durable) => {
       const snapshots = new SnapshotStore(
@@ -558,7 +558,7 @@ describe("snapshot multipart retention", () => {
     );
     const multipart = await env.SNAPSHOTS.createMultipartUpload(recoveringKey, {
       httpMetadata: { contentType: SNAPSHOT_MEDIA_TYPE, cacheControl: "private, no-store" },
-      customMetadata: snapshotCustomMetadata(metadata, "multipart-verified"),
+      customMetadata: snapshotCustomMetadata(metadata),
     });
     await runInDurableObject(sessionStub(session.sessionId), (_instance, durable) => {
       const snapshots = new SnapshotStore(
@@ -640,8 +640,16 @@ describe("snapshot multipart retention", () => {
       const session = await createSession();
       const blockedId = `snapshot_gc_blocked_${mode}`;
       const deletedId = `snapshot_gc_deleted_${mode}`;
-      let blockedKey = snapshotObjectKey(session.sessionId, blockedId);
-      const deletedKey = snapshotObjectKey(session.sessionId, deletedId);
+      let blockedKey = snapshotAttemptObjectKey(
+        session.sessionId,
+        blockedId,
+        "retention_block_0001",
+      );
+      const deletedKey = snapshotAttemptObjectKey(
+        session.sessionId,
+        deletedId,
+        "retention_delete_0001",
+      );
       const blockedMetadata = await metadataFor(session, blockedId);
       const deletedMetadata = await metadataFor(session, deletedId);
       const blockedObject =
@@ -665,14 +673,14 @@ describe("snapshot multipart retention", () => {
             `INSERT INTO snapshot
               (snapshot_id, session_epoch, cut_event_seq, next_pty_offset, engine_id,
                object_key, r2_version, etag, sha256, compressed_length,
-               uncompressed_length, compression, state, created_at, upload_kind)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'retired', ?, 'single-put-verified')`,
+               uncompressed_length, compression, state, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'retired', ?)`,
             metadata.snapshotId,
             metadata.sessionEpoch,
             metadata.cutEventSeq,
             metadata.nextPtyOffset,
             metadata.engineId,
-            snapshotObjectKey(metadata.sessionId, metadata.snapshotId),
+            metadata.snapshotId === blockedId ? blockedKey : deletedKey,
             object.version,
             object.etag,
             metadata.sha256,
@@ -1044,7 +1052,7 @@ describe("snapshot multipart retention", () => {
     );
     await env.SNAPSHOTS.createMultipartUpload(objectKey, {
       httpMetadata: { contentType: SNAPSHOT_MEDIA_TYPE, cacheControl: "private, no-store" },
-      customMetadata: snapshotCustomMetadata(metadata, "multipart-verified"),
+      customMetadata: snapshotCustomMetadata(metadata),
     });
     expect(await env.SNAPSHOTS.head(objectKey)).toBeNull();
 
@@ -1152,7 +1160,11 @@ describe("snapshot multipart retention", () => {
           uncompressedLength: body.byteLength.toString(),
           sha256: digest,
         };
-        const objectKey = snapshotObjectKey(session.sessionId, snapshotId);
+        const objectKey = snapshotAttemptObjectKey(
+          session.sessionId,
+          snapshotId,
+          "retention_backlog_0001",
+        );
         const object = await env.SNAPSHOTS.put(objectKey, body, {
           sha256: hexToBytes(digest),
           httpMetadata: {
@@ -1171,8 +1183,8 @@ describe("snapshot multipart retention", () => {
           `INSERT INTO snapshot
             (snapshot_id, session_epoch, cut_event_seq, next_pty_offset, engine_id,
              object_key, r2_version, etag, sha256, compressed_length,
-             uncompressed_length, compression, state, created_at, upload_kind)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'single-put-verified')`,
+             uncompressed_length, compression, state, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           entry.metadata.snapshotId,
           entry.metadata.sessionEpoch,
           entry.metadata.cutEventSeq,
@@ -1202,7 +1214,7 @@ describe("snapshot multipart retention", () => {
     expect(rejected.status).toBe(503);
     expect(await rejected.json()).toEqual({ error: "snapshot-reservation-failed" });
     expect(rejectedR2Calls).toBe(0);
-    expect(await env.SNAPSHOTS.head(snapshotObjectKey(session.sessionId, rejectedId))).toBeNull();
+    expect(await snapshotObjectKeys(session.sessionId, rejectedId)).toEqual([]);
 
     const saturated = await runInDurableObject(
       sessionStub(session.sessionId),
@@ -1383,7 +1395,7 @@ describe("snapshot multipart retention", () => {
       const response = await uploadSnapshot(session, snapshotId, session.hostCapability, overrides);
       expect(response.status).toBe(409);
       expect(await response.json()).toEqual({ error: "snapshot-conflict" });
-      expect(await env.SNAPSHOTS.head(snapshotObjectKey(session.sessionId, snapshotId))).toBeNull();
+      expect(await snapshotObjectKeys(session.sessionId, snapshotId)).toEqual([]);
       const pointer = await getSnapshot(session, snapshotId);
       expect(pointer.status).toBe(404);
       await pointer.body?.cancel();
@@ -1412,7 +1424,7 @@ describe("snapshot multipart retention", () => {
     );
     const multipart = await env.SNAPSHOTS.createMultipartUpload(objectKey, {
       httpMetadata: { contentType: SNAPSHOT_MEDIA_TYPE, cacheControl: "private, no-store" },
-      customMetadata: snapshotCustomMetadata(metadata, "multipart-verified"),
+      customMetadata: snapshotCustomMetadata(metadata),
     });
     const part = await multipart.uploadPart(1, body);
     await runInDurableObject(sessionStub(session.sessionId), (_instance, durable) => {
@@ -1687,7 +1699,7 @@ describe("snapshot multipart retention", () => {
     );
     const multipart = await env.SNAPSHOTS.createMultipartUpload(objectKey, {
       httpMetadata: { contentType: SNAPSHOT_MEDIA_TYPE, cacheControl: "private, no-store" },
-      customMetadata: snapshotCustomMetadata(metadata, "multipart-verified"),
+      customMetadata: snapshotCustomMetadata(metadata),
     });
     await runInDurableObject(sessionStub(session.sessionId), (_instance, durable) => {
       const snapshots = new SnapshotStore(

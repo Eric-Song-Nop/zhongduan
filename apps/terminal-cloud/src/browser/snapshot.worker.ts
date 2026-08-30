@@ -34,7 +34,7 @@ async function loadSnapshot(request: SnapshotWorkerRequest): Promise<void> {
       maxCompressedBytes: MAX_SNAPSHOT_COMPRESSED_BYTES,
       maxUncompressedBytes: MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
     });
-    const snapshot = await transport.load(request.manifest, abort.signal);
+    const snapshot = await transport.load(request.source, abort.signal);
     const bytes = transferableSnapshot(snapshot);
     const response = { type: "loaded", bytes } satisfies SnapshotWorkerResponse;
     worker.postMessage(response, [bytes]);

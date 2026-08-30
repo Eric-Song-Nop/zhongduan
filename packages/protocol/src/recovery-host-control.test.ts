@@ -2,19 +2,19 @@ import { describe, expect, it } from "vitest";
 
 import { HostControlFrameSchema, RelayToHostControlFrameSchema } from "./control-frame";
 import {
-  RecoveryV3CloudToHostControlFrameSchema,
-  RecoveryV3HostPrepareRejectedSchema,
-  RecoveryV3HostPrepareSchema,
-  RecoveryV3HostRoutingIdentitySchema,
-  RecoveryV3HostSourceClosedSchema,
-  RecoveryV3HostSourceGrantSchema,
-  RecoveryV3HostSourceReceivedSchema,
-  RecoveryV3HostSourceResetSchema,
-  RecoveryV3HostStartReadySchema,
-  RecoveryV3HostToCloudControlFrameSchema,
+  RecoveryCloudToHostControlFrameSchema,
+  RecoveryHostPrepareRejectedSchema,
+  RecoveryHostPrepareSchema,
+  RecoveryHostRoutingIdentitySchema,
+  RecoveryHostSourceClosedSchema,
+  RecoveryHostSourceGrantSchema,
+  RecoveryHostSourceReceivedSchema,
+  RecoveryHostSourceResetSchema,
+  RecoveryHostStartReadySchema,
+  RecoveryHostToCloudControlFrameSchema,
   toBrowserRecoverySourceClosed,
-} from "./recovery-v3-host-control";
-import { RecoverySourceClosedSchema } from "./recovery-v3-control";
+} from "./recovery-host-control";
+import { RecoverySourceClosedSchema } from "./recovery-control";
 import { MAX_U64 } from "./scalars";
 
 const routing = {
@@ -72,115 +72,113 @@ const sourceClosed = {
 } as const;
 
 const cloudToHostCases = [
-  [RecoveryV3HostPrepareSchema, prepare],
-  [RecoveryV3HostStartReadySchema, startReady],
-  [RecoveryV3HostSourceGrantSchema, sourceGrant],
-  [RecoveryV3HostSourceReceivedSchema, sourceReceived],
-  [RecoveryV3HostSourceResetSchema, sourceReset],
+  [RecoveryHostPrepareSchema, prepare],
+  [RecoveryHostStartReadySchema, startReady],
+  [RecoveryHostSourceGrantSchema, sourceGrant],
+  [RecoveryHostSourceReceivedSchema, sourceReceived],
+  [RecoveryHostSourceResetSchema, sourceReset],
 ] as const;
 const hostToCloudCases = [
-  [RecoveryV3HostPrepareRejectedSchema, prepareRejected],
-  [RecoveryV3HostSourceClosedSchema, sourceClosed],
+  [RecoveryHostPrepareRejectedSchema, prepareRejected],
+  [RecoveryHostSourceClosedSchema, sourceClosed],
 ] as const;
 const allCases = [...cloudToHostCases, ...hostToCloudCases] as const;
 
-describe("Recovery v3 Host control contracts", () => {
+describe("Recovery Host control contracts", () => {
   it("accepts every exact frame in only its isolated direction union", () => {
     for (const [schema, frame] of cloudToHostCases) {
       expect(schema.parse(frame)).toEqual(frame);
-      expect(RecoveryV3CloudToHostControlFrameSchema.parse(frame)).toEqual(frame);
-      expect(RecoveryV3HostToCloudControlFrameSchema.safeParse(frame).success).toBe(false);
+      expect(RecoveryCloudToHostControlFrameSchema.parse(frame)).toEqual(frame);
+      expect(RecoveryHostToCloudControlFrameSchema.safeParse(frame).success).toBe(false);
     }
     for (const [schema, frame] of hostToCloudCases) {
       expect(schema.parse(frame)).toEqual(frame);
-      expect(RecoveryV3HostToCloudControlFrameSchema.parse(frame)).toEqual(frame);
-      expect(RecoveryV3CloudToHostControlFrameSchema.safeParse(frame).success).toBe(false);
+      expect(RecoveryHostToCloudControlFrameSchema.parse(frame)).toEqual(frame);
+      expect(RecoveryCloudToHostControlFrameSchema.safeParse(frame).success).toBe(false);
     }
   });
 
-  it("does not make the candidate frames reachable through production control unions", () => {
+  it("makes each frame reachable through its production direction union", () => {
     for (const [, frame] of cloudToHostCases) {
-      expect(RelayToHostControlFrameSchema.safeParse(frame).success).toBe(false);
+      expect(RelayToHostControlFrameSchema.safeParse(frame).success).toBe(true);
     }
     for (const [, frame] of hostToCloudCases) {
-      expect(HostControlFrameSchema.safeParse(frame).success).toBe(false);
+      expect(HostControlFrameSchema.safeParse(frame).success).toBe(true);
     }
   });
 
   it("requires the complete bounded routing identity", () => {
-    expect(RecoveryV3HostRoutingIdentitySchema.parse(routing)).toEqual(routing);
+    expect(RecoveryHostRoutingIdentitySchema.parse(routing)).toEqual(routing);
     for (const field of ["recoveryId", "connectionId", "streamId", "deliveryGeneration"] as const) {
       const invalid = { ...routing } as Record<string, unknown>;
       delete invalid[field];
-      expect(RecoveryV3HostRoutingIdentitySchema.safeParse(invalid).success).toBe(false);
+      expect(RecoveryHostRoutingIdentitySchema.safeParse(invalid).success).toBe(false);
       for (const [schema, frame] of allCases) {
         expect(schema.safeParse({ ...frame, [field]: undefined }).success).toBe(false);
       }
     }
+    expect(RecoveryHostRoutingIdentitySchema.safeParse({ ...routing, unknown: true }).success).toBe(
+      false,
+    );
     expect(
-      RecoveryV3HostRoutingIdentitySchema.safeParse({ ...routing, unknown: true }).success,
+      RecoveryHostRoutingIdentitySchema.safeParse({ ...routing, recoveryId: "too-short" }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostRoutingIdentitySchema.safeParse({ ...routing, recoveryId: "too-short" })
-        .success,
-    ).toBe(false);
-    expect(
-      RecoveryV3HostRoutingIdentitySchema.safeParse({ ...routing, connectionId: "too-short" })
+      RecoveryHostRoutingIdentitySchema.safeParse({ ...routing, connectionId: "too-short" })
         .success,
     ).toBe(false);
   });
 
   it("strictly binds warm or snapshot source to prepare", () => {
     expect(
-      RecoveryV3HostPrepareSchema.parse({
+      RecoveryHostPrepareSchema.parse({
         ...prepare,
         source: { kind: "snapshot", snapshotId: "snapshot_AAAAAAAAAAA" },
       }).source,
     ).toEqual({ kind: "snapshot", snapshotId: "snapshot_AAAAAAAAAAA" });
     expect(
-      RecoveryV3HostPrepareSchema.safeParse({
+      RecoveryHostPrepareSchema.safeParse({
         ...prepare,
         source: { kind: "warm", snapshotId: "snapshot_AAAAAAAAAAA" },
       }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostPrepareSchema.safeParse({
+      RecoveryHostPrepareSchema.safeParse({
         ...prepare,
         source: { kind: "snapshot" },
       }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostPrepareSchema.safeParse({
+      RecoveryHostPrepareSchema.safeParse({
         ...prepare,
         source: { kind: "snapshot", snapshotId: "too-short" },
       }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostPrepareSchema.safeParse({ ...prepare, base: { ...base, unknown: true } })
-        .success,
+      RecoveryHostPrepareSchema.safeParse({ ...prepare, base: { ...base, unknown: true } }).success,
     ).toBe(false);
   });
 
   it("accepts only recovery-lane source receipts", () => {
-    expect(RecoveryV3HostSourceReceivedSchema.parse(sourceReceived)).toEqual(sourceReceived);
+    expect(RecoveryHostSourceReceivedSchema.parse(sourceReceived)).toEqual(sourceReceived);
     expect(
-      RecoveryV3HostSourceReceivedSchema.safeParse({ ...sourceReceived, lane: "live" }).success,
+      RecoveryHostSourceReceivedSchema.safeParse({ ...sourceReceived, lane: "live" }).success,
     ).toBe(false);
   });
 
   it("requires the exact committed-through cursor on start-ready", () => {
-    expect(RecoveryV3HostStartReadySchema.parse(startReady).committedThrough).toEqual(
+    expect(RecoveryHostStartReadySchema.parse(startReady).committedThrough).toEqual(
       committedThrough,
     );
     expect(
-      RecoveryV3HostStartReadySchema.safeParse({
+      RecoveryHostStartReadySchema.safeParse({
         ...startReady,
         committedThrough: { ...committedThrough, unknown: true },
       }).success,
     ).toBe(false);
     const { eventSeq: _eventSeq, ...incomplete } = committedThrough;
     expect(
-      RecoveryV3HostStartReadySchema.safeParse({ ...startReady, committedThrough: incomplete })
+      RecoveryHostStartReadySchema.safeParse({ ...startReady, committedThrough: incomplete })
         .success,
     ).toBe(false);
   });
@@ -190,14 +188,14 @@ describe("Recovery v3 Host control contracts", () => {
       expect(schema.safeParse({ ...frame, unknown: true }).success).toBe(false);
     }
     expect(
-      RecoveryV3CloudToHostControlFrameSchema.safeParse({ ...prepare, type: "recovery-unknown" })
+      RecoveryCloudToHostControlFrameSchema.safeParse({ ...prepare, type: "recovery-unknown" })
         .success,
     ).toBe(false);
     expect(
-      RecoveryV3HostSourceResetSchema.safeParse({ ...sourceReset, reason: "unknown" }).success,
+      RecoveryHostSourceResetSchema.safeParse({ ...sourceReset, reason: "unknown" }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostPrepareRejectedSchema.safeParse({
+      RecoveryHostPrepareRejectedSchema.safeParse({
         ...prepareRejected,
         reason: "unknown",
       }).success,
@@ -209,7 +207,7 @@ describe("Recovery v3 Host control contracts", () => {
     const overflow = (MAX_U64 + 1n).toString();
 
     expect(
-      RecoveryV3HostStartReadySchema.parse({
+      RecoveryHostStartReadySchema.parse({
         ...startReady,
         deliveryGeneration: max,
         streamId: 0xffff_ffff,
@@ -222,96 +220,96 @@ describe("Recovery v3 Host control contracts", () => {
       }),
     ).toBeDefined();
     expect(
-      RecoveryV3HostStartReadySchema.safeParse({
+      RecoveryHostStartReadySchema.safeParse({
         ...startReady,
         deliveryGeneration: "0",
       }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostStartReadySchema.safeParse({
+      RecoveryHostStartReadySchema.safeParse({
         ...startReady,
         deliveryGeneration: overflow,
       }).success,
     ).toBe(false);
-    expect(RecoveryV3HostStartReadySchema.safeParse({ ...startReady, streamId: 0 }).success).toBe(
+    expect(RecoveryHostStartReadySchema.safeParse({ ...startReady, streamId: 0 }).success).toBe(
       false,
     );
     expect(
-      RecoveryV3HostStartReadySchema.safeParse({
+      RecoveryHostStartReadySchema.safeParse({
         ...startReady,
         streamId: 0x1_0000_0000,
       }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostStartReadySchema.safeParse({
+      RecoveryHostStartReadySchema.safeParse({
         ...startReady,
         cumulativeGrantedEncodedBytes: overflow,
       }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostStartReadySchema.safeParse({
+      RecoveryHostStartReadySchema.safeParse({
         ...startReady,
         committedThrough: { ...committedThrough, eventSeq: overflow },
       }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostPrepareSchema.parse({
+      RecoveryHostPrepareSchema.parse({
         ...prepare,
         base: { sessionEpoch: max, eventSeq: max, nextPtyOffset: max },
       }),
     ).toBeDefined();
     expect(
-      RecoveryV3HostPrepareSchema.safeParse({
+      RecoveryHostPrepareSchema.safeParse({
         ...prepare,
         base: { ...base, nextPtyOffset: overflow },
       }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostSourceGrantSchema.parse({
+      RecoveryHostSourceGrantSchema.parse({
         ...sourceGrant,
         cumulativeGrantedEncodedBytes: max,
       }),
     ).toBeDefined();
     expect(
-      RecoveryV3HostSourceReceivedSchema.parse({
+      RecoveryHostSourceReceivedSchema.parse({
         ...sourceReceived,
         contiguousDeliveryOrdinal: max,
         cumulativeEncodedBytes: max,
       }),
     ).toBeDefined();
     expect(
-      RecoveryV3HostSourceReceivedSchema.safeParse({
+      RecoveryHostSourceReceivedSchema.safeParse({
         ...sourceReceived,
         contiguousDeliveryOrdinal: "0",
       }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostSourceReceivedSchema.safeParse({
+      RecoveryHostSourceReceivedSchema.safeParse({
         ...sourceReceived,
         cumulativeEncodedBytes: "0",
       }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostSourceReceivedSchema.safeParse({
+      RecoveryHostSourceReceivedSchema.safeParse({
         ...sourceReceived,
         contiguousDeliveryOrdinal: overflow,
       }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostSourceClosedSchema.parse({
+      RecoveryHostSourceClosedSchema.parse({
         ...sourceClosed,
         throughRecoveryOrdinal: max,
         throughRecoveryCumulativeEncodedBytes: max,
       }),
     ).toBeDefined();
     expect(
-      RecoveryV3HostSourceClosedSchema.safeParse({
+      RecoveryHostSourceClosedSchema.safeParse({
         ...sourceClosed,
         throughRecoveryOrdinal: "0",
       }).success,
     ).toBe(false);
     expect(
-      RecoveryV3HostSourceClosedSchema.safeParse({
+      RecoveryHostSourceClosedSchema.safeParse({
         ...sourceClosed,
         throughRecoveryCumulativeEncodedBytes: overflow,
       }).success,

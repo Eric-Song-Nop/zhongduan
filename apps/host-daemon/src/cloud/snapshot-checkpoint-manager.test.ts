@@ -12,7 +12,6 @@ import { SnapshotPendingSupersededError, type PublishedSnapshot } from "./snapsh
 const ENGINE_ID = "ghostty:test+snapshot-v1+wterm:test";
 const SESSION_ID = "session_AAAAAAAAAAAA";
 // Freeze the authority budgets independently from the manager implementation.
-const SNAPSHOT_CHECKPOINT_FRESHNESS_MS = 30_000;
 const SNAPSHOT_ENCODE_BUDGET_MS = 5_000;
 const SNAPSHOT_PUBLISH_TIMEOUT_MS = 120_000;
 const SNAPSHOT_IDS = [
@@ -101,13 +100,11 @@ function controlledSession(
 function manager(
   publisher: SnapshotPublisherLike,
   options: {
-    monotonicNow?: () => number;
     session?: SnapshotCheckpointManagerOptions["session"];
   } = {},
 ): SnapshotCheckpointManager {
   const session = options.session ?? controlledSession(capture()).session;
   return new SnapshotCheckpointManager({
-    ...(options.monotonicNow === undefined ? {} : { monotonicNow: options.monotonicNow }),
     publisher,
     session,
     sessionId: SESSION_ID,
@@ -126,57 +123,6 @@ function refresh(
 }
 
 describe("SnapshotCheckpointManager", () => {
-  it("classifies only the current checkpoint by age without expiring or renewing it", async () => {
-    let now = 100;
-    const snapshot = capture();
-    const publish = vi.fn(async () => published(snapshot));
-    const checkpointManager = manager({ publish }, { monotonicNow: () => now });
-
-    const checkpoint = await refresh(checkpointManager);
-    expect(checkpointManager.latestValid()).toBe(checkpoint);
-    expect(checkpointManager.isAgeFresh(checkpoint)).toBe(true);
-
-    now += SNAPSHOT_CHECKPOINT_FRESHNESS_MS - 1;
-    expect(checkpointManager.isAgeFresh(checkpoint)).toBe(true);
-    now += 1;
-    expect(checkpointManager.isAgeFresh(checkpoint)).toBe(false);
-    await expect(refresh(checkpointManager)).resolves.toBe(checkpoint);
-    expect(checkpointManager.latestValid()).toBe(checkpoint);
-    expect(checkpointManager.isAgeFresh(checkpoint)).toBe(false);
-    expect(publish).toHaveBeenCalledOnce();
-
-    checkpointManager.invalidate(checkpoint);
-    expect(checkpointManager.isAgeFresh(checkpoint)).toBe(false);
-  });
-
-  it("keeps the cut high-water while allowing an exact invalidation replacement", async () => {
-    const firstSnapshot = capture(2n, 3n);
-    const secondSnapshot = capture(3n, 4n);
-    const controlled = controlledSession(firstSnapshot);
-    let publishIndex = 0;
-    const publish = vi.fn(async (snapshot: SnapshotCapture) =>
-      published(snapshot, SNAPSHOT_IDS[publishIndex++]!),
-    );
-    const checkpointManager = manager({ publish }, { session: controlled.session });
-
-    const first = await refresh(checkpointManager);
-    controlled.setCurrent(secondSnapshot);
-    const second = await refresh(checkpointManager, { minimumCut: cursor(secondSnapshot) });
-    expect(Object.isFrozen(second)).toBe(true);
-    expect(Object.isFrozen(second.base)).toBe(true);
-    expect(Object.isFrozen(second.published.metadata)).toBe(true);
-
-    checkpointManager.invalidate(first, cursor(secondSnapshot));
-    expect(checkpointManager.latestValid()).toBe(second);
-    checkpointManager.invalidate(second, cursor(secondSnapshot));
-    expect(checkpointManager.latestValid()).toBeUndefined();
-
-    const replacement = await refresh(checkpointManager);
-    expect(replacement).not.toBe(second);
-    expect(replacement.base).toEqual(cursor(secondSnapshot));
-    expect(checkpointManager.latestValid()).toBe(replacement);
-  });
-
   it("fences immutable identity changes returned by a resumed pending upload", async () => {
     const firstSnapshot = capture(2n, 3n);
     const laterSnapshot = capture(3n, 4n);
@@ -191,12 +137,11 @@ describe("SnapshotCheckpointManager", () => {
     const publish = vi.fn(async () => published(firstSnapshot, SNAPSHOT_IDS[0]));
     const checkpointManager = manager({ publish, resumePending }, { session: controlled.session });
 
-    const first = await refresh(checkpointManager);
+    await refresh(checkpointManager);
     controlled.setCurrent(laterSnapshot);
     await expect(refresh(checkpointManager, { minimumCut: cursor(laterSnapshot) })).rejects.toThrow(
       "snapshot checkpoint immutable identity changed",
     );
-    expect(checkpointManager.latestValid()).toBe(first);
   });
 
   it("rejects a late regressed cut and a different identity at the same high-water", async () => {
@@ -213,7 +158,7 @@ describe("SnapshotCheckpointManager", () => {
       resumePending,
     };
     const checkpointManager = manager(publisher, { session: controlled.session });
-    const installed = await refresh(checkpointManager);
+    await refresh(checkpointManager);
     controlled.setCurrent(currentSnapshot);
 
     await expect(
@@ -222,34 +167,6 @@ describe("SnapshotCheckpointManager", () => {
     await expect(
       refresh(checkpointManager, { minimumCut: cursor(currentSnapshot) }),
     ).rejects.toThrow("snapshot checkpoint identity changed without advancing its cut");
-    expect(checkpointManager.latestValid()).toBe(installed);
-  });
-
-  it("fences an invalidated identity but permits a new identity at the same cut", async () => {
-    const snapshot = capture();
-    const controlled = controlledSession(snapshot);
-    const resumePending = vi
-      .fn<NonNullable<SnapshotPublisherLike["resumePending"]>>()
-      .mockReturnValueOnce(undefined)
-      .mockReturnValueOnce(Promise.resolve(published(snapshot, SNAPSHOT_IDS[0])))
-      .mockReturnValueOnce(Promise.resolve(published(snapshot, SNAPSHOT_IDS[1])));
-    const checkpointManager = manager(
-      {
-        publish: async () => published(snapshot, SNAPSHOT_IDS[0]),
-        resumePending,
-      },
-      { session: controlled.session },
-    );
-    const first = await refresh(checkpointManager);
-    checkpointManager.invalidate(first, first.base);
-
-    await expect(refresh(checkpointManager)).rejects.toThrow(
-      "invalidated snapshot checkpoint identity cannot be reinstalled",
-    );
-    await expect(refresh(checkpointManager)).resolves.toMatchObject({
-      base: cursor(snapshot),
-      published: { metadata: { snapshotId: SNAPSHOT_IDS[1] } },
-    });
   });
 
   it("validates resumed lineage before exposing a frozen replay base to admission", async () => {
@@ -300,7 +217,6 @@ describe("SnapshotCheckpointManager", () => {
       "published snapshot metadata does not match its terminal session",
     );
     expect(policy).not.toHaveBeenCalled();
-    expect(checkpointManager.latestValid()).toBeUndefined();
   });
 
   it("shares one common flight across 16 waiters when 15 abort", async () => {
@@ -336,7 +252,6 @@ describe("SnapshotCheckpointManager", () => {
     expect(checkpoint.base).toEqual(cursor(snapshot));
     expect(controlled.captureSnapshot).toHaveBeenCalledOnce();
     expect(publish).toHaveBeenCalledOnce();
-    expect(checkpointManager.latestValid()).toBe(checkpoint);
   });
 
   it("installs the first cut for an older waiter and performs exactly one newer-cut follow-up", async () => {
@@ -363,7 +278,6 @@ describe("SnapshotCheckpointManager", () => {
     await expect(newer).resolves.toMatchObject({ base: cursor(newerSnapshot) });
     expect(controlled.captureSnapshot).toHaveBeenCalledTimes(2);
     expect(publish).toHaveBeenCalledTimes(2);
-    expect(checkpointManager.latestValid()?.base).toEqual(cursor(newerSnapshot));
   });
 
   it("does not start a newer-cut follow-up after the last live waiter aborts", async () => {
@@ -388,60 +302,6 @@ describe("SnapshotCheckpointManager", () => {
     await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce());
 
     expect(controlled.captureSnapshot).toHaveBeenCalledOnce();
-    expect(checkpointManager.latestValid()?.base).toEqual(cursor(firstSnapshot));
-  });
-
-  it("keeps a global invalidation floor hidden until a follow-up reaches it", async () => {
-    const firstSnapshot = capture(2n, 3n);
-    const newerSnapshot = capture(5n, 8n);
-    const controlled = controlledSession(firstSnapshot);
-    let publishCount = 0;
-    const admissions: boolean[] = [];
-    const publish = vi.fn<SnapshotPublisherLike["publish"]>(async (snapshot, _signal, admit) => {
-      const uploaded = published(snapshot, SNAPSHOT_IDS[publishCount++]!);
-      admissions.push(admit?.(uploaded.metadata) ?? true);
-      return uploaded;
-    });
-    const checkpointManager = manager({ publish }, { session: controlled.session });
-    const first = await refresh(checkpointManager);
-
-    controlled.setCurrent(newerSnapshot);
-    checkpointManager.invalidate(first, cursor(newerSnapshot));
-    expect(checkpointManager.latestValid()).toBeUndefined();
-    const followUp = deferred<SnapshotCapture>();
-    controlled.captureSnapshot.mockResolvedValueOnce(firstSnapshot);
-    controlled.captureSnapshot.mockReturnValueOnce(followUp.promise);
-
-    const replacement = refresh(checkpointManager);
-    await vi.waitFor(() => expect(controlled.captureSnapshot).toHaveBeenCalledTimes(3));
-    expect(checkpointManager.latestValid()).toBeUndefined();
-    followUp.resolve(newerSnapshot);
-    await expect(replacement).resolves.toMatchObject({ base: cursor(newerSnapshot) });
-    expect(publish).toHaveBeenCalledTimes(3);
-    expect(admissions).toEqual([true, false, true]);
-    expect(checkpointManager.latestValid()?.base).toEqual(cursor(newerSnapshot));
-  });
-
-  it("ignores a stale checkpoint invalidation and its replacement floor", async () => {
-    const firstSnapshot = capture(2n, 3n);
-    const secondSnapshot = capture(3n, 4n);
-    const futureSnapshot = capture(5n, 8n);
-    const controlled = controlledSession(firstSnapshot);
-    let publishCount = 0;
-    const publish = vi.fn(async (snapshot: SnapshotCapture) =>
-      published(snapshot, SNAPSHOT_IDS[publishCount++]!),
-    );
-    const checkpointManager = manager({ publish }, { session: controlled.session });
-    const first = await refresh(checkpointManager);
-    controlled.setCurrent(secondSnapshot);
-    const second = await refresh(checkpointManager, { minimumCut: cursor(secondSnapshot) });
-    controlled.setCurrent(futureSnapshot);
-
-    checkpointManager.invalidate(first, cursor(futureSnapshot));
-
-    expect(checkpointManager.latestValid()).toBe(second);
-    await expect(refresh(checkpointManager)).resolves.toBe(second);
-    expect(publish).toHaveBeenCalledTimes(2);
   });
 
   it("validates a registered minimum cut against the fixed epoch and current cursor", async () => {
@@ -485,7 +345,6 @@ describe("SnapshotCheckpointManager", () => {
     await expect(refresh(checkpointManager)).resolves.toMatchObject({
       base: cursor(newerSnapshot),
     });
-    expect(checkpointManager.latestValid()?.base).toEqual(cursor(newerSnapshot));
   });
 
   it("enforces both the measured encode budget and the manager-owned encode deadline", async () => {
@@ -510,7 +369,6 @@ describe("SnapshotCheckpointManager", () => {
       await vi.advanceTimersByTimeAsync(SNAPSHOT_ENCODE_BUDGET_MS);
       await rejected;
       encoded.resolve(capture());
-      expect(deadlineManager.latestValid()).toBeUndefined();
     } finally {
       vi.useRealTimers();
     }
@@ -533,7 +391,6 @@ describe("SnapshotCheckpointManager", () => {
       await vi.advanceTimersByTimeAsync(SNAPSHOT_PUBLISH_TIMEOUT_MS);
       await rejected;
       uploaded.resolve(published(snapshot));
-      expect(checkpointManager.latestValid()).toBeUndefined();
     } finally {
       vi.useRealTimers();
     }
@@ -558,7 +415,6 @@ describe("SnapshotCheckpointManager", () => {
     expect(resumePending).toHaveBeenCalledOnce();
     expect(controlled.captureSnapshot).not.toHaveBeenCalled();
     expect(publish).not.toHaveBeenCalled();
-    expect(checkpointManager.latestValid()).toBeUndefined();
   });
 
   it("dispose aborts only the common flight and a late publisher result cannot install", async () => {
@@ -591,7 +447,6 @@ describe("SnapshotCheckpointManager", () => {
 
     uploaded.resolve(published(snapshot));
     await Promise.resolve();
-    expect(checkpointManager.latestValid()).toBeUndefined();
     expect(() => refresh(checkpointManager)).toThrow(reason);
   });
 });

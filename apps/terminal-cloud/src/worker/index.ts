@@ -2,8 +2,6 @@ import {
   ConnectionSetRequestSchema,
   CreateSessionRequestSchema,
   CreateSessionResponseSchema,
-  RELAY_CAPABILITIES_HEADER,
-  selectRelayCapabilities,
 } from "@zhongduan/protocol";
 import { AuthError, secretsEqual, verifyBearerCapability } from "./auth";
 import { handleCapabilityRequest, issueSessionCapability } from "./capability-http";
@@ -127,24 +125,12 @@ async function createConnectionSet(
   }
 
   const input = ConnectionSetRequestSchema.safeParse(await requestJson(request));
-  const selectedCapabilities = selectRelayCapabilities(
-    request.headers.get(RELAY_CAPABILITIES_HEADER),
-  );
-  if (
-    !input.success ||
-    selectedCapabilities === undefined ||
-    (claims.role === "host" && input.data.clientId !== undefined)
-  ) {
+  if (!input.success || (claims.role === "host" && input.data.clientId !== undefined)) {
     return json({ error: "invalid-connection-set" }, 400);
   }
   return sessionStub(env, sessionId).fetch("https://do.internal/internal/connection-sets", {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(selectedCapabilities.length > 0
-        ? { [RELAY_CAPABILITIES_HEADER]: selectedCapabilities.join(",") }
-        : {}),
-    },
+    headers: { "content-type": "application/json" },
     body: JSON.stringify({
       sessionId,
       subject: claims.subject,

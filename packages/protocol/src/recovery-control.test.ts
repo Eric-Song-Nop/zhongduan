@@ -7,7 +7,7 @@ import {
   RecoverySourceClosedSchema,
   RecoveryStartSchema,
   ReplicaAppliedSchema,
-} from "./recovery-v3-control";
+} from "./recovery-control";
 
 const base = { sessionEpoch: "7", eventSeq: "10", nextPtyOffset: "100" } as const;
 const committedThrough = {
@@ -21,7 +21,7 @@ const start = {
   deliveryGeneration: "3",
   streamId: 42,
   engineId: "engine",
-  authorityDataVersion: 2,
+  authorityDataFormat: 1,
   base,
   source: { kind: "warm" },
   committedThrough,
@@ -61,7 +61,7 @@ const sourceClosed = {
   throughRecoveryCumulativeEncodedBytes: "400",
 } as const;
 
-describe("Recovery v3 control contracts", () => {
+describe("Recovery control contracts", () => {
   it("accepts an exact warm start and rejects a non-successor live floor", () => {
     expect(RecoveryStartSchema.parse(start)).toEqual(start);
     expect(() =>

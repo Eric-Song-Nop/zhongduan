@@ -9,7 +9,6 @@ export default defineConfig({
         bindings: {
           BOOTSTRAP_TOKEN: "test-bootstrap-token-with-at-least-32-bytes",
           CAPABILITY_SIGNING_KEY: "test-capability-key-with-at-least-32-bytes",
-          RECOVERY_V3_ENABLED: "true",
         },
       },
     }),

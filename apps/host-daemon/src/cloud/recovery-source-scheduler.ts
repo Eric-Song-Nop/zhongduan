@@ -1,4 +1,4 @@
-import type { RecoveryV3HostRoutingIdentity } from "@zhongduan/protocol";
+import type { RecoveryHostRoutingIdentity } from "@zhongduan/protocol";
 
 import type {
   RecoverySourceDrainResult,
@@ -27,13 +27,13 @@ interface RecoverySourceSchedulerOptions {
 
 interface ScheduledSource {
   deficitBytes: number;
-  identity: RecoveryV3HostRoutingIdentity;
+  identity: RecoveryHostRoutingIdentity;
   needsQuantum: boolean;
   queued: boolean;
 }
 
 /**
- * Connection-local, deterministic DRR for Recovery v3 source records.
+ * Connection-local, deterministic DRR for recovery source records.
  *
  * The manager owns bytes and source truth. This scheduler only owns fair data turns. Every turn
  * crosses an asynchronous I/O yield and sends at most one record so control, input ACKs, and the
@@ -69,7 +69,7 @@ export class RecoverySourceScheduler {
       ((delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)));
   }
 
-  notify(identity: RecoveryV3HostRoutingIdentity): void {
+  notify(identity: RecoveryHostRoutingIdentity): void {
     if (this.#disposed) return;
     const current = this.#sources.get(identity.streamId);
     if (current === undefined || !sameRouting(current.identity, identity)) {
@@ -88,7 +88,7 @@ export class RecoverySourceScheduler {
     this.#schedule();
   }
 
-  forget(identity: RecoveryV3HostRoutingIdentity): void {
+  forget(identity: RecoveryHostRoutingIdentity): void {
     const source = this.#sources.get(identity.streamId);
     if (source === undefined || !sameRouting(source.identity, identity)) return;
     source.queued = false;
@@ -221,7 +221,7 @@ export class RecoverySourceScheduler {
   }
 }
 
-function frozenIdentity(identity: RecoveryV3HostRoutingIdentity): RecoveryV3HostRoutingIdentity {
+function frozenIdentity(identity: RecoveryHostRoutingIdentity): RecoveryHostRoutingIdentity {
   return Object.freeze({
     recoveryId: identity.recoveryId,
     connectionId: identity.connectionId,
@@ -231,8 +231,8 @@ function frozenIdentity(identity: RecoveryV3HostRoutingIdentity): RecoveryV3Host
 }
 
 function sameRouting(
-  left: RecoveryV3HostRoutingIdentity,
-  right: RecoveryV3HostRoutingIdentity,
+  left: RecoveryHostRoutingIdentity,
+  right: RecoveryHostRoutingIdentity,
 ): boolean {
   return (
     left.recoveryId === right.recoveryId &&

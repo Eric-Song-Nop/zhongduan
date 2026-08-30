@@ -2,8 +2,8 @@ import { z } from "zod";
 
 import { DecimalU64Schema, MAX_U64, PositiveDecimalU64Schema } from "./scalars";
 
-export const AuthorityDataVersionSchema = z.literal(2);
-export type AuthorityDataVersion = z.infer<typeof AuthorityDataVersionSchema>;
+export const AuthorityDataFormatSchema = z.literal(1);
+export type AuthorityDataFormat = z.infer<typeof AuthorityDataFormatSchema>;
 
 export const AuthorityCursorSchema = z.strictObject({
   sessionEpoch: PositiveDecimalU64Schema,

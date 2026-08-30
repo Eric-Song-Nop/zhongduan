@@ -3,7 +3,7 @@ import { env, exports as workerExports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { expect } from "vitest";
 import { DurableAlarmComponent, type DurableAlarmMux } from "../src/worker/durable-alarm-mux";
-import { isSnapshotObjectKey } from "../src/worker/snapshot-contract";
+import { isSnapshotAttemptObjectKey } from "../src/worker/snapshot-contract";
 
 export interface CreatedSession {
   hostCapability: string;
@@ -107,7 +107,19 @@ export async function forceNextSessionAlarmDue(sessionId: string): Promise<void>
 }
 
 export function matchesSnapshotKey(key: string, sessionId: string, snapshotId: string): boolean {
-  return isSnapshotObjectKey(key, sessionId, snapshotId);
+  return isSnapshotAttemptObjectKey(key, sessionId, snapshotId);
+}
+
+export async function snapshotObjectKeys(
+  sessionId: string,
+  snapshotId: string,
+): Promise<readonly string[]> {
+  const objects = await env.SNAPSHOTS.list({
+    prefix: `v1/sessions/${sessionId}/snapshots/${snapshotId}/attempts/`,
+  });
+  return objects.objects
+    .map((object) => object.key)
+    .filter((key) => matchesSnapshotKey(key, sessionId, snapshotId));
 }
 
 export async function storedSnapshotKey(sessionId: string, snapshotId: string): Promise<string> {

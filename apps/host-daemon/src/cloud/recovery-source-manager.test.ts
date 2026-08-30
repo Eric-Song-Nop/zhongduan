@@ -3,8 +3,8 @@ import {
   decodeDataFrame,
   decodeRecoveryStartFence,
   type AuthorityCursor,
-  type RecoveryV3HostPrepare,
-  type RecoveryV3HostRoutingIdentity,
+  type RecoveryHostPrepare,
+  type RecoveryHostRoutingIdentity,
   type ResizePayload,
 } from "@zhongduan/protocol";
 import { describe, expect, it } from "vitest";
@@ -92,7 +92,7 @@ function prepareFor(
   streamId: number,
   deliveryGeneration = "1",
   base: AuthorityCursor = EMPTY_BASE,
-): RecoveryV3HostPrepare {
+): RecoveryHostPrepare {
   return {
     type: "recovery-prepare",
     recoveryId: RECOVERY_ID,
@@ -105,7 +105,7 @@ function prepareFor(
   };
 }
 
-function routing(input: RecoveryV3HostPrepare): RecoveryV3HostRoutingIdentity {
+function routing(input: RecoveryHostPrepare): RecoveryHostRoutingIdentity {
   return {
     recoveryId: input.recoveryId,
     connectionId: input.connectionId,
@@ -128,7 +128,7 @@ function expectCapacity(result: RecoverySourcePrepareResult): void {
   });
 }
 
-/** Independent wire oracle: DeliveryEnvelopeV3 has a literal 40-byte fixed header. */
+/** Independent wire oracle: DeliveryEnvelope has a literal 40-byte fixed header. */
 function inspectEnvelope(encoded: Uint8Array) {
   const view = new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength);
   const payloadLength = view.getUint32(36, true);
@@ -212,7 +212,7 @@ describe("RecoverySourceManager", () => {
     const envelope = inspectEnvelope(sent[0]!);
     expect(envelope).toMatchObject({ deliveryOrdinal: 1n, cumulativeEncodedBytes: 88n });
     expect(decodeDataFrame(envelope.payload)).toMatchObject({
-      kind: DataFrameKind.ReplayCommit,
+      kind: DataFrameKind.RecoveryDone,
       sessionEpoch: 7n,
       eventSeq: 0n,
       ptyOffset: 0n,
@@ -275,10 +275,7 @@ describe("RecoverySourceManager", () => {
     const canonicalSent: Uint8Array[] = [];
     const publisherFailures: string[] = [];
     const publisher = new CanonicalPublisher({
-      canInterruptRecovery: () => false,
       onFailure: (reason) => publisherFailures.push(reason),
-      onIngress: () => {},
-      onRecoveryPressure: () => {},
       sendData: (encoded) => canonicalSent.push(encoded.slice()),
       session,
       yieldIo: () => Promise.resolve(),
@@ -301,7 +298,7 @@ describe("RecoverySourceManager", () => {
     expect(publisherFailures).toEqual([]);
     expect(canonicalSent.map((encoded) => decodeDataFrame(encoded).kind)).toEqual([
       DataFrameKind.PtyOutput,
-      DataFrameKind.DeliveryBarrier,
+      DataFrameKind.RecoveryStartFence,
       DataFrameKind.PtyOutput,
     ]);
     expect(canonicalSent.map((encoded) => decodeDataFrame(encoded).eventSeq)).toEqual([1n, 1n, 2n]);
@@ -439,7 +436,7 @@ describe("RecoverySourceManager", () => {
     const done = inspectEnvelope(doneRecords[0]!);
     expect(done).toMatchObject({ deliveryOrdinal: 2n, cumulativeEncodedBytes: 177n });
     expect(decodeDataFrame(done.payload)).toMatchObject({
-      kind: DataFrameKind.ReplayCommit,
+      kind: DataFrameKind.RecoveryDone,
       eventSeq: 1n,
       ptyOffset: 1n,
     });

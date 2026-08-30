@@ -2,12 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import { DataFrameKind, decodeDataFrame, encodeDataFrame, encodeResizePayload } from "./data-frame";
 import {
-  DELIVERY_ENVELOPE_V3_HEADER_BYTES,
+  DELIVERY_ENVELOPE_HEADER_BYTES,
   advanceDeliveryLaneCursor,
-  decodeDeliveryEnvelopeV3,
-  encodeDeliveryEnvelopeV3,
+  decodeDeliveryEnvelope,
+  encodeDeliveryEnvelope,
   initialDeliveryLaneCursor,
-} from "./delivery-envelope-v3";
+} from "./delivery-envelope";
 import { ProtocolError } from "./errors";
 import { MAX_U64 } from "./scalars";
 
@@ -30,7 +30,7 @@ function firstEnvelope() {
     lane: "live" as const,
     deliveryGeneration: 3n,
     deliveryOrdinal: 1n,
-    cumulativeEncodedBytes: BigInt(DELIVERY_ENVELOPE_V3_HEADER_BYTES + payload.byteLength),
+    cumulativeEncodedBytes: BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + payload.byteLength),
     streamId: 42,
     payload,
   };
@@ -42,11 +42,11 @@ function corruptEnvelope(encoded: Uint8Array, mutate: (view: DataView) => void):
   return corrupted;
 }
 
-describe("DeliveryEnvelope v3", () => {
-  it("round-trips explicit generation-scoped delivery progress around canonical v2", () => {
+describe("DeliveryEnvelope", () => {
+  it("round-trips explicit generation-scoped delivery progress around canonical", () => {
     const envelope = firstEnvelope();
 
-    const decoded = decodeDeliveryEnvelopeV3(encodeDeliveryEnvelopeV3(envelope));
+    const decoded = decodeDeliveryEnvelope(encodeDeliveryEnvelope(envelope));
     expect(decoded).toEqual(envelope);
     expect(advanceDeliveryLaneCursor(initialDeliveryLaneCursor(3n, "live", 42), decoded)).toEqual({
       deliveryGeneration: 3n,
@@ -59,7 +59,7 @@ describe("DeliveryEnvelope v3", () => {
 
   it("uses per-lane state to validate non-first cumulative progress", () => {
     const payload = canonicalOutput();
-    const encodedBytes = BigInt(DELIVERY_ENVELOPE_V3_HEADER_BYTES + payload.byteLength);
+    const encodedBytes = BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + payload.byteLength);
     const previous = {
       deliveryGeneration: 3n,
       deliveryOrdinal: 1n,
@@ -109,44 +109,44 @@ describe("DeliveryEnvelope v3", () => {
     }
   });
 
-  it("rejects malformed envelope magic, version, lane, flags, and length", () => {
-    const encoded = encodeDeliveryEnvelopeV3(firstEnvelope());
+  it("rejects malformed envelope magic, format, lane, flags, and length", () => {
+    const encoded = encodeDeliveryEnvelope(firstEnvelope());
     const corruptions = [
       [corruptEnvelope(encoded, (view) => view.setUint32(0, 0, false)), "BAD_MAGIC"],
-      [corruptEnvelope(encoded, (view) => view.setUint8(4, 2)), "BAD_VERSION"],
+      [corruptEnvelope(encoded, (view) => view.setUint8(4, 2)), "BAD_FORMAT"],
       [corruptEnvelope(encoded, (view) => view.setUint8(5, 3)), "BAD_KIND"],
       [corruptEnvelope(encoded, (view) => view.setUint16(6, 1, true)), "BAD_FLAGS"],
       [corruptEnvelope(encoded, (view) => view.setUint32(36, 0, true)), "BAD_LENGTH"],
     ] as const;
 
     for (const [corrupted, code] of corruptions) {
-      expect(() => decodeDeliveryEnvelopeV3(corrupted)).toThrowError(
+      expect(() => decodeDeliveryEnvelope(corrupted)).toThrowError(
         expect.objectContaining<Partial<ProtocolError>>({ code }),
       );
     }
   });
 
-  it("keeps v2 data frames and v3 delivery envelopes decoder-isolated", () => {
-    const v2 = canonicalOutput();
-    const v3 = encodeDeliveryEnvelopeV3(firstEnvelope());
+  it("keeps data frames and delivery envelopes decoder-isolated", () => {
+    const data = canonicalOutput();
+    const envelope = encodeDeliveryEnvelope(firstEnvelope());
 
-    expect(() => decodeDeliveryEnvelopeV3(v2)).toThrowError(
+    expect(() => decodeDeliveryEnvelope(data)).toThrowError(
       expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_MAGIC" }),
     );
-    expect(() => decodeDataFrame(v3)).toThrowError(
+    expect(() => decodeDataFrame(envelope)).toThrowError(
       expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_MAGIC" }),
     );
   });
 
   it("rejects an invalid lane at the encoder boundary", () => {
     expect(() =>
-      encodeDeliveryEnvelopeV3({ ...firstEnvelope(), lane: "unknown" as "live" }),
+      encodeDeliveryEnvelope({ ...firstEnvelope(), lane: "unknown" as "live" }),
     ).toThrowError(expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_KIND" }));
   });
 
-  it("allows an empty canonical v2 replay commit only on the recovery lane", () => {
+  it("allows an empty canonical recovery-done record only on the recovery lane", () => {
     const commit = encodeDataFrame({
-      kind: DataFrameKind.ReplayCommit,
+      kind: DataFrameKind.RecoveryDone,
       flags: 0,
       sessionEpoch: 7n,
       deliveryGeneration: 0n,
@@ -164,13 +164,13 @@ describe("DeliveryEnvelope v3", () => {
       payload: commit,
     };
 
-    expect(decodeDeliveryEnvelopeV3(encodeDeliveryEnvelopeV3(envelope))).toEqual(envelope);
-    expect(() => encodeDeliveryEnvelopeV3({ ...envelope, lane: "live" })).toThrowError(
+    expect(decodeDeliveryEnvelope(encodeDeliveryEnvelope(envelope))).toEqual(envelope);
+    expect(() => encodeDeliveryEnvelope({ ...envelope, lane: "live" })).toThrowError(
       expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_KIND" }),
     );
   });
 
-  it("rejects relay-owned fields in the canonical inner v2 frame", () => {
+  it("rejects relay-owned fields in the canonical inner frame", () => {
     const rewritten = encodeDataFrame({
       kind: DataFrameKind.ResizeApplied,
       flags: 0,
@@ -182,7 +182,7 @@ describe("DeliveryEnvelope v3", () => {
       payload: encodeResizePayload({ cols: 80, rows: 24, widthPx: 800, heightPx: 600 }),
     });
     expect(() =>
-      encodeDeliveryEnvelopeV3({
+      encodeDeliveryEnvelope({
         lane: "recovery",
         deliveryGeneration: 3n,
         deliveryOrdinal: 1n,
@@ -206,12 +206,10 @@ describe("DeliveryEnvelope v3", () => {
     });
     const overflowEnvelope = {
       ...firstEnvelope(),
-      cumulativeEncodedBytes: BigInt(
-        DELIVERY_ENVELOPE_V3_HEADER_BYTES + overflowPayload.byteLength,
-      ),
+      cumulativeEncodedBytes: BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + overflowPayload.byteLength),
       payload: overflowPayload,
     };
-    expect(() => encodeDeliveryEnvelopeV3(overflowEnvelope)).toThrowError(
+    expect(() => encodeDeliveryEnvelope(overflowEnvelope)).toThrowError(
       expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_PAYLOAD" }),
     );
 
@@ -219,9 +217,9 @@ describe("DeliveryEnvelope v3", () => {
       ...decodeDataFrame(overflowPayload),
       ptyOffset: MAX_U64 - 1n,
     });
-    const encoded = encodeDeliveryEnvelopeV3({ ...overflowEnvelope, payload: lastBytePayload });
-    encoded.set(overflowPayload, DELIVERY_ENVELOPE_V3_HEADER_BYTES);
-    expect(() => decodeDeliveryEnvelopeV3(encoded)).toThrowError(
+    const encoded = encodeDeliveryEnvelope({ ...overflowEnvelope, payload: lastBytePayload });
+    encoded.set(overflowPayload, DELIVERY_ENVELOPE_HEADER_BYTES);
+    expect(() => decodeDeliveryEnvelope(encoded)).toThrowError(
       expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_PAYLOAD" }),
     );
   });

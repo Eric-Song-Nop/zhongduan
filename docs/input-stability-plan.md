@@ -117,8 +117,9 @@ Snapshot 无法缩短健康连接上的这个下界。
 
 - 端到端经 Cloud 归一化后，Host 用 `(writerFence, inputEpoch, clientInputSeq)` 标识输入；Browser 只提交
   opaque writer lease 与 epoch/seq，不自报可信 fence。control transport 变化或新 input epoch 会把
-  outstanding input 标为 `uncertain` 并清空待发送队列，不盲目重放。data-only delivery
-  generation/resync 当前只把 replica 标为不 current，并不会自动更换 input epoch；prediction 层必须另行 reset。
+  outstanding input 标为 `uncertain` 并清空待发送队列，不盲目重放。connection set 更换会整体 fence
+  control/data pair并把replica标为不 current；下一份有效 writer Welcome 会建立新的 input epoch，prediction
+  层也必须随generation一起reset。
 - Cloud 每次只接受当前 writer lease，并把可信的 `connectionId/clientId/writerFence` 注入 Host control frame。
 - Host 在单一 session actor 中单调检查 writer fence、client、input epoch 和 seq，保留有界 duplicate
   suppression 结果。当前 seq 允许 gap，不是 contiguous/exactly-once log。
@@ -163,7 +164,6 @@ uncertainty。
 | Cloud 全局 HOL            | Browser control、Host control 和 Host data 共用一个 `BoundedSerialQueue`                                   | output/SQLite/fanout 可以把 key 或 Ctrl-C 排在后面 |
 | 每键续 writer lease       | 每个 input 都执行 token SHA-256、lease read/update；Browser 又每 10 秒单独 heartbeat                       | 增加 CPU、SQLite 和队列尾延迟                      |
 | Host actor 同步 snapshot  | `encodeSnapshot()` 与 input、PTY output 在同一个 actor 中执行                                              | 大 snapshot 可以直接阻塞 key→`pty.write`           |
-| 恢复全局 pause canonical  | warm/cold delivery 在 barrier/replay 周围 pause publisher                                                  | 一个 Browser 恢复可能延迟另一个 writer 的可见回显  |
 | context fence 太弱        | 只有 key 带 `observedEventSeq`，Host 只拒绝“观察到未来”，接受 stale；paste/text 没有该字段                 | 旧 UI 上产生的输入可以落到新 modal                 |
 | 无 termios/context 信号   | `PtyProcess` 没有 ECHO/ICANON generation，WTerm 也没暴露 app focus                                         | 无法可靠区分 password、shell edit、TUI raw mode    |
 | renderer 无 overlay 层    | DOM renderer 只从一个 `TerminalCore` 重建 dirty rows                                                       | 预测若直接写 core 会污染 authority replica         |
@@ -173,11 +173,12 @@ uncertainty。
 关键源码入口：
 
 - Browser 输入 lifecycle/seq/ACK：[`input-dispatcher.ts`](../apps/terminal-cloud/src/browser/input-dispatcher.ts#L102-L315)
-- Cloud lease 与输入转发：[`terminal-session-do.ts`](../apps/terminal-cloud/src/worker/terminal-session-do.ts#L978-L1099)
+- Cloud lease 与输入转发：[`terminal-session-do.ts`](../apps/terminal-cloud/src/worker/terminal-session-do.ts#L878-L982)
 - Cloud 全局串行 queue：[`relay-message-queue.ts`](../apps/terminal-cloud/src/worker/relay-message-queue.ts#L20-L64)
 - Host actor、input/dedup/ACK/PTY write：[`session.ts`](../apps/host-daemon/src/session.ts#L333-L569)
-- Host canonical pause/queue：[`canonical-publisher.ts`](../apps/host-daemon/src/cloud/canonical-publisher.ts#L80-L165)、
-  [`delivery-scheduler.ts`](../apps/host-daemon/src/cloud/delivery-scheduler.ts#L315-L639)
+- Host canonical 有序发布与 recovery 调度：
+  [`canonical-publisher.ts`](../apps/host-daemon/src/cloud/canonical-publisher.ts)、
+  [`recovery-source-scheduler.ts`](../apps/host-daemon/src/cloud/recovery-source-scheduler.ts)
 - 固定 WTerm fork 的
   [Ghostty input/mode ABI](https://github.com/Eric-Song-Nop/wterm/blob/4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6/packages/%40wterm/ghostty/zig/src/wasm_api.zig)、
   [DOM renderer](https://github.com/Eric-Song-Nop/wterm/blob/4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6/packages/%40wterm/dom/src/renderer.ts)
@@ -343,9 +344,9 @@ storage；不能越过已分配 seq 的 earlier input。如果要取消尚未 ad
 `not-sent/cancelled`，再给 Ctrl-C 分配 seq。
 
 writer lease 改为 connection-scoped capability：Cloud 在 control connection 建立时验证 token，把
-`clientId/writerFence/expiresAt/selectedCapabilities` 固定到可信 WebSocket attachment；input fast path
-只检查 attachment 和 cached fence，heartbeat 有界频率续租，不再每键 hash 和 storage update。无法从
-attachment/storage 确认时 fail closed。
+`clientId/connectionId/deliveryGeneration/leaseFence` 固定到可信 WebSocket attachment；deadline与token
+digest由SQL owner保存。input fast path只检查exact attachment和cached fence，heartbeat有界频率续租，
+不再每键hash和storage update。无法从attachment/storage确认时fail closed。
 
 ## `Mirrored`：应用仍拥有 buffer
 
@@ -650,8 +651,8 @@ reload 的 draft persistence 是单独 opt-in：只能 local-only（或用户明
 ### Cloud
 
 - 为 Browser control、Host control 和 Host data 建立独立 lane，保持每 socket/per-session 必需顺序；
-- control 可以越过**Browser 尚未观察到**的 bulk data，但 lease、writer transfer、barrier 和 input fence 必须有
-  明确 ordering rule，不能简单做无条件优先级队列；
+- control 可以越过**Browser 尚未观察到**的 bulk data，但 lease、writer transfer、
+  `RecoveryStartFence` 和 input fence 必须有明确 ordering rule，不能简单做无条件优先级队列；
 - 连接建立时绑定已验证 writer identity，input fast path 只检查 cached fence/token/expiry；
 - writer lease 由现有 heartbeat 或 rate limit 更新，不再每键 hash + SQLite UPDATE；
 - 记录各 lane queue wait/depth、SQLite time 和 fanout time。
@@ -663,7 +664,7 @@ reload 的 draft persistence 是单独 opt-in：只能 local-only（或用户明
 - 先测量当前同步 snapshot blocking；交付严格有界 immutable/COW cut 后，才启用可执行的 actor-pause hard
   guard，并把可安全的 encode/compress 工作迁出 actor，而不是把可变 Terminal 直接丢给另一个线程；
 - recovery 的 concurrent gap-fill、handoff 与 flow control 服从[协议总纲](terminal-protocol-architecture.md)，
-  不在 input fast path 中孤立删除现有 correctness barrier；
+  input fast path 不得绕过 `RecoveryStartFence`、generation owner 或 flow-control 边界；
 - 在 actor 内生成有界合并的 `InputValidationCut`，走 negotiated writer-only sideband，不写 journal。
 
 ### Browser
@@ -696,7 +697,7 @@ input-region-v1
 - writer-only input capability 可以按当前 writer connection 协商，terminal state plane 仍保持兼容版本；
 - negotiation mismatch fail closed 到现有 `Raw` PTY path。
 
-`InputValidationCut` 不进入 data protocol，因此无需把 terminal data v2 升级为 mutation/metadata 混合 log。
+`InputValidationCut` 不进入 canonical data frame，因此无需把 terminal mutation log 改成 metadata 混合 log。
 
 ## 分阶段实施
 
@@ -765,7 +766,7 @@ InputRegionEnd { id, revision, reason }
 - 保留 shell history、IME、completion、keymap 与 native fallback；
 - uncertain commit 永不自动 retry。
 
-Recovery v3、FrozenTerminalCut 和 rolling checkpoint 是并行工作流，phase owner 见相应计划。
+Recovery、FrozenTerminalCut 和 rolling checkpoint 是并行工作流，phase owner 见相应计划。
 
 ## 指标与 SLO
 
@@ -776,7 +777,7 @@ Recovery v3、FrozenTerminalCut 和 rolling checkpoint 是并行工作流，phas
 
 - Browser：keydown→WS send、keydown→ACK、keydown→predicted paint、keydown→matching canonical paint；
 - Cloud：各 lane queue wait/depth、lease verify/renew、Browser receive→Host send、Host data/ACK receive→Browser send；
-- Host：control queue、session actor wait、Ghostty encode、`pty.write`、snapshot blocking、canonical paused time；
+- Host：control queue、session actor wait、Ghostty encode、`pty.write`、snapshot actor pause、recovery source/scheduler wait；
 - 体验：Ctrl-C→`pty.write`、Ctrl-C→output quiet、Ctrl-C→prompt paint；
 - 预测：eligible coverage、hidden/visible epoch 数、match/mismatch、rollback duration、context reject、secure reset；
 - 资源：overlay cells/bytes/age、pending ACK、input queue、driver CPU/frame time。
@@ -802,7 +803,7 @@ Recovery v3、FrozenTerminalCut 和 rolling checkpoint 是并行工作流，phas
 - Browser↔Cloud、Cloud↔Host 分别注入 20/100/300/600 ms RTT、jitter、packet loss 和断连；
 - 10/30/60 keys/s，单键、burst、paste、IME composition；
 - idle shell、持续 PTY output、全屏 repaint、output flood + Ctrl-C；
-- 同时发生 cold attach、snapshot capture/upload、journal replay、writer transfer 和 resize。
+- 同时发生 cold attach、snapshot capture/upload、recovery gap-fill/live handoff、writer transfer 和 resize。
 
 ### 应用
 

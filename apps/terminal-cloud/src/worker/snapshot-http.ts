@@ -154,7 +154,7 @@ async function getSnapshot(
     object === null ||
     object.version !== pointer.data.r2Version ||
     object.etag !== pointer.data.etag ||
-    !matchesSnapshotObject(object, pointer.data, pointer.data.uploadKind)
+    !matchesSnapshotObject(object, pointer.data)
   ) {
     if (object !== null) await cancelBody(object.body, "snapshot pointer mismatch");
     return json({ error: "snapshot-unavailable" }, 503);

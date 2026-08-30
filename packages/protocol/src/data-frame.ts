@@ -2,16 +2,15 @@ import { ProtocolError } from "./errors";
 import { MAX_U64 } from "./scalars";
 
 export const DATA_MAGIC = 0x5a54524d;
-export const DATA_PROTOCOL_VERSION = 2;
+export const DATA_FORMAT = 1;
 export const DATA_HEADER_BYTES = 48;
 export const MAX_DATA_PAYLOAD_BYTES = 16 * 1024 * 1024;
 
 export const DataFrameKind = {
   PtyOutput: 1,
   ResizeApplied: 2,
-  ReplayCommit: 3,
-  Reset: 4,
-  DeliveryBarrier: 5,
+  RecoveryDone: 3,
+  RecoveryStartFence: 4,
 } as const;
 
 export type DataFrameKind = (typeof DataFrameKind)[keyof typeof DataFrameKind];
@@ -80,7 +79,7 @@ export function encodeDataFrame(frame: DataFrame): Uint8Array {
   const view = new DataView(encoded.buffer);
 
   view.setUint32(0, DATA_MAGIC, false);
-  view.setUint8(4, DATA_PROTOCOL_VERSION);
+  view.setUint8(4, DATA_FORMAT);
   view.setUint8(5, frame.kind);
   view.setUint16(6, frame.flags, true);
   view.setBigUint64(8, frame.sessionEpoch, true);
@@ -105,8 +104,8 @@ export function decodeDataFrame(encoded: ArrayBuffer | Uint8Array): DataFrame {
   if (view.getUint32(0, false) !== DATA_MAGIC) {
     throw new ProtocolError("BAD_MAGIC", "invalid data frame magic");
   }
-  if (view.getUint8(4) !== DATA_PROTOCOL_VERSION) {
-    throw new ProtocolError("BAD_VERSION", "unsupported data frame version");
+  if (view.getUint8(4) !== DATA_FORMAT) {
+    throw new ProtocolError("BAD_FORMAT", "unsupported data frame format");
   }
 
   const kind = view.getUint8(5);
@@ -133,22 +132,6 @@ export function decodeDataFrame(encoded: ArrayBuffer | Uint8Array): DataFrame {
     streamId: view.getUint32(40, true),
     payload: bytes.subarray(DATA_HEADER_BYTES),
   };
-}
-
-export function rewriteDelivery(
-  encoded: Uint8Array,
-  deliveryGeneration: bigint,
-  streamId: number,
-): Uint8Array {
-  assertU64(deliveryGeneration, "deliveryGeneration");
-  assertU32(streamId, "streamId");
-  decodeDataFrame(encoded);
-
-  const rewritten = encoded.slice();
-  const view = new DataView(rewritten.buffer, rewritten.byteOffset, rewritten.byteLength);
-  view.setBigUint64(16, deliveryGeneration, true);
-  view.setUint32(40, streamId, true);
-  return rewritten;
 }
 
 export interface ResizePayload {

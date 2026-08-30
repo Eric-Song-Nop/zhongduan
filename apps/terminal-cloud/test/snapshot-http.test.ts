@@ -8,22 +8,18 @@ import {
 import { env, exports as workerExports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import {
-  hexToBytes,
-  snapshotCustomMetadata,
-  snapshotObjectKey,
-} from "../src/worker/snapshot-contract";
+import { hexToBytes, snapshotCustomMetadata } from "../src/worker/snapshot-contract";
 import {
   bucketWithOverrides,
   createSession,
   encoder,
   engineId,
   getSnapshot,
-  metadataFor,
   overrideSnapshotBucket,
   origin,
   sessionStub,
   sha256Hex,
+  snapshotObjectKeys,
   snapshotHeaders,
   storedSnapshotKey,
   uploadSnapshot,
@@ -78,7 +74,7 @@ describe("private HTTP snapshots", () => {
     const response = await workerExports.default.fetch(request);
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: "invalid-snapshot-metadata" });
-    expect(await env.SNAPSHOTS.head(snapshotObjectKey(session.sessionId, snapshotId))).toBeNull();
+    expect(await snapshotObjectKeys(session.sessionId, snapshotId)).toEqual([]);
   });
 
   it("aborts multipart ownership when the upload body stream fails", async () => {
@@ -106,7 +102,7 @@ describe("private HTTP snapshots", () => {
     );
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({ error: "snapshot-upload-failed" });
-    expect(await env.SNAPSHOTS.head(snapshotObjectKey(session.sessionId, snapshotId))).toBeNull();
+    expect(await snapshotObjectKeys(session.sessionId, snapshotId)).toEqual([]);
     const upload = await runInDurableObject(
       sessionStub(session.sessionId),
       (_instance, durable) =>
@@ -186,53 +182,6 @@ describe("private HTTP snapshots", () => {
     );
   });
 
-  it("serves legacy single-put rows whose R2 metadata predates uploadKind", async () => {
-    const session = await createSession();
-    const snapshotId = "snapshot_legacy_single_01";
-    const body = encoder.encode("legacy-single-put");
-    const metadata = await metadataFor(session, snapshotId, body);
-    const objectKey = snapshotObjectKey(session.sessionId, snapshotId);
-    const object = await env.SNAPSHOTS.put(objectKey, body, {
-      sha256: hexToBytes(metadata.sha256),
-      httpMetadata: {
-        contentType: SNAPSHOT_MEDIA_TYPE,
-        cacheControl: "private, no-store",
-      },
-      customMetadata: snapshotCustomMetadata(metadata),
-    });
-    await runInDurableObject(sessionStub(session.sessionId), (_instance, durable) => {
-      durable.storage.sql.exec(
-        `INSERT INTO snapshot
-          (snapshot_id, session_epoch, cut_event_seq, next_pty_offset, engine_id,
-           object_key, r2_version, etag, sha256, compressed_length,
-           uncompressed_length, compression, state, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'servable', ?)`,
-        snapshotId,
-        metadata.sessionEpoch,
-        metadata.cutEventSeq,
-        metadata.nextPtyOffset,
-        metadata.engineId,
-        objectKey,
-        object.version,
-        object.etag,
-        metadata.sha256,
-        Number(metadata.compressedLength),
-        metadata.uncompressedLength,
-        metadata.compression,
-        Date.now(),
-      );
-      durable.storage.sql.exec(
-        "UPDATE session_state SET latest_snapshot_id = ? WHERE singleton = 1",
-        snapshotId,
-      );
-    });
-
-    const response = await getSnapshot(session, snapshotId);
-    expect(response.status).toBe(200);
-    expect(new Uint8Array(await response.arrayBuffer())).toEqual(body);
-    expect(object.customMetadata).not.toHaveProperty("uploadKind");
-  });
-
   it("does not publish a body whose SHA-256 fails R2 validation", async () => {
     const session = await createSession();
     const snapshotId = "snapshot_bad_digest_001";
@@ -241,7 +190,7 @@ describe("private HTTP snapshots", () => {
     });
     expect(response.status).toBe(422);
     expect(await response.json()).toEqual({ error: "snapshot-checksum-mismatch" });
-    expect(await env.SNAPSHOTS.head(snapshotObjectKey(session.sessionId, snapshotId))).toBeNull();
+    expect(await snapshotObjectKeys(session.sessionId, snapshotId)).toEqual([]);
     const count = await runInDurableObject(sessionStub(session.sessionId), (_instance, durable) => {
       return durable.storage.sql.exec("SELECT COUNT(*) AS value FROM snapshot").one() as {
         value: number;

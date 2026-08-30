@@ -3,7 +3,7 @@ import { configDefaults } from "vite-plus/test/config";
 
 export default defineConfig({
   fmt: {
-    ignorePatterns: ["resource.md", "snapshot-police.md", "vendor/wterm/**"],
+    ignorePatterns: ["vendor/wterm/**"],
     sortPackageJson: true,
   },
   lint: {
@@ -38,14 +38,6 @@ export default defineConfig({
           "vp test --run",
           "vp run @zhongduan/terminal-cloud#test",
           "vp run @zhongduan/terminal-cloud#test:browser",
-        ],
-        cache: false,
-      },
-      "verify-phase0": {
-        command: [
-          "vp test --run packages/protocol/src/control-frame.test.ts packages/protocol/src/cloud-api.test.ts apps/host-daemon/src/cloud/delivery-recovery-queue.test.ts apps/host-daemon/src/cloud/delivery-barrier-waiter.test.ts apps/host-daemon/src/cloud/delivery-scheduler.test.ts",
-          "pnpm --dir apps/terminal-cloud exec vp test --config vitest.worker.config.ts --run test/relay.test.ts test/runtime.test.ts",
-          "pnpm --dir apps/terminal-cloud exec vp test --config vitest.browser.config.ts --run src/browser/terminal-session.test.ts",
         ],
         cache: false,
       },

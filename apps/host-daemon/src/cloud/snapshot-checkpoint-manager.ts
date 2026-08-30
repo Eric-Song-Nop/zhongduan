@@ -8,7 +8,6 @@ import {
 } from "./snapshot-publisher";
 
 const SNAPSHOT_ENCODE_BUDGET_MS = 5_000;
-const SNAPSHOT_CHECKPOINT_FRESHNESS_MS = 30_000;
 const SNAPSHOT_PUBLISH_TIMEOUT_MS = 120_000;
 
 export class SnapshotEncodeBudgetError extends Error {
@@ -50,15 +49,9 @@ type SnapshotManagerSession = Pick<
 >;
 
 export interface SnapshotCheckpointManagerOptions {
-  monotonicNow?: () => number;
   publisher: SnapshotPublisherLike;
   session: SnapshotManagerSession;
   sessionId: string;
-}
-
-interface InstalledCheckpoint {
-  readonly checkpoint: SnapshotCheckpoint;
-  readonly installedAt: number;
 }
 
 interface RefreshWaiter {
@@ -77,7 +70,6 @@ interface RefreshFlight {
 
 export class SnapshotCheckpointManager {
   readonly #engineId: string;
-  readonly #monotonicNow: () => number;
   readonly #publisher: SnapshotPublisherLike;
   readonly #session: SnapshotManagerSession;
   readonly #sessionEpoch: bigint;
@@ -86,29 +78,16 @@ export class SnapshotCheckpointManager {
 
   #disposedReason: Error | undefined;
   #highWater: SnapshotCheckpoint | undefined;
-  #latestValid: InstalledCheckpoint | undefined;
+  #latestValid: SnapshotCheckpoint | undefined;
   #refreshInFlight: RefreshFlight | undefined;
   #replacementMinimumCut: Readonly<ReplayCursor> | undefined;
 
   constructor(options: SnapshotCheckpointManagerOptions) {
     this.#engineId = options.session.engineId;
-    this.#monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
     this.#publisher = options.publisher;
     this.#session = options.session;
     this.#sessionEpoch = options.session.sessionEpoch;
     this.#sessionId = options.sessionId;
-  }
-
-  latestValid(): SnapshotCheckpoint | undefined {
-    if (this.#disposedReason !== undefined) return undefined;
-    return this.#latestValid?.checkpoint;
-  }
-
-  isAgeFresh(checkpoint: SnapshotCheckpoint): boolean {
-    if (this.#disposedReason !== undefined || this.#latestValid?.checkpoint !== checkpoint) {
-      return false;
-    }
-    return this.#monotonicNow() - this.#latestValid.installedAt < SNAPSHOT_CHECKPOINT_FRESHNESS_MS;
   }
 
   refresh(request: SnapshotRefreshRequest): Promise<SnapshotCheckpoint> {
@@ -118,7 +97,7 @@ export class SnapshotCheckpointManager {
       request.minimumCut === undefined
         ? undefined
         : this.#validatedRegisteredMinimum(request.minimumCut);
-    const latest = this.#latestValid?.checkpoint;
+    const latest = this.#latestValid;
     if (
       latest !== undefined &&
       this.#cursorSatisfies(latest.base, minimumCut) &&
@@ -149,16 +128,6 @@ export class SnapshotCheckpointManager {
       }
       this.#startRefreshIfNeeded();
     });
-  }
-
-  invalidate(checkpoint: SnapshotCheckpoint, replacementMinimumCut?: Readonly<ReplayCursor>): void {
-    if (this.#latestValid?.checkpoint !== checkpoint) return;
-    const validatedMinimum =
-      replacementMinimumCut === undefined
-        ? undefined
-        : this.#validatedRegisteredMinimum(replacementMinimumCut);
-    this.#latestValid = undefined;
-    if (validatedMinimum !== undefined) this.#mergeReplacementMinimum(validatedMinimum);
   }
 
   dispose(reason: unknown = new Error("snapshot checkpoint manager disposed")): void {
@@ -363,15 +332,14 @@ export class SnapshotCheckpointManager {
     const metadata = SnapshotMetadataSchema.parse(published.metadata);
     const base = this.#validatedBase(metadata, capture);
     if (!this.#cursorSatisfies(base, this.#replacementMinimumCut)) return undefined;
-    const latest = this.#latestValid?.checkpoint;
+    const latest = this.#latestValid;
     const highWater = this.#highWater;
     if (highWater !== undefined) {
       if (metadata.snapshotId === highWater.published.metadata.snapshotId) {
         if (!sameSnapshotMetadata(metadata, highWater.published.metadata)) {
           throw new Error("snapshot checkpoint immutable identity changed");
         }
-        if (latest === highWater) return latest;
-        throw new Error("invalidated snapshot checkpoint identity cannot be reinstalled");
+        return highWater;
       }
       const comparison = compareCursor(base, highWater.base);
       if (comparison < 0) throw new Error("snapshot checkpoint cut regressed");
@@ -385,7 +353,7 @@ export class SnapshotCheckpointManager {
       published: Object.freeze({ metadata: ownedMetadata }),
     });
     this.#highWater = checkpoint;
-    this.#latestValid = Object.freeze({ checkpoint, installedAt: this.#monotonicNow() });
+    this.#latestValid = checkpoint;
     return checkpoint;
   }
 

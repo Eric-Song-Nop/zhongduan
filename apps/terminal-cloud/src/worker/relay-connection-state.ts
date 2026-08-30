@@ -1,4 +1,3 @@
-import type { RecoveryStrategy, RelayCapability } from "@zhongduan/protocol";
 import { readSocketAttachment, type RelayChannel, type SocketAttachment } from "./relay-socket";
 import type { TicketRow } from "./relay-store";
 
@@ -17,12 +16,12 @@ export interface ConnectionSockets {
 }
 
 export function deriveConnectionPhase(
-  controlState: SocketAttachment["controlState"] | undefined,
+  controlReady: boolean | undefined,
   dataOpen: boolean,
   reserved: boolean,
 ): ConnectionPhase {
-  const controlOpen = controlState !== undefined;
-  if (controlOpen && dataOpen) return controlState === "active" ? "ready" : "paired";
+  const controlOpen = controlReady !== undefined;
+  if (controlOpen && dataOpen) return controlReady ? "ready" : "paired";
   if (controlOpen) return "control-open";
   if (dataOpen) return "data-open";
   return reserved ? "reserved" : "closed";
@@ -63,7 +62,7 @@ export function connectionSockets(
   }
 
   const phase = deriveConnectionPhase(
-    control === undefined ? undefined : readSocketAttachment(control)?.controlState,
+    control === undefined ? undefined : readSocketAttachment(control)?.ready,
     data !== undefined,
     reserved,
   );
@@ -84,8 +83,6 @@ export function eligibleControlForDataTicket(
   ticket: TicketRow,
   currentHostFence: string | undefined,
   currentReadyHostFence?: string,
-  browserRecoveryStrategy?: RecoveryStrategy,
-  ticketRelayCapabilities?: readonly RelayCapability[],
 ): SocketAttachment | undefined {
   if (ticket.channel !== "data") return undefined;
   for (const socket of state.getWebSockets(`set:${ticket.connection_set_id}`)) {
@@ -99,12 +96,7 @@ export function eligibleControlForDataTicket(
       attachment.subject !== ticket.subject ||
       attachment.role !== ticket.role ||
       attachment.streamId !== ticket.stream_id ||
-      attachment.deliveryGeneration !== ticket.delivery_generation ||
-      ticketRelayCapabilities === undefined ||
-      attachment.relayCapabilities.length !== ticketRelayCapabilities.length ||
-      attachment.relayCapabilities.some(
-        (capability, index) => capability !== ticketRelayCapabilities[index],
-      )
+      attachment.deliveryGeneration !== ticket.delivery_generation
     ) {
       continue;
     }
@@ -113,24 +105,12 @@ export function eligibleControlForDataTicket(
         ? attachment
         : undefined;
     }
-    if (
-      ticket.client_id === null ||
-      attachment.clientId !== ticket.client_id ||
-      ticket.recovery_strategy !== browserRecoveryStrategy
-    ) {
+    if (ticket.client_id === null || attachment.clientId !== ticket.client_id) {
       return undefined;
     }
-    if (ticket.recovery_strategy === "v3") {
-      return attachment.recoveryStrategy === "v3" &&
-        attachment.hostFence === null &&
-        ticket.host_fence !== null &&
-        ticket.host_fence === currentReadyHostFence
-        ? attachment
-        : undefined;
-    }
-    return attachment.recoveryStrategy === "v2" &&
-      attachment.hostFence === null &&
-      ticket.host_fence === null
+    return attachment.hostFence === null &&
+      ticket.host_fence !== null &&
+      ticket.host_fence === currentReadyHostFence
       ? attachment
       : undefined;
   }

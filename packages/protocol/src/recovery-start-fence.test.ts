@@ -26,7 +26,7 @@ describe("RecoveryStartFence", () => {
     const frame = decodeDataFrame(encoded);
 
     expect(frame).toMatchObject({
-      kind: DataFrameKind.DeliveryBarrier,
+      kind: DataFrameKind.RecoveryStartFence,
       sessionEpoch: 7n,
       deliveryGeneration: 3n,
       eventSeq: 12n,

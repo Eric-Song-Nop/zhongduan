@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import {
   AuthorityCursorSchema,
-  AuthorityDataVersionSchema,
+  AuthorityDataFormatSchema,
   MutationBoundarySchema,
   successorBoundary,
 } from "./authority-cursor";
@@ -18,8 +18,10 @@ const snapshotDownloadSeparator = "/snapshots/";
 const maxSnapshotDownloadPathChars =
   snapshotDownloadPrefix.length + 128 + snapshotDownloadSeparator.length + 128;
 
-const WarmRecoverySourceSchema = z.strictObject({ kind: z.literal("warm") });
-const SnapshotRecoverySourceSchema = SnapshotMetadataSchema.safeExtend({
+export const WarmRecoverySourceSchema = z.strictObject({ kind: z.literal("warm") });
+export type WarmRecoverySource = z.infer<typeof WarmRecoverySourceSchema>;
+
+export const SnapshotRecoverySourceSchema = SnapshotMetadataSchema.safeExtend({
   kind: z.literal("snapshot"),
   downloadPath: z.string().max(maxSnapshotDownloadPathChars),
   restoreThrough: z.literal("finish"),
@@ -32,6 +34,7 @@ const SnapshotRecoverySourceSchema = SnapshotMetadataSchema.safeExtend({
     path: ["downloadPath"],
   },
 );
+export type SnapshotRecoverySource = z.infer<typeof SnapshotRecoverySourceSchema>;
 
 export const RecoverySourceSchema = z.discriminatedUnion("kind", [
   WarmRecoverySourceSchema,
@@ -50,7 +53,7 @@ export const RecoveryStartSchema = z
     deliveryGeneration: PositiveDecimalU64Schema,
     streamId,
     engineId,
-    authorityDataVersion: AuthorityDataVersionSchema,
+    authorityDataFormat: AuthorityDataFormatSchema,
     base: AuthorityCursorSchema,
     source: RecoverySourceSchema,
     committedThrough: AuthorityCursorSchema,
@@ -125,8 +128,8 @@ export const RecoveryAdoptedSchema = z.strictObject({
 });
 export type RecoveryAdopted = z.infer<typeof RecoveryAdoptedSchema>;
 
-// Reconstructed from a recovery-lane DeliveryEnvelope carrying canonical v2
-// REPLAY_COMMIT; this is deliberately not a standalone control frame.
+// Reconstructed from the terminal record on the recovery delivery lane; this is
+// deliberately not a standalone control frame.
 export const RecoveryDoneRecordSchema = z.strictObject({
   type: z.literal("recovery-done"),
   recoveryId: RecoveryResourceIdSchema,
@@ -146,15 +149,15 @@ export const RecoverySourceClosedSchema = z.strictObject({
 });
 export type RecoverySourceClosed = z.infer<typeof RecoverySourceClosedSchema>;
 
-export const RecoveryV3ClientControlFrameSchema = z.discriminatedUnion("type", [
+export const RecoveryProgressFrameSchema = z.discriminatedUnion("type", [
   DeliveryReceivedSchema,
   ReplicaAppliedSchema,
   RecoveryAdoptedSchema,
 ]);
-export type RecoveryV3ClientControlFrame = z.infer<typeof RecoveryV3ClientControlFrameSchema>;
+export type RecoveryProgressFrame = z.infer<typeof RecoveryProgressFrameSchema>;
 
-export const RecoveryV3ServerControlFrameSchema = z.discriminatedUnion("type", [
+export const RecoveryServerControlFrameSchema = z.discriminatedUnion("type", [
   RecoveryStartSchema,
   RecoverySourceClosedSchema,
 ]);
-export type RecoveryV3ServerControlFrame = z.infer<typeof RecoveryV3ServerControlFrameSchema>;
+export type RecoveryServerControlFrame = z.infer<typeof RecoveryServerControlFrameSchema>;

@@ -7,7 +7,7 @@ import {
   advanceDeliveryLaneCursor,
   applyMutationCursor,
   decodeDataFrame,
-  decodeDeliveryEnvelopeV3,
+  decodeDeliveryEnvelope,
   initialDeliveryLaneCursor,
   type AuthorityCursor,
   type DataFrame,
@@ -115,7 +115,7 @@ export interface RecoveryAssemblerSnapshot {
 }
 
 interface OwnedEnvelope {
-  readonly envelope: ReturnType<typeof decodeDeliveryEnvelopeV3>;
+  readonly envelope: ReturnType<typeof decodeDeliveryEnvelope>;
   readonly frame: DataFrame;
   readonly raw: Uint8Array;
   pending: boolean;
@@ -249,7 +249,7 @@ function deliveryReceived(cursor: DeliveryLaneCursor): DeliveryReceived | null {
 }
 
 /**
- * Generation-scoped Recovery v3 assembly core.
+ * Generation-scoped Recovery assembly core.
  *
  * This class deliberately does not own transport, snapshot loading, timers, or visible-core
  * adoption. A caller may send the latest receipt after every successful `acceptEnvelope` call,
@@ -537,10 +537,10 @@ export class RecoveryAssembler {
       return false;
     }
 
-    let envelope: ReturnType<typeof decodeDeliveryEnvelopeV3>;
+    let envelope: ReturnType<typeof decodeDeliveryEnvelope>;
     let frame: DataFrame;
     try {
-      envelope = decodeDeliveryEnvelopeV3(inputBytes);
+      envelope = decodeDeliveryEnvelope(inputBytes);
       frame = decodeDataFrame(envelope.payload);
     } catch {
       this.reset("protocol-conflict");
@@ -574,7 +574,7 @@ export class RecoveryAssembler {
 
     const raw = inputBytes.slice();
     try {
-      envelope = decodeDeliveryEnvelopeV3(raw);
+      envelope = decodeDeliveryEnvelope(raw);
       frame = decodeDataFrame(envelope.payload);
     } catch {
       this.reset("protocol-conflict");
@@ -1012,7 +1012,7 @@ export class RecoveryAssembler {
     if (
       start === null ||
       envelope.lane !== "recovery" ||
-      frame.kind !== DataFrameKind.ReplayCommit ||
+      frame.kind !== DataFrameKind.RecoveryDone ||
       frame.payload.byteLength !== 0
     ) {
       throw new Error("invalid RecoveryDone record");

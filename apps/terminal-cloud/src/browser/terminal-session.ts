@@ -1,31 +1,19 @@
 import {
+  BrowserConnectionSetResponseSchema,
   ClientControlFrameSchema,
-  ClientControlFrameV3Schema,
   CloudResourceIdSchema,
   ConnectionSetRequestSchema,
-  ConnectionSetResponseSchema,
-  RELAY_CAPABILITIES_HEADER,
-  RelayCapability,
-  confirmedRelayCapabilities,
   decodeServerControlFrame,
-  decodeDataFrame,
   type BrowserCapabilityRole,
   type ClientControlFrame,
-  type ClientControlFrameV3,
-  type ConnectionSetResponse,
   type ReplicaCursor,
-  type RecoveryStrategy,
-  type RecoveryV3ClientControlFrame,
+  type RecoveryProgressFrame,
   type ServerControlFrame,
-  type ServerControlFrameV3,
-  type RelayCapability as RelayCapabilityValue,
 } from "@zhongduan/protocol";
 import {
   RecoveryRuntime,
-  SessionCoordinator,
   type DeliveryState,
   type ReplicaHost,
-  type ResyncReason,
   type SnapshotTransport,
 } from "@zhongduan/session-client";
 
@@ -34,35 +22,14 @@ import type { InputDispatcher } from "./input-dispatcher";
 
 const CLIENT_ID_PREFIX = "zhongduan:browser-client:";
 const SOCKET_OPEN_TIMEOUT_MS = 10_000;
-// CURRENT recovery serializes delivery barriers for at most 16 Browsers. A cold build may spend 5s
-// encoding and 120s publishing before each Browser then consumes up to a 5s barrier window. Keep a
-// 10s scheduling margin beyond that 205s service envelope. A later capability replaces this
-// duplicated cross-app budget with generation-scoped progress.
-const ATTACH_START_TIMEOUT_MS = 5_000 + 120_000 + 16 * 5_000 + 10_000;
-const DATA_REPLACEMENT_GRACE_MS = 350;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 45_000;
 const WRITER_LEASE_RENEW_INTERVAL_MS = 10_000;
 const HTTP_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_RECONNECT_DELAY_MS = 10_000;
-const SNAPSHOT_RETRY_BASE_MS = 2_000;
-const SNAPSHOT_RETRY_MAX_MS = 30_000;
 // A legal 1 MiB input can expand to six bytes per byte when JSON escapes control characters.
 const MAX_CONTROL_FRAME_BYTES = 6 * 1024 * 1024 + 4_096;
 const MAX_CONTROL_QUEUE_BYTES = MAX_CONTROL_FRAME_BYTES;
-const BROWSER_RELAY_CAPABILITIES = [
-  RelayCapability.capabilityNegotiationV1,
-  RelayCapability.authorityDataV2,
-] as const;
-const BROWSER_RECOVERY_V3_CAPABILITIES = [
-  RelayCapability.capabilityNegotiationV1,
-  RelayCapability.authorityDataV2,
-  RelayCapability.wireEndpointV3,
-  RelayCapability.deliveryEnvelopeV3,
-  RelayCapability.deliveryReceiveCreditV1,
-  RelayCapability.authorityApplyProgressV1,
-  RelayCapability.recoveryV3GapFillV1,
-] as const;
 const BROWSER_RECOVERY_LIMITS = {
   maxApplyFramesPerCall: 32,
   maxGapSpan: 1_024n,
@@ -104,8 +71,6 @@ export interface TerminalSessionOptions {
   initialCursor?: ReplicaCursor;
   sessionId: string;
   snapshots: SnapshotTransport;
-  /** Test/rollout seam. Production omits this and therefore cannot advertise Recovery v3. */
-  relayCapabilities?: readonly RelayCapabilityValue[];
   fetch?: typeof fetch;
   createWebSocket?: (url: string) => WebSocket;
   makeWebSocketUrl?: (path: string) => string;
@@ -149,14 +114,6 @@ function readClientId(
   return value;
 }
 
-function frameMatchesDelivery(
-  frame: Extract<ServerControlFrame, { type: "replay-start" | "snapshot-manifest" }>,
-  generation: bigint,
-  streamId: number,
-): boolean {
-  return BigInt(frame.deliveryGeneration) === generation && frame.streamId === streamId;
-}
-
 export class TerminalSession {
   readonly #sessionId: string;
   readonly #engineId: string;
@@ -172,17 +129,14 @@ export class TerminalSession {
   readonly #setTimer: NonNullable<TerminalSessionOptions["setTimer"]>;
   readonly #clearTimer: NonNullable<TerminalSessionOptions["clearTimer"]>;
   readonly #storage?: TerminalSessionOptions["storage"];
-  readonly #relayCapabilities: readonly RelayCapabilityValue[];
   readonly #listeners = new Set<() => void>();
   readonly #intentionalSockets = new WeakSet<WebSocket>();
-  coordinator: SessionCoordinator;
   #snapshot: TerminalSessionSnapshot;
   #control: WebSocket | null = null;
   #data: WebSocket | null = null;
   #connectionEpoch = 0;
   #dataEpoch = 0;
   #generation: bigint | null = null;
-  #recoveryStrategy: RecoveryStrategy | null = null;
   #recoveryRuntime: RecoveryRuntime | null = null;
   #activeCursor: ReplicaCursor | null;
   #streamId = 0;
@@ -192,15 +146,10 @@ export class TerminalSession {
   #clientId: string | undefined;
   #connectPromise: Promise<void> | null = null;
   #connectAbort: AbortController | null = null;
-  #replacementAbort: AbortController | null = null;
   #needsReconnect = false;
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  #dataFailureTimer: ReturnType<typeof setTimeout> | null = null;
   #heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
-  #attachStartTimer: ReturnType<typeof setTimeout> | null = null;
   #writerLeaseTimer: ReturnType<typeof setTimeout> | null = null;
-  #snapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  #snapshotFailureCount = 0;
   #lastControlPongAt = 0;
   #lastDataPongAt = 0;
   #automaticReconnectBlocked = false;
@@ -222,9 +171,6 @@ export class TerminalSession {
       options.setTimer ?? ((callback, delayMs) => globalThis.setTimeout(callback, delayMs));
     this.#clearTimer = options.clearTimer ?? ((timer) => globalThis.clearTimeout(timer));
     this.#storage = options.storage;
-    this.#relayCapabilities = Object.freeze([
-      ...(options.relayCapabilities ?? BROWSER_RELAY_CAPABILITIES),
-    ]);
     this.#activeCursor = options.initialCursor ? { ...options.initialCursor } : null;
     this.#clientId = readClientId(this.#storage, this.#sessionId);
     this.#snapshot = {
@@ -238,25 +184,14 @@ export class TerminalSession {
       phase: "idle",
       role: options.capabilities.role,
     };
-    this.coordinator = this.#createCoordinator(this.#activeCursor);
-  }
-
-  #createCoordinator(initialCursor: ReplicaCursor | null): SessionCoordinator {
-    return new SessionCoordinator({
-      host: this.#host,
-      ...(initialCursor === null ? {} : { initialCursor }),
-      snapshots: this.#snapshots,
-      onAcknowledge: (cursor) => this.#acknowledge(cursor),
-      onReplicaProgress: (cursor) => {
-        this.#activeCursor = { ...cursor };
-        this.#syncDeliveryState();
-      },
-      onResync: (reason) => this.#handleCoordinatorResync(reason),
-    });
   }
 
   get snapshot(): TerminalSessionSnapshot {
     return this.#snapshot;
+  }
+
+  get activeCursor(): ReplicaCursor | null {
+    return this.#activeCursor === null ? null : { ...this.#activeCursor };
   }
 
   subscribe(listener: () => void): () => void {
@@ -273,7 +208,6 @@ export class TerminalSession {
   reconnectNow(): void {
     if (this.#closed) return;
     this.#automaticReconnectBlocked = false;
-    this.#cancelSnapshotRetry(true);
     this.#cancelReconnectTimer();
     this.#invalidateFullConnection();
     if (this.#connectPromise === null) this.#startFullConnection(true);
@@ -285,10 +219,8 @@ export class TerminalSession {
     this.#closed = true;
     this.#needsReconnect = false;
     this.#cancelReconnectTimer();
-    this.#cancelSnapshotRetry(true);
     this.#invalidateFullConnection();
     this.#capabilities.stop();
-    this.coordinator.close();
     this.#update({
       controlConnected: false,
       dataConnected: false,
@@ -313,12 +245,7 @@ export class TerminalSession {
         if (this.#closed || this.#automaticReconnectBlocked) return;
         this.#invalidateFullConnection();
         this.#update({
-          lastError:
-            error instanceof AuthenticationError
-              ? "authentication"
-              : error instanceof ProtocolNegotiationError
-                ? "protocol"
-                : "connection",
+          lastError: error instanceof AuthenticationError ? "authentication" : "connection",
           phase: error instanceof AuthenticationError ? "failed" : "reconnecting",
         });
         if (!(error instanceof AuthenticationError)) this.#scheduleReconnect();
@@ -339,15 +266,13 @@ export class TerminalSession {
     this.#writerLease = null;
     this.#stopHeartbeat();
     this.#stopWriterLeaseRenewal();
-    this.#cancelDataFailureTimer();
 
     const response = await this.#createConnectionSet(signal);
     if (!this.#isCurrentConnection(connectionEpoch)) return;
     const generation = BigInt(response.deliveryGeneration);
-    const recoveryStrategy = this.#confirmedRecoveryStrategy(response);
 
     // Activation is one synchronous fence before any replacement callback can run.
-    this.#activateDeliveryGeneration(recoveryStrategy, generation);
+    this.#activateDeliveryGeneration();
     ++this.#dataEpoch;
     this.#generation = generation;
     this.#streamId = response.streamId;
@@ -373,8 +298,6 @@ export class TerminalSession {
       connectionEpoch,
       dataEpoch,
       generation,
-      response.streamId,
-      recoveryStrategy,
       signal,
     );
     if (!this.#isCurrentData(connectionEpoch, dataEpoch, generation)) {
@@ -402,7 +325,6 @@ export class TerminalSession {
           headers: {
             ...this.#capabilities.authorizationHeaders(),
             "Content-Type": "application/json",
-            [RELAY_CAPABILITIES_HEADER]: this.#relayCapabilities.join(","),
           },
           body: JSON.stringify(request),
           signal: requestSignal,
@@ -411,11 +333,8 @@ export class TerminalSession {
       this.#throwIfAborted(requestSignal);
       if (response.status === 401 || response.status === 403) throw new AuthenticationError();
       if (!response.ok) throw new Error("connection set request failed");
-      const connectionSet = ConnectionSetResponseSchema.parse(await response.json());
+      const connectionSet = BrowserConnectionSetResponseSchema.parse(await response.json());
       this.#throwIfAborted(requestSignal);
-      if (connectionSet.clientId === null || connectionSet.streamId === 0) {
-        throw new Error("browser connection set has no delivery identity");
-      }
       this.#clientId = connectionSet.clientId;
       try {
         this.#storage?.setItem(clientStorageKey(this.#sessionId), connectionSet.clientId);
@@ -426,33 +345,14 @@ export class TerminalSession {
     });
   }
 
-  #confirmedRecoveryStrategy(response: ConnectionSetResponse): RecoveryStrategy {
-    if (response.recoveryStrategy !== "v3") return "v2";
-    const confirmed = new Set(confirmedRelayCapabilities(response, this.#relayCapabilities));
-    if (!BROWSER_RECOVERY_V3_CAPABILITIES.every((capability) => confirmed.has(capability))) {
-      throw new ProtocolNegotiationError();
-    }
-    return "v3";
-  }
-
-  #activateDeliveryGeneration(strategy: RecoveryStrategy, generation: bigint): void {
+  #activateDeliveryGeneration(): void {
     this.#closeRecoveryRuntime();
-    this.#recoveryStrategy = strategy;
-    if (strategy === "v2") {
-      if (this.coordinator.state === "closed") {
-        this.coordinator = this.#createCoordinator(this.#activeCursor);
-      }
-      this.coordinator.fenceDeliveryGeneration(generation);
-      return;
-    }
-
-    this.coordinator.close();
     this.#input.setReplicaCurrent(false);
     this.#update({ deliveryState: "awaiting-control" });
   }
 
   #startRecoveryRuntime(generation: bigint, streamId: number): void {
-    if (this.#recoveryStrategy !== "v3" || this.#recoveryRuntime !== null) return;
+    if (this.#recoveryRuntime !== null) return;
     let runtime!: RecoveryRuntime;
     runtime = new RecoveryRuntime({
       deliveryGeneration: generation,
@@ -465,16 +365,16 @@ export class TerminalSession {
       now: this.#now,
       setTimer: this.#setTimer,
       clearTimer: this.#clearTimer,
-      onProgress: (frame) => this.#recoveryRuntime === runtime && this.#sendRecoveryControl(frame),
+      onProgress: (frame) => this.#recoveryRuntime === runtime && this.#sendProgressControl(frame),
       onFailure: () => {
         if (this.#recoveryRuntime === runtime) this.#protocolFailure();
       },
       onStateChange: () => {
-        if (this.#recoveryRuntime === runtime) this.#syncRecoveryState();
+        if (this.#recoveryRuntime === runtime) this.#syncDeliveryState();
       },
     });
     this.#recoveryRuntime = runtime;
-    this.#syncRecoveryState();
+    this.#syncDeliveryState();
   }
 
   async #openControl(
@@ -506,8 +406,6 @@ export class TerminalSession {
     connectionEpoch: number,
     dataEpoch: number,
     generation: bigint,
-    streamId: number,
-    recoveryStrategy: RecoveryStrategy,
     signal?: AbortSignal,
   ): Promise<WebSocket> {
     const socket = this.#createWebSocket(
@@ -529,24 +427,14 @@ export class TerminalSession {
         return;
       }
       try {
-        if (recoveryStrategy === "v3") {
-          const runtime = this.#recoveryRuntime;
-          if (runtime === null || !runtime.acceptEnvelope(event.data)) {
-            if (this.#isCurrentData(connectionEpoch, dataEpoch, generation)) {
-              this.#protocolFailure();
-            }
-            return;
-          }
-          this.#syncRecoveryState();
-        } else {
-          const frame = decodeDataFrame(event.data);
-          if (frame.deliveryGeneration !== generation || frame.streamId !== streamId) {
+        const runtime = this.#recoveryRuntime;
+        if (runtime === null || !runtime.acceptEnvelope(event.data)) {
+          if (this.#isCurrentData(connectionEpoch, dataEpoch, generation)) {
             this.#protocolFailure();
-            return;
           }
-          this.coordinator.acceptData(event.data);
-          this.#syncDeliveryState();
+          return;
         }
+        this.#syncDeliveryState();
       } catch {
         this.#protocolFailure();
       }
@@ -562,13 +450,8 @@ export class TerminalSession {
       this.#stopHeartbeat();
       this.#input.setReplicaCurrent(false);
       this.#update({ dataConnected: false, phase: "reconnecting" });
-      this.#cancelDataFailureTimer();
-      this.#dataFailureTimer = this.#setTimer(() => {
-        this.#dataFailureTimer = null;
-        if (this.#snapshotRetryTimer !== null) return;
-        this.#invalidateFullConnection();
-        this.#scheduleReconnect();
-      }, DATA_REPLACEMENT_GRACE_MS);
+      this.#invalidateFullConnection();
+      this.#scheduleReconnect();
     });
     return this.#awaitOpen(socket, signal);
   }
@@ -640,9 +523,7 @@ export class TerminalSession {
             lastEventSeq: cursor.lastEventSeq.toString(),
             nextPtyOffset: cursor.nextPtyOffset.toString(),
           };
-    if (this.#sendControl(ClientControlFrameSchema.parse(frame), true)) {
-      this.#startAttachStartWatchdog(generation);
-    }
+    this.#sendControl(ClientControlFrameSchema.parse(frame), true);
   }
 
   #handleControlMessage(data: unknown): void {
@@ -654,14 +535,9 @@ export class TerminalSession {
       this.#protocolFailure();
       return;
     }
-    const recoveryStrategy = this.#recoveryStrategy;
-    if (recoveryStrategy === null) {
-      this.#protocolFailure();
-      return;
-    }
-    let frame: ServerControlFrame | ServerControlFrameV3;
+    let frame: ServerControlFrame;
     try {
-      frame = decodeServerControlFrame(data, recoveryStrategy);
+      frame = decodeServerControlFrame(data);
     } catch {
       this.#protocolFailure();
       return;
@@ -682,45 +558,22 @@ export class TerminalSession {
       case "resync-required":
         this.#handleResyncRequired(frame);
         return;
-      case "replay-start":
-        if (recoveryStrategy !== "v2") {
-          this.#protocolFailure();
-          return;
-        }
-        if (!this.#matchesCurrentDelivery(frame)) return;
-        this.#update({ hostOnline: true });
-        this.coordinator.startWarmReplay(frame);
-        this.#syncDeliveryState();
-        return;
-      case "snapshot-manifest":
-        if (recoveryStrategy !== "v2") {
-          this.#protocolFailure();
-          return;
-        }
-        if (!this.#matchesCurrentDelivery(frame)) return;
-        this.#cancelAttachStartWatchdog();
-        this.#update({ hostOnline: true, phase: "restoring" });
-        void this.coordinator
-          .startSnapshot(frame)
-          .then(() => this.#syncDeliveryState())
-          .catch(() => this.#protocolFailure());
-        return;
       case "recovery-start": {
         const runtime = this.#recoveryRuntime;
-        if (recoveryStrategy !== "v3" || runtime === null || !runtime.acceptStart(frame)) {
+        if (runtime === null || !runtime.acceptStart(frame)) {
           if (this.#recoveryRuntime === runtime) this.#protocolFailure();
           return;
         }
-        this.#syncRecoveryState();
+        this.#syncDeliveryState();
         return;
       }
       case "recovery-source-closed": {
         const runtime = this.#recoveryRuntime;
-        if (recoveryStrategy !== "v3" || runtime === null || !runtime.acceptSourceClosed(frame)) {
+        if (runtime === null || !runtime.acceptSourceClosed(frame)) {
           if (this.#recoveryRuntime === runtime) this.#protocolFailure();
           return;
         }
-        this.#syncRecoveryState();
+        this.#syncDeliveryState();
         return;
       }
     }
@@ -781,134 +634,23 @@ export class TerminalSession {
       return;
     }
     const generation = BigInt(frame.deliveryGeneration);
-    if (this.#recoveryStrategy === "v3") {
-      if (this.#generation === null || generation <= this.#generation) {
-        this.#protocolFailure();
-        return;
-      }
-      this.#cancelAttachStartWatchdog();
-      this.#input.setReplicaCurrent(false);
-      this.#invalidateFullConnection();
-      this.#scheduleReconnect();
-      return;
-    }
-    if (
-      frame.dataTicket !== undefined &&
-      (this.#generation === null ||
-        generation <= this.#generation ||
-        frame.expiresAt! <= this.#now())
-    ) {
+    if (this.#generation === null || generation <= this.#generation) {
       this.#protocolFailure();
       return;
     }
-    if (frame.dataTicket !== undefined) this.#cancelSnapshotRetry(false);
-    this.#cancelAttachStartWatchdog();
     this.#input.setReplicaCurrent(false);
-    this.coordinator.fenceDeliveryGeneration(generation);
-    this.#syncDeliveryState();
-    if (frame.dataTicket === undefined) {
-      this.#invalidateFullConnection();
-      this.#scheduleReconnect();
-      return;
-    }
-    this.#cancelDataFailureTimer();
-    void this.#replaceData(frame.dataTicket, generation);
+    this.#invalidateFullConnection();
+    this.#scheduleReconnect();
   }
 
-  async #replaceData(ticket: string, generation: bigint): Promise<void> {
-    if (this.#recoveryStrategy !== "v2") {
-      this.#protocolFailure();
-      return;
-    }
-    const connectionEpoch = this.#connectionEpoch;
-    if (!this.#isCurrentConnection(connectionEpoch) || this.#control?.readyState !== 1) {
-      this.#invalidateFullConnection();
-      this.#scheduleReconnect();
-      return;
-    }
-    this.#abortDataReplacement();
-    // Fence first, then invalidate the old transport callback before opening replacement data.
-    this.coordinator.fenceDeliveryGeneration(generation);
-    const dataEpoch = ++this.#dataEpoch;
-    const abort = new AbortController();
-    this.#replacementAbort = abort;
-    this.#generation = generation;
-    this.#input.setReplicaCurrent(false);
-    this.#stopHeartbeat();
-    this.#closeSocket(this.#data);
-    this.#data = null;
-    this.#update({ dataConnected: false, phase: "reconnecting" });
-    try {
-      const data = await this.#openData(
-        ticket,
-        connectionEpoch,
-        dataEpoch,
-        generation,
-        this.#streamId,
-        "v2",
-        abort.signal,
-      );
-      if (!this.#isCurrentData(connectionEpoch, dataEpoch, generation)) {
-        this.#closeSocket(data);
-        return;
-      }
-      this.#data = data;
-      this.#lastDataPongAt = this.#now();
-      this.#startHeartbeat(connectionEpoch, dataEpoch, generation);
-      this.#update({ dataConnected: true, phase: "attaching" });
-      this.#sendAttach();
-    } catch {
-      if (abort.signal.aborted || !this.#isCurrentData(connectionEpoch, dataEpoch, generation)) {
-        return;
-      }
-      if (this.#snapshotRetryTimer !== null) return;
-      this.#invalidateFullConnection();
-      this.#scheduleReconnect();
-    } finally {
-      if (this.#replacementAbort === abort) this.#replacementAbort = null;
-    }
+  #sendProgressControl(frame: RecoveryProgressFrame): boolean {
+    return this.#sendControl(ClientControlFrameSchema.parse(frame), true);
   }
 
-  #matchesCurrentDelivery(
-    frame: Extract<ServerControlFrame, { type: "replay-start" | "snapshot-manifest" }>,
-  ): boolean {
-    const generation = this.#generation;
-    if (generation === null) return false;
-    const frameGeneration = BigInt(frame.deliveryGeneration);
-    if (frameGeneration < generation) return false;
-    if (!frameMatchesDelivery(frame, generation, this.#streamId)) {
-      this.#protocolFailure();
-      return false;
-    }
-    return true;
-  }
-
-  #acknowledge(cursor: ReplicaCursor): void {
-    if (this.#recoveryStrategy !== "v2" || cursor.deliveryGeneration !== this.#generation) return;
-    this.#sendControl(
-      ClientControlFrameSchema.parse({
-        type: "ack",
-        sessionEpoch: cursor.sessionEpoch.toString(),
-        deliveryGeneration: cursor.deliveryGeneration.toString(),
-        eventSeq: cursor.lastEventSeq.toString(),
-        nextPtyOffset: cursor.nextPtyOffset.toString(),
-      }),
-      true,
-    );
-  }
-
-  #sendRecoveryControl(frame: RecoveryV3ClientControlFrame): boolean {
-    if (this.#recoveryStrategy !== "v3") return false;
-    return this.#sendControl(ClientControlFrameV3Schema.parse(frame), true);
-  }
-
-  #sendControl(frame: ClientControlFrame | ClientControlFrameV3, critical = false): boolean {
+  #sendControl(frame: ClientControlFrame, critical = false): boolean {
     const control = this.#control;
     try {
-      const validated =
-        this.#recoveryStrategy === "v3"
-          ? ClientControlFrameV3Schema.parse(frame)
-          : ClientControlFrameSchema.parse(frame);
+      const validated = ClientControlFrameSchema.parse(frame);
       const payload = JSON.stringify(validated);
       const payloadBytes = textEncoder.encode(payload).byteLength;
       if (
@@ -933,33 +675,14 @@ export class TerminalSession {
   }
 
   #syncDeliveryState(): void {
-    if (this.#recoveryStrategy !== "v2") return;
-    const deliveryState = this.coordinator.state;
-    let phase = this.#snapshot.phase;
-    if (deliveryState === "live") {
-      this.#cancelAttachStartWatchdog();
-      phase = "live";
-      this.#cancelSnapshotRetry(true);
-      this.#input.setReplicaCurrent(true);
-    } else {
-      this.#input.setReplicaCurrent(false);
-      if (deliveryState === "restoring" || deliveryState === "replaying") phase = "restoring";
-      else if (deliveryState === "resyncing") phase = "reconnecting";
-    }
-    this.#update({ deliveryState, phase });
-  }
-
-  #syncRecoveryState(): void {
     const runtime = this.#recoveryRuntime;
-    if (this.#recoveryStrategy !== "v3" || runtime === null) return;
+    if (runtime === null) return;
     this.#activeCursor = runtime.activeCursor;
     let deliveryState: DeliveryState;
     let phase: SessionPhase;
     if (runtime.state === "live") {
       deliveryState = "live";
       phase = "live";
-      this.#cancelAttachStartWatchdog();
-      this.#cancelSnapshotRetry(true);
       this.#input.setReplicaCurrent(true);
     } else if (runtime.state === "failed") {
       deliveryState = "resyncing";
@@ -977,29 +700,6 @@ export class TerminalSession {
     this.#update({ deliveryState, phase });
   }
 
-  #handleCoordinatorResync(reason: ResyncReason): void {
-    if (this.#recoveryStrategy !== "v2") return;
-    this.#activeCursor = this.coordinator.activeCursor;
-    if (reason === "engine-mismatch") {
-      this.#terminalFailure("engine");
-      return;
-    }
-    if (
-      reason === "restore-failed" ||
-      (this.#snapshot.phase === "restoring" &&
-        (reason === "journal-gap" || reason === "slow-client"))
-    ) {
-      this.#scheduleSnapshotRetry();
-      return;
-    }
-    this.#update({
-      lastError: "protocol",
-      phase: "reconnecting",
-    });
-    this.#invalidateFullConnection();
-    this.#scheduleReconnect();
-  }
-
   #protocolFailure(kind: "engine" | "protocol" = "protocol"): void {
     if (kind === "engine") {
       this.#terminalFailure("engine");
@@ -1013,7 +713,6 @@ export class TerminalSession {
   #scheduleReconnect(): void {
     if (this.#closed || this.#automaticReconnectBlocked) return;
     this.#needsReconnect = true;
-    if (this.#snapshotRetryTimer !== null) return;
     if (this.#reconnectTimer !== null || this.#connectPromise !== null) return;
     this.#input.detachTransport();
     const exponent = Math.min(6, Math.max(0, this.#snapshot.attempt - 1));
@@ -1077,30 +776,6 @@ export class TerminalSession {
     this.#heartbeatTimer = this.#setTimer(tick, HEARTBEAT_INTERVAL_MS);
   }
 
-  #startAttachStartWatchdog(generation: bigint): void {
-    this.#cancelAttachStartWatchdog();
-    const connectionEpoch = this.#connectionEpoch;
-    const dataEpoch = this.#dataEpoch;
-    this.#attachStartTimer = this.#setTimer(() => {
-      this.#attachStartTimer = null;
-      if (
-        !this.#isCurrentData(connectionEpoch, dataEpoch, generation) ||
-        (this.#recoveryStrategy === "v3"
-          ? this.#recoveryRuntime?.state === "live"
-          : this.coordinator.state === "live")
-      ) {
-        return;
-      }
-      this.#update({ lastError: "connection", phase: "reconnecting" });
-      this.#failFullConnection();
-    }, ATTACH_START_TIMEOUT_MS);
-  }
-
-  #cancelAttachStartWatchdog(): void {
-    if (this.#attachStartTimer !== null) this.#clearTimer(this.#attachStartTimer);
-    this.#attachStartTimer = null;
-  }
-
   #startWriterLeaseRenewal(): void {
     this.#stopWriterLeaseRenewal();
     const connectionEpoch = this.#connectionEpoch;
@@ -1151,7 +826,6 @@ export class TerminalSession {
     this.#automaticReconnectBlocked = true;
     this.#needsReconnect = false;
     this.#cancelReconnectTimer();
-    this.#cancelSnapshotRetry(false);
     this.#invalidateFullConnection();
     this.#update({ lastError: kind, phase: "failed" });
   }
@@ -1161,14 +835,10 @@ export class TerminalSession {
     ++this.#dataEpoch;
     this.#connectAbort?.abort(new DOMException("connection replaced", "AbortError"));
     this.#connectAbort = null;
-    this.#abortDataReplacement();
-    this.#cancelDataFailureTimer();
-    this.#cancelAttachStartWatchdog();
     this.#stopHeartbeat();
     this.#stopWriterLeaseRenewal();
     this.#input.detachTransport();
     this.#closeRecoveryRuntime();
-    this.#recoveryStrategy = null;
     this.#closeSocket(this.#control);
     this.#closeSocket(this.#data);
     this.#control = null;
@@ -1182,39 +852,6 @@ export class TerminalSession {
     this.#activeCursor = runtime.activeCursor;
     this.#recoveryRuntime = null;
     runtime.close();
-  }
-
-  #scheduleSnapshotRetry(): void {
-    if (this.#closed || this.#automaticReconnectBlocked || this.#snapshotRetryTimer !== null)
-      return;
-    const exponent = Math.min(4, this.#snapshotFailureCount++);
-    const base = Math.min(SNAPSHOT_RETRY_MAX_MS, SNAPSHOT_RETRY_BASE_MS * 2 ** exponent);
-    const delay = Math.max(0, Math.round(base * (0.8 + this.#random() * 0.4)));
-    this.#input.setReplicaCurrent(false);
-    this.#update({ lastError: "connection", phase: "reconnecting" });
-    this.#snapshotRetryTimer = this.#setTimer(() => {
-      this.#snapshotRetryTimer = null;
-      if (this.#closed || this.#automaticReconnectBlocked) return;
-      this.#invalidateFullConnection();
-      if (this.#connectPromise === null) this.#startFullConnection(false);
-      else this.#needsReconnect = true;
-    }, delay);
-  }
-
-  #cancelSnapshotRetry(resetFailures: boolean): void {
-    if (this.#snapshotRetryTimer !== null) this.#clearTimer(this.#snapshotRetryTimer);
-    this.#snapshotRetryTimer = null;
-    if (resetFailures) this.#snapshotFailureCount = 0;
-  }
-
-  #cancelDataFailureTimer(): void {
-    if (this.#dataFailureTimer !== null) this.#clearTimer(this.#dataFailureTimer);
-    this.#dataFailureTimer = null;
-  }
-
-  #abortDataReplacement(): void {
-    this.#replacementAbort?.abort(new DOMException("data replacement superseded", "AbortError"));
-    this.#replacementAbort = null;
   }
 
   #closeSocket(socket: WebSocket | null): void {
@@ -1277,4 +914,3 @@ export class TerminalSession {
 }
 
 class AuthenticationError extends Error {}
-class ProtocolNegotiationError extends Error {}

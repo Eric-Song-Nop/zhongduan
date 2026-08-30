@@ -1,127 +1,53 @@
 # MVP 架构
 
-> 状态：本文只描述 **CURRENT protocol v2** 的已实现架构。三逻辑平面、Recovery v3、
-> writer-only validation cut 和 prediction branch 都是 TARGET，见
-> [终端协议架构与不变量](terminal-protocol-architecture.md)。当前实现到目标状态的迁移见
-> [高性能远程终端 Snapshot 恢复实施计划](high-performance-snapshot-recovery-plan.md)和
-> [输入稳定性与高 RTT 交互实施计划](input-stability-plan.md)。
+Zhongduan 把本地 PTY/terminal authority 通过 Cloudflare Durable Object提供给 Browser。当前架构只有一套
+连接、恢复和输入实践；协议细节见[终端协议架构](terminal-protocol-architecture.md)与
+[Recovery 协议](recovery-protocol.md)。
 
-## 目标
+## Host daemon
 
-MVP 交付一个 Linux Host 上持续运行、可从浏览器附加和重连的远程终端。它必须正确运行 Vim、tmux、htop 等 TUI，并在网络抖动、浏览器刷新、Cloudflare Durable Object 休眠和持续高速输出下保持有界资源占用。
+Host 进程拥有 PTY、GhosttyCore、authority actor、mutation journal和 snapshot capture。`HostCloudRelay`
+维护与 Cloud 的 control/data socket pair，并在 session生命周期内持有：
 
-## 权威模型
+- `CanonicalPublisher`：持续发布 canonical mutation和有序 start fence；
+- `SnapshotRefreshOwner`：独立 prime/refresh immutable snapshot；
+- `RecoverySourceManager`：固化 recovery gap、grant、receipt、deadline与retained bytes；
+- `RecoverySourceScheduler`：连接内 byte-DRR 与 shared socket backpressure。
+
+Host 不为 Browser恢复暂停 authority，也不保留另一套 barrier/replay scheduler。
+
+## Terminal Cloud
+
+Worker负责认证、HTTP、snapshot upload/download和 WebSocket upgrade。每个 session映射到一个 SQLite-backed
+`TerminalSessionDO`。DO持有 connection/generation、writer lease、authority head、recovery/lane ledger、
+control outbox、snapshot retention、shared payload ring与 weighted delivery scheduler。
+
+Durable scalar先提交，socket I/O后执行；休眠恢复从 SQL与strict attachment重建。开发态旧 schema在首次
+启动时直接重建，不提供兼容迁移。
+
+## Browser
+
+Browser `TerminalSession`为每个 connection set启动 generation-scoped `RecoveryRuntime`。Runtime选择 warm
+visible replica或cold snapshot，持续接受两条 lane，apply mutation，并通过 `WTermReplicaHost`原子 adopt。
+完成后由 `RecoveryLiveReceiver`长期接管 live lane。Writer input使用独立 lease fence和 input epoch。
+
+## 数据流
 
 ```text
-Host daemon
-  PTY + child process
-  authoritative libghostty core
-  ordered journal
-  reusable Ghostty snapshot
-          |
-          | ordered PTY/resize mutations
-          v
-Cloudflare Worker + TerminalSessionDO + R2
-          |
-          v
-Browser wterm
-  passive libghostty replica
+PTY / semantic input
+  -> Host authority actor
+  -> canonical mutation journal
+  -> Host data WebSocket
+  -> TerminalSessionDO authority commit
+  -> shared delivery ring + per-client envelope
+  -> Browser RecoveryRuntime
+  -> Ghostty/WTerm replica
 ```
 
-Host 是唯一终端设备权威。它按同一 actor 顺序执行 PTY 输出、resize、终端 query response 和语义输入编码。浏览器 core 永久采用 `effects: discard`，不会回答 DA/DSR、写入 PTY 或重放 bell、clipboard 等瞬时副作用。
+Cold recovery另外通过 R2 snapshot建立 base；gap与live仍走同一 delivery owner。
 
-当前 `eventSeq` 只由影响可恢复终端状态的 `PTY_OUTPUT` 和 `RESIZE_APPLIED` 消耗。Control ACK、
-writer lease、input receipt 等消息不进入 terminal journal，也不改变 snapshot/tail cursor。
+## MVP 边界
 
-## 实时与恢复
-
-健康连接直接转发有序的原始 PTY bytes。`PTY_OUTPUT` 和 `RESIZE_APPLIED` 共用一个二进制数据 WebSocket 和同一个 `eventSeq`，因此 resize 的 reflow 位置不会丢失。
-
-恢复有两条路径：
-
-1. 页面仍保留相同 engine 的 live core，且 Host journal 覆盖缺口时，只重放 tail。
-2. 页面刷新、journal gap 或慢客户端重置时，恢复 Host 的 Ghostty snapshot，再严格应用 snapshot cut 之后的 tail。
-
-Ghostty snapshot 只承担 checkpoint，不承担事件传输。它的 continuation 恢复 snapshot cut 之前未完成的 VT/UTF-8 parser 状态；tail 从 `nextPtyOffset` 开始，不能重复 continuation bytes。
-
-CURRENT v2 的 cold/warm recovery 使用 fixed commit、barrier 和 pinned delivery。在 barrier 到
-ReplayCommit 的线性交接窗口，Host 会全局暂停 canonical publisher；Cloud 在 pinned delivery 存在时也
-不能接受新的 canonical head。这个 global pause 是当前线性交接协议的 **correctness invariant**，不只是待优化的性能开关：
-若单独移除，恢复中的客户端会漏掉 fixed commit 之后的新 mutation，或把不同 generation 的
-snapshot、tail 和 live output 错拼。只有 TARGET Recovery v3 的 live floor、concurrent gap-fill、
-`RecoveryDone`/`RecoveryAdopted` 和有界 assembler 全部协商成功后，才能在完整协商的新 recovery
-generation 中替换它；所有 v2 attempt 继续保持原语义。
-
-## 进程边界
-
-### Host daemon
-
-- Node.js 24 + TypeScript，由 Vite+ 构建和测试。
-- `node-pty` 持有真实 PTY 和 child process。
-- 复用 wterm fork 的 Ghostty WASM 作为权威 core，使 Host 和浏览器天然共享相同 codec。
-- relay-agent 是 daemon 内的可重启连接组件；网络断开不终止 PTY。
-- journal 只保留 warm replay 和 snapshot tail，不因客户端 ACK 无限延长。
-
-### Cloudflare
-
-- 一个 Cloudflare Vite 应用同时包含 React SPA、Worker 和 SQLite-backed `TerminalSessionDO`。
-- 两条 Hibernation WebSocket：control 负责 attach、lease、input、ACK 和 resync；data 负责有序终端
-  mutation、journal tail、delivery barrier 与 replay commit。
-- DO 持久化 session/client、writer lease、ticket、snapshot/upload 等控制面 metadata，并负责连接协调、
-  fencing 和短暂转发；不保存高吞吐 Host journal。
-- R2 保存不可变压缩 snapshot；blob 成功写入后才发布 DO metadata。浏览器通过受权 HTTP `ReadableStream` 下载，以获得背压、取消和零 DO 缓冲。
-
-### wterm fork
-
-- Ghostty SHA、snapshot schema、Zig toolchain 和 patchset 共同形成精确 `engineId`。
-- 增加 snapshot encode、detached passive restore、显式 `takeCore()` ownership transfer、`dispose()` 和原子 `adoptCore()`。
-- READY 前同步恢复当前画面；history 每页解码一次并在 JS event loop 间 yield。
-- CURRENT Browser manifest 固定选择 FINISH 后才 adopt。WTerm decoder 支持在 READY 后永久放弃 history，
-  但当前网络恢复不使用 READY-only adopt，也不跨 owner 保留 decoder。
-
-## 有界策略
-
-下表是当前实现的不同资源闸门，不是一个可互换的“tail budget”。这些值是实现保护条件，
-不是 wire compatibility 保证；恢复策略的目标值与迁移方式见高性能 Snapshot 计划。
-
-| 层级/用途                                | 当前默认值                                                       |
-| ---------------------------------------- | ---------------------------------------------------------------- |
-| Journal segment                          | 256 KiB 或 250 ms                                                |
-| Journal retention                        | 60 s / 8 MiB                                                     |
-| Host warm replay admission               | 256 KiB / 512 frames                                             |
-| Host cold snapshot tail admission        | 256 KiB / 512 frames                                             |
-| Relay delivery outstanding               | 512 KiB                                                          |
-| Host paused canonical queue              | 8 MiB / 1024 frames                                              |
-| Browser recovery tail buffer             | 2 MiB / 1024 frames                                              |
-| Browser snapshot load + restore deadline | 5 s                                                              |
-| Checkpoint age classification            | 30 s；不删除或隐藏 checkpoint                                    |
-| Snapshot recovery quiet                  | 250 ms                                                           |
-| Snapshot 最小构建间隔                    | 1 s                                                              |
-| Snapshot blob                            | 32 MiB compressed / 128 MiB uncompressed                         |
-| Cloud snapshot/upload rows               | 32 total / 4 pending；保留集合为 latest + active pins + 2 recent |
-
-客户端 data ACK 同时推进 relay delivery credit，并提供 warm replay baseline；它不会 pin Host journal。
-某客户端的 relay delivery outstanding 超过 512 KiB 时，只重置该客户端的 data WebSocket 并增加其
-`deliveryGeneration`，control WebSocket 保持可用。Cloud 全局 inbound queue 或 Host canonical queue
-超限属于更大的 fail-closed 边界，不适用这一隔离规则。但当前 Cloud 仍使用跨 socket
-全局串行队列；上文所述 v2 global pause 也会让 recovery 期间的 canonical output 停止发布。因此
-Ctrl-C、输入和可见回显仍可能发生 head-of-line blocking。TARGET 的逻辑 lane、并发 gap-fill 和
-独立 receive/apply progress 见[终端协议架构](terminal-protocol-architecture.md)，实施顺序见
-[输入稳定性计划](input-stability-plan.md)。
-
-## MVP 安全边界
-
-- capability token 明确区分 host、writer 和 observer；token 绑定 session、角色和过期时间。
-- writer lease 带 fencing token；同一 session 同时只有一个控制者可以输入和 resize。
-- Host/Cloud 入站应用 frame 在解析、复制或入队前执行长度/有界队列检查；Browser control 使用 strict schema，
-  但 WebSocket API 会先物化 message。Snapshot 同时限制压缩后和解压后长度。
-- Cloudflare 在 MVP 中是可信 relay，传输依赖 TLS；端到端加密不在本阶段。
-- `engineId` 必须精确相等。Ghostty snapshot envelope 的 `version=1` 不构成兼容保证。
-
-## 非目标
-
-- CRDT、多 writer 合并和共享输入草稿。
-- 录制回放、无限 scrollback、Kitty graphics 恢复。
-- 跨 `engineId` snapshot 迁移。
-- daemon 崩溃后恢复 shell 进程。
-- 端到端加密和零知识 relay。
+当前 correctness gates覆盖本地 Host/DO/Browser owner组合、DO hibernation、故障注入、committed Ghostty WASM
+continuation和 WTerm atomic adoption。MVP尚需 production-like staging、真实网络与R2、长期负载、性能/SLO和
+部署观测；这些工作不构成保留旧实现的理由。

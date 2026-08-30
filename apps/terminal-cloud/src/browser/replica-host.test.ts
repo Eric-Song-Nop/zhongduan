@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 
 import { GhosttyCore, GhosttyRuntime } from "@wterm/ghostty";
 import type { ReplicaCursor } from "@zhongduan/protocol";
-import type { SnapshotManifest } from "@zhongduan/session-client";
+import type { SnapshotRestoreSource } from "@zhongduan/session-client";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WTermReplicaHost } from "./replica-host";
@@ -70,11 +70,11 @@ describe("WTermReplicaHost committed-WASM adoption", () => {
       expect(previousGrid?.textContent).toContain("OLD-ACTIVE");
 
       const snapshot = await candidateSnapshot();
-      const manifest = snapshotManifest(host.engineId, snapshot.byteLength);
+      const source = snapshotSource(host.engineId, snapshot.byteLength);
       await expect(
         host.restore(
           snapshot.subarray(0, snapshot.byteLength - 1),
-          manifest,
+          source,
           new AbortController().signal,
         ),
       ).rejects.toThrow();
@@ -83,7 +83,7 @@ describe("WTermReplicaHost committed-WASM adoption", () => {
       expect(previousGrid?.innerHTML).toBe(previousHtml);
       expect(onAdopt).not.toHaveBeenCalled();
 
-      const candidate = await host.restore(snapshot, manifest, new AbortController().signal);
+      const candidate = await host.restore(snapshot, source, new AbortController().signal);
       candidate.writePty(encoder.encode("-EXACT-TAIL"));
       candidate.resize({ cols: 14, rows: 4, widthPx: 140, heightPx: 68 });
       expect(host.active).toBe(previous);
@@ -159,18 +159,15 @@ async function candidateSnapshot(): Promise<Uint8Array> {
   }
 }
 
-function snapshotManifest(engineId: string, byteLength: number): SnapshotManifest {
+function snapshotSource(engineId: string, byteLength: number): SnapshotRestoreSource {
   return {
-    type: "snapshot-manifest",
+    kind: "snapshot",
+    sessionId: "session_123456789",
     snapshotId: "snapshot_12345678",
     engineId,
     sessionEpoch: "7",
-    streamId: 3,
-    deliveryGeneration: "4",
     cutEventSeq: "10",
     nextPtyOffset: "20",
-    commitEventSeq: "12",
-    commitPtyOffset: "24",
     compression: "none",
     compressedLength: byteLength.toString(),
     uncompressedLength: byteLength.toString(),

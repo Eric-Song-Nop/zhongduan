@@ -1,8 +1,8 @@
 import {
-  DELIVERY_ENVELOPE_V3_HEADER_BYTES,
+  DELIVERY_ENVELOPE_HEADER_BYTES,
   DataFrameKind,
   encodeDataFrame,
-  encodeDeliveryEnvelopeV3,
+  encodeDeliveryEnvelope,
   encodeResizePayload,
   type DeliveryLane,
   type DeliveryLaneCursor,
@@ -123,8 +123,8 @@ function envelope(options: EnvelopeOptions): Uint8Array {
         ? Uint8Array.from(options.payload ?? [])
         : encodeResizePayload(options.resize),
   });
-  const encodedBytes = BigInt(DELIVERY_ENVELOPE_V3_HEADER_BYTES + payload.byteLength);
-  return encodeDeliveryEnvelopeV3({
+  const encodedBytes = BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + payload.byteLength);
+  return encodeDeliveryEnvelope({
     cumulativeEncodedBytes:
       options.cumulativeEncodedBytes ??
       (options.previousCumulativeEncodedBytes ?? SEED_LANE.cumulativeEncodedBytes) + encodedBytes,
@@ -437,7 +437,7 @@ describe("RecoveryLiveReceiver", () => {
       deliveryGeneration: DELIVERY_GENERATION.toString(),
       streamId: STREAM_ID,
       engineId: ENGINE_ID,
-      authorityDataVersion: 2,
+      authorityDataFormat: 1,
       base: { ...SEED_APPLIED.authorityCursor },
       source: { kind: "warm" },
       committedThrough: { ...SEED_APPLIED.authorityCursor },
@@ -448,7 +448,7 @@ describe("RecoveryLiveReceiver", () => {
       },
     };
     const donePayload = encodeDataFrame({
-      kind: DataFrameKind.ReplayCommit,
+      kind: DataFrameKind.RecoveryDone,
       flags: 0,
       sessionEpoch: SESSION_EPOCH,
       deliveryGeneration: 0n,
@@ -457,8 +457,8 @@ describe("RecoveryLiveReceiver", () => {
       streamId: 0,
       payload: new Uint8Array(),
     });
-    const doneCumulativeBytes = BigInt(DELIVERY_ENVELOPE_V3_HEADER_BYTES + donePayload.byteLength);
-    const done = encodeDeliveryEnvelopeV3({
+    const doneCumulativeBytes = BigInt(DELIVERY_ENVELOPE_HEADER_BYTES + donePayload.byteLength);
+    const done = encodeDeliveryEnvelope({
       cumulativeEncodedBytes: doneCumulativeBytes,
       deliveryGeneration: DELIVERY_GENERATION,
       deliveryOrdinal: 1n,
