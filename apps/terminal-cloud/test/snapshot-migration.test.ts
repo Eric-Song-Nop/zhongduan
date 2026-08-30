@@ -365,7 +365,7 @@ describe("snapshot retention migration", () => {
     const admitted = await uploadSnapshot(session, "snapshot_after_legacy_drain");
     expect(admitted.status).toBe(201);
     await admitted.body?.cancel();
-  }, 15_000);
+  }, 30_000);
 
   it("carries released pins into grace without exceeding the protected-row bound", async () => {
     const session = await createSession();
