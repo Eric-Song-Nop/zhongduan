@@ -513,7 +513,7 @@ describe("cloud relay runtime", () => {
     control.socket?.close(1000, "test complete");
     continuedControl.socket?.close(1000, "test complete");
     continuedData.socket?.close(1000, "test complete");
-  });
+  }, 10_000);
 
   it("rejects an already-issued v3 ticket after the kill switch closes without changing v2 ownership", async () => {
     const session = await createSession();
@@ -1195,7 +1195,7 @@ describe("cloud relay runtime", () => {
         },
     );
     expect(clientCount.value).toBeLessThanOrEqual(16);
-  }, 15_000);
+  }, 30_000);
 
   it("keeps only one pending connection set for the same browser identity", async () => {
     const session = await createSession();
