@@ -4,7 +4,7 @@ import {
   KeyModifier,
   type ResizePayload,
 } from "@zhongduan/protocol";
-import { GHOSTTY_ENGINE_ID } from "@wterm/ghostty";
+import { GHOSTTY_ENGINE_ID, GhosttyCore, type GhosttyPassiveRestore } from "@wterm/ghostty";
 import { describe, expect, it } from "vitest";
 
 import { EventJournal } from "./journal";
@@ -135,6 +135,85 @@ describe("WtermGhosttyAuthority", () => {
       authority.dispose();
     }
   });
+
+  it.each([
+    {
+      name: "UTF-8",
+      prefix: Uint8Array.of(0xe2, 0x82),
+      tail: Uint8Array.of(0xac),
+    },
+    {
+      name: "CSI",
+      prefix: encoder.encode("\u001b[38;5;20"),
+      tail: encoder.encode("0m"),
+    },
+    {
+      name: "OSC",
+      prefix: encoder.encode("\u001b]8;;https://exam"),
+      tail: encoder.encode("ple.com\u001b\\OSC-LINK\u001b]8;;\u001b\\"),
+    },
+    {
+      name: "DCS",
+      prefix: encoder.encode("\u001bP+q54"),
+      tail: encoder.encode("4E\u001b\\"),
+    },
+  ])(
+    "matches an uninterrupted committed-WASM oracle across a half $name checkpoint",
+    async ({ prefix, tail }) => {
+      const runtime = await loadCommittedGhosttyRuntime();
+      const uninterrupted = GhosttyCore.fromRuntime(runtime, {
+        effects: "discard",
+        scrollbackLimit: 1024 * 1024,
+      });
+      uninterrupted.init(20, 4);
+      const preCheckpoint = continuityPrelude(prefix);
+      applyContinuityOperations(uninterrupted, preCheckpoint);
+      const snapshotAtR = uninterrupted.encodeSnapshot();
+      const restoredAtR = runtime.beginPassiveRestore(snapshotAtR, {
+        effects: "discard",
+        maxContinuationBytes: 64 * 1024,
+      });
+      const recovered = runtime.beginPassiveRestore(snapshotAtR, {
+        effects: "discard",
+        maxContinuationBytes: 64 * 1024,
+      });
+      let checkpointCore: GhosttyCore | null = null;
+      let recoveredCore: GhosttyCore | null = null;
+
+      try {
+        await restoredAtR.advanceToFinish({ yieldBetweenPages: false });
+        checkpointCore = restoredAtR.takeCore();
+
+        expect(snapshotAtR.subarray(0, 8)).toEqual(encoder.encode("GHOSTSNP"));
+        expect(uninterrupted.getContinuation().byteLength).toBeGreaterThan(0);
+        expect(uninterrupted.usingAltScreen()).toBe(true);
+        expect(uninterrupted.synchronizedOutput()).toBe(true);
+        expect(checkpointCore.encodeSnapshot()).toEqual(snapshotAtR);
+        expect(terminalState(checkpointCore)).toEqual(terminalState(uninterrupted));
+
+        await recovered.advanceToFinish({ yieldBetweenPages: false });
+        const postCheckpoint = continuityTail(tail);
+        applyContinuityOperations(uninterrupted, postCheckpoint);
+        applyContinuityOperations(recovered, postCheckpoint);
+        recoveredCore = recovered.takeCore();
+
+        expect(recoveredCore.encodeSnapshot()).toEqual(uninterrupted.encodeSnapshot());
+        expect(terminalState(recoveredCore)).toEqual(terminalState(uninterrupted));
+        expect(uninterrupted.getContinuation()).toEqual(new Uint8Array());
+        expect(uninterrupted.usingAltScreen()).toBe(false);
+        expect(uninterrupted.synchronizedOutput()).toBe(false);
+        expect(uninterrupted.cursorKeysApp()).toBe(true);
+        expect(uninterrupted.bracketedPaste()).toBe(true);
+        expect(uninterrupted.getScrollbackCount()).toBeGreaterThan(0);
+      } finally {
+        recoveredCore?.dispose();
+        checkpointCore?.dispose();
+        recovered.dispose();
+        restoredAtR.dispose();
+        uninterrupted.dispose();
+      }
+    },
+  );
 
   it("returns ordered DA and DSR binary effects exactly once", async () => {
     const authority = await WtermGhosttyAuthority.create(dimensions);
@@ -380,5 +459,112 @@ function liveOwners(runtime: Awaited<ReturnType<typeof loadCommittedGhosttyRunti
     buffers: runtime.wasm.exports.live_bridge_buffers(),
     handles: runtime.wasm.exports.live_restore_handles(),
     states: runtime.wasm.exports.live_terminal_states(),
+  };
+}
+
+type ContinuityOperation =
+  | { type: "resize"; dimensions: ResizePayload }
+  | { type: "write"; data: Uint8Array };
+
+interface ContinuityTarget {
+  resize(cols: number, rows: number, widthPx?: number, heightPx?: number): void;
+  writeRaw(data: Uint8Array): void;
+}
+
+function continuityPrelude(continuationPrefix: Uint8Array): ContinuityOperation[] {
+  return [
+    {
+      type: "write",
+      data: encoder.encode(
+        "primary-00-abcdefghij\r\n" +
+          "primary-01-abcdefghij\r\n" +
+          "primary-02-abcdefghij\r\n" +
+          "primary-03-abcdefghij\r\n" +
+          "primary-04-abcdefghij\r\n" +
+          "primary-05-abcdefghij\r\n",
+      ),
+    },
+    {
+      type: "resize",
+      dimensions: { cols: 11, rows: 5, widthPx: 110, heightPx: 85 },
+    },
+    {
+      type: "write",
+      data: encoder.encode(
+        "\u001b[?1h\u001b[?2004h\u001b[?1004h" +
+          "\u001b[?1049hALT-CHECKPOINT\r\n" +
+          "\u001b[?2026hheld:",
+      ),
+    },
+    { type: "write", data: continuationPrefix },
+  ];
+}
+
+function continuityTail(continuationTail: Uint8Array): ContinuityOperation[] {
+  return [
+    { type: "write", data: continuationTail },
+    { type: "write", data: encoder.encode("-exact-tail") },
+    {
+      type: "resize",
+      dimensions: { cols: 13, rows: 4, widthPx: 130, heightPx: 68 },
+    },
+    {
+      type: "write",
+      data: encoder.encode(
+        "\u001b[?2026l\u001b[?1049l" +
+          "\r\nprobe-€-中-abcdefghi\r\n" +
+          "probe-scroll-1\r\nprobe-scroll-2\r\nprobe-scroll-3\r\n",
+      ),
+    },
+    {
+      type: "resize",
+      dimensions: { cols: 9, rows: 5, widthPx: 90, heightPx: 85 },
+    },
+    { type: "write", data: encoder.encode("probe-finish") },
+  ];
+}
+
+function applyContinuityOperations(
+  target: GhosttyCore | GhosttyPassiveRestore,
+  operations: readonly ContinuityOperation[],
+): void {
+  const mutable = target as ContinuityTarget;
+  for (const operation of operations) {
+    if (operation.type === "write") {
+      mutable.writeRaw(operation.data);
+      continue;
+    }
+    const { cols, rows, widthPx, heightPx } = operation.dimensions;
+    mutable.resize(cols, rows, widthPx, heightPx);
+  }
+}
+
+function terminalState(core: GhosttyCore) {
+  const viewport = Array.from({ length: core.getRows() }, (_, row) =>
+    Array.from({ length: core.getCols() }, (_unused, col) => core.getCell(row, col)),
+  );
+  const scrollback = Array.from({ length: core.getScrollbackCount() }, (_, offset) => {
+    const length = core.getScrollbackLineLen(offset);
+    return {
+      length,
+      cells: Array.from({ length }, (_unused, col) => core.getScrollbackCell(offset, col)),
+    };
+  });
+  return {
+    cols: core.getCols(),
+    rows: core.getRows(),
+    cursor: core.getCursor(),
+    continuation: core.getContinuation(),
+    modes: {
+      bracketedPaste: core.bracketedPaste(),
+      cursorKeysApp: core.cursorKeysApp(),
+      focusEvents: core.focusEvents(),
+      mouseSgr: core.mouseSgr(),
+      mouseTracking: core.mouseTracking(),
+      synchronizedOutput: core.synchronizedOutput(),
+      usingAltScreen: core.usingAltScreen(),
+    },
+    scrollback,
+    viewport,
   };
 }
