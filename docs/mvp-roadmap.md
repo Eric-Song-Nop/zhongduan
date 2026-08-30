@@ -6,7 +6,7 @@
 > 具体工作分别见[高性能远程终端 Snapshot 恢复实施计划](high-performance-snapshot-recovery-plan.md)与
 > [输入稳定性与高 RTT 交互实施计划](input-stability-plan.md)。
 >
-> Recovery v3 当前新增的 P2.5a stacked candidate 交付 Cloud v9 no-payload delivery ledger、
+> Recovery v3 当前的 P2.5a stacked candidate 交付 Cloud v9 no-payload delivery ledger、
 > enqueue/begin/send/confirm ordering 与 hibernation 后的 delivery-owner fence；P2.5b 在现有
 > `2 MiB / 1024 records` cap/grant 内交付 Host recovery source multi-outstanding、connection-local
 > DRR、shared data backpressure yield 与 per-source deadline isolation；P2.5c stacked candidate 交付
@@ -14,9 +14,12 @@
 > exact start-ready ACK 后 bounded refill、ephemeral shared canonical ring、writer reserve/observer-first
 > reconcile、live/recovery windows，以及 `4 / 2 / 2 / 1` 四类 weighted byte-DRR。每 record
 > `scheduler.wait(0)` 只提供调度机会，不是 ingress priority、物理 socket high-water、性能或 SLO 证明。
-> wake 时 `queued`/`sending` fail closed，`sent` 不重发；默认 production kill switch=false，Host/Browser
-> offer 仍选择 v2，P2.6 continuity/rolling gate 仍后置。这不改写下方历史 MVP stack，也不修改
-> WTerm/Ghostty；真实 API 缺口仍须先在 `Eric-Song-Nop` 对应 fork 走独立 PR，再更新 Zhongduan 固定 submodule。
+> wake 时 `queued`/`sending` fail closed，`sent` 不重发；P2.6 stacked candidate 已完成本地 deterministic
+> three-owner continuity、generation-scoped rollout/rollback、committed-WASM Ghostty continuation 与真实
+> WTerm atomic adoption gates。
+> 默认 production kill switch=false，Host/Browser offer 仍选择 v2，production-like staging、真实网络和
+> 性能验证继续后置。这不改写下方历史 MVP stack，也不修改 WTerm/Ghostty production code 或固定 pin；
+> 未来真实 API 缺口仍须先在 `Eric-Song-Nop` 对应 fork 走独立 PR，再更新 Zhongduan 固定 submodule。
 
 每层 PR 都基于前一层分支，并提供一个可运行或可验证的纵向能力。后续 PR 只在其直接依赖合并后改 base，不压平历史。
 
