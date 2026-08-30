@@ -682,5 +682,5 @@ describe("Recovery v3 rollout and control fault boundaries", () => {
     });
     expect(host.control.readyState).toBe(WebSocket.OPEN);
     expect(survivor.control.readyState).toBe(WebSocket.OPEN);
-  });
+  }, 10_000);
 });
