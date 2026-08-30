@@ -971,6 +971,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.rejectInput(webSocket, frame.inputEpoch, frame.clientInputSeq);
       return;
     }
+    const hostAttachment = readAttachment(host);
     const sendResult = this.sendHostControl(
       host,
       {
@@ -980,6 +981,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         writerFence: latestAttachment.leaseFence,
       },
       "semantic input delivery failed",
+      true,
     );
     if (sendResult !== "sent") {
       this.rejectInput(
@@ -988,6 +990,9 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         frame.clientInputSeq,
         sendResult === "uncertain" ? "uncertain" : "rejected",
       );
+      if (sendResult === "uncertain" && hostAttachment?.peer === "host") {
+        this.failCurrentHost(hostAttachment, "semantic input delivery failed");
+      }
     }
   }
 
@@ -2753,6 +2758,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     webSocket: WebSocket,
     frame: z.input<typeof RelayToHostControlFrameSchema>,
     failureReason: string,
+    deferUncertainFailure = false,
   ): HostControlSendResult {
     const attachment = readAttachment(webSocket);
     if (
@@ -2778,7 +2784,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       webSocket.send(encoded);
       return "sent";
     } catch {
-      this.failCurrentHost(attachment, failureReason);
+      if (!deferUncertainFailure) this.failCurrentHost(attachment, failureReason);
       return "uncertain";
     }
   }

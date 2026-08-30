@@ -2776,7 +2776,7 @@ describe("recovery Durable Object runtime", () => {
     expect(host.data.readyState).toBe(WebSocket.OPEN);
   });
 
-  it("isolates pre-Attach data loss, missing data, and repeated Attach exactly", async () => {
+  it("isolates pre-Attach data loss without leaving a control socket", async () => {
     const disconnectedSession = await createSession();
     const disconnectedHost = await openReadyHost(disconnectedSession);
     await publishSnapshot(disconnectedSession, "snapshot_pre_attach_data_01");
@@ -2796,9 +2796,12 @@ describe("recovery Durable Object runtime", () => {
     );
     const disconnectedControlClosed = nextClose(disconnectedControl);
     disconnectedData.close(1000, "data ended before Attach");
+    await drainSession(disconnectedSession.sessionId);
     expect(await disconnectedControlClosed).toMatchObject({ code: 4400 });
     expect(disconnectedHost.control.readyState).toBe(WebSocket.OPEN);
+  });
 
+  it("fails closed when initial Attach has no data channel", async () => {
     const missingSession = await createSession();
     const missingHost = await openReadyHost(missingSession);
     await publishSnapshot(missingSession, "snapshot_pre_attach_none_01");
@@ -2823,9 +2826,12 @@ describe("recovery Durable Object runtime", () => {
         nextPtyOffset: "0",
       }),
     );
+    await drainSession(missingSession.sessionId);
     expect(await missingControlClosed).toMatchObject({ code: 4400 });
     expect(missingHost.control.readyState).toBe(WebSocket.OPEN);
+  });
 
+  it("isolates a divergent repeated Attach without replacing its generation baseline", async () => {
     const repeatedSession = await createSession();
     const repeatedHost = await openReadyHost(repeatedSession);
     await publishSnapshot(repeatedSession, "snapshot_repeat_attach_0001");
@@ -2839,10 +2845,11 @@ describe("recovery Durable Object runtime", () => {
         deliveryGeneration: repeated.connection.deliveryGeneration,
         hasLiveReplica: true,
         lastSessionEpoch: "7",
-        lastEventSeq: "0",
+        lastEventSeq: "1",
         nextPtyOffset: "0",
       }),
     );
+    await drainSession(repeatedSession.sessionId);
     expect(
       (await Promise.all([repeatedControlClosed, repeatedDataClosed])).map(({ code }) => code),
     ).toEqual([4400, 4400]);
@@ -2972,7 +2979,9 @@ describe("recovery Durable Object runtime", () => {
 
     const hostControlClosed = nextClose(host.control);
     const hostDataClosed = nextClose(host.data);
-    const browserMessages = nextTexts(browser.control, 2);
+    const uncertainMessage = nextText(browser.control);
+    const browserControlClosed = nextClose(browser.control);
+    const browserDataClosed = nextClose(browser.data);
     browser.control.send(
       JSON.stringify({
         type: "text",
@@ -2985,15 +2994,14 @@ describe("recovery Durable Object runtime", () => {
     expect(
       (await Promise.all([hostControlClosed, hostDataClosed])).map(({ code }) => code),
     ).toEqual([4400, 4400]);
-    const frames = (await browserMessages).map((message) => decodeServerControlFrame(message));
-    expect(frames).toEqual([
-      { type: "host-offline" },
-      {
-        type: "input-ack",
-        inputEpoch: "uncertain_input",
-        clientInputSeq: "1",
-        status: "uncertain",
-      },
-    ]);
+    expect(decodeServerControlFrame(await uncertainMessage)).toMatchObject({
+      type: "input-ack",
+      inputEpoch: "uncertain_input",
+      clientInputSeq: "1",
+      status: "uncertain",
+    });
+    expect(
+      (await Promise.all([browserControlClosed, browserDataClosed])).map(({ code }) => code),
+    ).toEqual([4400, 4400]);
   });
 });
