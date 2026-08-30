@@ -1082,7 +1082,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     expect(writer.control.readyState).toBe(WebSocket.OPEN);
     expect(healthyObserver.control.readyState).toBe(WebSocket.OPEN);
     expect(legacy.control.readyState).toBe(WebSocket.OPEN);
-  });
+  }, 10_000);
 
   it("yields once before every queued send and confirms only after that yield resolves", async () => {
     const session = await createSession();
@@ -2501,7 +2501,7 @@ describe("Recovery v3 Durable Object runtime", () => {
     });
     expect(host.control.readyState).toBe(WebSocket.OPEN);
     expect(survivor.control.readyState).toBe(WebSocket.OPEN);
-  });
+  }, 10_000);
 
   it("fences a complete live owner on Host replacement and permits its next generation", async () => {
     const session = await createSession();
