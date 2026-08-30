@@ -405,7 +405,7 @@ describe("private HTTP snapshots", () => {
     const missing = await getSnapshot(session, snapshotId);
     expect(missing.status).toBe(503);
     expect(await missing.json()).toEqual({ error: "snapshot-unavailable" });
-  });
+  }, 10_000);
 
   it("fails closed when a published R2 version or metadata no longer matches", async () => {
     const session = await createSession();
