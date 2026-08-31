@@ -23,8 +23,7 @@ non-blocking recovery 等 gate；它在对应 cutover 前作为冻结的 grandfa
 
 规范性产品决策、roadmap 和新协议边界发生冲突时，以本文为准。CURRENT runtime 行为发生冲突时，
 以基线 commit 的代码、[MVP 架构](mvp-architecture.md)和 [Wire Protocol V2](wire-protocol.md)为准，
-并修正文档，不能用未来 gate 重新解释现状。[历史设计归档](archive/README.md)只保留研究上下文，
-不是 roadmap、兼容性承诺或实施依据。
+并修正文档，不能用未来 gate 重新解释现状。
 
 ## 产品判断
 
@@ -311,7 +310,7 @@ executable contract。v2 在 R4 前保持唯一运行时；替换必须由完整
 - terminal state delta 网络格式；
 - Mosh 式 UDP roaming。
 
-这些主题可以在以后重新提案，但不能从归档文档直接恢复为 roadmap。
+这些主题只有在重新通过上述产品 gate 后，才能进入 roadmap。
 
 ## 新提案的决策门槛
 

@@ -119,8 +119,7 @@ URL fragment 不会发送给 HTTP 服务器，页面加载后也会立即从地�
 - [产品契约与协议边界](docs/terminal-protocol-architecture.md)
 - [Wire protocol](docs/wire-protocol.md)
 - [Phase 0 验收契约](docs/phase-0-acceptance-contract.md)
-- [历史设计归档](docs/archive/README.md)
-- [历史设计记录（非规范）](resource.md)
+- [设计记录与资源约束（非规范）](resource.md)
 
 ## License
 

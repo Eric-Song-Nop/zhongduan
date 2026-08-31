@@ -3,8 +3,7 @@
 > 历史文档：这里记录 MVP 最初的 stacked PR 规划。相关实现已于 2026-08-28 合并到
 > `main`，不再用本页判断当前功能或部署状态。当前入口见[项目 README](../README.md)和
 > [部署指南](deployment.md)。当前产品契约、冻结边界和后续 PR 依赖顺序见
-> [产品契约与协议边界](terminal-protocol-architecture.md)。退出当前路线的旧研究见
-> [历史设计归档](archive/README.md)。
+> [产品契约与协议边界](terminal-protocol-architecture.md)。
 
 每层 PR 都基于前一层分支，并提供一个可运行或可验证的纵向能力。后续 PR 只在其直接依赖合并后改 base，不压平历史。
 
