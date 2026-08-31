@@ -1,61 +1,171 @@
-# 终端协议架构与不变量
+# Zhongduan 产品契约与协议边界
 
-> 状态：规范性架构边界；同时记录 CURRENT protocol v2 和 TARGET 演进方向
+> 状态：规范性产品与架构决策框架
 >
-> 决策日期：2026-08-28
+> 决策日期：2026-08-31
 >
-> 适用范围：Host authority、input、snapshot/journal、Cloud delivery、Browser replica 与 prediction
+> 当前运行时基线：PR #24 head，`5d7511782542de511292d25908b8d92be4319636`
+>
+> 适用范围：Host authority、Browser replica、input effect、snapshot/recovery、Cloud relay、
+> presentation 与后续协议演进
 
-本文定义所有实施计划都必须服从的正确性边界。标为 **CURRENT** 的内容已经存在于 protocol v2；
-标为 **TARGET** 的内容需要代码、wire capability 和灰度验证，不能当作当前能力。性能优化可以改变
-checkpoint 频率、传输调度和 presentation，但不能放宽本文件中的不变量。
+本文定义 Zhongduan 以后做产品和协议决策时必须同时满足的边界。它不设计新的 wire protocol，
+也不改变 CURRENT protocol v2 的任何 runtime 行为。当前实现事实分别记录在
+[MVP 架构](mvp-architecture.md)、[Wire Protocol V2](wire-protocol.md)和
+[Phase 0 验收契约](phase-0-acceptance-contract.md)中。
 
-## 最高级不变量
+## 阅读约定：GATE 与 CURRENT
 
-> 客户端采用的 execution terminal state，始终等于一个 immutable checkpoint 加同一
-> authority mutation log 的连续前缀；所有 prediction 仅是其上的 disposable
-> presentation branch。
+除明确标为 **CURRENT** 的章节外，本文中的“必须”和“不能”都是后续变更与发布的 acceptance gate，
+不是对 PR #24 已实现能力的声明。PR #24 已知尚未完全满足 input 分类/连续性、hot-path 隔离和
+non-blocking recovery 等 gate；它在对应 cutover 前作为冻结的 grandfathered baseline 保留，不能被当作
+新架构的合规先例。
 
-形式化地，对同一 `engineId` 和 `sessionEpoch`：
+规范性产品决策、roadmap 和新协议边界发生冲突时，以本文为准。CURRENT runtime 行为发生冲突时，
+以基线 commit 的代码、[MVP 架构](mvp-architecture.md)和 [Wire Protocol V2](wire-protocol.md)为准，
+并修正文档，不能用未来 gate 重新解释现状。[历史设计归档](archive/README.md)只保留研究上下文，
+不是 roadmap、兼容性承诺或实施依据。
+
+## 产品判断
+
+Zhongduan 的目标是提供一个状态正确、输入结果明确、健康路径持续可用的远程终端，而不是精确持久化
+每一次三方 recovery attempt。系统必须同时守住三项地位相同的产品级不变量：
+
+1. **Adopted-state safety**：Browser 不能采用错误的 terminal-engine state。
+2. **Input/effect safety**：每个被 UI 消费的 semantic input 都有明确、不会被误重试的结果分类。
+3. **Hot-path liveness and bounded latency**：恢复和后台工作不能无限期阻塞 writer input 或 live output。
+
+三项不变量没有主次关系。只证明状态安全、但长期拒绝恢复或阻塞输入的实现不合格；只追求低延迟、
+但可能采用错误状态或重复输入 effect 的实现也不合格。任何权衡都必须记录影响、边界和验证证据，
+不能把其中一项静默降级成“后续优化”。
+
+## 1. Adopted-state safety
+
+> Browser 已采用的 terminal-engine state，必须与 Host authority 在某个 committed revision 的状态
+> 观察等价。
+
+默认正确性参考模型是：
 
 ```text
-AdoptedExecutionState(C)
-  = Restore(ImmutableCheckpoint@R)
-  + Apply(AuthorityMutationLog(R, C])
-
-DisplayedState
-  = Compose(AdoptedExecutionState(C), DisposablePresentationBranch?)
+StateAt(H)
+  = Apply(
+      ImmutableCheckpointAt(R),
+      CanonicalSuffix(R, H]
+    )
 ```
 
-其中 `(R,C]` 必须是同一 authority lineage 上无 gap、无乱序的连续前缀。重复 mutation 只有在
-kind、cursor、payload 等字段完全相同时才能去重；重复 identity 内容不一致必须 fail closed。首版可以
-逐字段比较，不要求 mutation hash chain。采用 candidate 必须是一次原子操作，不能暴露恢复一半的 core。
+其中：
 
-这个不变量带来以下强制规则：
+- checkpoint 的 `sessionEpoch`、engine identity、schema 和 checksum 必须匹配；
+- checkpoint 必须包含从其 cut 之后继续解析所需的 terminal-engine state，包括 parser continuation；
+- suffix 必须来自同一 authority lineage，并且无 gap、无重复、顺序一致；
+- PTY byte offset、resize 顺序和其他 canonical mutation identity 必须连续；
+- cold restore 必须在 detached candidate 中完成，验证通过后才能原子 adopt；
+- cold/detached recovery 失败时必须丢弃 detached candidate，不能污染仍在显示的 active replica；
+- prediction 或其他 presentation state 永远不能进入 adopted core、journal、snapshot 或 canonical suffix。
 
-- Host session actor、真实 PTY 和 authoritative Ghostty core 构成唯一 effect path；Browser 永不生成
-  PTY query response 或重放 terminal effect。
-- `eventSeq` 只排序重建 authority 所需的 terminal mutation。当前是 `PTY_OUTPUT` 和
-  `RESIZE_APPLIED`；未来只有确实改变可恢复 execution state 的事件才能加入。
-- Input receipt、validation cut、writer state、context token、delivery ACK 和 telemetry 都不消耗
-  `eventSeq`，也不进入 terminal journal、snapshot 或 replay tail。
-- Snapshot 只能通过选择更新的 immutable cut 吸收旧 mutation。不能在旧 snapshot 后任意跳过
-  中间 mutation，也不能把 transport batching 误写成 presentation-frame 丢弃。
-- Prediction 只影响 renderer 合成；清除 prediction 前后，权威 replica 的 cursor、snapshot 和 hash
-  必须完全不变。Prediction 不进入 selection、copy、search、ARIA、日志、网络或恢复状态。
-- 任一 cursor、engine、epoch、generation、offset、duplicate 或 payload 校验失败，都必须丢弃 candidate、
-  reset/rebase 或断开；不能猜测修复后继续 adopt。
-- 所有 queue、reorder buffer、snapshot、tail、waiter 和 prediction branch 都必须按风险维度设置硬上限，
-  至少覆盖适用的 bytes/frames、attempt age/deadline 和 session concurrency。无法在 envelope 内收敛时，
-  必须在最小可证明安全的 scope 内 fail/reset，不能无限缓存。
+`checkpoint + suffix` 是 correctness reference model，不是对物理网络格式的永久规定。未来可以传输
+raw PTY mutation、active-screen checkpoint、state delta 或 coalesced synchronized frame；前提是实现
+能够证明最终采用的 state 与某个 Host committed revision 观察等价，并通过相同的连续性 oracle。
 
-这里的 execution state 是继续正确解析和显示未来 mutation 所需的 terminal state。无限 transcript、
-child process state 和非恢复型瞬时 effect 不因此变成产品承诺。若未来把 history 拆成可延迟 hydrate 的
-页面，execution candidate 的 adopt 仍必须满足它自身声明的 immutable checkpoint 与连续 mutation 前缀。
+这里的 state 是 **terminal emulator engine state**，不是 application execution state。它不保存 shell、
+Vim、Codex 或其他 child process 的内存，也不能证明 child 是否读取、执行或提交了某个 input。
 
-## CURRENT：protocol v2
+## 2. Input/effect safety
 
-当前实现使用：
+> 每个被 Browser UI 消费的 semantic input，必须明确落入 `not-sent`、`deterministic` 或
+> `uncertain` 三类之一。
+
+```text
+not-sent
+  已确定 input 没有离开 Browser。
+  它不得在恢复、重连或 writer transfer 后自动发送。
+
+deterministic
+  Host 已产生可重复返回且不会重复施加 PTY effect 的结果，
+  或更早的 owner 已确定拒绝且证明没有施加 effect。
+
+uncertain
+  input 可能已跨过某一边界，但无法证明 effect 是否发生。
+  当前 input epoch 必须终止，该 input 永不自动重发。
+```
+
+这是端到端产品分类，不是 CURRENT v2 wire status 的同义词。v2 的过渡映射是：
+
+| v2 事实或 status                                     | 产品分类        | 限定                                                   |
+| ---------------------------------------------------- | --------------- | ------------------------------------------------------ |
+| Browser 证明尚未进入 transport                       | `not-sent`      | 当前尚无稳定 wire status，UI 必须能观察结果            |
+| `written` / `duplicate`                              | `deterministic` | 仅在声明的 result-retention/dedupe window 内可重复返回 |
+| owner 能证明无 PTY effect 的 `rejected`              | `deterministic` | rejection 必须绑定明确 identity 和 owner               |
+| `uncertain`、owner 丢失或过期后无法证明的旧 identity | `uncertain`     | 终止 epoch，禁止自动重发                               |
+
+超过 result-retention window 后不能重新施加旧 effect；无法继续证明原结果时只能转为 `uncertain`。
+`not-sent` 也不是“稍后自动发送”的本地队列状态。
+
+这项不变量要求：
+
+- Browser 必须先完成 schema/semantic validation，并成功 admit 到有界发送队列，再分配 input sequence；
+- 同一 `{writerFence,inputEpoch}` 内只允许严格连续的 input prefix；
+- duplicate 只能返回已记录的确定结果，不能重复写 PTY；
+- writer transfer 后，旧 fence 不能继续产生成功 input；
+- UI 已 `preventDefault` 或表示已消费的 input 不能静默消失；
+- transport 或 owner 结果不确定时必须显式进入 `uncertain`，不能靠猜测重试；
+- secure-input 场景不启用 speculative presentation。
+
+每个被 UI 消费的 resize、mouse move 等可合并 state intent 仍需要本地可观察分类。被较新 intent 取代且
+尚未 admit 的 intent 不分配 wire identity/sequence，并归为 `not-sent/superseded`；重连后的 state
+reconciliation 是新 intent，必须在 validate/admit 后分配新 identity，不能自动重放旧 input。CURRENT v2
+的 latest-resize resend 和 mouse coalescing 是等待 E1 明确收口的 grandfathered 行为，不是此 gate 已满足的证据。
+
+`pty.write()` 成功只表示 Host 的同步 write 调用没有失败，不表示 PTY slave 或 child 已经读取，
+更不表示 application transaction 已提交。Zhongduan 不宣称 PTY input 能提供跨 Host crash 的
+exactly-once application effect。
+
+## 3. Hot-path liveness and bounded latency
+
+> 在受支持负载内，snapshot、recovery、observer、R2、bulk output 和 Durable Object maintenance
+> 不得无限期阻塞 writer input 或 live terminal output。
+
+这项不变量要求：
+
+- 所有 queue、buffer、waiter 和 background work 都有明确的 bytes、frames、age 或 concurrency 上限；
+- overload 必须隔离到具体 client、generation 或 background task，不能默认阻塞整个 authority；
+- control/input 不能与 bulk data 共用一个无界串行尾部；
+- snapshot 不能成为 input actor 上任意长的同步任务；
+- recovery 可以失败、被丢弃并重新开始，新架构不能靠阻塞 authority 获得正确性；
+- performance 和 liveness 是 MVP gate，不能等功能完成后再补；
+- timeout 只有在其 workload、环境和 oracle 明确时才能作为 latency 证据；防挂死 deadline 不是 SLO。
+
+## 后续架构必须分离的四类对象
+
+下表是后续架构的 owner/lifetime 约束，不是 CURRENT v2 的实现清单。“不要求持久化”表示产品契约不要求
+跨所列生命周期恢复同一对象，不表示进程内可以提前丢弃仍由当前 attempt 使用的 state。
+
+| 对象                | 含义与 owner                              | 必须保留的逻辑生命周期    | 跨生命周期 durability 要求 |
+| ------------------- | ----------------------------------------- | ------------------------- | -------------------------- |
+| Authority state     | Host Ghostty + PTY 的唯一权威状态         | Host session 生命周期     | 不承诺 Host crash 后恢复   |
+| Adopted replica     | Browser 当前正式采用的 terminal state     | Browser replica 生命周期  | 不要求                     |
+| Presentation branch | prediction、overlay、stale 标记等展示状态 | 当前 presentation attempt | 不要求                     |
+| Recovery attempt    | 某次 snapshot/replay/transport 过程       | 当前 recovery generation  | 不要求跨 hibernation 延续  |
+
+由此得到以下架构规则：
+
+- recovery attempt 不是 terminal truth，也不是 application transaction；
+- transport outcome 不确定时，可以 fence/结束 generation、丢弃 candidate 并重新 attach；
+- 重试可以从仍然正确的 active cursor 或更新 checkpoint 开始，不必继续同一 ordinal 或 send cut；
+- cold detached candidate 在 adopt 前不能写入 active replica；
+- warm recovery 只能向 active replica 原地 apply 已验证的连续 suffix，失败时不能把 cursor 推进到实际
+  apply prefix 之外，也不能把 non-contiguous state 宣称为已采用；
+- 新增长期 durable owner、ledger 或 convergence state 前，必须证明它改善已测得的产品指标，
+  而不是仅让中间过程更容易被形式化描述。
+
+CURRENT v2 会把 delivery generation、cursor、pin/commit 等 attachment state 序列化到 Cloudflare
+WebSocket attachment，以便跨 Durable Object hibernation 继续。这是 R4 前冻结保留的 legacy 实现，
+不构成未来 recovery attempt 必须跨 hibernation 延续的产品要求。
+
+## CURRENT：冻结的 protocol v2 基线
+
+PR #24 是当前唯一运行时基线：
 
 ```text
 control WebSocket    attach / lease / input / ACK / resync
@@ -63,389 +173,170 @@ data WebSocket       PTY_OUTPUT / RESIZE_APPLIED / directed replay / barrier / c
 snapshot HTTP        immutable compressed Ghostty snapshot
 ```
 
-Host 用一个严格 actor 顺序更新 PTY authority、Ghostty core、`eventSeq` 和 `nextPtyOffset`。Browser
-健康时直接应用 canonical mutation；发生缺口时恢复 live core 的短 tail，或在 detached core 中恢复
-snapshot 后应用 tail，再原子 adopt。
+它还存在计划一明确要由后续 PR 收口的事实：Browser 尚未统一做到 validate/admit 后再分配 sequence，
+Host input 还不是 strict contiguous stream，某些无 transport/lease 路径没有逐 input 可见结果，Cloud
+仍有跨 socket 的全局串行尾部，recovery 仍依赖 global pause。A1 只把这些事实列为 gate，不在本次
+纯文档变更中修改它们。
 
-CURRENT recovery 的线性交接依赖：
+CURRENT recovery 使用 fixed commit、barrier、pinned delivery 和 global canonical publisher pause：
 
 ```text
 pause canonical publisher
   -> select immutable base R and fixed commit C
   -> barrier / pin delivery generation
-  -> send snapshot + exact tail(R,C]
+  -> warm: send exact tail(base, C]
+     cold: send snapshot@R + exact tail(R, C]
   -> ReplayCommit(C)
   -> resume canonical publisher
 ```
 
-在 v2 中，global pause 是 correctness invariant。Cloud 在 pinned delivery 存在时不能推进 canonical
-head；Browser 可以在收到匹配的 ReplayCommit 后、candidate 尚未 adopt 时有界缓存后续 live frame，但不能
-让 `C+1` 在 pinned commit 之前越过 directed tail，也没有把 recovery/live 任意交错重排的 assembler。只删除
-Host pause 会先触发 Cloud pinned check，或在错误实现中造成 commit 前缺口/错拼。TARGET Recovery v3 完整
-上线前，任何 v2 session epoch 都必须保留 pause、barrier 和 pinned commit 的既有语义。
+这些行为是 v2 整体 correctness contract。Global pause 是与新架构 liveness 边界冲突的已知历史债务，
+不是以后 recovery 的设计先例；但在 v2 内局部删除它会先破坏 adopted-state safety，因此只能在完整
+replacement 通过 gate 后由 R4 一次性移除。计划二完成 destructive cutover 前：
 
-CURRENT 还具有以下边界：
+- v2 继续作为唯一运行时；
+- 只接受 blocker、安全问题和验证 v2 既有行为的测试修复；
+- 不继续扩展 checkpoint serviceability、recovery fairness 或 durable attempt continuity；
+- 不从 v2 局部删除 pause、barrier 或 pinned commit；
+- 不同时维护一个逐步渗入 v2 的第二套 recovery protocol。
 
-- control 与 data 是两条物理 WebSocket，但 Cloud 调度仍可能产生跨 lane head-of-line blocking；
-- delivery credit 与 terminal apply progress 尚未完全分离；
-- input sequence 当前不是 TARGET 定义的严格连续 stream；
-- 没有 `InputValidationCut`、visible `Mirrored` prediction 或可靠 generic TUI context；
-- 没有可用于 v2/v3 混合部署的完整 capability negotiation。
+本次 A1 文档变更不修改 source、runtime、wire schema、capability 或部署行为。
 
-因此本文件后续的 TARGET 消息和状态机不能通过单个 feature flag 在 v2 上局部开启。
+## 后续实现的证据基线
 
-## TARGET：三个逻辑平面
+计划一只定义 gate，不在本 PR 实现测试 harness 或功能。后续首先建立 raw semantic PTY path 的真实
+E2E baseline；在该 baseline 完成前不做 prediction，也不开始 recovery replacement。
 
-目标协议把职责拆成三个由 causal cut 关联、但不共享 sequence 的逻辑平面：
-
-| 逻辑平面                       | 保存与排序的内容                                               | 明确不负责                                           |
-| ------------------------------ | -------------------------------------------------------------- | ---------------------------------------------------- |
-| Terminal authority state plane | Immutable checkpoint、canonical mutation log、authority cursor | Input validation、writer/context 和 transport credit |
-| Interaction sideband           | Ordered semantic input、validation cut、可选 context assertion | 重建 terminal state 或广播 writer 输入节奏           |
-| Delivery plane                 | 每客户端 generation、lane ordinal、credit、重排和 reset        | 决定 terminal mutation 的语义或 replica 已 apply     |
-
-“三个逻辑平面”不等于“必须使用三条物理 WebSocket”。首版可以把不同 lane 多路复用到现有连接，只要
-每条 lane 的顺序、credit、容量和跨平面的 causal cut 是显式的。只有测量证明 TCP/WebSocket HOL 仍然影响
-输入或 live output 时，才把 control/input、live-data、recovery-data 映射到独立 WebSocket 或 QUIC stream。
-Snapshot blob 继续适合使用可取消、有背压的 HTTP stream。
-
-### Cursor 职责
-
-四种 cursor 是需要隔离的语义时钟，不要求一次 wire migration 同时暴露四个最终类型：
+### 网络与故障矩阵
 
 ```text
-AuthorityCursor {
-  sessionEpoch,
-  eventSeq,       // 已连续 apply 的最后一个 authority mutation
-  nextPtyOffset   // 下一段 PTY output 必须开始的位置
-}
-
-InputCursor {
-  writerFence,
-  inputEpoch,
-  nextExpectedSeq // Host 要求的下一个 semantic input sequence
-}
-
-ContextCursor {   // 仅显式 opt-in integration 存在时有效
-  contextGeneration,
-  contextToken
-}
-
-DeliveryCursor {
-  deliveryGeneration,
-  lane,
-  deliveryOrdinal,
-  receivedBytes   // 该 lane 已安全进入 Browser 有界 buffer 的累计 transport bytes
-}
+Browser <-> Cloud RTT: 20 / 100 / 300 / 600 ms
+Cloud <-> Host RTT:    20 / 100 / 300 / 600 ms
+jitter
+disconnect
+reconnect
+output flood
+cold attach
+DO hibernation
+Host relay replacement
 ```
 
-- `AuthorityCursor` 证明 replica 对同一 authority log 连续 apply 到哪里。Snapshot manifest、tail、
-  prediction validation cut 和 `ReplicaApplied` 都可以引用它，但不能由 delivery ACK 推断。
-- `InputCursor` 只描述同一 writer fence/epoch 的有序输入。Host 只推进连续、已有确定结果的前缀；
-  高 seq 不能越过缺口并提升 high-water。Transport 结果变成 `uncertain` 时终止 input epoch，禁止自动重发。
-- `ContextCursor` 是 prompt、input region、modal 或 geometry 的可选 optimistic-concurrency assertion。
-  它只能来自明确 integration/Host assertion；没有 opt-in context 时不构造 token，也不能通过屏幕 heuristic
-  声称 Enter、approval 或 Owned buffer 是 context-safe。
-- `DeliveryCursor` 只释放 transport credit，表示 frame 已被 Browser 的有界 assembler 接收；它不证明
-  Ghostty 已 apply，更不证明 candidate 已 adopt。Terminal apply progress 仍用 `AuthorityCursor` 报告。
+### 正确性 gate
 
-Recovery v3 必须先把 Authority progress 与 Delivery receive progress 分开；ordered input 需要明确
-`InputCursor`。`ContextCursor` 可以长期保持可选。稳定 hash chain、最终字段编码和物理 lane 数量都不是
-首版 correctness 前置条件。
+1. 被 UI 消费但结果为 silent loss 的 input：0。
+2. dedupe window 内 duplicate PTY effect：0。
+3. uncertain input 自动重发：0。
+4. output flood 下 Ctrl-C 准确写入一次。
+5. writer transfer 后旧 writer input 成功次数：0。
+6. cold candidate 在验证完成前 visible 次数：0。
+7. snapshot/recovery 开启与关闭时，Host authority state 仍由相同 canonical input/output 决定。
+8. secure-input 场景启用 speculative presentation 的次数：0。
 
-## Terminal authority state plane
+### 延迟 gate
 
-Authority plane 只保存采用 execution state 所必需的事实：
+E0 第一轮只产生 baseline，不凭空写绝对阈值。至少采集：
+
+- Browser keydown 到 send decision；
+- Cloud Browser receive 到 Host send；
+- Host receive 到 `pty.write`；
+- input 到 matching Browser render；
+- PTY output 到 Browser useful render；
+- Ctrl-C 到 `pty.write`；
+- Ctrl-C 到应用 quiet 或 prompt 恢复。
+
+基线完成后，把相对阈值写入 source-controlled benchmark contract。至少必须验证：
 
 ```text
-ImmutableCheckpoint@R
-AuthorityMutation(R+1)
-AuthorityMutation(R+2)
-...
-AuthorityMutation(C)
+Cloud input latency 不随 Host data queue depth 线性增长
+snapshot/recovery 开启后的 Host local input p99
+  不超过关闭时 baseline 的约定倍数
+output flood 中 Ctrl-C 仍有有界完成时间
 ```
 
-Mutation 必须具有严格 `eventSeq` 和连续 `ptyOffset` 规则。Resize 即使没有 PTY bytes 也改变 terminal
-execution state，因此消耗 `eventSeq`；input receipt 或 validation metadata 即使与输入有关，也不改变
-可恢复 terminal state，因此不能进入该序列。
+## 主线依赖顺序
 
-Checkpoint 有三个不同属性：
-
-- `valid`：blob、checksum、engine、epoch 和 cut 自洽；
-- `usable`：从 cut 到目标 head 的 mutation 仍可在 age、bytes 和 frames 上连续补齐；
-- `fresh`：策略上值得优先使用，或已经值得异步刷新。
-
-TTL 只能影响 freshness/refresh，不能让 idle 且仍可服务的 checkpoint 自动失效。Pending snapshot 每次
-retry/install 前都必须重新检查 tail serviceability；旧 cut 已不可补齐时允许 abandon/supersede，不能让
-幂等 retry 永久阻止新 cut。
-
-Rolling capture 只有在取得 immutable cut 的 actor pause 已满足 input SLO 后才能启用 hard deadline；
-同步 WASM timeout 不是可抢占保护。具体 capture、retry 和 freshness policy 由 Snapshot 实施计划定义。
-
-## Interaction sideband
-
-### Ordered semantic input
-
-TARGET 的同一 `{writerFence,inputEpoch}` 是严格连续的 semantic input stream：
+三个计划按依赖推进，不并行铺开：
 
 ```text
-seq == nextExpectedSeq  -> 产生确定结果并推进
-seq <  nextExpectedSeq  -> duplicate/result lookup，不重复 effect
-seq >  nextExpectedSeq  -> missing-input，不推进并终止该 input epoch
-transport uncertain     -> 终止整个 input epoch，不自动 resend
-```
-
-Browser 先完成 schema/semantic 校验并成功 admission 到有界发送队列，再分配 sequence。Urgent input 可以
-越过 snapshot、recovery、bulk output 和无关数据库工作，但不能越过已经分配的 earlier semantic input。
-若 Ctrl-C 要取消尚未发送的本地 edit，必须先把它们明确标为 `not-sent/cancelled`，再为 Ctrl-C 分配顺序；
-不能让 lane 竞态决定 input 语义。
-
-`Raw` 只表示“不预测”，不表示“输入安全”。Replica catching-up 时应由独立 policy allowlist interrupt，
-并默认阻止 Enter、Tab、Esc、paste、mouse 等危险输入；被阻止的输入不缓存，也不在 recovery 后自动重放。
-
-### `InputValidationCut`
-
-Prediction 的验证资格使用 writer-only、live-only 的 causal certificate：
-
-```text
-InputValidationCut {
-  writerFence,
-  inputEpoch,
-  settledThroughContiguous,
-  authorityCut: AuthorityCursor,
-  synchronizedOutputGeneration?
-}
-```
-
-Host 在 session actor 已按连续输入顺序产生确定结果，并经过最小 settle window 或 synchronized-output
-边界后，原子采样 `authorityCut`。消息只发给当前 writer，可以 piggyback，也可以走有明确 lane ordering
-的 sideband。
-
-它具有以下硬边界：
-
-- 不消耗 `eventSeq`，不写 journal、snapshot/tail、Cloud canonical head 或 observer fanout；
-- 丢失、乱序、reconnect 或 generation change 只让 prediction timeout/reset，不触发 replay；
-- Browser 必须等 `AuthoritativeReplica.cursor >= authorityCut` 且完整 synchronized frame 结束后才能验证；
-- 它只证明“到这个 authority cut 已有资格观察预测”，不证明 child 已消费输入，也不是 app-effect ACK；
-- `settledThroughContiguous` 只能覆盖无 gap、已有确定 Host 处理结果的输入前缀。
-
-因此 sideband 可以因果地引用 authority plane，但不能混入 authority mutation log。
-
-### Context 是 opt-in 能力
-
-Generic PTY 画面不能证明 Codex/Claude 当前是 composer 还是 approval，也不能证明 shell/readline buffer 的
-ownership。TARGET 可以为支持的 shell 或 TUI 定义 input-region/context integration，由 Host 签发绑定
-region revision、mode/geometry 和 authority cut 的 token。未协商该能力时：
-
-- `Mirrored` 只能在保守 eligibility 和隐藏学习下预测 presentation；
-- `Owned` 不得仅凭 OSC 133 或“看起来像 prompt”接管 command buffer；
-- commit/approval 不能被宣传为 guarded-context safe。
-
-## Delivery plane 与 Recovery v3
-
-TARGET Recovery v3 用 concurrent gap-fill 取代 v2 的 global pause，但不改变最高级不变量。
-
-### Start fence、committed-through 与 live floor
-
-一次 generation 的起点固定为：
-
-```text
-RecoveryStart {
-  recoveryId,
-  deliveryGeneration,
-  engineId,
-  base: AuthorityCursor R,
-  snapshotId?,
-  committedThrough: AuthorityCursor H,
-  liveFloor: successor(H)
-}
-```
-
-选择 base 之后，Host 必须在同一个有序 canonical publisher 中原子取得严格有界、可保留的
-`PreparedGap(R,H]`，并在 mutation `H` 之后、任何 `H+1` 之前插入不消耗 `eventSeq` 的
-`RecoveryStartFence`。Cloud 处理这个 fence 时必须先确认自己的 committed head 恰好是 `H`，再与 canonical
-ingress 原子地安装从 `H+1` 开始的 live-delivery obligation、固定 start metadata，之后才允许处理下一条
-Host data message 并向 Browser 发送 `RecoveryStart`。若未来把 live/recovery 拆到不同物理 stream，也必须
-提供等价的 cross-stream fence，不能依赖到达时序猜测。
-
-因此在 attach 与 start 之间到达的 mutation 要么包含在 `PreparedGap(R,H]`，要么属于从 `liveFloor`
-开始的 live lane，不存在无人负责的窗口。准备失败、Cloud head 不等于 H、generation 已失效或 source 无法
-保留到发送完成，都只能 reset/replan，不能发送截断 gap-fill。
-
-`liveFloor` 是该 generation 中 live lane 必须开始覆盖的第一条 mutation，通常是 `H+1`。它不是固定全局
-head；authority 可以立即继续提交 `H+1,H+2,...`。Cloud 不必长期保存第二份 per-client payload holdback，
-但必须保证这些 mutation 经有界 delivery lane 到达 Browser assembler；承诺无法履行时只能 reset generation。
-
-`{deliveryGeneration, base R, snapshotId, committedThrough H, liveFloor}` 一旦对 Browser 可见就不可原地
-更换。需要新 snapshot 或更近 base 时增加 generation，丢弃旧 candidate。两个 lane 因 retry 产生相同
-mutation 时允许一致 duplicate；任何 divergent duplicate 都 fail closed。
-
-### 并发 gap-fill
-
-```text
-recovery lane:  snapshot@R + exact mutations (R,H] + RecoveryDone(H)
-live lane:      H+1, H+2, H+3, ...
-                                      \
-Browser bounded RecoveryAssembler -----+--> continuous apply
-```
-
-Browser 可以并行下载/restore snapshot、接收 gap-fill 和接收 live mutation。Assembler 按 `eventSeq` 去重、
-检查 `ptyOffset`，只把从 `nextExpected` 开始的连续 mutation apply 到 recovery target：warm 使用已存在且
-cursor 精确等于 R 的 active replica，cold 使用从 snapshot@R 创建的 detached candidate。它必须同时限制：
-
-- 每客户端和每 generation 的 bytes、frames 与最大 age；
-- 每 session 所有 recovering client 的合计预算和并发公平性；
-- 单 frame/payload 上限、gap 数量、duplicate 检查成本和 apply work slice；
-- snapshot download、restore、recovery lane 和 live lane 的 deadline。
-
-Frame 从 reorder map 被 apply 后，assembler 仍须在可能产生 overlap/late retry 的窗口内保留有界的完整
-canonical identity。Browser 发送 receipt 不证明 source 已收到；只有它收到匹配的
-`RecoverySourceClosed`，且本地 contiguous delivery ordinal 已达到 certificate 声明的位置，才能释放该
-overlap cache。Late duplicate 也必须逐字段/逐 payload 比较；divergent duplicate 会 taint target。Cold 直接
-discard candidate；warm active core 必须标记 non-current/tainted，并从新 generation 的 cold base 恢复，
-绝不能把已污染 cursor 当作 warm base。
-
-超过任一上限、source 无法履行 `(R,H]`、live lane 从 floor 出现不可修复 gap，或 duplicate 不一致时，
-在上述 taint 规则下 reset 该客户端并提升 generation。不能无限扩大 reorder/identity map，也不能让慢
-observer 阻止其他 synced client 或 authority head。
-
-```text
-RecoveryDone {
-  recoveryId,
-  deliveryGeneration,
-  replayedThrough: AuthorityCursor H
-}
-```
-
-它只表示 recovery source 已完成该 attempt 承诺的 `(R,H]`，不表示 Browser 已 apply，也不要求 authority
-停在 H。Browser 满足以下条件后才能完成 handoff：
-
-1. warm base 已验证，或 cold immutable checkpoint/base R 已完整恢复；
-2. recovery target 已连续 apply 到至少 H；
-3. 已收到匹配 `recoveryId/generation` 的 `RecoveryDone(H)`；
-4. engine、epoch、offset、duplicate 和资源检查全部通过。
-
-Cold 必须原子 adopt detached core；warm 已在 active core 上逐前缀 catch up，不做无意义 clone/swap，但同样要
-原子地把 delivery 状态从 assembling 切到 synced。完成后发送：
-
-```text
-RecoveryAdopted {
-  recoveryId,
-  deliveryGeneration,
-  replicaApplied: AuthorityCursor // 实际已连续 apply 的位置，可以高于 H
-}
-
-RecoverySourceClosed {
-  recoveryId,
-  deliveryGeneration,
-  throughRecoveryOrdinal
-}
-```
-
-资源按 ownership 分层释放：Host/source 只有实际收到覆盖 recovery lane `RecoveryDone` 的
-`DeliveryReceived` 后，才能原子记录 source closed、release-once `PreparedGap` payload/lease，并通过 Cloud
-幂等发送 `RecoverySourceClosed`。Browser 收到 closure 且本地 ordinal 达标后才释放 applied identity cache。
-Cloud 的 generation/start bookkeeping 保留到 matching closure 与 `RecoveryAdopted` 都成立，之后才把客户端
-视为 synced。任一 ACK/closure 丢失只会延长有界 retention 或触发 deadline/reset，不能提前释放比较证据。
-提前到达的 `H+1...` 可以已在 recovery target 上连续 apply，或仍留在有界 assembler 中继续 apply；两种情况
-都不能丢失或重复执行 effect。
-
-### Receive credit 与 apply progress 分离
-
-乱序数据进入 Browser buffer 后，前方 gap 可能暂时阻止 Ghostty apply。TARGET 因此使用两类进度：
-
-```text
-DeliveryReceived(DeliveryCursor)
-  // frame 已被校验并安全 admission 到有界 Browser buffer，可释放 transport credit
-
-ReplicaApplied(deliveryGeneration, AuthorityCursor)
-  // authority mutation 已被 Ghostty 连续 apply
-```
-
-Browser 只有成功保留 frame 所需内存后才发送 `DeliveryReceived`；一旦自身预算不足就停止 receive credit
-或 reset。Cloud 不能用 `DeliveryReceived` 推断 terminal cursor，Host 也不能用 `ReplicaApplied` 代替
-per-lane transport credit。这种分离允许 gap-fill 与 live lane 乱序到达，又不让一个旧 gap 永久锁死
-network window。
-
-### CURRENT pause 的移除条件
-
-只有以下能力在同一 session epoch 内全部协商并通过故障测试，才允许选择 Recovery v3：
-
-- immutable `RecoveryStart` fence、committed-through H 和 live floor；
-- catching-up client 的 uninterrupted live delivery obligation；
-- bounded assembler、duplicate/gap/offset verification；
-- `RecoveryDone`、atomic local handoff、`RecoveryAdopted` 与双向 `RecoverySourceClosed` closure；
-- receive credit 与 authority apply progress 分离；
-- per-client reset、generation fence 和 multi-client aggregate budget。
-
-缺少任一项都回退完整 v2 recovery，而不是关闭 pause 后混用一半 v3。
-
-## Prediction 是 disposable presentation branch
-
-`Raw` 不预测；`Mirrored` 仍由 application 拥有 buffer、每键立即发 PTY，Browser 只叠加可撤销 overlay；
-`Owned` 只有在显式 integration 转移 ownership 后才持有本地 draft。`Mirrored` 的 authority path 与 `Raw`
-完全相同。
-
-Browser 应按 predicted prefix 而不是“一键对应一次 echo”对账：`InputValidationCut` 只开放验证资格，
-verifier 退休最大 informative compatible prefix，再从新 authority base 重算未确认 suffix；冲突则清空整个
-prediction epoch。Libghostty 只计算 grapheme、width、wrap、cells 和 cursor geometry，不能猜应用语义。
-Overlay failure 只能关闭 prediction，不能阻断真实 input 或修改 authority replica。
-
-## Capability negotiation 与灰度
-
-Wire 变化不能只依赖 deployment feature flag。Host、Cloud 和 Browser 必须先 advertise 支持的 protocol
-versions 与 capability families；未知 version/kind/status 必须在发送新语义前被拒绝，不能让 strict v2
-decoder 收到 v3 frame 后才失败。不同能力按其实际 ownership 选择，不能为了一个 writer sideband 把所有
-observer 或整个 session 强绑到同一升级节奏：
-
-- 改变 canonical authority log 语义的 data protocol 固定到 `sessionEpoch`；
-- recovery strategy 在新 `deliveryGeneration` 上从三方交集选择，并且必须兼容该 session 的 authority
-  protocol；同一 generation 内不可热切换；
-- writer sideband 在新的 writer control connection 上协商，只发给当前 writer；observer 无需支持；
-- context/input-region capability 还必须由具体 application integration 显式 opt in。
-
-Capability family 至少需要覆盖以下依赖关系（最终 wire 名称可在实现时版本化）：
-
-```text
-ordered-input + writer-sideband
+计划一：重新定义项目边界
         |
-        +--> input-validation-cut --> mirrored-presentation
-
-delivery-receive-credit + authority-apply-progress
+        v
+计划三前半：建立 E2E baseline 并修复输入热路径
         |
-        +--> recovery-v3-gap-fill
-
-explicit-context/input-region
+        v
+计划二：在 baseline 和测试约束下替换 v2 recovery
         |
-        +--> guarded-context / owned-buffer
+        v
+计划三后半：真实 Cloudflare / TUI / 长会话发布验证
 ```
 
-Rollout 规则：
+推荐 PR 顺序：
 
-- 现存 long-lived v2 authority session 保持 v2 canonical 语义；若其协议无法承载完整 Recovery v3，则继续
-  使用 global pause，等新 session epoch 升级，不能热切换 authority cursor。
-- 同一 delivery generation 不混用 v2 barrier/pinned commit 与 v3 concurrent gap-fill。
-- 不支持 sideband 的参与者不能收到 `InputValidationCut`，observer 永远不接收 writer validation metadata。
-- `Mirrored`、Recovery v3、context integration 和物理 transport split 使用独立 capability/kill switch；
-  一个失败不应迫使其他无依赖能力一起回滚。
-- Shadow 不改变 wire/effect；回滚只影响新 generation/epoch，已有 attempt 完成既定协议或明确 reset。
+```text
+A1  docs: reset product and protocol boundaries
 
-具体实现依赖和灰度比例由两份实施计划维护；总纲要求每项 capability 只能在上述对应边界生效，并且任何
-feature 都不能绕过 authority 连续前缀不变量。
+E0  test: terminal journey baseline
+E1  browser validate/admit
+E2  Cloud input lanes and connection-scoped writer
+E3  Host contiguous input
+E4a finalized background snapshots
+E4b immutable Ghostty cut (only if measurements prove it necessary)
 
-## 验证要求
+R0  freeze v2 behavioral contract (codify the A1 policy in executable tests)
+R1  Host ordered generation stream
+R2  Browser stream runtime
+R3  ephemeral Cloud relay
+R4  destructive cutover and delete v2
 
-实现必须把最高级不变量直接编码成 model/property tests，而不只依赖端到端截图：
+E5  real applications and Cloudflare staging release gate
+```
 
-- 对随机 checkpoint cut、gap-fill/live interleaving、duplicate、resize、UTF-8/VT continuation，adopt 后的
-  authority cursor 和 future parser behavior 必须等同于 uninterrupted continuous prefix；
-- 任意 missing/divergent mutation、错误 live floor、跨 epoch/generation 或 offset mismatch 均不得 adopt；
-- `InputValidationCut` 丢失、重复、先于 data 到达、reconnect 或 observer attach 不改变 authority log；
-- prediction overlay 在 clear/reset/crash 前后不改变 core snapshot、selection/copy/search/ARIA 和 network；
-- 16 个 recovering client、慢 Browser、持续输出、snapshot retry/supersede 下，各层预算有界且 synced
-  client 与 input/control 不被单一 recovery 全局阻塞；
-- v2/v3 rolling deployment 中，未协商 capability 的 endpoint 永远收不到未知 frame。
+计划二不能在 E0 之前开始。A1 先冻结允许的政策边界，R0 再把 v2 既有行为固化成 replacement 的
+executable contract。v2 在 R4 前保持唯一运行时；替换必须由完整 gate 约束并在切换后删除旧路径，
+不能长期维护 v2 与新 recovery 的兼容矩阵。
 
-实施细节和阶段 gate 分别见[高性能 Snapshot 恢复计划](high-performance-snapshot-recovery-plan.md)与
-[输入稳定性计划](input-stability-plan.md)。若实施计划与本文件冲突，以这里的 authority/prediction
-不变量和 CURRENT/TARGET 边界为准，并先更新架构决策再改代码。
+## 当前明确不做
+
+在 E5 完成前，不进入本轮计划：
+
+- Mirrored prediction；
+- Owned shell command buffer；
+- Codex/Claude application driver；
+- input-region protocol；
+- rolling/delta snapshot；
+- history pages；
+- recovery fairness 调参；
+- multi-writer；
+- Recovery v3 compatibility；
+- terminal state delta 网络格式；
+- Mosh 式 UDP roaming。
+
+这些主题可以在以后重新提案，但不能从归档文档直接恢复为 roadmap。
+
+## 新提案的决策门槛
+
+每个新 protocol、owner、state machine 或持久化字段在进入实现前，必须回答：
+
+```text
+它改善哪个已测得的用户指标？
+raw PTY baseline 哪里不够？
+失败时能否安全关闭或丢弃？
+是否值得增加新的长期 owner/state machine？
+```
+
+并且必须同时写明：
+
+- 受影响的三个产品级不变量及其 oracle；
+- CURRENT owner、拟新增 owner、生命周期和清理责任；
+- queue/bytes/frames/age/concurrency 的硬上限；
+- reconnect、replacement、hibernation 和 outcome uncertainty 时的收敛路径；
+- capability、rollout、rollback 和 destructive cleanup 边界；
+- 能证明收益的 workload、指标和 source-controlled gate。
+
+没有这些证据时，默认保留 raw PTY path 和当时的 CURRENT recovery runtime；R4 前保持 v2 冻结，
+并选择能够丢弃的临时过程，而不是新增 durable recovery state。
+
+Zhongduan 的核心边界最终表述为：
+
+> **精确采用 terminal state，明确处理 input effect，让健康路径始终快速，并允许任何 recovery
+> attempt 被安全丢弃。**

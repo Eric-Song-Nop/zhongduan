@@ -1,8 +1,7 @@
-> 本文是设计记录，不是独立的协议规范。最高级不变量与 current/target 边界见
-> [终端协议架构](docs/terminal-protocol-architecture.md)；已接受的分阶段实施门槛见
-> [高性能远程终端 Snapshot 恢复实施计划](docs/high-performance-snapshot-recovery-plan.md)与
-> [输入稳定性与高 RTT 交互实施计划](docs/input-stability-plan.md)。这些文档取代本文的历史调优建议；
-> 当前行为与常量仍以代码和 [Wire Protocol V2](docs/wire-protocol.md) 为准。
+> 历史设计记录：本文不是协议规范、roadmap 或实施门槛，其中多轮讨论的结论可能彼此冲突或已经失效。
+> 当前产品决策以[产品契约与协议边界](docs/terminal-protocol-architecture.md)为准；退出当前路线的详细提案见
+> [历史设计归档](docs/archive/README.md)。当前行为与常量仍以代码、[MVP 架构](docs/mvp-architecture.md)和
+> [Wire Protocol V2](docs/wire-protocol.md)为准。
 
 可以。先把方案压缩成一个明确的复制模型：
 

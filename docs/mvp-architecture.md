@@ -1,10 +1,7 @@
 # MVP 架构
 
-> 状态：本文只描述 **CURRENT protocol v2** 的已实现架构。三逻辑平面、Recovery v3、
-> writer-only validation cut 和 prediction branch 都是 TARGET，见
-> [终端协议架构与不变量](terminal-protocol-architecture.md)。当前实现到目标状态的迁移见
-> [高性能远程终端 Snapshot 恢复实施计划](high-performance-snapshot-recovery-plan.md)和
-> [输入稳定性与高 RTT 交互实施计划](input-stability-plan.md)。
+> 状态：本文只描述 **CURRENT protocol v2** 的已实现架构。v2 是冻结的唯一运行时，
+> 当前产品 gate、允许的变更范围和后续工作顺序见[产品契约与协议边界](terminal-protocol-architecture.md)。
 
 ## 目标
 
@@ -48,9 +45,8 @@ CURRENT v2 的 cold/warm recovery 使用 fixed commit、barrier 和 pinned deliv
 ReplayCommit 的线性交接窗口，Host 会全局暂停 canonical publisher；Cloud 在 pinned delivery 存在时也
 不能接受新的 canonical head。这个 global pause 是当前线性交接协议的 **correctness invariant**，不只是待优化的性能开关：
 若单独移除，恢复中的客户端会漏掉 fixed commit 之后的新 mutation，或把不同 generation 的
-snapshot、tail 和 live output 错拼。只有 TARGET Recovery v3 的 live floor、concurrent gap-fill、
-`RecoveryDone`/`RecoveryAdopted` 和有界 assembler 全部协商成功后，才能在完整协商的新 recovery
-generation 中替换它；所有 v2 attempt 继续保持原语义。
+snapshot、tail 和 live output 错拼。替代方案只能在 E0 baseline 之后独立实现、通过完整 gate，
+再进行 destructive cutover；所有 v2 attempt 在切换前继续保持原语义。
 
 ## 进程边界
 
@@ -82,7 +78,7 @@ generation 中替换它；所有 v2 attempt 继续保持原语义。
 ## 有界策略
 
 下表是当前实现的不同资源闸门，不是一个可互换的“tail budget”。这些值是实现保护条件，
-不是 wire compatibility 保证；恢复策略的目标值与迁移方式见高性能 Snapshot 计划。
+不是 wire compatibility 保证；任何调整都必须遵守产品契约中的证据和有界性要求。
 
 | 层级/用途                                | 当前默认值                                                       |
 | ---------------------------------------- | ---------------------------------------------------------------- |
@@ -105,9 +101,8 @@ generation 中替换它；所有 v2 attempt 继续保持原语义。
 `deliveryGeneration`，control WebSocket 保持可用。Cloud 全局 inbound queue 或 Host canonical queue
 超限属于更大的 fail-closed 边界，不适用这一隔离规则。但当前 Cloud 仍使用跨 socket
 全局串行队列；上文所述 v2 global pause 也会让 recovery 期间的 canonical output 停止发布。因此
-Ctrl-C、输入和可见回显仍可能发生 head-of-line blocking。TARGET 的逻辑 lane、并发 gap-fill 和
-独立 receive/apply progress 见[终端协议架构](terminal-protocol-architecture.md)，实施顺序见
-[输入稳定性计划](input-stability-plan.md)。
+Ctrl-C、输入和可见回显仍可能发生 head-of-line blocking。这是后续 E0 baseline 与输入热路径工作
+必须直接测量的已知局限，不授权在 v2 内继续扩展 recovery 状态机。
 
 ## MVP 安全边界
 

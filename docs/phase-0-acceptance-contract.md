@@ -1,7 +1,7 @@
 # Phase 0 验收契约
 
-Phase 0 只收口 CURRENT protocol v2 的 recovery 活性。它不实现 TARGET Recovery v3，也不以测试数量、
-分支存在或笼统的 E2E 标签代替具体状态转换证据。
+Phase 0 只收口 CURRENT protocol v2 的 recovery 活性，是冻结基线的历史验收证据。它不设计后续
+recovery replacement，也不以测试数量、分支存在或笼统的 E2E 标签代替具体状态转换证据。
 
 本契约按 revision 判定：只有该 revision 同时包含实现和下列验收测试，且测试通过，才能称为 Phase 0
 candidate complete；只有进入 `main` 后才能称为主线完成。每个 Phase 0 PR 必须在正文中写明它翻转的
@@ -101,7 +101,7 @@ effect 或 pixel paint，也不能被用于性能、SLO 或 production rollout �
 这些是受控的状态机、组件和本地 Worker runtime 测试。它们不证明：
 
 - production Cloudflare Durable Objects、R2、真实网络或真实滚动发布的行为；
-- snapshot restore/adoption、tail continuity 或 TARGET Recovery v3 的 gap-fill correctness；
+- snapshot restore/adoption、tail continuity 或任何未来 recovery replacement 的 correctness；
 - Browser、Host 与 Cloud 之间的纯 network RTT；
 - 通用 shell/TUI application effect、WTerm/Ghostty pixel paint 或 composite；
 - latency percentile、99.9% 成功率、throughput、资源上限或 instrumentation overhead；
@@ -114,7 +114,8 @@ effect 或 pixel paint，也不能被用于性能、SLO 或 production rollout �
 
 后续阶段需要分别设计，而不是扩张 Phase 0 的 correctness tests：
 
-- Recovery v3 的 state model、property/fuzz、generation/retry/reset/adopt 和 snapshot tail-continuity oracle；
+- recovery replacement 的 state model、property/fuzz、generation/retry/reset/adopt 和
+  snapshot tail-continuity oracle；
 - 两条链路的 fault injection，以及 production-like staging 对 DO/R2 与滚动发布的验证；
 - 多客户端、writer transfer、output flood、load/soak 和资源有界性；
 - 能区分 Cloud、Host、PTY 与受支持 workload effect 的运维查询或 dashboard；

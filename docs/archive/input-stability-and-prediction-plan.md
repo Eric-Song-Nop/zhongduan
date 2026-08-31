@@ -1,21 +1,26 @@
-# 输入稳定性与高 RTT 交互实施计划
+# 已归档：输入稳定性与高 RTT 交互实施计划
 
-> 状态：方向已确认，等待实施
+> 状态：历史设计提案，已由 issue #45 的产品边界决策归档；不得作为当前路线或实现依据。
+>
+> 当前规范以[产品契约与协议边界](../terminal-protocol-architecture.md)为准。本文包含尚未获准的
+> prediction、Owned buffer、context integration 与旧 Recovery v3 依赖，仅保留作研究记录。
+
+> 归档时原状态（已失效）：方向已确认，等待实施
 >
 > 决策日期：2026-08-28
 >
 > 适用范围：Browser 输入、Cloud relay、Host session actor、PTY、Ghostty/WTerm replica 与 DOM renderer
 >
-> 协议总纲：[终端协议架构与核心不变量](terminal-protocol-architecture.md)
+> 归档时依赖：旧“终端三平面协议总纲”（已由[当前产品契约](../terminal-protocol-architecture.md)替代）
 >
-> 相关计划：[高性能远程终端 Snapshot 恢复实施计划](high-performance-snapshot-recovery-plan.md)
+> 相关计划：[已归档 Recovery v3 计划](recovery-v3-plan.md)
 
 ## 最高优先级不变量
 
 > 客户端终端当前采用的状态，永远等于某个 immutable checkpoint，加上同一 authority mutation log
 > 的一个连续前缀；所有输入预测都只是这个状态之上的可丢弃 presentation branch。
 
-输入方案必须服从[协议总纲](terminal-protocol-architecture.md)定义的三个平面：
+输入方案原本服从现已失效的“三平面”设计；当前产品契约不把它作为实施路线：
 
 | 平面                 | 输入相关职责                                                     | 持久化与重放                                                  |
 | -------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------- |
@@ -172,12 +177,12 @@ uncertainty。
 
 关键源码入口：
 
-- Browser 输入 lifecycle/seq/ACK：[`input-dispatcher.ts`](../apps/terminal-cloud/src/browser/input-dispatcher.ts#L102-L315)
-- Cloud lease 与输入转发：[`terminal-session-do.ts`](../apps/terminal-cloud/src/worker/terminal-session-do.ts#L978-L1099)
-- Cloud 全局串行 queue：[`relay-message-queue.ts`](../apps/terminal-cloud/src/worker/relay-message-queue.ts#L20-L64)
-- Host actor、input/dedup/ACK/PTY write：[`session.ts`](../apps/host-daemon/src/session.ts#L333-L569)
-- Host canonical pause/queue：[`canonical-publisher.ts`](../apps/host-daemon/src/cloud/canonical-publisher.ts#L80-L165)、
-  [`delivery-scheduler.ts`](../apps/host-daemon/src/cloud/delivery-scheduler.ts#L315-L639)
+- Browser 输入 lifecycle/seq/ACK：[`input-dispatcher.ts`](../../apps/terminal-cloud/src/browser/input-dispatcher.ts#L102-L315)
+- Cloud lease 与输入转发：[`terminal-session-do.ts`](../../apps/terminal-cloud/src/worker/terminal-session-do.ts#L978-L1099)
+- Cloud 全局串行 queue：[`relay-message-queue.ts`](../../apps/terminal-cloud/src/worker/relay-message-queue.ts#L20-L64)
+- Host actor、input/dedup/ACK/PTY write：[`session.ts`](../../apps/host-daemon/src/session.ts#L333-L569)
+- Host canonical pause/queue：[`canonical-publisher.ts`](../../apps/host-daemon/src/cloud/canonical-publisher.ts#L80-L165)、
+  [`delivery-scheduler.ts`](../../apps/host-daemon/src/cloud/delivery-scheduler.ts#L315-L639)
 - 固定 WTerm fork 的
   [Ghostty input/mode ABI](https://github.com/Eric-Song-Nop/wterm/blob/4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6/packages/%40wterm/ghostty/zig/src/wasm_api.zig)、
   [DOM renderer](https://github.com/Eric-Song-Nop/wterm/blob/4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6/packages/%40wterm/dom/src/renderer.ts)
@@ -516,9 +521,8 @@ Enter 落到新 modal。
 | paste                                | 默认 `not-sent`                                                     |
 | mouse、focus、geometry-sensitive key | 默认 `not-sent`，直到 current 且 resize confirmed                   |
 
-被阻止事件不分配 seq、不缓存、不在恢复后重放。恢复的 concurrent gap-fill、delivery credit、apply cursor 与
-handoff 由[协议总纲](terminal-protocol-architecture.md)和
-[Snapshot 计划](high-performance-snapshot-recovery-plan.md)统一定义；本计划不再把“删除 global pause”
+被阻止事件不分配 seq、不缓存、不在恢复后重放。归档提案把 recovery 的 concurrent gap-fill、delivery
+credit、apply cursor 与 handoff 交给[已归档 Snapshot 计划](recovery-v3-plan.md)统一定义；本计划不再把“删除 global pause”
 作为一个孤立 input phase。
 
 ## Context fence：减少 stale typeahead
@@ -662,7 +666,7 @@ reload 的 draft persistence 是单独 opt-in：只能 local-only（或用户明
   否则 Ghostty 可能用旧 keyboard mode 编码 key；
 - 先测量当前同步 snapshot blocking；交付严格有界 immutable/COW cut 后，才启用可执行的 actor-pause hard
   guard，并把可安全的 encode/compress 工作迁出 actor，而不是把可变 Terminal 直接丢给另一个线程；
-- recovery 的 concurrent gap-fill、handoff 与 flow control 服从[协议总纲](terminal-protocol-architecture.md)，
+- recovery 的 concurrent gap-fill、handoff 与 flow control 服从[已归档 Recovery v3 计划](recovery-v3-plan.md)，
   不在 input fast path 中孤立删除现有 correctness barrier；
 - 在 actor 内生成有界合并的 `InputValidationCut`，走 negotiated writer-only sideband，不写 journal。
 
@@ -884,9 +888,9 @@ ordered-input 或 sideband wire 语义的 kill switch 只能 fence/结束当前 
 
 ### 项目源码
 
-- Browser input dispatcher：[`apps/terminal-cloud/src/browser/input-dispatcher.ts`](../apps/terminal-cloud/src/browser/input-dispatcher.ts)
-- Cloud session relay：[`apps/terminal-cloud/src/worker/terminal-session-do.ts`](../apps/terminal-cloud/src/worker/terminal-session-do.ts)
-- Host session authority：[`apps/host-daemon/src/session.ts`](../apps/host-daemon/src/session.ts)
+- Browser input dispatcher：[`apps/terminal-cloud/src/browser/input-dispatcher.ts`](../../apps/terminal-cloud/src/browser/input-dispatcher.ts)
+- Cloud session relay：[`apps/terminal-cloud/src/worker/terminal-session-do.ts`](../../apps/terminal-cloud/src/worker/terminal-session-do.ts)
+- Host session authority：[`apps/host-daemon/src/session.ts`](../../apps/host-daemon/src/session.ts)
 - 固定 WTerm fork：
   [Ghostty adapter](https://github.com/Eric-Song-Nop/wterm/blob/4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6/packages/%40wterm/ghostty/zig/src/wasm_api.zig)、
   [DOM renderer](https://github.com/Eric-Song-Nop/wterm/blob/4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6/packages/%40wterm/dom/src/renderer.ts)
