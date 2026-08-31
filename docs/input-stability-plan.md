@@ -1,14 +1,18 @@
 # 输入稳定性与高 RTT 交互实施计划
 
-> 状态：方向已确认，等待实施
+> 状态：方向已确认。I-A 部分完成，I-B–I-E 尚未开始
 >
 > 决策日期：2026-08-28
+>
+> 实现审计：2026-08-31，基于当前 `main`
 >
 > 适用范围：Browser 输入、Cloud relay、Host session actor、PTY、Ghostty/WTerm replica 与 DOM renderer
 >
 > 协议总纲：[终端协议架构与核心不变量](terminal-protocol-architecture.md)
 >
 > 相关计划：[高性能远程终端 Snapshot 恢复实施计划](high-performance-snapshot-recovery-plan.md)
+>
+> 全局状态与 MVP gate：[MVP Roadmap](mvp-roadmap.md)
 
 ## 最高优先级不变量
 
@@ -68,6 +72,21 @@ MVP 先让支持矩阵内的窄 ASCII shell/REPL 编辑反馈在本地一帧内�
 稳定 context 和显式 opt-in 的 TUI composer 才扩大可见预测。commit、执行和 canonical confirmation 仍受
 网络影响。本计划不承诺任意 TUI 动作都能在本地确定执行，也不宣称在所有维度“全面超过 Mosh”。
 
+## 当前实施状态
+
+高 RTT 输入使用 I-A–I-E，避免与 Recovery Phase 0–5 混淆。早期数字编号已由这套顺序取代。
+
+| ID  | 目标                                    | 状态          | 当前证据与缺口                                                                                  |
+| --- | --------------------------------------- | ------------- | ----------------------------------------------------------------------------------------------- |
+| I-A | Input correctness 与 hot path           | `partial`     | 已有 fence/dedup/ACK/uncertain；连续 seq、逐事件结果、recovery input policy 和 fast lane 未完成 |
+| I-B | Authority-isolated presentation overlay | `not-started` | 没有 overlay owner、resource bound 或 authority-isolation property                              |
+| I-C | ASCII `Mirrored`                        | `not-started` | 没有 validation cut、predictor、rebase/rollback 或 predicted paint                              |
+| I-D | Unicode/TUI Mirrored 与 input-region    | `not-started` | 没有 input-region、context token、driver 或 Unicode predictor                                   |
+| I-E | 显式 `Owned` shell buffer               | `not-started` | 没有 ownership transfer、draft/commit 或 shell integration                                      |
+
+I-A–I-C 是当前 MVP 计划；I-D/I-E 后置。现有 semantic input 测试只证明基本 schema、fence、dedup、ACK、
+bounded queue 和 uncertain 不重发，不证明高 RTT feedback、Ctrl-C 优先级、prediction isolation 或任何 RTT/SLO。
+
 ## “输入稳定”具体指什么
 
 这里的稳定性不是单一延迟数字，而是以下性质同时成立：
@@ -121,9 +140,10 @@ Snapshot 无法缩短健康连接上的这个下界。
   control/data pair并把replica标为不 current；下一份有效 writer Welcome 会建立新的 input epoch，prediction
   层也必须随generation一起reset。
 - Cloud 每次只接受当前 writer lease，并把可信的 `connectionId/clientId/writerFence` 注入 Host control frame。
-- Host 在单一 session actor 中单调检查 writer fence、client、input epoch 和 seq，保留有界 duplicate
-  suppression 结果。当前 seq 允许 gap，不是 contiguous/exactly-once log。
-- 已记住的输入返回 `duplicate`；太旧且已逐出 dedup window 的输入返回 `uncertain`，不会假定安全重写。
+- Host 在单一 session actor 中检查 writer fence、client 和 input epoch；新 epoch 的首个 seq 必须为 1，之后只和
+  high-water/cache 比较，当前仍允许 gap，不是 contiguous/exactly-once log。
+- 有界 cache 只记录 `written` 与 `uncertain`：重送 cached `written` 返回 `duplicate`，cached `uncertain` 或
+  已低于 high-water 但逐出的 seq 返回 `uncertain`。`rejected` 当前不消费 seq，也不进入 cache。
 - semantic key 在 Host 依据**当前权威 Ghostty modes**编码。Browser 落后时不会用旧 cursor-key、keypad 或
   Kitty keyboard mode 生成最终 PTY bytes。
 - writer fence 和 relay-pair fence 能阻止旧连接的输入或 ACK 冒充当前连接。
@@ -144,8 +164,10 @@ exactly-once。PTY 不是事务数据库；`pty.write` 返回之后 Host 若崩�
 因此当前 `written` 名称还混合了“写入 bytes”和“成功处理但没有 bytes”。它**不表示** PTY slave 或应用已经读取，
 不表示应用产生了效果，也不表示 Browser 已经显示回显。协议演进时应拆成 `written` 与
 `handled-no-bytes`，或统一改名为不暗示 I/O 的 `accepted` 并另带 byte count。
-ACK 中的 `authorityEventSeq` 是写入时的 Host head，是前置 watermark，不是 echo/effect ACK。ACK 与
-canonical data 又使用不同 WebSocket，因此二者没有跨通道总顺序。
+Host 生成的 ACK 中，`authorityEventSeq` 在每次构造 ACK 时重新采样当前 Host head，是前置 watermark，不是
+原始 write-time result，也不是 echo/effect ACK；晚到的 duplicate ACK 可以带更晚的 head。Cloud 在 input
+抵达 Host 前生成的 rejection 使用 DO durable head，也不证明 Host sample。ACK 与 canonical data 又使用不同
+WebSocket，因此二者没有跨通道总顺序。
 
 当前 journal/snapshot/tail 只保存 terminal mutation（PTY output 与 resize），不保存 input，也不能在恢复后证明
 应用消费过哪些 key。后文的 `InputValidationCut` 是 writer-only、live-only 的 sideband causal
@@ -157,18 +179,19 @@ uncertainty。
 
 ## 当前代码中已确认的风险
 
-以下是 2026-08-28 当前实现事实，不是未来设计：
+以下是 2026-08-31 对当前 `main` 的实现审计，不是未来设计：
 
-| 风险                      | 当前实现                                                                                                   | 直接影响                                           |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
-| Cloud 全局 HOL            | Browser control、Host control 和 Host data 共用一个 `BoundedSerialQueue`                                   | output/SQLite/fanout 可以把 key 或 Ctrl-C 排在后面 |
-| 每键续 writer lease       | 每个 input 都执行 token SHA-256、lease read/update；Browser 又每 10 秒单独 heartbeat                       | 增加 CPU、SQLite 和队列尾延迟                      |
-| Host actor 同步 snapshot  | `encodeSnapshot()` 与 input、PTY output 在同一个 actor 中执行                                              | 大 snapshot 可以直接阻塞 key→`pty.write`           |
-| context fence 太弱        | 只有 key 带 `observedEventSeq`，Host 只拒绝“观察到未来”，接受 stale；paste/text 没有该字段                 | 旧 UI 上产生的输入可以落到新 modal                 |
-| 无 termios/context 信号   | `PtyProcess` 没有 ECHO/ICANON generation，WTerm 也没暴露 app focus                                         | 无法可靠区分 password、shell edit、TUI raw mode    |
-| renderer 无 overlay 层    | DOM renderer 只从一个 `TerminalCore` 重建 dirty rows                                                       | 预测若直接写 core 会污染 authority replica         |
-| 非法首事件可卡死 epoch    | Browser 在 schema parse 前递增 seq；若首事件无效，下一条从 seq=2 发出，而 Host 建立新 epoch 要求首条 seq=1 | 一个本地坏事件可让后续合法输入持续被拒绝           |
-| 无 transport 时静默吞输入 | dispatcher 没有 writer transport/lease 时直接 return，DOM sink 已 `preventDefault`，也没有逐事件失败反馈   | 用户以为已经输入，实际上事件没有排队也没有送达     |
+| 风险                        | 当前实现                                                                                                   | 直接影响                                           |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| Cloud 全局 HOL              | Browser control、Host control 和 Host data 共用一个 `BoundedSerialQueue`                                   | output/SQLite/fanout 可以把 key 或 Ctrl-C 排在后面 |
+| 每键续 writer lease         | 每个 input 都执行 token SHA-256、lease read/update；Browser 又每 10 秒单独 heartbeat                       | 增加 CPU、SQLite 和队列尾延迟                      |
+| Host actor 同步 snapshot    | `encodeSnapshot()` 与 input、PTY output 在同一个 actor 中执行                                              | 大 snapshot 可以直接阻塞 key→`pty.write`           |
+| context fence 太弱          | 只有 key 带 `observedEventSeq`，Host 只拒绝“观察到未来”，接受 stale；paste/text 没有该字段                 | 旧 UI 上产生的输入可以落到新 modal                 |
+| 无 termios/context 信号     | `PtyProcess` 没有 ECHO/ICANON generation，WTerm 也没暴露 app focus                                         | 无法可靠区分 password、shell edit、TUI raw mode    |
+| renderer 无 overlay 层      | DOM renderer 只从一个 `TerminalCore` 重建 dirty rows                                                       | 预测若直接写 core 会污染 authority replica         |
+| 非法首事件可卡死 epoch      | Browser 在 schema parse 前递增 seq；若首事件无效，下一条从 seq=2 发出，而 Host 建立新 epoch 要求首条 seq=1 | 一个本地坏事件可让后续合法输入持续被拒绝           |
+| 无 transport 时静默吞输入   | dispatcher 没有 writer transport/lease 时直接 return，DOM sink 已 `preventDefault`，也没有逐事件失败反馈   | 用户以为已经输入，实际上事件没有排队也没有送达     |
+| catching-up 输入未完整 gate | 当前只阻止未确认 geometry/current replica 上的 mouse；key/text/paste/focus 仍可发送                        | stale composer 的普通或高风险输入可能落到新上下文  |
 
 关键源码入口：
 
@@ -374,8 +397,8 @@ wide glyph、wrap、multiline、word motion 和 app-specific region。每项都�
 ### 确认、兼容和置信度
 
 Control ACK 可以越过 data，`written` 又只证明 Host 处理了 input，且 encoding 非空时调用 `pty.write` 未抛错。
-因此 overlay 不能看到 ACK 或任意一帧相同画面就宣布“应用已确认”。允许开始验证的是协商后的、
-writer-only、live-only、non-replayable interaction sideband：
+因此 overlay 不能看到 ACK 或任意一帧相同画面就宣布“应用已确认”。允许开始验证的是当前 schema 中严格由
+writer owner 产生的 live-only、non-replayable interaction sideband：
 
 ```text
 InputValidationCut {
@@ -508,6 +531,8 @@ context 内的 informative cut validation，以及显式 `mirrored_echo_off` opt
 catching-up 时展示旧 state 或尚未 adopt 的 candidate。强制 `Raw` 只关闭预测，无法阻止旧 composer 上的
 Enter 落到新 modal。
 
+下表是 I-A 必须实现的目标策略；当前 Browser 只对 mouse 执行 current/resize gate，其他 input class 尚未按表分流：
+
 | Input class                          | catching-up 默认行为                                                |
 | ------------------------------------ | ------------------------------------------------------------------- |
 | resize                               | 允许走 authority resize path；确认前阻止 geometry-sensitive input   |
@@ -559,8 +584,8 @@ InputClass  = edit | commit | control | geometry-sensitive
 
 ## `Owned`：显式 shell command buffer（后置）
 
-`Owned` 的实施晚于 `Mirrored`，只对显式安装/allowlist 的 shell integration 或协商后的 input-region
-ownership transfer 启用。Host 必须持有 integration assertion，并在 submit
+`Owned` 的实施晚于 `Mirrored`，只对显式安装/allowlist 的 shell integration，或已经明确完成 ownership
+transfer 的 input-region 启用。Host 必须持有 integration assertion，并在 submit
 时同时核对 foreground shell、prompt epoch 和 authority context。OSC 133 可以作为正向信号，但普通 child 也能
 打印 OSC，因此单独使用它不是授权或安全边界；side channel/session nonce 主要防 stale 或 accidental spoof，
 也不能天然隔离能继承环境或控制同一 PTY 的恶意 child。
@@ -665,57 +690,59 @@ reload 的 draft persistence 是单独 opt-in：只能 local-only（或用户明
   guard，并把可安全的 encode/compress 工作迁出 actor，而不是把可变 Terminal 直接丢给另一个线程；
 - recovery 的 concurrent gap-fill、handoff 与 flow control 服从[协议总纲](terminal-protocol-architecture.md)，
   input fast path 不得绕过 `RecoveryStartFence`、generation owner 或 flow-control 边界；
-- 在 actor 内生成有界合并的 `InputValidationCut`，走 negotiated writer-only sideband，不写 journal。
+- 在 actor 内生成有界合并的 `InputValidationCut`，走 current writer-only sideband，不写 journal。
 
 ### Browser
 
 - keydown 不等待上一条 ACK，保持 pipeline；
 - control transport/input epoch 变化继续将 outstanding 标成 uncertain，绝不自动 resend；data delivery
-  generation、resync 和 snapshot adoption 至少清 prediction epoch，不能误写成当前已经清 input pending；
+  generation、connection-set replacement 和 snapshot adoption 至少清 prediction epoch，不能误写成当前已经清
+  input pending；
 - 控制输入和 ordinary edit 分队列、分指标；高风险 input queue 超限时 fail closed；
 - dispatcher 对 `sent/queued/not-sent/uncertain` 给出逐事件结果；没有 writer transport 时不再静默吞掉已被
   DOM `preventDefault` 的输入；
 - paint 和 verifier 不阻塞真实 WebSocket send。
 
-## 能力协商与滚动部署
+## 单实现 wire 与 feature enablement
 
-feature flag 不能代替 wire compatibility。Browser、Cloud、Host 在握手时 advertisement，Cloud 选择三方交集：
+项目在 MVP 前不保留旧 input wire、旧 session 协商或 mixed-commit fallback。Browser、Cloud、Host 必须从同一提交
+部署；新增 interaction sideband 时三端 schema、owner 和测试在同一个变更中落地。无法识别或缺少 owner 的 frame
+直接 fail closed，不能静默退回另一套协议。
 
-```text
-input-contiguous-v1
-input-result-v1
-input-validation-cut-v1
-guarded-context-v1
-presentation-overlay-v1
-input-region-v1
-```
+Feature enablement 只控制**当前 schema 内的展示策略**：
 
-- selected capability 绑定 session/input epoch 或 connection/delivery generation，生命周期内不可静默改变；
-- Cloud 只发送接收方已选择的 sideband/status，strict old decoder 永远看不到未知 kind；
-- 不支持 `input-contiguous-v1` 就不能启用 validation cut 或 visible Mirrored；
-- 长生命周期旧 session 保持旧协议；升级必须经过新协商边界，必要时新建 input epoch/delivery generation；
-- writer-only input capability 可以按当前 writer connection 协商，terminal state plane 仍保持兼容版本；
-- negotiation mismatch fail closed 到现有 `Raw` PTY path。
+- `Raw` 永远是无需另一套 wire 的安全表现；
+- hidden measurement、internal visible、opt-in 和默认开启可以分步进行；
+- presentation/driver switch 可以立即清空 overlay 并回到 `Raw`；
+- 改变 ordered-input、validation cut 或 context fence 语义时必须结束当前 input epoch/connection，不能在未决 input
+  中途切换；
+- feature switch 不能绕过 strict schema、writer fence、input epoch、generation owner 或 flow control。
 
 `InputValidationCut` 不进入 canonical data frame，因此无需把 terminal mutation log 改成 metadata 混合 log。
 
 ## 分阶段实施
 
-### Phase A：input correctness 与 hot path
+### I-A：input correctness 与 hot path
+
+状态：`partial`。已有 semantic input、writer/input identity、Host dedup、ACK、bounded Browser queue 和
+uncertain 不重发；下列 exit items 尚未完成。
 
 - Browser 完整 validate/admit 后才分配 seq；
 - Host 使用 strict `nextExpectedSeq`；确定性 reject 消费 seq，`uncertain` 终止 epoch；
 - 建立单一 per-writer sequencer，明确 urgent cancellation 与 resize ordering；
 - 完成 `sent/queued/not-sent/uncertain` 逐事件反馈；
+- 接通 recovery/catching-up input class policy；被阻止事件不分配 seq、不缓存、不延迟重放；
 - writer lease 改为 connection-scoped capability；
 - 拆除 input 热路径上的每键 storage/hash/lease renewal；
-- 建立 capability negotiation 和分段 monotonic telemetry；
+- 建立当前 wire 的三端 schema/owner 和分段 monotonic telemetry；
 - 测量并约束 snapshot actor pause，但 recovery 协议改造由 snapshot/总纲计划负责。
 
 完成门槛：预测关闭时，schema failure、断连、writer transfer、urgent input 和 duplicate injection 都不会制造
 silent loss、seq gap 或重复 PTY effect；本地 input latency 不被 bulk work 线性放大。
 
-### Phase B：authority-isolated overlay
+### I-B：authority-isolated overlay
+
+状态：`not-started`。当前 renderer 没有独立 presentation overlay，也没有 prediction resource owner。
 
 - WTerm renderer 增 `PresentationOverlay`；
 - 补最小 parser/wrap/mode/cursor/sync generation/region digest 只读 API；
@@ -725,9 +752,11 @@ silent loss、seq gap 或重复 PTY effect；本地 input latency 不被 bulk wo
 完成门槛：任意时刻清 overlay 后 core 与 canonical replay 一致；speculative content 在
 snapshot/copy/selection/ARIA/log/network 中出现次数为 0。
 
-### Phase C：ASCII `Mirrored` MVP
+### I-C：ASCII `Mirrored` MVP
 
-- 协商 `input-validation-cut-v1`；
+状态：`not-started`。当前没有 validation cut、predictor、compatible-prefix、rebase 或 rollback 实现。
+
+- 定义并接通当前 `InputValidationCut` schema 与三端 owner；
 - Host 生成 writer-only live cut，Cloud 绑定 delivery generation；
 - 实现 authoritative base、pending inputs、prefix states 与 maximal compatible prefix；
 - 实现 credit/no-credit/incompatible、suffix rebase 和 sync-output full-frame validation；
@@ -736,7 +765,9 @@ snapshot/copy/selection/ARIA/log/network 中出现次数为 0。
 完成门槛：eligible edit 的 predicted paint p95 在一个本地 frame 内；conflict 到 overlay 清除 p95 在一个
 frame 内；coalesced redraw 不会重复 overlay 或错误退休 suffix。
 
-### Phase D：扩大 Mirrored 与 input-region
+### I-D：扩大 Mirrored 与 input-region
+
+状态：`not-started`，`post-MVP`。
 
 input-region 是长期核心抽象，现在定义、后置实现；ASCII MVP 不依赖它：
 
@@ -759,14 +790,16 @@ InputRegionEnd { id, revision, reason }
 
 协议仍通过 PTY，未知应用忽略；普通 child 可打印 OSC/DCS，所以它不是抵御同 PTY 恶意进程的授权边界。
 
-### Phase E：显式 `Owned`
+### I-E：显式 `Owned`
+
+状态：`not-started`，`post-MVP`。
 
 - 只在 shell integration/input-region 明确 ownership transfer 后启用；
 - 实现 revisioned draft/commit、context token 和 known-empty/buffer sync；
 - 保留 shell history、IME、completion、keymap 与 native fallback；
 - uncertain commit 永不自动 retry。
 
-Recovery、FrozenTerminalCut 和 rolling checkpoint 是并行工作流，phase owner 见相应计划。
+Recovery R3 immutable-cut 与 R4 rolling snapshot 是并行工作流，状态和 owner 见相应计划。
 
 ## 指标与 SLO
 
@@ -784,14 +817,18 @@ Recovery、FrozenTerminalCut 和 rolling checkpoint 是并行工作流，phase o
 
 遥测只能记录枚举、大小、时延、digest 和计数，不能记录 text、paste、command、cell 内容或 key 明文。
 
-### 初始发布门槛
+### I-A–I-C target 与验收指标
+
+以下数值是输入路线的待实现、测量并由 release owner 批准的 target，不是另一份全局 release gate，
+也不是当前性能事实或已经冻结的 SLO。MVP 是否通过只由 [Roadmap G2](mvp-roadmap.md#mvp-release-gates) 汇总：
 
 - predicted paint p95 不超过一个 60 Hz frame；
 - conflicting canonical output 到 overlay 清除 p95 不超过一个 frame；
-- supported-load 下 Cloud+Host 非网络 input overhead p99 不超过 25 ms，Phase A 后按实测校准；
+- supported-load 下 Cloud+Host 非网络 input overhead p99 不超过 25 ms，I-A 后按实测校准；
 - end-to-end result/ACK 目标写成“实测 relay 网络 RTT + Browser/Cloud/Host 本地预算”，不能在注入
   600 ms RTT 时要求物理上不可能的固定 500 ms；
-- recovery/snapshot 开启时本地 control→`pty.write` p99 不得超过无恢复 baseline 的 2 倍，并单独报告网络段；
+- recovery/snapshot 开启时本地 control→`pty.write` p99 不得超过无恢复 baseline 的 2 倍，并同时满足 G7 批准的
+  absolute bound；单独报告网络段；
 - fault-injection 中 live dedup 窗口内的重复 PTY write、Host 已观察到 invalidation 后的 stale guarded write、
   已声明或已被 Host 观察到的 secure state visible prediction 均为 0；
 - authority isolation property test 在所有 fuzz case 中成立。
@@ -858,10 +895,10 @@ input_region_protocol
 shell_owned_buffer
 ```
 
-发布顺序是 capability negotiation → hidden measurement → internal visible → opt-in → 支持矩阵内默认开启。
-feature flag 不替代 wire negotiation。Presentation/driver kill switch 可以立即清 overlay、回到 `Raw`；改变
-ordered-input 或 sideband wire 语义的 kill switch 只能 fence/结束当前 input epoch 或 control connection，
-再按已协商 fallback 重连，不能在未决 input 中途静默切换协议。两者都不需要重建 terminal snapshot。
+发布顺序是 schema/owner 同提交落地 → hidden measurement → internal visible → opt-in → 支持矩阵内默认开启。
+Presentation/driver switch 可以立即清 overlay、回到 `Raw`；改变 ordered-input 或 sideband wire 语义只能
+fence/结束当前 input epoch 或 control connection，不能在未决 input 中途静默切换，也不能回退到已经删除的协议。
+两者都不需要重建 terminal snapshot。
 
 ## 明确不做
 
@@ -877,7 +914,7 @@ ordered-input 或 sideband wire 语义的 kill switch 只能 fence/结束当前 
 - 不让 urgent lane 越过 earlier semantic input；
 - 不把 `Raw` 表述成 context-safe；
 - 不让 input-region implementation 阻塞 ASCII Mirrored MVP；
-- 不在没有 capability negotiation 时仅靠 feature flag 发送新 wire kind；
+- 不在三端 strict schema/owner 尚未同时落地时仅靠 feature flag 发送新 wire kind；
 - 不承诺在纯 PTY 下识别应用尚未输出的内部 modal 状态；
 - 不把 Mosh 的 UDP roaming 当成现代 Browser 部署必须照搬的架构。
 

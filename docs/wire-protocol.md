@@ -11,7 +11,7 @@ Control channel 使用 strict JSON object。每个方向都有独立 schema，un
 
 - Browser → Cloud：attach、writer lease renew、semantic input、delivery receipt、replica apply progress、
   recovery adopted；
-- Cloud → Browser：welcome、input acknowledgement、Host/status/resync、recovery start、source closed；
+- Cloud → Browser：welcome、input acknowledgement、Host offline、writer lease status、recovery start、source closed；
 - Host → Cloud：host ready、input acknowledgement、source rejected、source closed；
 - Cloud → Host：host ready acknowledgement、forwarded input、prepare、start-ready、grant、receipt、reset。
 

@@ -30,6 +30,8 @@ delivery、durable scalar ledger 与 atomic replica adoption 守住这个边界�
 项目仍在 MVP 开发阶段。当前代码已经形成可构建、可验证的单一 Recovery 基础，但尚未完成
 production-like 演练、安全审查、容量冻结和正式上线批准。
 
+阶段完成度、计划偏差和唯一的全局 MVP release gates 见 [MVP Roadmap](docs/mvp-roadmap.md)。
+
 - 支持一个 Linux Host、最多一个活动 writer 和多个 observer。
 - writer 可以输入和调整尺寸；observer 只能查看。
 - Host 与浏览器使用同一个固定版本的 Ghostty WASM 和严格 `engineId`。
@@ -107,6 +109,7 @@ URL fragment 不会发送给 HTTP 服务器，页面加载后也会立即从地�
 
 ## 文档
 
+- [MVP Roadmap：阶段、状态、偏差与发布门槛](docs/mvp-roadmap.md)
 - [部署指南](docs/deployment.md)
 - [MVP 架构](docs/mvp-architecture.md)
 - [终端协议架构与不变量](docs/terminal-protocol-architecture.md)
