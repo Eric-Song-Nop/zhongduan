@@ -1,7 +1,8 @@
 # Phase 0 验收契约
 
 Phase 0 只收口 CURRENT protocol v2 的 recovery 活性，是冻结基线的历史验收证据。它不设计后续
-recovery replacement，也不以测试数量、分支存在或笼统的 E2E 标签代替具体状态转换证据。
+recovery replacement，也不以测试数量、分支存在或笼统的 E2E 标签代替具体状态转换证据。稳定产品
+边界见[产品契约与协议边界](terminal-protocol-architecture.md)，当前后续阶段见 [MVP 路线](mvp-roadmap.md)。
 
 本契约按 revision 判定：只有该 revision 同时包含实现和下列验收测试，且测试通过，才能称为 Phase 0
 candidate complete；只有进入 `main` 后才能称为主线完成。每个 Phase 0 PR 必须在正文中写明它翻转的

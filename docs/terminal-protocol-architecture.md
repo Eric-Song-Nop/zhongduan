@@ -1,29 +1,25 @@
 # Zhongduan 产品契约与协议边界
 
-> 状态：规范性产品与架构决策框架
+> 状态：稳定的规范性产品与架构决策框架
 >
 > 决策日期：2026-08-31
->
-> 当前运行时基线：PR #24 head，`5d7511782542de511292d25908b8d92be4319636`
 >
 > 适用范围：Host authority、Browser replica、input effect、snapshot/recovery、Cloud relay、
 > presentation 与后续协议演进
 
-本文定义 Zhongduan 以后做产品和协议决策时必须同时满足的边界。它不设计新的 wire protocol，
-也不改变 CURRENT protocol v2 的任何 runtime 行为。当前实现事实分别记录在
-[MVP 架构](mvp-architecture.md)、[Wire Protocol V2](wire-protocol.md)和
-[Phase 0 验收契约](phase-0-acceptance-contract.md)中。
+本文只定义 Zhongduan 做产品和协议决策时必须同时满足的稳定边界，不承担 CURRENT runtime inventory、
+阶段测试矩阵或 PR 排期。当前实现事实记录在 [MVP 架构](mvp-architecture.md)和
+[Wire Protocol V2](wire-protocol.md)中；active 阶段、证据和依赖记录在
+[MVP 路线](mvp-roadmap.md)中；输入热路径的实施契约记录在[输入核心实施计划](input-core-plan.md)中。
 
-## 阅读约定：GATE 与 CURRENT
+## 文档职责与阅读约定
 
-除明确标为 **CURRENT** 的章节外，本文中的“必须”和“不能”都是后续变更与发布的 acceptance gate，
-不是对 PR #24 已实现能力的声明。PR #24 已知尚未完全满足 input 分类/连续性、hot-path 隔离和
-non-blocking recovery 等 gate；它在对应 cutover 前作为冻结的 grandfathered baseline 保留，不能被当作
-新架构的合规先例。
+本文中的“必须”和“不能”都是后续变更与发布的 acceptance gate，不是对某个实现 revision
+已经具备相应能力的声明。Roadmap 可以调整阶段划分和顺序，但不能弱化这里的产品不变量；CURRENT
+实现只能作为事实基线，不能反向定义未来架构的合规标准。
 
-规范性产品决策、roadmap 和新协议边界发生冲突时，以本文为准。CURRENT runtime 行为发生冲突时，
-以基线 commit 的代码、[MVP 架构](mvp-architecture.md)和 [Wire Protocol V2](wire-protocol.md)为准，
-并修正文档，不能用未来 gate 重新解释现状。
+规范性产品决策、roadmap 和新协议边界发生冲突时，以本文为准。CURRENT runtime 文档与代码发生冲突时，
+以对应基线 commit 的代码为准并修正 CURRENT 文档，不能用未来 gate 重新解释现状。
 
 ## 产品判断
 
@@ -42,6 +38,58 @@ Zhongduan 的目标是提供一个状态正确、输入结果明确、健康路�
 
 > Browser 已采用的 terminal-engine state，必须与 Host authority 在某个 committed revision 的状态
 > 观察等价。
+
+### Authority revision 与 committed
+
+最小逻辑 revision identity 是：
+
+```text
+AuthorityRevision {
+  engineId
+  sessionEpoch
+  eventSeq
+  nextPtyOffset
+}
+```
+
+- `engineId` 绑定 terminal-engine 实现、snapshot schema 和必要 codec；
+- `sessionEpoch` 绑定同一个 PTY/child-process 生命周期；
+- `eventSeq` 是该 revision 已包含的最高连续 canonical terminal mutation；
+- `nextPtyOffset` 是已消费 PTY byte prefix 的 exclusive end。Resize 等非 PTY-byte mutation 消耗
+  `eventSeq`，但不推进该 offset。
+
+这是 correctness 所需的最小逻辑 identity，不要求未来 wire 永久使用同一字段布局。实现可以增加
+lineage、checksum 或 generation fence，但不能让同一个 revision identity 指向两份不同 authority state。
+
+`committed` 表示 Host authority actor 已完成该 canonical mutation 对 terminal-engine state 的 transition，
+并把对应连续 identity 提交到 authority journal/head。WebSocket send、Cloud receive、delivery ACK、Browser
+receive 或 Browser apply 都不能创建 committed authority revision。若 engine transition 已发生、但
+journal/head commit 失败，authority actor 必须 fail closed；该未提交状态不能被发布为可采用 revision。
+
+### 观察等价与 correctness oracle
+
+“观察等价”不是 DOM cells 当前看起来相同，也不要求某个 snapshot serialization 的 bytes 完全相同。
+同一 `engineId` 和 `sessionEpoch` 下的两个 engine state，只有在以下条件同时成立时才观察等价：
+
+- screen/history 内容、cursor 与 attributes、terminal modes、pending wrap、margins、tab stops、palette、
+  parser continuation 以及其他会影响后续解析或可见行为的规范化状态等价；
+- 从两者继续应用同一合法 canonical suffix 时，产生的 terminal state、query response 和后续行为不会分叉；
+- presentation-only overlay、DOM layout、缓存布局和 serialization 非语义差异不参与判断。
+
+实现必须提供不依赖特定 wire encoding 的对照 oracle：
+
+```text
+uninterrupted authority engine at H
+
+vs.
+
+restore checkpoint at R
+  + apply canonical suffix (R, H]
+```
+
+先比较两边的 normalized engine state，再继续输入覆盖 UTF-8、CSI、OSC/DCS、resize、pending-wrap 和
+mode-sensitive continuation 的共同 fixtures，验证状态与行为仍然等价。测试可以使用有限且不断扩充的
+fixture/property corpus，但不能把 DOM equality 或 snapshot byte equality 当作长期正确性定义。
 
 默认正确性参考模型是：
 
@@ -89,17 +137,9 @@ uncertain
   当前 input epoch 必须终止，该 input 永不自动重发。
 ```
 
-这是端到端产品分类，不是 CURRENT v2 wire status 的同义词。v2 的过渡映射是：
-
-| v2 事实或 status                                     | 产品分类        | 限定                                                   |
-| ---------------------------------------------------- | --------------- | ------------------------------------------------------ |
-| Browser 证明尚未进入 transport                       | `not-sent`      | 当前尚无稳定 wire status，UI 必须能观察结果            |
-| `written` / `duplicate`                              | `deterministic` | 仅在声明的 result-retention/dedupe window 内可重复返回 |
-| owner 能证明无 PTY effect 的 `rejected`              | `deterministic` | rejection 必须绑定明确 identity 和 owner               |
-| `uncertain`、owner 丢失或过期后无法证明的旧 identity | `uncertain`     | 终止 epoch，禁止自动重发                               |
-
-超过 result-retention window 后不能重新施加旧 effect；无法继续证明原结果时只能转为 `uncertain`。
-`not-sent` 也不是“稍后自动发送”的本地队列状态。
+这是端到端产品分类，不是任何一版 wire status 的同义词。每版协议都必须给出到这三类结果的完整映射，
+并声明 result-retention/dedupe window。超过该 window 后不能重新施加旧 effect；无法继续证明原结果时
+只能转为 `uncertain`。`not-sent` 也不是“稍后自动发送”的本地队列状态。
 
 这项不变量要求：
 
@@ -113,23 +153,26 @@ uncertain
 
 每个被 UI 消费的 resize、mouse move 等可合并 state intent 仍需要本地可观察分类。被较新 intent 取代且
 尚未 admit 的 intent 不分配 wire identity/sequence，并归为 `not-sent/superseded`；重连后的 state
-reconciliation 是新 intent，必须在 validate/admit 后分配新 identity，不能自动重放旧 input。CURRENT v2
-的 latest-resize resend 和 mouse coalescing 是等待 E1 明确收口的 grandfathered 行为，不是此 gate 已满足的证据。
+reconciliation 是新 intent，必须在 validate/admit 后分配新 identity，不能自动重放旧 input。
 
 `pty.write()` 成功只表示 Host 的同步 write 调用没有失败，不表示 PTY slave 或 child 已经读取，
 更不表示 application transaction 已提交。Zhongduan 不宣称 PTY input 能提供跨 Host crash 的
 exactly-once application effect。
 
+阶段拆分、CURRENT gap 和每层 evidence 见[输入核心实施计划](input-core-plan.md)。
+
 ## 3. Hot-path liveness and bounded latency
 
 > 在受支持负载内，snapshot、recovery、observer、R2、bulk output 和 Durable Object maintenance
-> 不得无限期阻塞 writer input 或 live terminal output。
+> 不得无限期阻塞 writer input 或 live terminal output，也不得让 input queue wait 随无关 bulk backlog
+> 线性增长。
 
 这项不变量要求：
 
 - 所有 queue、buffer、waiter 和 background work 都有明确的 bytes、frames、age 或 concurrency 上限；
 - overload 必须隔离到具体 client、generation 或 background task，不能默认阻塞整个 authority；
-- control/input 不能与 bulk data 共用一个无界串行尾部；
+- 在 supported load 内，control/input 不得与无关 bulk work 共用会让其 queue wait 随 bulk backlog
+  线性增长的串行执行 owner；若继续共享，必须用 source-controlled benchmark 证明等价隔离；
 - snapshot 不能成为 input actor 上任意长的同步任务；
 - recovery 可以失败、被丢弃并重新开始，新架构不能靠阻塞 authority 获得正确性；
 - performance 和 liveness 是 MVP gate，不能等功能完成后再补；
@@ -158,159 +201,16 @@ exactly-once application effect。
 - 新增长期 durable owner、ledger 或 convergence state 前，必须证明它改善已测得的产品指标，
   而不是仅让中间过程更容易被形式化描述。
 
-CURRENT v2 会把 delivery generation、cursor、pin/commit 等 attachment state 序列化到 Cloudflare
-WebSocket attachment，以便跨 Durable Object hibernation 继续。这是 R4 前冻结保留的 legacy 实现，
-不构成未来 recovery attempt 必须跨 hibernation 延续的产品要求。
+## CURRENT v2 冻结原则
 
-## CURRENT：冻结的 protocol v2 基线
+CURRENT runtime 的结构、限制和已知缺陷只由 [MVP 架构](mvp-architecture.md)与
+[Wire Protocol V2](wire-protocol.md)记录。Active cutover 阶段与证据见 [MVP 路线](mvp-roadmap.md)。
 
-PR #24 是当前唯一运行时基线：
-
-```text
-control WebSocket    attach / lease / input / ACK / resync
-data WebSocket       PTY_OUTPUT / RESIZE_APPLIED / directed replay / barrier / commit
-snapshot HTTP        immutable compressed Ghostty snapshot
-```
-
-它还存在计划一明确要由后续 PR 收口的事实：Browser 尚未统一做到 validate/admit 后再分配 sequence，
-Host input 还不是 strict contiguous stream，某些无 transport/lease 路径没有逐 input 可见结果，Cloud
-仍有跨 socket 的全局串行尾部，recovery 仍依赖 global pause。A1 只把这些事实列为 gate，不在本次
-纯文档变更中修改它们。
-
-CURRENT recovery 使用 fixed commit、barrier、pinned delivery 和 global canonical publisher pause：
-
-```text
-pause canonical publisher
-  -> select immutable base R and fixed commit C
-  -> barrier / pin delivery generation
-  -> warm: send exact tail(base, C]
-     cold: send snapshot@R + exact tail(R, C]
-  -> ReplayCommit(C)
-  -> resume canonical publisher
-```
-
-这些行为是 v2 整体 correctness contract。Global pause 是与新架构 liveness 边界冲突的已知历史债务，
-不是以后 recovery 的设计先例；但在 v2 内局部删除它会先破坏 adopted-state safety，因此只能在完整
-replacement 通过 gate 后由 R4 一次性移除。计划二完成 destructive cutover 前：
-
-- v2 继续作为唯一运行时；
-- 只接受 blocker、安全问题和验证 v2 既有行为的测试修复；
-- 不继续扩展 checkpoint serviceability、recovery fairness 或 durable attempt continuity；
-- 不从 v2 局部删除 pause、barrier 或 pinned commit；
-- 不同时维护一个逐步渗入 v2 的第二套 recovery protocol。
-
-本次 A1 文档变更不修改 source、runtime、wire schema、capability 或部署行为。
-
-## 后续实现的证据基线
-
-计划一只定义 gate，不在本 PR 实现测试 harness 或功能。后续首先建立 raw semantic PTY path 的真实
-E2E baseline；在该 baseline 完成前不做 prediction，也不开始 recovery replacement。
-
-### 网络与故障矩阵
-
-```text
-Browser <-> Cloud RTT: 20 / 100 / 300 / 600 ms
-Cloud <-> Host RTT:    20 / 100 / 300 / 600 ms
-jitter
-disconnect
-reconnect
-output flood
-cold attach
-DO hibernation
-Host relay replacement
-```
-
-### 正确性 gate
-
-1. 被 UI 消费但结果为 silent loss 的 input：0。
-2. dedupe window 内 duplicate PTY effect：0。
-3. uncertain input 自动重发：0。
-4. output flood 下 Ctrl-C 准确写入一次。
-5. writer transfer 后旧 writer input 成功次数：0。
-6. cold candidate 在验证完成前 visible 次数：0。
-7. snapshot/recovery 开启与关闭时，Host authority state 仍由相同 canonical input/output 决定。
-8. secure-input 场景启用 speculative presentation 的次数：0。
-
-### 延迟 gate
-
-E0 第一轮只产生 baseline，不凭空写绝对阈值。至少采集：
-
-- Browser keydown 到 send decision；
-- Cloud Browser receive 到 Host send；
-- Host receive 到 `pty.write`；
-- input 到 matching Browser render；
-- PTY output 到 Browser useful render；
-- Ctrl-C 到 `pty.write`；
-- Ctrl-C 到应用 quiet 或 prompt 恢复。
-
-基线完成后，把相对阈值写入 source-controlled benchmark contract。至少必须验证：
-
-```text
-Cloud input latency 不随 Host data queue depth 线性增长
-snapshot/recovery 开启后的 Host local input p99
-  不超过关闭时 baseline 的约定倍数
-output flood 中 Ctrl-C 仍有有界完成时间
-```
-
-## 主线依赖顺序
-
-三个计划按依赖推进，不并行铺开：
-
-```text
-计划一：重新定义项目边界
-        |
-        v
-计划三前半：建立 E2E baseline 并修复输入热路径
-        |
-        v
-计划二：在 baseline 和测试约束下替换 v2 recovery
-        |
-        v
-计划三后半：真实 Cloudflare / TUI / 长会话发布验证
-```
-
-推荐 PR 顺序：
-
-```text
-A1  docs: reset product and protocol boundaries
-
-E0  test: terminal journey baseline
-E1  browser validate/admit
-E2  Cloud input lanes and connection-scoped writer
-E3  Host contiguous input
-E4a finalized background snapshots
-E4b immutable Ghostty cut (only if measurements prove it necessary)
-
-R0  freeze v2 behavioral contract (codify the A1 policy in executable tests)
-R1  Host ordered generation stream
-R2  Browser stream runtime
-R3  ephemeral Cloud relay
-R4  destructive cutover and delete v2
-
-E5  real applications and Cloudflare staging release gate
-```
-
-计划二不能在 E0 之前开始。A1 先冻结允许的政策边界，R0 再把 v2 既有行为固化成 replacement 的
-executable contract。v2 在 R4 前保持唯一运行时；替换必须由完整 gate 约束并在切换后删除旧路径，
-不能长期维护 v2 与新 recovery 的兼容矩阵。
-
-## 当前明确不做
-
-在 E5 完成前，不进入本轮计划：
-
-- Mirrored prediction；
-- Owned shell command buffer；
-- Codex/Claude application driver；
-- input-region protocol；
-- rolling/delta snapshot；
-- history pages；
-- recovery fairness 调参；
-- multi-writer；
-- Recovery v3 compatibility；
-- terminal state delta 网络格式；
-- Mosh 式 UDP roaming。
-
-这些主题只有在重新通过上述产品 gate 后，才能进入 roadmap。
+在 roadmap 的 destructive cutover 完成前，v2 保持唯一生产运行时；它的 recovery correctness invariant
+与状态机作为一个整体冻结，recovery 路径只接受 blocker、安全问题和验证既有行为的测试修复。输入与
+hot-path 阶段可以在不改变 pause/barrier/pin 等 recovery 行为的前提下收口本身的 gate，但不能借机局部
+删除或扩展 v2 recovery，也不能并行维护第二套长期生产协议。Replacement 必须作为完整路径通过本文
+三个产品 gate 后再切换，而不是逐步渗入 v2 recovery。
 
 ## 新提案的决策门槛
 
@@ -332,8 +232,8 @@ raw PTY baseline 哪里不够？
 - capability、rollout、rollback 和 destructive cleanup 边界；
 - 能证明收益的 workload、指标和 source-controlled gate。
 
-没有这些证据时，默认保留 raw PTY path 和当时的 CURRENT recovery runtime；R4 前保持 v2 冻结，
-并选择能够丢弃的临时过程，而不是新增 durable recovery state。
+没有这些证据时，默认保留 raw PTY path 和当时的 CURRENT recovery runtime；destructive cutover
+完成前保持 CURRENT baseline 冻结，并选择能够丢弃的临时过程，而不是新增 durable recovery state。
 
 Zhongduan 的核心边界最终表述为：
 
