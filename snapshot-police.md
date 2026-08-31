@@ -1,7 +1,8 @@
 > 历史评审草稿：本文保留早期 snapshot 方案的审查记录，其中部分前提已经失效。当前项目
 > 入口和实现状态以 [README](README.md)、[MVP 架构](docs/mvp-architecture.md)、
 > [部署指南](docs/deployment.md)与 [Wire Protocol V2](docs/wire-protocol.md)为准；产品与恢复边界见
-> [产品契约与协议边界](docs/terminal-protocol-architecture.md)。本文中的后续方案没有路线约束力。
+> [产品契约与协议边界](docs/terminal-protocol-architecture.md)，实施顺序见
+> [MVP 路线](docs/mvp-roadmap.md)。本文中的后续方案没有路线约束力。
 
 可以。先把两个容易混在一起的概念拆开：
 

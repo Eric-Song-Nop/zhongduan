@@ -1,6 +1,6 @@
 > 设计记录：本文不是协议规范、roadmap 或实施门槛，其中多轮讨论的结论可能彼此冲突或已经失效。
-> 当前产品决策以[产品契约与协议边界](docs/terminal-protocol-architecture.md)为准；当前行为与常量仍以代码、
-> [MVP 架构](docs/mvp-architecture.md)和
+> 当前产品决策以[产品契约与协议边界](docs/terminal-protocol-architecture.md)为准，实施顺序以
+> [MVP 路线](docs/mvp-roadmap.md)为准；当前行为与常量仍以代码、[MVP 架构](docs/mvp-architecture.md)和
 > [Wire Protocol V2](docs/wire-protocol.md)为准。
 
 可以。先把方案压缩成一个明确的复制模型：

@@ -21,17 +21,19 @@ Zhongduan 同时把以下三项作为产品 gate：
    committed revision 观察等价。
 2. **Input/effect safety**：每个被 UI 消费的 semantic input 必须明确归类为 `not-sent`、
    `deterministic` 或 `uncertain`，不允许 silent loss 或不安全的自动重发。
-3. **Hot-path liveness and bounded latency**：snapshot、recovery、bulk output 和后台维护不能无限期
-   阻塞 writer input 或 live output。
+3. **Hot-path liveness and bounded latency**：在 supported load 内，snapshot、recovery、bulk output
+   和后台维护不能无限期阻塞 writer input 或 live output，也不能让 input wait 随无关 bulk backlog
+   线性增长。
 
 这些是后续变更和发布的 acceptance gate，不表示 PR #24 的 CURRENT v2 已全部满足。v2 仍有 input
 分类/连续性、全局 HOL 和 recovery pause 等已知例外，在对应 cutover 前按冻结基线保留。
 
 默认状态正确性参考模型仍是 matching immutable checkpoint 加同一 authority 的连续 canonical
 suffix；它不是对未来物理网络格式的强制规定。Prediction 只允许存在于可丢弃的 presentation branch，
-未来若重新提案也不能进入 adopted replica。CURRENT protocol v2 是冻结的唯一运行时，在完整替换前只接受 blocker、
-安全问题和测试修复，不继续扩展 recovery attempt 状态机。完整边界和后续工作顺序见
-[产品契约与协议边界](docs/terminal-protocol-architecture.md)。
+未来若重新提案也不能进入 adopted replica。CURRENT protocol v2 是唯一生产运行时；它的 recovery
+correctness invariant 在完整替换前保持冻结，不继续扩展 recovery attempt 状态机。稳定边界见
+[产品契约与协议边界](docs/terminal-protocol-architecture.md)，阶段顺序和输入实施契约分别见
+[MVP 路线](docs/mvp-roadmap.md)与[输入核心实施计划](docs/input-core-plan.md)。
 
 ## 当前状态
 
@@ -116,6 +118,8 @@ URL fragment 不会发送给 HTTP 服务器，页面加载后也会立即从地�
 
 - [部署指南](docs/deployment.md)
 - [MVP 架构](docs/mvp-architecture.md)
+- [MVP 路线](docs/mvp-roadmap.md)
+- [输入核心实施计划](docs/input-core-plan.md)
 - [产品契约与协议边界](docs/terminal-protocol-architecture.md)
 - [Wire protocol](docs/wire-protocol.md)
 - [Phase 0 验收契约](docs/phase-0-acceptance-contract.md)

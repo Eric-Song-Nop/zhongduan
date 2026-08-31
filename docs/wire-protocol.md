@@ -1,7 +1,7 @@
 # Wire Protocol V2
 
-> 本文只描述当前已实现、已经冻结的 v2 wire behavior。产品级不变量、允许的变更范围和后续
-> cutover 顺序见[产品契约与协议边界](terminal-protocol-architecture.md)。v2 的 global canonical
+> 本文只描述当前已实现、已经冻结的 v2 wire behavior。产品级不变量与允许的变更边界见
+> [产品契约与协议边界](terminal-protocol-architecture.md)，cutover 顺序见 [MVP 路线](mvp-roadmap.md)。v2 的 global canonical
 > pause、barrier 与 pinned commit 是一个整体 correctness contract，不能在 v2 内单独删除。
 
 ## 通道
