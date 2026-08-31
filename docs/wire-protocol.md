@@ -1,8 +1,8 @@
 # Wire Protocol V2
 
-> 本文只描述当前已实现的 v2 wire behavior。协议长期不变量、三逻辑平面和 Recovery v3 / 输入
-> sideband 的目标设计见[终端协议架构](terminal-protocol-architecture.md)。在完整 v3 handoff 取代
-> barrier 之前，v2 的 global canonical pause 与 pinned commit 仍是 correctness 条件，不能单独删除。
+> 本文只描述当前已实现、已经冻结的 v2 wire behavior。产品级不变量、允许的变更范围和后续
+> cutover 顺序见[产品契约与协议边界](terminal-protocol-architecture.md)。v2 的 global canonical
+> pause、barrier 与 pinned commit 是一个整体 correctness contract，不能在 v2 内单独删除。
 
 ## 通道
 

@@ -1,13 +1,19 @@
-# 高性能远程终端 Snapshot 与 Recovery v3 实施计划
+# 已归档：高性能远程终端 Snapshot 与 Recovery v3 实施计划
 
-> 状态：根据 PR review 重写，等待分阶段实施
+> 状态：历史设计提案，已由 issue #45 的产品边界决策归档；不得作为当前路线或实现依据。
+>
+> 当前规范以[产品契约与协议边界](../terminal-protocol-architecture.md)为准。本文保留当时的
+> 研究上下文，文中的 TARGET、阶段和验收要求均不再生效。
+
+> 归档时原状态（已失效）：根据 PR review 重写，等待分阶段实施
 >
 > 决策日期：2026-08-28
 >
 > 适用范围：Host authority、snapshot/checkpoint、journal、Cloud delivery 和 Browser replica
 
-本文是[终端三平面协议总纲](terminal-protocol-architecture.md)的 snapshot/recovery 子计划；输入顺序、
-高 RTT 反馈和 prediction 见[输入稳定性计划](input-stability-plan.md)。跨文档最高优先级不变量是：
+本文原是旧“终端三平面协议总纲”的 snapshot/recovery 子计划；该总纲已由
+[当前产品契约](../terminal-protocol-architecture.md)替代。输入顺序、高 RTT 反馈和 prediction 见
+[已归档输入稳定性计划](input-stability-and-prediction-plan.md)。以下内容按原提案保留：
 
 > 客户端终端当前采用的状态，永远等于某个 immutable checkpoint，加上同一 authority mutation
 > log 的一个连续前缀；所有输入预测都只是这个状态之上的可丢弃 presentation branch。
@@ -485,7 +491,7 @@ generation，避免跨 attempt 拼接。
 
 ### Phase 0：修 CURRENT recovery 活性
 
-Phase 0 的规范范围、直接测试证据与局限见 [Phase 0 验收契约](phase-0-acceptance-contract.md)。本阶段只收口
+Phase 0 的规范范围、直接测试证据与局限见 [Phase 0 验收契约](../phase-0-acceptance-contract.md)。本阶段只收口
 CURRENT protocol v2 的 recovery 活性：
 
 - 保留 v2 pause/barrier/pinned commit correctness invariant；
@@ -557,7 +563,7 @@ Gate：持续 50–100 ms output、从不 quiet 时 cut 仍有界前进，且 in
 ## 验证矩阵与上线 gate
 
 以下矩阵服务于后续 TARGET recovery、完整上线与项目完成定义；除
-[Phase 0 验收契约](phase-0-acceptance-contract.md)明确列出的项目外，不是 Phase 0 的阻塞条件。
+[Phase 0 验收契约](../phase-0-acceptance-contract.md)明确列出的项目外，不是 Phase 0 的阻塞条件。
 
 ### 正确性与状态机
 

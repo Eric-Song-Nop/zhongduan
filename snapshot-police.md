@@ -1,7 +1,7 @@
 > 历史评审草稿：本文保留早期 snapshot 方案的审查记录，其中部分前提已经失效。当前项目
-> 入口、部署方式和实现状态以 [README](README.md)、[部署指南](docs/deployment.md)与
-> [资源约束](resource.md)为准；已接受的恢复演进方向见
-> [高性能远程终端 Snapshot 恢复实施计划](docs/high-performance-snapshot-recovery-plan.md)。
+> 入口和实现状态以 [README](README.md)、[MVP 架构](docs/mvp-architecture.md)、
+> [部署指南](docs/deployment.md)与 [Wire Protocol V2](docs/wire-protocol.md)为准；产品与恢复边界见
+> [产品契约与协议边界](docs/terminal-protocol-architecture.md)。本文中的后续方案没有路线约束力。
 
 可以。先把两个容易混在一起的概念拆开：
 
