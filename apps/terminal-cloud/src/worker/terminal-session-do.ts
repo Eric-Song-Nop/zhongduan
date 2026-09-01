@@ -292,17 +292,20 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         webSocket,
         inbound.bytes,
         (timing) => this.processWebSocketMessage(webSocket, message, { ...timing, receivedAtMs }),
-        (timing) => {
+        (timing, reason) => {
+          const disposition = reason === "age" ? "lane-expired" : "lane-overload";
           this.recordDroppedBrowserInput(
             inbound.attachment,
             message,
             { ...timing, receivedAtMs },
-            "lane-expired",
+            disposition,
           );
           this.rejectInboundMessage(
             webSocket,
             inbound.attachment,
-            "browser control lane age exceeded",
+            reason === "age"
+              ? "browser control lane age exceeded"
+              : "browser control lane isolated an overloaded source",
           );
         },
         inbound.queueLimits,

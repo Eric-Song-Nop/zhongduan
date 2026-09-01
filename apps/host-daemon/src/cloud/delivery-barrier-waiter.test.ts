@@ -78,15 +78,37 @@ describe("DeliveryBarrierWaiter", () => {
     });
 
     await expect(waiting).resolves.toEqual(resultFor(warmIdentity));
-    expect(order).toEqual(["marker", "send"]);
+    expect(order).toEqual(["send", "marker"]);
     expect(sendData).toHaveBeenCalledOnce();
+  });
+
+  it("does not mark or settle a barrier until the data sender reports its WebSocket receipt", async () => {
+    let reportSent!: () => void;
+    const receipt = new Promise<void>((resolve) => {
+      reportSent = resolve;
+    });
+    const onMarkerSent = vi.fn();
+    const waiter = new DeliveryBarrierWaiter({
+      sessionEpoch: () => 5n,
+      sendData: () => receipt,
+    });
+
+    const waiting = waiter.wait(warmIdentity, new AbortController().signal, onMarkerSent);
+    waiter.handle(resultFor(warmIdentity));
+    expect(onMarkerSent).not.toHaveBeenCalled();
+
+    reportSent();
+    await expect(waiting).resolves.toEqual(resultFor(warmIdentity));
+    expect(onMarkerSent).toHaveBeenCalledOnce();
   });
 
   it("encodes snapshot identity and ignores every non-matching result", async () => {
     const sent: Uint8Array[] = [];
     const waiter = new DeliveryBarrierWaiter({
       sessionEpoch: () => 23n,
-      sendData: (encoded) => sent.push(encoded),
+      sendData: (encoded) => {
+        sent.push(encoded);
+      },
     });
     const waiting = waiter.wait(snapshotIdentity, new AbortController().signal, () => {});
 
@@ -158,20 +180,20 @@ describe("DeliveryBarrierWaiter", () => {
     );
 
     const markerError = new Error("marker transition failed");
+    sendData.mockImplementation(() => undefined);
     await expect(
       waiter.wait(warmIdentity, new AbortController().signal, () => {
         throw markerError;
       }),
     ).rejects.toBe(markerError);
-    expect(sendData).toHaveBeenCalledOnce();
+    expect(sendData).toHaveBeenCalledTimes(2);
 
-    sendData.mockImplementation(() => undefined);
     const retry = waiter.wait(warmIdentity, new AbortController().signal, () => {});
     waiter.handle(resultFor(warmIdentity));
     await expect(retry).resolves.toEqual(resultFor(warmIdentity));
   });
 
-  it("does not send when marking aborts the signal", async () => {
+  it("rejects after a sent marker transition aborts the signal", async () => {
     const abort = new AbortController();
     const reason = new Error("recovery superseded");
     const sendData = vi.fn();
@@ -180,7 +202,7 @@ describe("DeliveryBarrierWaiter", () => {
     const waiting = waiter.wait(warmIdentity, abort.signal, () => abort.abort(reason));
 
     await expect(waiting).rejects.toBe(reason);
-    expect(sendData).not.toHaveBeenCalled();
+    expect(sendData).toHaveBeenCalledOnce();
   });
 
   it("dispose rejects the active wait and permanently rejects later waits", async () => {

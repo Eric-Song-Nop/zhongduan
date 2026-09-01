@@ -15,7 +15,7 @@ import { EventJournal } from "../journal";
 import type { PtyProcess } from "../pty-process";
 import { TerminalSession } from "../session";
 import type { SemanticMouse } from "../terminal-authority";
-import type { SnapshotPublisherLike } from "./delivery-scheduler";
+import { DELIVERY_BARRIER_TIMEOUT_MS, type SnapshotPublisherLike } from "./delivery-scheduler";
 import { HostRelayConnection, HOST_CONTROL_QUEUE_LIMITS } from "./host-relay-connection";
 import type { HostSocketPair } from "./paired-websocket";
 
@@ -238,6 +238,51 @@ describe("HostRelayConnection", () => {
     harness.data.message("data-ack");
     expect(decodeDataFrameBatch(harness.data.sent[2] as Uint8Array)).toHaveLength(1);
     harness.relay.close();
+    harness.session.dispose();
+  });
+
+  it("starts the recovery barrier timeout only after the credited batch reaches WebSocket.send", async () => {
+    vi.useFakeTimers();
+    const harness = createHarness({ hostDataBatch: true });
+    await acknowledgeReady(harness);
+    harness.pty.emit(Uint8Array.of(0x41));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(harness.data.sent).toHaveLength(1);
+
+    harness.control.message(
+      JSON.stringify({
+        type: "attach-request",
+        connectionId: "connection_browser_A",
+        streamId: 1,
+        deliveryGeneration: "1",
+        engineId: harness.session.engineId,
+        hasLiveReplica: true,
+        lastSessionEpoch: "1",
+        lastEventSeq: "0",
+        nextPtyOffset: "0",
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(harness.data.sent).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(DELIVERY_BARRIER_TIMEOUT_MS + 1);
+    expect(harness.control.readyState).toBe(FakeWebSocket.OPEN);
+    expect(harness.data.readyState).toBe(FakeWebSocket.OPEN);
+
+    harness.data.message("data-ack");
+    await Promise.resolve();
+    expect(harness.data.sent).toHaveLength(2);
+    expect(
+      decodeDataFrameBatch(harness.data.sent[1] as Uint8Array).some(
+        (frame) => frame.kind === DataFrameKind.DeliveryBarrier,
+      ),
+    ).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(DELIVERY_BARRIER_TIMEOUT_MS - 1);
+    expect(harness.control.readyState).toBe(FakeWebSocket.OPEN);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(harness.control.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(harness.data.readyState).toBe(FakeWebSocket.CLOSED);
     harness.session.dispose();
   });
 

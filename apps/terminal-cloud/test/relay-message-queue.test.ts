@@ -3,7 +3,7 @@ import {
   BoundedSerialQueue,
   RELAY_MESSAGE_QUEUE_PROFILES,
 } from "../src/worker/relay-message-queue";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 describe("BoundedSerialQueue", () => {
   it("bounds a burst while the first task is awaiting and releases every reservation", async () => {
@@ -107,6 +107,8 @@ describe("BoundedKeyedQueue", () => {
     maxAgeMs: 250,
     maxConcurrency: 2,
   };
+
+  afterEach(() => vi.useRealTimers());
 
   it("preserves connection FIFO while an independent connection makes progress", async () => {
     const queue = new BoundedKeyedQueue<object>(limits);
@@ -269,14 +271,6 @@ describe("BoundedKeyedQueue", () => {
         expiredWait = timing.waitMs;
       },
     );
-    expect(
-      queue.enqueue(
-        socket,
-        1,
-        () => undefined,
-        () => undefined,
-      ),
-    ).toBeUndefined();
     now = 251;
     releaseFirst();
     await Promise.all([first, expired]);
@@ -287,8 +281,131 @@ describe("BoundedKeyedQueue", () => {
     expect(queue.queuedBytes).toBe(0);
   });
 
-  it("enforces per-connection and lane-level count and byte reservations", async () => {
-    const queue = new BoundedKeyedQueue<object>({ ...limits, maxConcurrency: 1 });
+  it("expires a permanently pending head on its own deadline and releases the whole key", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const queue = new BoundedKeyedQueue<object>({ ...limits, maxConcurrency: 1 }, () => now);
+    const blockedSocket = {};
+    const healthySocket = {};
+    let releaseBlocked!: () => void;
+    const blockedGate = new Promise<void>((resolve) => {
+      releaseBlocked = resolve;
+    });
+    const expirations: Array<{ reason: string; waitMs: number }> = [];
+    let queuedRan = false;
+
+    const head = queue.enqueue(
+      blockedSocket,
+      4,
+      () => blockedGate,
+      (timing, reason) => {
+        expirations.push({ reason, waitMs: timing.waitMs });
+      },
+    );
+    const queued = queue.enqueue(
+      blockedSocket,
+      4,
+      () => {
+        queuedRan = true;
+      },
+      (timing, reason) => {
+        expirations.push({ reason, waitMs: timing.waitMs });
+      },
+    );
+
+    now = limits.maxAgeMs;
+    await vi.advanceTimersByTimeAsync(limits.maxAgeMs);
+    await Promise.all([head, queued]);
+
+    expect(queuedRan).toBe(false);
+    expect(expirations).toEqual([
+      { reason: "age", waitMs: 0 },
+      { reason: "age", waitMs: limits.maxAgeMs },
+    ]);
+    expect(queue.activeCount).toBe(0);
+    expect(queue.queuedCount).toBe(0);
+    expect(queue.queuedBytes).toBe(0);
+
+    const healthy = queue.enqueue(
+      healthySocket,
+      1,
+      () => undefined,
+      () => undefined,
+    );
+    await healthy;
+    releaseBlocked();
+    await Promise.resolve();
+    expect(queue.queuedCount).toBe(0);
+  });
+
+  it("isolates the largest source so a new healthy connection can enter a full lane", async () => {
+    const queue = new BoundedKeyedQueue<object>({
+      ...limits,
+      globalBytes: 4,
+      globalCount: 4,
+      socketBytes: 4,
+      socketCount: 4,
+      maxAgeMs: 10_000,
+      maxConcurrency: 2,
+    });
+    const noisySocket = {};
+    const healthySocket = {};
+    const newcomerSocket = {};
+    let releaseNoisy!: () => void;
+    let releaseHealthy!: () => void;
+    const noisyGate = new Promise<void>((resolve) => {
+      releaseNoisy = resolve;
+    });
+    const healthyGate = new Promise<void>((resolve) => {
+      releaseHealthy = resolve;
+    });
+    const expired: string[] = [];
+    const expire = (_timing: unknown, reason: string) => {
+      expired.push(reason);
+    };
+    const noisy = [
+      queue.enqueue(noisySocket, 1, () => noisyGate, expire),
+      queue.enqueue(noisySocket, 1, () => undefined, expire),
+      queue.enqueue(noisySocket, 1, () => undefined, expire),
+    ];
+    const healthy = queue.enqueue(
+      healthySocket,
+      1,
+      () => healthyGate,
+      () => undefined,
+    );
+
+    let newcomerRan = false;
+    const newcomer = queue.enqueue(
+      newcomerSocket,
+      1,
+      () => {
+        newcomerRan = true;
+      },
+      () => undefined,
+    );
+
+    expect(newcomer).toBeDefined();
+    await newcomer;
+    expect(newcomerRan).toBe(true);
+    expect(expired).toEqual(["global-overload", "global-overload", "global-overload"]);
+    expect(queue.queuedCount).toBe(1);
+
+    releaseHealthy();
+    await healthy;
+    await Promise.all(noisy.filter((task): task is Promise<void> => task !== undefined));
+    releaseNoisy();
+    await Promise.resolve();
+    expect(queue.queuedCount).toBe(0);
+  });
+
+  it("enforces per-connection count and byte reservations", async () => {
+    const queue = new BoundedKeyedQueue<object>({
+      ...limits,
+      globalBytes: 1_024,
+      globalCount: 1_024,
+      maxConcurrency: 1,
+    });
     const firstSocket = {};
     const secondSocket = {};
     let releaseFirst!: () => void;
@@ -302,14 +419,9 @@ describe("BoundedKeyedQueue", () => {
       queue.enqueue(firstSocket, 4, () => undefined, expire),
     ];
     expect(queue.enqueue(firstSocket, 1, () => undefined, expire)).toBeUndefined();
-    pending.push(
-      queue.enqueue(secondSocket, 4, () => undefined, expire),
-      queue.enqueue(secondSocket, 4, () => undefined, expire),
-    );
     expect(pending.every((task) => task !== undefined)).toBe(true);
-    expect(queue.queuedCount).toBe(4);
-    expect(queue.queuedBytes).toBe(16);
-    expect(queue.enqueue({}, 1, () => undefined, expire)).toBeUndefined();
+    expect(queue.queuedCount).toBe(2);
+    expect(queue.queuedBytes).toBe(8);
 
     releaseFirst();
     await Promise.all(pending.filter((task): task is Promise<void> => task !== undefined));
@@ -320,7 +432,7 @@ describe("BoundedKeyedQueue", () => {
       {
         ...limits,
         globalBytes: 1_024,
-        globalCount: 2,
+        globalCount: 1_024,
         socketBytes: 1_024,
         socketCount: 1,
         maxConcurrency: 1,
@@ -334,7 +446,6 @@ describe("BoundedKeyedQueue", () => {
     const countFirst = countQueue.enqueue(firstSocket, 1, () => countGate, expire);
     expect(countQueue.enqueue(firstSocket, 1, () => undefined, expire)).toBeUndefined();
     const countSecond = countQueue.enqueue(secondSocket, 1, () => undefined, expire);
-    expect(countQueue.enqueue({}, 1, () => undefined, expire)).toBeUndefined();
     releaseCount();
     await Promise.all([countFirst, countSecond]);
     expect(countQueue.queuedCount).toBe(0);

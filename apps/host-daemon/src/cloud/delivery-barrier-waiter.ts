@@ -30,7 +30,9 @@ export type BarrierIdentity =
     });
 
 interface PendingBarrier {
+  earlyResult?: DeliveryBarrierResult;
   readonly expected: BarrierIdentity;
+  markerSent: boolean;
   readonly onAbort: () => void;
   readonly reject: (error: unknown) => void;
   readonly resolve: (result: DeliveryBarrierResult) => void;
@@ -38,7 +40,7 @@ interface PendingBarrier {
 }
 
 export interface DeliveryBarrierWaiterOptions {
-  sendData: (frame: Uint8Array) => void;
+  sendData: (frame: Uint8Array) => Promise<void> | void;
   sessionEpoch: () => bigint;
 }
 
@@ -59,7 +61,7 @@ export function isMatchingDeliveryBarrierResult(
 }
 
 export class DeliveryBarrierWaiter {
-  readonly #sendData: (frame: Uint8Array) => void;
+  readonly #sendData: (frame: Uint8Array) => Promise<void> | void;
   readonly #sessionEpoch: () => bigint;
 
   #disposedReason: unknown;
@@ -103,6 +105,7 @@ export class DeliveryBarrierWaiter {
       const onAbort = () => this.#rejectPending(pending, signal.reason);
       const pending: PendingBarrier = {
         expected,
+        markerSent: false,
         onAbort,
         reject,
         resolve,
@@ -116,9 +119,15 @@ export class DeliveryBarrierWaiter {
       }
 
       try {
-        onMarkerSent();
-        signal.throwIfAborted();
-        this.#sendData(encoded);
+        const receipt = this.#sendData(encoded);
+        if (receipt === undefined) {
+          this.#markSent(pending, onMarkerSent);
+        } else {
+          void receipt.then(
+            () => this.#markSent(pending, onMarkerSent),
+            (error: unknown) => this.#rejectPending(pending, error),
+          );
+        }
       } catch (error) {
         this.#rejectPending(pending, error);
       }
@@ -128,6 +137,30 @@ export class DeliveryBarrierWaiter {
   handle(result: DeliveryBarrierResult): void {
     const pending = this.#pending;
     if (pending === undefined || !isMatchingDeliveryBarrierResult(pending.expected, result)) return;
+    if (!pending.markerSent) {
+      pending.earlyResult ??= result;
+      return;
+    }
+    this.#resolvePending(pending, result);
+  }
+
+  #markSent(pending: PendingBarrier, onMarkerSent: () => void): void {
+    if (this.#pending !== pending) return;
+    pending.markerSent = true;
+    try {
+      onMarkerSent();
+      pending.signal.throwIfAborted();
+    } catch (error) {
+      this.#rejectPending(pending, error);
+      return;
+    }
+    if (pending.earlyResult !== undefined) {
+      this.#resolvePending(pending, pending.earlyResult);
+    }
+  }
+
+  #resolvePending(pending: PendingBarrier, result: DeliveryBarrierResult): void {
+    if (this.#pending !== pending) return;
     this.#pending = undefined;
     pending.signal.removeEventListener("abort", pending.onAbort);
     pending.resolve(result);
