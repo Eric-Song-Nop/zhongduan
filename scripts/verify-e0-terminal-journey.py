@@ -60,9 +60,11 @@ from e0_terminal_journey import (
     build_e4b_decision,
     canonical_sha256,
     load_json,
+    load_report_bundle,
     matrix_cells,
     validate_contract,
     validate_scenario_report,
+    write_report_bundle,
 )
 
 
@@ -1964,7 +1966,7 @@ def merge_scenario_files(args: argparse.Namespace, contract: dict[str, Any]) -> 
             contract, scenarios, authority, **common
         )
     assert args.current_report is not None
-    current_report = load_json(args.current_report)
+    current_report = load_report_bundle(args.current_report)
     host_measurements = [
         {
             **measurement,
@@ -2005,15 +2007,19 @@ def main() -> None:
         )
     except (JourneyError, ValueError) as error:
         raise SystemExit(f"E0 journey failed: {error}") from None
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    if args.merge_scenarios is None:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        written_schema = report["schemaVersion"]
+    else:
+        written_schema = write_report_bundle(args.report, report)["schemaVersion"]
     if args.e4b_decision is not None:
         assert args.current_report is not None
         decision = build_e4b_decision(
-            load_json(args.current_report), report, contract
+            load_report_bundle(args.current_report), report, contract
         )
         args.e4b_decision.parent.mkdir(parents=True, exist_ok=True)
         args.e4b_decision.write_text(
@@ -2024,7 +2030,7 @@ def main() -> None:
         json.dumps(
             {
                 "report": str(args.report),
-                "schemaVersion": report["schemaVersion"],
+                "schemaVersion": written_schema,
                 "variant": report.get("variant"),
                 "oracles": Counter(
                     item["status"] for item in report.get("oracleResults", {}).values()

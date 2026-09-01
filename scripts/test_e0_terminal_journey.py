@@ -6,6 +6,7 @@ import ast
 import copy
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 
 from scripts.e0_terminal_fixture import FixtureProtocolError, FixtureState
@@ -24,13 +25,16 @@ from scripts.e0_terminal_journey import (
     compare_relative_thresholds,
     evaluate_oracles,
     load_json,
+    load_report_bundle,
     matrix_cells,
     measure_relative_thresholds,
+    report_archive_path,
     summarize_span_samples,
     validate_contract,
     validate_candidate_report,
     validate_report,
     validate_scenario_report,
+    write_report_bundle,
 )
 
 
@@ -509,14 +513,41 @@ class E0ContractTest(unittest.TestCase):
         self.assertEqual(set(self.contract["workload"]["requiredVariants"]), EXPECTED_VARIANTS)
         self.assertEqual(len(matrix_cells(self.contract)), 23)
 
-    def test_incomplete_checked_in_artifact_is_never_accepted_as_current(self) -> None:
+    def test_checked_in_current_is_a_small_validated_bundle(self) -> None:
         self.assertTrue(BASELINE_PATH.exists())
-        baseline = load_json(BASELINE_PATH)
-        if baseline.get("baselineStatus") == "complete":
-            validate_report(baseline, self.contract)
-        else:
-            with self.assertRaises(ValueError):
-                validate_report(baseline, self.contract)
+        bundle = load_json(BASELINE_PATH)
+        self.assertEqual(
+            bundle["schemaVersion"], "zhongduan-terminal-journey-bundle-v1"
+        )
+        self.assertTrue(
+            {"scenarioReports", "events", "observations", "latencySamples"}.isdisjoint(
+                bundle
+            )
+        )
+        self.assertLess(BASELINE_PATH.stat().st_size, 100_000)
+        with BASELINE_PATH.open(encoding="utf-8") as baseline_file:
+            self.assertLess(sum(1 for _ in baseline_file), 2_000)
+        archive = report_archive_path(BASELINE_PATH)
+        self.assertTrue(archive.exists())
+        self.assertLess(archive.stat().st_size, 2_000_000)
+        validate_report(load_report_bundle(BASELINE_PATH), self.contract)
+
+    def test_report_bundle_round_trip_and_tamper_detection(self) -> None:
+        report = complete_report(self.contract)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "current-baseline.json"
+            bundle = write_report_bundle(path, report)
+            self.assertEqual(load_report_bundle(path), report)
+            self.assertEqual(bundle["scenarioArchive"]["scenarioCount"], 25)
+            archive = report_archive_path(path)
+            first_summary = path.read_bytes()
+            first_archive = archive.read_bytes()
+            write_report_bundle(path, report)
+            self.assertEqual(path.read_bytes(), first_summary)
+            self.assertEqual(archive.read_bytes(), first_archive)
+            archive.write_bytes(archive.read_bytes() + b"tampered")
+            with self.assertRaisesRegex(ValueError, "compressed (size|digest)"):
+                load_report_bundle(path)
 
     def test_complete_report_is_fully_recomputed(self) -> None:
         report = complete_report(self.contract)
@@ -814,6 +845,17 @@ class CandidateReportTest(unittest.TestCase):
             )
         )
         validate_candidate_report(candidate, self.current, self.contract)
+
+    def test_candidate_bundle_round_trip_retains_decision_evidence(self) -> None:
+        candidate = self.candidate()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "candidate.json"
+            bundle = write_report_bundle(path, candidate)
+            self.assertNotIn("scenarioReports", bundle)
+            self.assertIn("snapshotPhaseMeasurements", bundle)
+            reconstructed = load_report_bundle(path)
+            self.assertEqual(reconstructed, candidate)
+            validate_candidate_report(reconstructed, self.current, self.contract)
 
     def test_candidate_rejects_relabelled_current_and_missing_phase_evidence(self) -> None:
         with self.assertRaisesRegex(ValueError, "candidate report schema"):

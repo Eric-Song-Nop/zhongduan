@@ -1,0 +1,944 @@
+{
+  "authorityOracle": {
+    "artifactVerified": true,
+    "comparison": {
+      "checkpointSourceContinuationEqual": true,
+      "checkpointSourceStateEqual": true,
+      "continuationEqual": true,
+      "corpusCaseCount": 5,
+      "corpusSha256": "4c77e4e7253718c352d7d0dab8d17ac194ca2350026cece0db0947e63b528806",
+      "effectCaseCount": 3,
+      "effectCorpusSha256": "a05137052bbfa085bad7351ac99f529b50a7faf59000e7c19b126249275fe425",
+      "effectsEqual": true,
+      "normalizedStateEqual": true,
+      "recoveredContinuationEqual": true,
+      "recoveredStateEqual": true,
+      "sampleId": "ghostty-snapshot-on-off",
+      "snapshotCaptureStateEqual": true
+    },
+    "corpus": [
+      {
+        "afterCaptureStateSha256": "64e3a517c85b31f4087bf182869cd88bc0002f16aaab4aeddf90d985c8ac058a",
+        "beforeCaptureStateSha256": "64e3a517c85b31f4087bf182869cd88bc0002f16aaab4aeddf90d985c8ac058a",
+        "checkpointSourceContinuationEqual": true,
+        "checkpointSourceContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "checkpointSourceStateEqual": true,
+        "checkpointSourceStateSha256": "67fe23d78ec328dd2d006c9b283c3b06e0a9bc79d7b05655f1473ffa8270e0ab",
+        "continuationEqual": true,
+        "coveredFields": [
+          "screen",
+          "history",
+          "cursor",
+          "modes",
+          "alternate-screen",
+          "parser-continuation",
+          "cell-colors-and-flags",
+          "effect-relevant-encoders"
+        ],
+        "id": "history-modes-alt-screen-incomplete-csi",
+        "normalizedStateEqual": true,
+        "recoveredContinuationEqual": true,
+        "recoveredContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "recoveredStateEqual": true,
+        "recoveredStateSha256": "67fe23d78ec328dd2d006c9b283c3b06e0a9bc79d7b05655f1473ffa8270e0ab",
+        "snapshotBytes": 3503,
+        "snapshotCaptureStateEqual": true,
+        "uninterruptedContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "uninterruptedStateSha256": "67fe23d78ec328dd2d006c9b283c3b06e0a9bc79d7b05655f1473ffa8270e0ab"
+      },
+      {
+        "afterCaptureStateSha256": "3662e9614e20e0df634cd98b8dd4fcb7fbb6c37bcb75d4b469d965e18e7843c1",
+        "beforeCaptureStateSha256": "3662e9614e20e0df634cd98b8dd4fcb7fbb6c37bcb75d4b469d965e18e7843c1",
+        "checkpointSourceContinuationEqual": true,
+        "checkpointSourceContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "checkpointSourceStateEqual": true,
+        "checkpointSourceStateSha256": "39ad8d027f078067e0ed213910476c81cc273d50d822f0d1f335605f8618d15c",
+        "continuationEqual": true,
+        "coveredFields": ["parser-continuation", "utf8-decoder", "grapheme", "cell-width"],
+        "id": "split-utf8-grapheme",
+        "normalizedStateEqual": true,
+        "recoveredContinuationEqual": true,
+        "recoveredContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "recoveredStateEqual": true,
+        "recoveredStateSha256": "39ad8d027f078067e0ed213910476c81cc273d50d822f0d1f335605f8618d15c",
+        "snapshotBytes": 1159,
+        "snapshotCaptureStateEqual": true,
+        "uninterruptedContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "uninterruptedStateSha256": "39ad8d027f078067e0ed213910476c81cc273d50d822f0d1f335605f8618d15c"
+      },
+      {
+        "afterCaptureStateSha256": "d2f8f85c657b97819c085ba898509eddd34e0432014a5f2359d4aec1cde27a0e",
+        "beforeCaptureStateSha256": "d2f8f85c657b97819c085ba898509eddd34e0432014a5f2359d4aec1cde27a0e",
+        "checkpointSourceContinuationEqual": true,
+        "checkpointSourceContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "checkpointSourceStateEqual": true,
+        "checkpointSourceStateSha256": "2d9a0cc5433dd30e29d0997a1f75cc5c2d6ee2e1219ea78bac3a2aa671eba426",
+        "continuationEqual": true,
+        "coveredFields": ["parser-continuation", "osc", "title", "hyperlink-cell-metadata"],
+        "id": "split-osc-and-hyperlink",
+        "normalizedStateEqual": true,
+        "recoveredContinuationEqual": true,
+        "recoveredContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "recoveredStateEqual": true,
+        "recoveredStateSha256": "2d9a0cc5433dd30e29d0997a1f75cc5c2d6ee2e1219ea78bac3a2aa671eba426",
+        "snapshotBytes": 1177,
+        "snapshotCaptureStateEqual": true,
+        "uninterruptedContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "uninterruptedStateSha256": "2d9a0cc5433dd30e29d0997a1f75cc5c2d6ee2e1219ea78bac3a2aa671eba426"
+      },
+      {
+        "afterCaptureStateSha256": "60314584971f3d27005d58b1f37ef76e778bd0d4e78ab3fb2fd86cefd9dd1518",
+        "beforeCaptureStateSha256": "60314584971f3d27005d58b1f37ef76e778bd0d4e78ab3fb2fd86cefd9dd1518",
+        "checkpointSourceContinuationEqual": true,
+        "checkpointSourceContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "checkpointSourceStateEqual": true,
+        "checkpointSourceStateSha256": "1548ee5b4bdd38572dcc0696e20800351a37beb94a0c7fe3596f721cb2824e79",
+        "continuationEqual": true,
+        "coveredFields": ["margins", "tab-stops", "palette", "charset", "pending-wrap", "cursor"],
+        "id": "margins-tabs-palette-charset-pending-wrap",
+        "normalizedStateEqual": true,
+        "recoveredContinuationEqual": true,
+        "recoveredContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "recoveredStateEqual": true,
+        "recoveredStateSha256": "1548ee5b4bdd38572dcc0696e20800351a37beb94a0c7fe3596f721cb2824e79",
+        "snapshotBytes": 1105,
+        "snapshotCaptureStateEqual": true,
+        "uninterruptedContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "uninterruptedStateSha256": "1548ee5b4bdd38572dcc0696e20800351a37beb94a0c7fe3596f721cb2824e79"
+      },
+      {
+        "afterCaptureStateSha256": "62e244efd02a7454434c5e3a82bc9f4a941bca79c49c90e5472838b7cb1529e3",
+        "beforeCaptureStateSha256": "62e244efd02a7454434c5e3a82bc9f4a941bca79c49c90e5472838b7cb1529e3",
+        "checkpointSourceContinuationEqual": true,
+        "checkpointSourceContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "checkpointSourceStateEqual": true,
+        "checkpointSourceStateSha256": "efa241121346e31c901f470876729c2d21b63e7dca3ddc8650b0d99621812404",
+        "continuationEqual": true,
+        "coveredFields": ["resize", "geometry", "screen", "history", "cursor"],
+        "id": "resize-geometry-and-scrollback",
+        "normalizedStateEqual": true,
+        "recoveredContinuationEqual": true,
+        "recoveredContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "recoveredStateEqual": true,
+        "recoveredStateSha256": "efa241121346e31c901f470876729c2d21b63e7dca3ddc8650b0d99621812404",
+        "snapshotBytes": 1146,
+        "snapshotCaptureStateEqual": true,
+        "uninterruptedContinuationSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "uninterruptedStateSha256": "efa241121346e31c901f470876729c2d21b63e7dca3ddc8650b0d99621812404"
+      }
+    ],
+    "coveredFields": [
+      "alternate-screen",
+      "cell-colors-and-flags",
+      "cell-width",
+      "charset",
+      "cursor",
+      "effect-relevant-encoders",
+      "geometry",
+      "grapheme",
+      "history",
+      "hyperlink-cell-metadata",
+      "margins",
+      "modes",
+      "osc",
+      "palette",
+      "parser-continuation",
+      "pending-wrap",
+      "resize",
+      "screen",
+      "tab-stops",
+      "title",
+      "utf8-decoder"
+    ],
+    "effectCorpus": {
+      "cases": [
+        {
+          "coveredFields": ["parser-continuation", "write-pty-effects", "cursor-position-query"],
+          "effectFrameCount": 1,
+          "effectsEqual": true,
+          "id": "split-cursor-position-query",
+          "splitEffectsSha256": "abf5e7cb320a08216cb788a10d5985e36cda2628646df720e3e7f72e87f600a3",
+          "uninterruptedEffectsSha256": "abf5e7cb320a08216cb788a10d5985e36cda2628646df720e3e7f72e87f600a3"
+        },
+        {
+          "coveredFields": ["parser-continuation", "write-pty-effects", "device-attributes"],
+          "effectFrameCount": 1,
+          "effectsEqual": true,
+          "id": "split-device-attributes-query",
+          "splitEffectsSha256": "c691d85aad509d05394a5111b221e2fe4eeca1325430863f5d34b0d896f18eef",
+          "uninterruptedEffectsSha256": "c691d85aad509d05394a5111b221e2fe4eeca1325430863f5d34b0d896f18eef"
+        },
+        {
+          "coveredFields": ["modes", "effect-relevant-encoders"],
+          "effectFrameCount": 0,
+          "effectsEqual": true,
+          "id": "focus-and-mode-effect-state",
+          "splitEffectsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "uninterruptedEffectsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      ],
+      "effectsEqual": true,
+      "scope": "authority WRITE_PTY effects under equivalent whole-vs-byte-split canonical output; passive snapshot restore intentionally emits no effects"
+    },
+    "engineId": "ghostty:fe317f850c3ab212f6638122c459b9b48b99a016:wterm-engine-sha256:2836a71302115fb2989235666560fc4b6a5739158478e85e4d25bd1f1248fe96",
+    "schemaVersion": "zhongduan-e0-authority-oracle-v3",
+    "snapshotBytes": 8090,
+    "snapshotPause": {
+      "clock": "node-performance-now",
+      "p99": {
+        "snapshotDisabledMs": 0.016834000000002902,
+        "snapshotEnabledMs": 0.04154199999999264
+      },
+      "samples": 24,
+      "snapshotDisabledMs": [
+        0.016834000000002902, 0.0012499999999988631, 0.0014170000000035543, 0.0006660000000096034,
+        0.0013339999999999463, 0.0008749999999935199, 0.0007500000000106866, 0.0009170000000011669,
+        0.0012499999999988631, 0.0010830000000083828, 0.0015000000000071623, 0.0003750000000053433,
+        0.0003750000000053433, 0.0003750000000053433, 0.0016249999999899956, 0.0003749999999911324,
+        0.0003750000000053433, 0.0003749999999911324, 0.0003750000000053433, 0.0003339999999951715,
+        0.00033299999999769625, 0.0003339999999951715, 0.0003330000000119071, 0.0003750000000053433
+      ],
+      "snapshotEnabledMs": [
+        0.04154199999999264, 0.030500000000003524, 0.02745900000000745, 0.027374999999992156,
+        0.03170800000000895, 0.028750000000002274, 0.029000000000010573, 0.030083000000004745,
+        0.028000000000005798, 0.036040999999997325, 0.028125000000002842, 0.027167000000005714,
+        0.027250000000009322, 0.03829199999999844, 0.02745900000000745, 0.02733299999999872,
+        0.027291999999988548, 0.028707999999994627, 0.027416999999999803, 0.027417000000014013,
+        0.028082999999995195, 0.02991700000001174, 0.02745899999999324, 0.03070899999998744
+      ]
+    },
+    "sourceRevision": "b02a8f29496d85a2cf89d98fb012149b8bd803df",
+    "sourceTreeDirty": false,
+    "sourceTreeGitOid": "cb56a0418f6462963ed2d041905b44958ff5cebc"
+  },
+  "baseline": "CURRENT",
+  "baselineStatus": "complete",
+  "contractSha256": "8cc45e7a56f4c0b88c4472bb264eee3082f28e19bcdf26880fe74d6730b34c85",
+  "currentFailures": [],
+  "deadlineIsSlo": false,
+  "deadlineMs": 120000,
+  "environment": {
+    "executionTier": "local-workerd",
+    "ghosttyArtifactVerified": true,
+    "ghosttyEngineId": "ghostty:fe317f850c3ab212f6638122c459b9b48b99a016:wterm-engine-sha256:2836a71302115fb2989235666560fc4b6a5739158478e85e4d25bd1f1248fe96",
+    "node": "v24.20.0",
+    "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+    "python": "3.14.7",
+    "wtermGitlink": "4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6"
+  },
+  "evidenceBoundary": {
+    "cloudSpanBoundary": "after Browser/Cloud proxy delay through before Cloud/Host proxy delay",
+    "notClaimed": [
+      "Cloudflare edge latency",
+      "real Durable Object hibernation",
+      "real Host relay process replacement"
+    ],
+    "realCloudflareEdge": false,
+    "realComponents": [
+      "Chromium",
+      "WTerm/Ghostty WASM",
+      "Browser application",
+      "Vite Workerd/Miniflare Durable Object and R2",
+      "Host daemon",
+      "node-pty",
+      "deterministic raw PTY child"
+    ],
+    "simulated": ["link RTT", "link jitter", "acceptance-uncertainty disconnect"]
+  },
+  "generatedAt": "2026-09-01T00:54:09Z",
+  "latencySampleCount": 5964,
+  "latencySummaries": [
+    {
+      "maxMs": 0.4003,
+      "p50Ms": 0.2,
+      "p95Ms": 0.4001,
+      "p99Ms": 0.4003,
+      "sampleCount": 24,
+      "span": "browser-keydown-to-send-decision",
+      "variant": "output-flood"
+    },
+    {
+      "maxMs": 0.4004,
+      "p50Ms": 0.2,
+      "p95Ms": 0.3002,
+      "p99Ms": 0.4,
+      "sampleCount": 408,
+      "span": "browser-keydown-to-send-decision",
+      "variant": "steady"
+    },
+    {
+      "maxMs": 27.215,
+      "p50Ms": 4.225,
+      "p95Ms": 4.794,
+      "p99Ms": 27.215,
+      "sampleCount": 24,
+      "span": "cloud-browser-receive-to-host-send",
+      "variant": "bulk-backlog-0"
+    },
+    {
+      "maxMs": 16.043,
+      "p50Ms": 3.071,
+      "p95Ms": 8.029,
+      "p99Ms": 16.043,
+      "sampleCount": 48,
+      "span": "cloud-browser-receive-to-host-send",
+      "variant": "bulk-backlog-1048576"
+    },
+    {
+      "maxMs": 13.164,
+      "p50Ms": 3.045,
+      "p95Ms": 6.125,
+      "p99Ms": 13.164,
+      "sampleCount": 48,
+      "span": "cloud-browser-receive-to-host-send",
+      "variant": "bulk-backlog-262144"
+    },
+    {
+      "maxMs": 23.831,
+      "p50Ms": 3.657,
+      "p95Ms": 10.252,
+      "p99Ms": 23.831,
+      "sampleCount": 48,
+      "span": "cloud-browser-receive-to-host-send",
+      "variant": "bulk-backlog-4194304"
+    },
+    {
+      "maxMs": 13.281,
+      "p50Ms": 5.926,
+      "p95Ms": 9.743,
+      "p99Ms": 13.281,
+      "sampleCount": 27,
+      "span": "cloud-browser-receive-to-host-send",
+      "variant": "correctness-faults"
+    },
+    {
+      "maxMs": 30.48,
+      "p50Ms": 4.809,
+      "p95Ms": 6.771,
+      "p99Ms": 30.48,
+      "sampleCount": 72,
+      "span": "cloud-browser-receive-to-host-send",
+      "variant": "output-flood"
+    },
+    {
+      "maxMs": 4.825,
+      "p50Ms": 4.32,
+      "p95Ms": 4.665,
+      "p99Ms": 4.825,
+      "sampleCount": 24,
+      "span": "cloud-browser-receive-to-host-send",
+      "variant": "snapshot-disabled"
+    },
+    {
+      "maxMs": 7.12,
+      "p50Ms": 4.475,
+      "p95Ms": 6.789,
+      "p99Ms": 7.12,
+      "sampleCount": 24,
+      "span": "cloud-browser-receive-to-host-send",
+      "variant": "snapshot-enabled"
+    },
+    {
+      "maxMs": 364.992,
+      "p50Ms": 7.861,
+      "p95Ms": 158.754,
+      "p99Ms": 298.724,
+      "sampleCount": 1224,
+      "span": "cloud-browser-receive-to-host-send",
+      "variant": "steady"
+    },
+    {
+      "maxMs": 45064.3001,
+      "p50Ms": 44942.6003,
+      "p95Ms": 45059.3997,
+      "p99Ms": 45064.3001,
+      "sampleCount": 24,
+      "span": "ctrl-c-to-application-quiet",
+      "variant": "output-flood"
+    },
+    {
+      "maxMs": 2034.6,
+      "p50Ms": 788.6001,
+      "p95Ms": 1886.4,
+      "p99Ms": 1955.3001,
+      "sampleCount": 408,
+      "span": "ctrl-c-to-application-quiet",
+      "variant": "steady"
+    },
+    {
+      "maxMs": 255.973,
+      "p50Ms": 214.8832,
+      "p95Ms": 244.39,
+      "p99Ms": 255.973,
+      "sampleCount": 24,
+      "span": "ctrl-c-to-pty-write",
+      "variant": "output-flood"
+    },
+    {
+      "maxMs": 935.218,
+      "p50Ms": 358.505,
+      "p95Ms": 906.8087,
+      "p99Ms": 910.327,
+      "sampleCount": 408,
+      "span": "ctrl-c-to-pty-write",
+      "variant": "steady"
+    },
+    {
+      "maxMs": 0.982,
+      "p50Ms": 0.656,
+      "p95Ms": 0.931,
+      "p99Ms": 0.982,
+      "sampleCount": 24,
+      "span": "host-receive-to-pty-write",
+      "variant": "bulk-backlog-0"
+    },
+    {
+      "maxMs": 1.563,
+      "p50Ms": 0.681,
+      "p95Ms": 0.932,
+      "p99Ms": 1.563,
+      "sampleCount": 48,
+      "span": "host-receive-to-pty-write",
+      "variant": "bulk-backlog-1048576"
+    },
+    {
+      "maxMs": 2.036,
+      "p50Ms": 0.588,
+      "p95Ms": 1.369,
+      "p99Ms": 2.036,
+      "sampleCount": 48,
+      "span": "host-receive-to-pty-write",
+      "variant": "bulk-backlog-262144"
+    },
+    {
+      "maxMs": 2.307,
+      "p50Ms": 0.734,
+      "p95Ms": 1.364,
+      "p99Ms": 2.307,
+      "sampleCount": 48,
+      "span": "host-receive-to-pty-write",
+      "variant": "bulk-backlog-4194304"
+    },
+    {
+      "maxMs": 18.559,
+      "p50Ms": 1.146,
+      "p95Ms": 4.628,
+      "p99Ms": 18.559,
+      "sampleCount": 27,
+      "span": "host-receive-to-pty-write",
+      "variant": "correctness-faults"
+    },
+    {
+      "maxMs": 4.125,
+      "p50Ms": 0.893,
+      "p95Ms": 3.168,
+      "p99Ms": 4.125,
+      "sampleCount": 72,
+      "span": "host-receive-to-pty-write",
+      "variant": "output-flood"
+    },
+    {
+      "maxMs": 0.962,
+      "p50Ms": 0.625,
+      "p95Ms": 0.957,
+      "p99Ms": 0.962,
+      "sampleCount": 24,
+      "span": "host-receive-to-pty-write",
+      "variant": "snapshot-disabled"
+    },
+    {
+      "maxMs": 1.238,
+      "p50Ms": 0.896,
+      "p95Ms": 1.236,
+      "p99Ms": 1.238,
+      "sampleCount": 24,
+      "span": "host-receive-to-pty-write",
+      "variant": "snapshot-enabled"
+    },
+    {
+      "maxMs": 24.199,
+      "p50Ms": 1.308,
+      "p95Ms": 2.716,
+      "p99Ms": 4.14,
+      "sampleCount": 1224,
+      "span": "host-receive-to-pty-write",
+      "variant": "steady"
+    },
+    {
+      "maxMs": 141.7998,
+      "p50Ms": 122.3,
+      "p95Ms": 124.6,
+      "p99Ms": 141.7998,
+      "sampleCount": 24,
+      "span": "input-to-matching-browser-render",
+      "variant": "bulk-backlog-0"
+    },
+    {
+      "maxMs": 11977.9998,
+      "p50Ms": 11941.3002,
+      "p95Ms": 11961.9998,
+      "p99Ms": 11977.9998,
+      "sampleCount": 24,
+      "span": "input-to-matching-browser-render",
+      "variant": "bulk-backlog-1048576"
+    },
+    {
+      "maxMs": 3045.5,
+      "p50Ms": 3009.3,
+      "p95Ms": 3042.4998,
+      "p99Ms": 3045.5,
+      "sampleCount": 24,
+      "span": "input-to-matching-browser-render",
+      "variant": "bulk-backlog-262144"
+    },
+    {
+      "maxMs": 45096.5002,
+      "p50Ms": 28028.9002,
+      "p95Ms": 42843.8,
+      "p99Ms": 45096.5002,
+      "sampleCount": 24,
+      "span": "input-to-matching-browser-render",
+      "variant": "bulk-backlog-4194304"
+    },
+    {
+      "maxMs": 319.7997,
+      "p50Ms": 297.3,
+      "p95Ms": 311.0,
+      "p99Ms": 319.7997,
+      "sampleCount": 27,
+      "span": "input-to-matching-browser-render",
+      "variant": "correctness-faults"
+    },
+    {
+      "maxMs": 45097.5003,
+      "p50Ms": 44975.0998,
+      "p95Ms": 45092.7,
+      "p99Ms": 45097.5003,
+      "sampleCount": 24,
+      "span": "input-to-matching-browser-render",
+      "variant": "output-flood"
+    },
+    {
+      "maxMs": 136.8001,
+      "p50Ms": 122.3997,
+      "p95Ms": 124.7001,
+      "p99Ms": 136.8001,
+      "sampleCount": 24,
+      "span": "input-to-matching-browser-render",
+      "variant": "snapshot-disabled"
+    },
+    {
+      "maxMs": 137.6,
+      "p50Ms": 123.8,
+      "p95Ms": 134.5002,
+      "p99Ms": 137.6,
+      "sampleCount": 24,
+      "span": "input-to-matching-browser-render",
+      "variant": "snapshot-enabled"
+    },
+    {
+      "maxMs": 2067.6,
+      "p50Ms": 738.4002,
+      "p95Ms": 1629.4,
+      "p99Ms": 1927.4998,
+      "sampleCount": 816,
+      "span": "input-to-matching-browser-render",
+      "variant": "steady"
+    },
+    {
+      "maxMs": 93.746,
+      "p50Ms": 89.945,
+      "p95Ms": 92.348,
+      "p99Ms": 93.746,
+      "sampleCount": 24,
+      "span": "pty-output-to-browser-useful-render",
+      "variant": "bulk-backlog-0"
+    },
+    {
+      "maxMs": 11950.5972,
+      "p50Ms": 11916.1048,
+      "p95Ms": 11940.6512,
+      "p99Ms": 11950.5972,
+      "sampleCount": 24,
+      "span": "pty-output-to-browser-useful-render",
+      "variant": "bulk-backlog-1048576"
+    },
+    {
+      "maxMs": 3019.374,
+      "p50Ms": 2976.7308,
+      "p95Ms": 3015.167,
+      "p99Ms": 3019.374,
+      "sampleCount": 24,
+      "span": "pty-output-to-browser-useful-render",
+      "variant": "bulk-backlog-262144"
+    },
+    {
+      "maxMs": 45044.7378,
+      "p50Ms": 28011.0448,
+      "p95Ms": 42821.8548,
+      "p99Ms": 45044.7378,
+      "sampleCount": 24,
+      "span": "pty-output-to-browser-useful-render",
+      "variant": "bulk-backlog-4194304"
+    },
+    {
+      "maxMs": 205.806,
+      "p50Ms": 179.0281,
+      "p95Ms": 186.689,
+      "p99Ms": 205.806,
+      "sampleCount": 27,
+      "span": "pty-output-to-browser-useful-render",
+      "variant": "correctness-faults"
+    },
+    {
+      "maxMs": 104.391,
+      "p50Ms": 89.8427,
+      "p95Ms": 93.948,
+      "p99Ms": 104.391,
+      "sampleCount": 24,
+      "span": "pty-output-to-browser-useful-render",
+      "variant": "snapshot-disabled"
+    },
+    {
+      "maxMs": 99.1682,
+      "p50Ms": 90.0401,
+      "p95Ms": 98.5772,
+      "p99Ms": 99.1682,
+      "sampleCount": 24,
+      "span": "pty-output-to-browser-useful-render",
+      "variant": "snapshot-enabled"
+    },
+    {
+      "maxMs": 693.507,
+      "p50Ms": 284.406,
+      "p95Ms": 673.496,
+      "p99Ms": 685.5933,
+      "sampleCount": 408,
+      "span": "pty-output-to-browser-useful-render",
+      "variant": "steady"
+    }
+  ],
+  "matrixCoverage": [
+    {
+      "browserCloudRttMs": 20,
+      "cloudHostRttMs": 20,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 20,
+      "cloudHostRttMs": 100,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 20,
+      "cloudHostRttMs": 300,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 20,
+      "cloudHostRttMs": 600,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 20,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 100,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 300,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 600,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 300,
+      "cloudHostRttMs": 20,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 300,
+      "cloudHostRttMs": 100,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 300,
+      "cloudHostRttMs": 300,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 300,
+      "cloudHostRttMs": 600,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 600,
+      "cloudHostRttMs": 20,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 600,
+      "cloudHostRttMs": 100,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 600,
+      "cloudHostRttMs": 300,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 600,
+      "cloudHostRttMs": 600,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 100,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "jitter",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 100,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "disconnect",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 100,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "steady",
+      "networkFault": "reconnect",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 100,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "output-flood",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 100,
+      "lifecycleAndReplacement": "none",
+      "loadAndRecovery": "cold-attach",
+      "networkFault": "none",
+      "status": "measured"
+    },
+    {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 100,
+      "lifecycleAndReplacement": "do-hibernation",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "reason": "real infrastructure lifecycle evidence is collected at staging",
+      "status": "requires-staging"
+    },
+    {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 100,
+      "lifecycleAndReplacement": "host-relay-replacement",
+      "loadAndRecovery": "steady",
+      "networkFault": "none",
+      "reason": "real infrastructure lifecycle evidence is collected at staging",
+      "status": "requires-staging"
+    }
+  ],
+  "oracleResults": {
+    "cold-candidate-visible-before-validation": {
+      "metric": "prematureCandidateVisibilityCount",
+      "sampleCount": 1,
+      "status": "passed",
+      "target": 0,
+      "value": 0,
+      "violations": []
+    },
+    "duplicate-pty-effect": {
+      "metric": "duplicatePtyEffectCount",
+      "sampleCount": 1539,
+      "status": "passed",
+      "target": 0,
+      "value": 0,
+      "violations": []
+    },
+    "old-writer-effect-after-transfer": {
+      "metric": "oldWriterSuccessfulEffectCount",
+      "sampleCount": 1,
+      "status": "passed",
+      "target": 0,
+      "value": 0,
+      "violations": []
+    },
+    "output-flood-ctrl-c-once": {
+      "metric": "invalidCtrlCEffectCount",
+      "sampleCount": 24,
+      "status": "passed",
+      "target": 0,
+      "value": 0,
+      "violations": []
+    },
+    "secure-input-speculative-presentation": {
+      "metric": "secureInputSpeculationCount",
+      "sampleCount": 1,
+      "status": "passed",
+      "target": 0,
+      "value": 0,
+      "violations": []
+    },
+    "snapshot-authority-divergence": {
+      "metric": "authorityDivergenceCount",
+      "sampleCount": 1,
+      "status": "passed",
+      "target": 0,
+      "value": 0,
+      "violations": []
+    },
+    "ui-consumed-silent-loss": {
+      "metric": "silentLossCount",
+      "sampleCount": 1541,
+      "status": "passed",
+      "target": 0,
+      "value": 0,
+      "violations": []
+    },
+    "uncertain-auto-retry": {
+      "metric": "uncertainAutoRetryCount",
+      "sampleCount": 1,
+      "status": "passed",
+      "target": 0,
+      "value": 0,
+      "violations": []
+    }
+  },
+  "rawEventCount": 82036,
+  "reconstructedReportSha256": "d2c982ab9e6498de086d975737de54c0286740ba4fa8f5d2abef83279dedcc67",
+  "relativeThresholdMeasurements": {
+    "cloudBulkIsolation": {
+      "metric": "one-plus-nonnegative-normalized-p99-slope-per-MiB",
+      "probeP99MsByVariant": {
+        "bulk-backlog-0": 27.215,
+        "bulk-backlog-1048576": 16.043,
+        "bulk-backlog-262144": 10.478,
+        "bulk-backlog-4194304": 23.831
+      },
+      "rawNormalizedSlopePerMiB": 0.043997829,
+      "requiredVariants": [
+        "bulk-backlog-0",
+        "bulk-backlog-262144",
+        "bulk-backlog-1048576",
+        "bulk-backlog-4194304"
+      ],
+      "sampleCounts": {
+        "bulk-backlog-0": 24,
+        "bulk-backlog-1048576": 24,
+        "bulk-backlog-262144": 24,
+        "bulk-backlog-4194304": 24
+      },
+      "sampleSelector": {
+        "sampleIdPrefix": "probe-measured-",
+        "span": "cloud-browser-receive-to-host-send"
+      },
+      "status": "measured",
+      "value": 1.043997829
+    },
+    "outputFloodCtrlC": {
+      "baselineP99Ms": 1955.3001,
+      "candidateP99Ms": 45064.3001,
+      "metric": "output-flood/steady",
+      "requiredVariants": ["steady", "output-flood"],
+      "status": "measured",
+      "value": 23.047255048
+    },
+    "snapshotHostInput": {
+      "baselineP99Ms": 0.962,
+      "candidateP99Ms": 1.238,
+      "metric": "snapshot-enabled/snapshot-disabled",
+      "requiredVariants": ["snapshot-disabled", "snapshot-enabled"],
+      "status": "measured",
+      "value": 1.286902287
+    }
+  },
+  "reportSchemaVersion": "zhongduan-terminal-journey-report-v1",
+  "scenarioArchive": {
+    "compressedBytes": 510121,
+    "compressedSha256": "7d7d764d8ca115baef4caa962247daf751afbd16ba6f85efc44d28d7cd09fb37",
+    "compression": "gzip-9-mtime-0",
+    "format": "canonical-jsonl",
+    "path": "current-baseline.scenarios.jsonl.gz",
+    "scenarioCount": 25,
+    "uncompressedBytes": 14790782,
+    "uncompressedSha256": "5eb03139f423ccbdbe3417b6b18b5906f829a1a8c13b51f5b13624b593573304"
+  },
+  "schemaVersion": "zhongduan-terminal-journey-bundle-v1",
+  "sourceRevision": "f56205fd99b6ea0133fc387098221ebf2906ca3b",
+  "sourceTreeDirty": false,
+  "sourceTreeGitOid": "ef3922f354493327e41adae24c1258f7eaa07c50",
+  "unmeasuredLatencySpans": [],
+  "workload": {
+    "id": "raw-semantic-pty-v1",
+    "samplesPerVariant": 24,
+    "warmupSamples": 4
+  }
+}

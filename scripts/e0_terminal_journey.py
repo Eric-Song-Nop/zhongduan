@@ -11,7 +11,9 @@ and lives in ``verify-e0-terminal-journey.py``.
 from __future__ import annotations
 
 from collections import defaultdict
+import gzip
 import hashlib
+import io
 import json
 import math
 from pathlib import Path
@@ -63,6 +65,15 @@ EXPECTED_VARIANTS = {
 
 TERMINAL_OUTCOMES = {"not-sent", "deterministic", "uncertain"}
 MIN_MEASURED_SAMPLES = 24
+REPORT_BUNDLE_SCHEMA = "zhongduan-terminal-journey-bundle-v1"
+REPORT_BUNDLE_PAYLOAD_FIELDS = {
+    "events",
+    "latencySamples",
+    "observations",
+    "scenarioReports",
+}
+MAX_SCENARIO_ARCHIVE_COMPRESSED_BYTES = 16 * 1024 * 1024
+MAX_SCENARIO_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 
 
 class ContractError(ValueError):
@@ -82,6 +93,189 @@ def load_json(path: Path) -> dict[str, Any]:
 def canonical_sha256(value: Any) -> str:
     encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _scenario_jsonl(scenarios: list[dict[str, Any]]) -> bytes:
+    return b"".join(
+        json.dumps(
+            scenario,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+        for scenario in scenarios
+    )
+
+
+def report_archive_path(report_path: Path) -> Path:
+    return report_path.with_suffix(".scenarios.jsonl.gz")
+
+
+def build_report_bundle(
+    report: dict[str, Any], report_path: Path
+) -> tuple[dict[str, Any], bytes]:
+    """Split a validated report into a reviewable summary and canonical raw archive."""
+
+    scenarios = report.get("scenarioReports")
+    latency_samples = report.get("latencySamples")
+    if not isinstance(scenarios, list) or any(
+        not isinstance(scenario, dict) for scenario in scenarios
+    ):
+        raise ContractError("report bundle requires raw scenario reports")
+    if not isinstance(latency_samples, list):
+        raise ContractError("report bundle requires derived latency samples")
+    archive_path = report_archive_path(report_path)
+    raw = _scenario_jsonl(scenarios)
+    compressed = gzip.compress(raw, compresslevel=9, mtime=0)
+    if len(compressed) > MAX_SCENARIO_ARCHIVE_COMPRESSED_BYTES:
+        raise ContractError("scenario archive exceeds its compressed size limit")
+    if len(raw) > MAX_SCENARIO_ARCHIVE_UNCOMPRESSED_BYTES:
+        raise ContractError("scenario archive exceeds its uncompressed size limit")
+
+    bundle = {
+        key: value
+        for key, value in report.items()
+        if key not in REPORT_BUNDLE_PAYLOAD_FIELDS
+    }
+    bundle["schemaVersion"] = REPORT_BUNDLE_SCHEMA
+    bundle["reportSchemaVersion"] = report.get("schemaVersion")
+    bundle["reconstructedReportSha256"] = canonical_sha256(report)
+    bundle["latencySampleCount"] = len(latency_samples)
+    bundle["scenarioArchive"] = {
+        "path": archive_path.name,
+        "format": "canonical-jsonl",
+        "compression": "gzip-9-mtime-0",
+        "scenarioCount": len(scenarios),
+        "compressedBytes": len(compressed),
+        "compressedSha256": _sha256_bytes(compressed),
+        "uncompressedBytes": len(raw),
+        "uncompressedSha256": _sha256_bytes(raw),
+    }
+    return bundle, compressed
+
+
+def write_report_bundle(report_path: Path, report: dict[str, Any]) -> dict[str, Any]:
+    bundle, compressed = build_report_bundle(report, report_path)
+    archive_path = report_archive_path(report_path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_path.write_bytes(compressed)
+    report_path.write_text(
+        json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return bundle
+
+
+def load_report_bundle(report_path: Path) -> dict[str, Any]:
+    """Load a full legacy report or reconstruct one from a bounded evidence bundle."""
+
+    bundle = load_json(report_path)
+    if bundle.get("schemaVersion") != REPORT_BUNDLE_SCHEMA:
+        return bundle
+    metadata = bundle.get("scenarioArchive")
+    if not isinstance(metadata, dict):
+        raise ContractError("report bundle must identify its scenario archive")
+    archive_name = metadata.get("path")
+    if (
+        not isinstance(archive_name, str)
+        or not archive_name
+        or Path(archive_name).name != archive_name
+    ):
+        raise ContractError("scenario archive path must be a local basename")
+    if (
+        metadata.get("format") != "canonical-jsonl"
+        or metadata.get("compression") != "gzip-9-mtime-0"
+    ):
+        raise ContractError("report bundle uses an unsupported scenario archive format")
+    compressed_bytes = metadata.get("compressedBytes")
+    uncompressed_bytes = metadata.get("uncompressedBytes")
+    scenario_count = metadata.get("scenarioCount")
+    if (
+        not isinstance(compressed_bytes, int)
+        or not 0 < compressed_bytes <= MAX_SCENARIO_ARCHIVE_COMPRESSED_BYTES
+        or not isinstance(uncompressed_bytes, int)
+        or not 0 < uncompressed_bytes <= MAX_SCENARIO_ARCHIVE_UNCOMPRESSED_BYTES
+        or not isinstance(scenario_count, int)
+        or scenario_count <= 0
+    ):
+        raise ContractError("report bundle has invalid scenario archive bounds")
+
+    archive_path = report_path.parent / archive_name
+    try:
+        actual_compressed_bytes = archive_path.stat().st_size
+    except OSError as error:
+        raise ContractError(f"cannot read scenario archive {archive_path}: {error}") from error
+    if (
+        actual_compressed_bytes != compressed_bytes
+        or actual_compressed_bytes > MAX_SCENARIO_ARCHIVE_COMPRESSED_BYTES
+    ):
+        raise ContractError("scenario archive compressed size does not match its manifest")
+    try:
+        compressed = archive_path.read_bytes()
+    except OSError as error:
+        raise ContractError(f"cannot read scenario archive {archive_path}: {error}") from error
+    if _sha256_bytes(compressed) != metadata.get("compressedSha256"):
+        raise ContractError("scenario archive compressed digest does not match its manifest")
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed), mode="rb") as archive:
+            raw = archive.read(MAX_SCENARIO_ARCHIVE_UNCOMPRESSED_BYTES + 1)
+    except (EOFError, OSError) as error:
+        raise ContractError(f"cannot decompress scenario archive: {error}") from error
+    if (
+        len(raw) != uncompressed_bytes
+        or len(raw) > MAX_SCENARIO_ARCHIVE_UNCOMPRESSED_BYTES
+        or _sha256_bytes(raw) != metadata.get("uncompressedSha256")
+    ):
+        raise ContractError("scenario archive raw digest does not match its manifest")
+    if not raw.endswith(b"\n"):
+        raise ContractError("canonical scenario archive must end with a newline")
+    try:
+        scenarios = [json.loads(line) for line in raw.splitlines()]
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError(f"scenario archive contains invalid JSONL: {error}") from error
+    if len(scenarios) != scenario_count or any(
+        not isinstance(scenario, dict) for scenario in scenarios
+    ):
+        raise ContractError("scenario archive count does not match its manifest")
+    if _scenario_jsonl(scenarios) != raw:
+        raise ContractError("scenario archive is not canonical JSONL")
+
+    report = {
+        key: value
+        for key, value in bundle.items()
+        if key
+        not in {
+            "latencySampleCount",
+            "reconstructedReportSha256",
+            "reportSchemaVersion",
+            "scenarioArchive",
+        }
+    }
+    report["schemaVersion"] = bundle.get("reportSchemaVersion")
+    report["scenarioReports"] = scenarios
+    report["events"] = [
+        event
+        for scenario in scenarios
+        for event in scenario.get("events", [])
+        if isinstance(event, dict)
+    ]
+    authority_oracle = report.get("authorityOracle")
+    if not isinstance(authority_oracle, dict):
+        raise ContractError("report bundle must retain its authority oracle")
+    report["observations"] = merge_observations(scenarios, authority_oracle)
+    report["latencySamples"] = collect_scenario_span_samples(
+        load_json(CONTRACT_PATH), scenarios
+    )
+    if len(report["latencySamples"]) != bundle.get("latencySampleCount"):
+        raise ContractError("reconstructed latency sample count does not match the bundle")
+    if canonical_sha256(report) != bundle.get("reconstructedReportSha256"):
+        raise ContractError("reconstructed report digest does not match the bundle")
+    return report
 
 
 def _unique_ids(items: Any, label: str) -> set[str]:
@@ -1817,7 +2011,7 @@ def main() -> None:
     contract = load_json(CONTRACT_PATH)
     validate_contract(contract)
     if BASELINE_PATH.exists():
-        validate_report(load_json(BASELINE_PATH), contract)
+        validate_report(load_report_bundle(BASELINE_PATH), contract)
     print(
         json.dumps(
             {
