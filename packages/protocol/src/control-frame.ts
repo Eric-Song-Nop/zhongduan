@@ -160,15 +160,17 @@ const writerLeaseRenew = z.strictObject({
 });
 
 export const ClientControlFrameSchema = z.union([
-  attach,
-  ack,
-  writerLeaseRenew,
+  // Input dominates the control hot path. Keep its alternatives first so Zod does not walk the
+  // attach/ACK schemas before validating every key, text, paste, focus, mouse, or resize frame.
   key,
   text,
   paste,
   focus,
   mouse,
   resizeRequest,
+  attach,
+  ack,
+  writerLeaseRenew,
 ]);
 
 export type ClientControlFrame = z.infer<typeof ClientControlFrameSchema>;
