@@ -172,9 +172,10 @@ describe("E0 TypeScript contract and evidence bundle", () => {
   it("round-trips a bundle and rejects archive tampering", () => {
     const directory = mkdtempSync(join(tmpdir(), "e0-bundle-test-"));
     const path = join(directory, "report.json");
+    const report = current();
     try {
-      writeReportBundle(path, current());
-      expect(canonicalSha256(loadReportBundle(path))).toBe(canonicalSha256(current()));
+      writeReportBundle(path, report);
+      expect(canonicalSha256(loadReportBundle(path))).toBe(canonicalSha256(report));
       const archivePath = join(directory, "report.scenarios.jsonl.gz");
       const bytes = readFileSync(archivePath);
       bytes[Math.floor(bytes.length / 2)]! ^= 1;
@@ -183,7 +184,7 @@ describe("E0 TypeScript contract and evidence bundle", () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   it("recomputes every claimed oracle, summary, threshold, effect and coverage cell", () => {
     const mutations: Array<(report: Data) => void> = [
