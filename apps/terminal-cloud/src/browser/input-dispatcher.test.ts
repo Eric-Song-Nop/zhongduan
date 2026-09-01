@@ -107,6 +107,7 @@ interface Harness {
 
 function harness(
   options: {
+    assertInvariants?: boolean;
     getObservedEventSeq?: () => bigint | null;
     onIntentResult?: (result: InputIntentResult) => void;
     policy?: (event: TerminalInputEvent) => boolean;
@@ -119,6 +120,9 @@ function harness(
   let localSequence = 0;
   let epochSequence = 1;
   const dispatcher = new InputDispatcher({
+    ...(options.assertInvariants === undefined
+      ? {}
+      : { assertInvariants: options.assertInvariants }),
     getObservedEventSeq: options.getObservedEventSeq ?? (() => 9n),
     inputEpoch: "epoch-1",
     createInputEpoch: () => `epoch-${++epochSequence}`,
@@ -730,6 +734,10 @@ describe("InputDispatcher E1 admission owner", () => {
     const microtasks: Array<() => void> = [];
     let delivered = 0;
     const dispatcher = new InputDispatcher({
+      // This test measures 50,000 committed notifications. The randomized command trace below
+      // performs the deep per-turn invariant audit; repeating a full 4,096-record scan here would
+      // measure the test oracle rather than the production transition.
+      assertInvariants: false,
       getObservedEventSeq: () => 0n,
       createLocalIntentId: () => "bulk-local-rejection",
       queueMicrotask: (callback) => microtasks.push(callback),
@@ -782,5 +790,107 @@ describe("InputDispatcher E1 admission owner", () => {
       outcome: "not-sent",
       reason: "not-writable",
     });
+  });
+
+  it("preserves global invariants across a deterministic interleaving command trace", () => {
+    let randomState = 0x45e1cafe;
+    const random = () => {
+      randomState = (Math.imul(randomState, 1_664_525) + 1_013_904_223) >>> 0;
+      return randomState;
+    };
+    const setup = harness({ assertInvariants: true });
+    const localIntentIds: string[] = [];
+    const observedResults = new Map<string, InputIntentResult>();
+    let highestFence = 1;
+    let generation = 1;
+    setup.attach({
+      fence: String(highestFence),
+      generation,
+      onSend: () => (["accepted", "proven-not-accepted", "uncertain"] as const)[random() % 3]!,
+    });
+
+    for (let step = 0; step < 1_000; step += 1) {
+      const command = random() % 12;
+      if (command <= 3) {
+        const input =
+          command === 0
+            ? key({ code: `Key${String.fromCharCode(65 + (random() % 26))}` })
+            : command === 1
+              ? ({ type: "text", text: `trace-${step}`, source: "input" } as const)
+              : command === 2
+                ? ({ ...RESIZE, cols: 80 + (random() % 80) } as const)
+                : mouse(random() % 2 === 0 ? "move" : "press", random() % 900);
+        localIntentIds.push(setup.dispatcher.send(input));
+      } else if (command === 4) {
+        setup.runNext();
+      } else if (command === 5) {
+        setup.flush();
+      } else if (command === 6) {
+        const active = localIntentIds
+          .map((localIntentId) => setup.dispatcher.getIntent(localIntentId))
+          .filter(
+            (snapshot): snapshot is NonNullable<typeof snapshot> =>
+              snapshot?.identity !== null &&
+              snapshot?.identity !== undefined &&
+              (snapshot.state === "sent" || snapshot.state === "terminating"),
+          );
+        const candidate = active[random() % Math.max(1, active.length)];
+        if (candidate?.identity !== null && candidate?.identity !== undefined) {
+          acknowledge(
+            setup.dispatcher,
+            candidate.identity,
+            (["written", "rejected", "duplicate", "uncertain"] as const)[random() % 4]!,
+          );
+        }
+      } else if (command === 7) {
+        setup.dispatcher.detachTransport(random() % 4 === 0 ? "closed" : "control-replaced");
+      } else if (command === 8) {
+        const useHigherFence = random() % 3 !== 0;
+        if (useHigherFence) highestFence += 1;
+        generation += 1;
+        setup.attach({
+          fence: String(useHigherFence ? highestFence : Math.max(1, highestFence - 1)),
+          generation,
+          onSend: () => (["accepted", "proven-not-accepted", "uncertain"] as const)[random() % 3]!,
+        });
+      } else if (command === 9) {
+        setup.dispatcher.revokeWriterAuthority();
+      } else if (command === 10) {
+        setup.clock.elapseWithoutTimers(random() % 40_001);
+      } else {
+        setup.clock.advance(random() % 40_001);
+      }
+
+      setup.dispatcher.setReplicaCurrent(random() % 2 === 0);
+      if (random() % 5 === 0) setup.dispatcher.confirmAuthoritativeResize(RESIZE);
+      for (const result of setup.results) {
+        const previous = observedResults.get(result.localIntentId);
+        if (previous === undefined) observedResults.set(result.localIntentId, result);
+        else expect(result).toBe(previous);
+      }
+      expect(setup.dispatcher.status).toMatchObject({
+        pending: expect.any(Number),
+        preAdmission: expect.any(Number),
+        queued: expect.any(Number),
+      });
+      expect(setup.dispatcher.status.pending).toBeLessThanOrEqual(INPUT_QUEUE_CONTRACT.maxPending);
+      expect(
+        setup.dispatcher.status.preAdmission + setup.dispatcher.status.queued,
+      ).toBeLessThanOrEqual(INPUT_QUEUE_CONTRACT.maxCount);
+      expect(
+        setup.dispatcher.status.preAdmissionBytes + setup.dispatcher.status.queuedBytes,
+      ).toBeLessThanOrEqual(INPUT_QUEUE_CONTRACT.maxBytes);
+    }
+
+    setup.flush();
+    setup.dispatcher.detachTransport("closed");
+    setup.flush();
+    const sentIdentities = setup.frames.map(
+      (frame) => `${frame.writerLease}\u0000${frame.inputEpoch}\u0000${frame.clientInputSeq}`,
+    );
+    expect(new Set(sentIdentities).size).toBe(sentIdentities.length);
+    expect(new Set(setup.results.map((result) => result.localIntentId)).size).toBe(
+      setup.results.length,
+    );
   });
 });
