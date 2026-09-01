@@ -50,6 +50,26 @@ drains product-result notifications before returning. The reentrant worklist the
 across calls or remain captured by a delayed microtask; observer exceptions still cannot roll back an
 owner transition.
 
+## Internal owner structure
+
+`InputDispatcher` remains the only public writer and the only owner that invokes callbacks or commits
+effects. Its implementation is split without introducing independently mutable managers:
+
+- `input-codec.ts` contains pure normalization, schema validation, encoding, and coalescing predicates;
+- `input-intent-ledger.ts` owns the single canonical record map, LocalIntentId-only indexes, byte
+  accounting, retention, and typed intent transitions;
+- `input-authority.ts` represents Browser authority as a `detached | read-only | open | sealed`
+  discriminated union. Writable state and replacement-required status are derived from that union;
+- `input-dispatcher.ts` retains owner turns, external effects, scheduling, deadline catch-up, status
+  publication, and reentrancy ordering.
+
+Tests enable a deep invariant audit after every outer owner turn, except the dedicated 50,000-result
+throughput case that would otherwise benchmark the test oracle. A deterministic command trace mixes
+input, admission, ACK, stale/higher-fence attach, detach, revocation, timer firing, timer suspension,
+replica gates, and resize confirmation while checking the global indexes, bytes, identities, retention,
+and immutable-result constraints. This is a behavior-preserving E1 structure; it adds no E2 lane or E3
+wire/Host state.
+
 ## Replacement and coalescing
 
 - A full/control replacement makes pre-admission work `not-sent/control-replaced`, makes admitted but
