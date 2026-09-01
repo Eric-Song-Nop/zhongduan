@@ -34,6 +34,7 @@ export default defineConfig({
         command: [
           "node scripts/prepare-wterm.mjs",
           "node scripts/e0-terminal-journey.ts",
+          "node scripts/e1-browser-latency.ts",
           "node scripts/e0_authority_oracle.mjs",
           "vp check",
           "node scripts/verify-no-source-emit.mjs",
@@ -63,6 +64,10 @@ export default defineConfig({
       },
       "verify-e0-local": {
         command: "node scripts/verify-e0-terminal-journey.ts",
+        cache: false,
+      },
+      "verify-e1-browser-latency": {
+        command: "node scripts/e1-browser-latency.ts",
         cache: false,
       },
       "verify-clean-host": {

@@ -107,6 +107,21 @@ Browser-owner test/API boundary for bounded replacement convergence; its wire im
 E3 work. A fresh higher Cloud fence starts a new Browser epoch at sequence 1. Same-fence rollover is
 not supported in E1.
 
+## Browser latency candidate
+
+The checked E1 candidate measures the real Chromium `keydown` through the Browser control sender's
+send decision in the E0 steady journey. Its five clean 100/100 ms, no-jitter runs contribute 120
+measured samples after warmup. The raw nearest-rank p99 is 0.4002 ms; at the harness's declared 0.1 ms
+Browser-clock resolution it is 0.4 ms. The frozen E0 CURRENT population contains 408 samples across
+all 17 steady scenarios and has a 0.4 ms raw and comparison p99. The resulting no-regression ratio is
+1.0, exactly at the frozen maximum.
+
+The summary and bounded raw archive live in `benchmarks/browser-input-admission/`. The verifier checks
+their hashes, replays every scenario, recomputes the samples and percentiles, and requires the clean
+measurement commit and tree to be reachable from the checked head. This is Browser hot-path evidence
+inside the E0 supported-load envelope; it is not a queue-saturation, hard-limit throughput, edge,
+E2, or E3 claim.
+
 ## Verification entry points
 
 ```bash
@@ -122,6 +137,8 @@ pnpm --filter @zhongduan/terminal-cloud exec vp test \
 pnpm --filter @zhongduan/terminal-cloud exec vp test \
   --config vitest.worker.config.ts --run test/relay.test.ts \
   -t "negotiates E1 Browser fences"
+
+node scripts/e1-browser-latency.ts
 
 node scripts/verify-e0-terminal-journey.ts \
   --allow-dirty-development \
