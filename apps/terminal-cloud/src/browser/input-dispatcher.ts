@@ -321,19 +321,26 @@ export class InputDispatcher implements InputSink {
    */
   attachTransport(transport: InputTransport): boolean {
     return this.#transaction(() => {
+      const replacementWasRequired = this.#controlReplacementRequired;
       if (this.#transport !== null && this.#transport !== transport) {
         this.#detachTransport("control-replaced");
       }
       this.#transport = transport;
-      this.#controlReplacementRequired = false;
       const fence = positiveFence(transport.writerFence);
       const hasAuthorityPair = fence !== null && transport.writerLease !== undefined;
       if (!hasAuthorityPair || fence <= this.#highestWriterFence) {
+        // Replacing the transport as part of this attempt must not erase a requirement that the
+        // old sealed epoch could satisfy only with a strictly newer writer fence.
+        if (replacementWasRequired) this.#controlReplacementRequired = true;
         this.#markDirty();
         return false;
       }
 
       this.#highestWriterFence = fence;
+      // A stale, same-fence, or incomplete attachment cannot satisfy a previously required
+      // control replacement. Clear the observable requirement only after accepting the strictly
+      // newer authority that can create a writable epoch.
+      this.#controlReplacementRequired = false;
       const inputEpoch = this.#unusedInitialEpoch;
       this.#unusedInitialEpoch = this.#safeGeneratedId(undefined, "input-epoch");
       this.#activeEpoch = {

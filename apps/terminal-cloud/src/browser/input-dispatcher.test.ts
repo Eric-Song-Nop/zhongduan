@@ -468,7 +468,7 @@ describe("InputDispatcher E1 admission owner", () => {
 
   it("seals a proven-not-accepted identity and starts sequence one only on a higher fence", () => {
     const setup = harness();
-    setup.attach({ decision: "proven-not-accepted" });
+    setup.attach({ decision: "proven-not-accepted", fence: "2" });
     const failed = setup.dispatcher.send(key());
     setup.flush();
     expect(setup.dispatcher.getResult(failed)).toMatchObject({
@@ -486,13 +486,25 @@ describe("InputDispatcher E1 admission owner", () => {
       identity: null,
     });
 
-    setup.dispatcher.detachTransport();
-    expect(setup.attach({ fence: "1", generation: 2 })).toBe(false);
-    expect(setup.attach({ fence: "2", generation: 3 })).toBe(true);
+    expect(setup.attach({ fence: "2", generation: 3 })).toBe(false);
+    expect(setup.dispatcher.status).toMatchObject({
+      writable: false,
+      controlReplacementRequired: true,
+    });
+    const stillSealed = setup.dispatcher.send(key());
+    expect(setup.dispatcher.getResult(stillSealed)).toMatchObject({
+      outcome: "not-sent",
+      reason: "not-writable",
+      identity: null,
+    });
+    expect(setup.attach({ fence: "1", generation: 4 })).toBe(false);
+    expect(setup.dispatcher.status.controlReplacementRequired).toBe(true);
+    expect(setup.attach({ fence: "3", generation: 5 })).toBe(true);
+    expect(setup.dispatcher.status.controlReplacementRequired).toBe(false);
     const recovered = setup.dispatcher.send(key());
     setup.flush();
     expect(identityFor(setup.dispatcher, recovered)).toEqual({
-      writerFence: "2",
+      writerFence: "3",
       inputEpoch: "epoch-2",
       clientInputSeq: "1",
     });
