@@ -21,6 +21,13 @@ proven local non-send seals that epoch; it is never skipped or replayed. Accepta
 seals the epoch and waits only for the bounded proof interval. Terminal results are immutable and are
 published as `zhongduan:input-intent-result` `CustomEvent`s for UI, journey, and telemetry observers.
 
+Non-coalescible key input completes validation, admission, identity allocation, and the healthy send
+decision in its originating owner turn. Other semantic input retains one pre-admission microtask,
+which provides the coalescing window for adjacent resize and mouse-move state; after admission the
+production sender drain is inline. Tests inject the send scheduler only when they need to hold the
+otherwise-transient queued state at an exact replacement or age-expiry boundary. Reentrant sends join
+the current FIFO drain instead of recursing.
+
 The source-of-truth limits are exported as `INPUT_QUEUE_CONTRACT` from
 `apps/terminal-cloud/src/browser/input-dispatcher.ts`:
 

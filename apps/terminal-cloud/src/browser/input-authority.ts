@@ -1,3 +1,4 @@
+import { MAX_U64 } from "@zhongduan/protocol";
 import type { InputIdentity } from "./input-intent-ledger";
 import type { InputFrame } from "./input-codec";
 
@@ -54,7 +55,7 @@ export function positiveWriterFence(value: string | undefined): bigint | null {
   if (value === undefined) return null;
   try {
     const parsed = BigInt(value);
-    return parsed > 0n && parsed.toString() === value ? parsed : null;
+    return parsed > 0n && parsed <= MAX_U64 && parsed.toString() === value ? parsed : null;
   } catch {
     return null;
   }
@@ -84,7 +85,13 @@ export function attachAuthority(
   inputEpoch: string,
 ): { readonly authority: AuthorityState; readonly accepted: boolean } {
   const fence = positiveWriterFence(transport.writerFence);
-  if (fence !== null && transport.writerLease !== undefined && fence > current.highestWriterFence) {
+  if (
+    fence !== null &&
+    transport.writerLease !== undefined &&
+    transport.writerLease.length > 0 &&
+    transport.writerLease.length <= 128 &&
+    fence > current.highestWriterFence
+  ) {
     return {
       accepted: true,
       authority: {

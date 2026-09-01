@@ -1,4 +1,4 @@
-import type { InputFrame, InputKind, InputPayload } from "./input-codec";
+import type { InputFrame, InputKind, ValidatedInputPayload } from "./input-codec";
 
 /** Product limits for the Browser-local E1 owner, not tuning defaults. */
 export const INPUT_QUEUE_CONTRACT = Object.freeze({
@@ -102,7 +102,7 @@ export interface ConsumedIntentRecord extends IntentRecordBase {
 export interface PreAdmissionIntentRecord extends IntentRecordBase {
   readonly phase: "pre-admission";
   readonly identity: null;
-  readonly normalized: InputPayload;
+  readonly normalized: ValidatedInputPayload;
   readonly preAdmissionBytes: number;
   readonly encodedBytes: 0;
 }
@@ -289,7 +289,7 @@ export class IntentLedger {
 
   enqueuePreAdmission(
     localIntentId: LocalIntentId,
-    normalized: InputPayload,
+    normalized: ValidatedInputPayload,
     preAdmissionBytes: number,
   ): PreAdmissionIntentRecord {
     const record = this.require(localIntentId, "consumed");
