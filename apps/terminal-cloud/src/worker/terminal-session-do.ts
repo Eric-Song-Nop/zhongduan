@@ -20,14 +20,18 @@ import {
   decodeDeliveryBarrierPayload,
   encodeControlFrame,
   rewriteDelivery,
-  type ClientControlFrame,
   type DataFrame,
   type DeliveryBarrierPayload,
 } from "@zhongduan/protocol";
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { randomId, sha256Hex } from "./auth";
-import { CloudInputTelemetry, type CloudInputDisposition } from "./cloud-input-telemetry";
+import {
+  BrowserControlLane,
+  isSemanticInputFrame,
+  type BrowserControlTiming,
+} from "./browser-control-lane";
+import { HostDataBatchProcessor } from "./host-data-batch-processor";
 import {
   connectionSockets,
   eligibleControlForDataTicket,
@@ -36,13 +40,10 @@ import {
 } from "./relay-connection-state";
 import { RelayConnectionStore } from "./relay-connection-store";
 import type { CloudEnv } from "./env";
-import { advanceDeliveryCursor, advanceDeliveryCursorBatch } from "./relay-delivery";
+import { advanceDeliveryCursor } from "./relay-delivery";
 import {
-  BROWSER_CONTROL_LANE_LIMITS,
-  BoundedKeyedQueue,
   BoundedSerialQueue,
   RELAY_MESSAGE_QUEUE_PROFILES,
-  type QueueTaskTiming,
   type SocketQueueLimits,
 } from "./relay-message-queue";
 import {
@@ -58,10 +59,10 @@ import {
   type ClientRow,
   type SessionRow,
   type TicketRow,
-  type WriterLeaseRow,
 } from "./relay-store";
 import { SnapshotStore } from "./snapshot-store";
 import { SnapshotUploadCoordinator } from "./snapshot-upload-coordinator";
+import { WriterAuthority } from "./writer-authority";
 
 const identifier = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/);
 const engineId = z.string().min(1).max(512);
@@ -84,33 +85,12 @@ export const CreateConnectionSetSchema = z.strictObject({
 });
 const RelayCapabilitiesSchema = z.array(RelayCapabilitySchema).max(16);
 
-interface AcquiredLease {
-  expiresAt: number;
-  fence: string;
-  token: string;
-}
-
 type HostControlSendResult = "sent" | "rejected" | "uncertain";
 
 interface HostInputSendOutcome {
   hostSendAtMs: number | null;
   result: HostControlSendResult;
 }
-
-type SemanticInputFrame = Exclude<
-  ClientControlFrame,
-  { type: "ack" | "attach" | "writer-lease-renew" }
->;
-
-interface BrowserControlTiming extends QueueTaskTiming {
-  receivedAtMs: number;
-}
-
-type LiveWriterAttachment = SocketAttachment & {
-  clientId: string;
-  leaseExpiresAt: number;
-  leaseFence: string;
-};
 
 interface BrowserAttachContext {
   client: ClientRow;
@@ -137,7 +117,6 @@ type BrowserAttachContextResult =
     };
 
 const TICKET_LIFETIME_MS = 30_000;
-const WRITER_LEASE_MS = 30_000;
 const MAX_BROWSER_CONNECTIONS = 16;
 const MAX_PENDING_CONNECTION_SETS = MAX_BROWSER_CONNECTIONS + 1;
 const MAX_CONTROL_MESSAGE_CHARS = 6 * 1024 * 1024 + 4_096;
@@ -148,19 +127,6 @@ const HOST_DATA_BATCH_YIELD_FRAMES = 1;
 const HOST_DATA_BATCH_YIELD_MS = 1;
 const HOST_DATA_BATCH_ACK = "data-ack";
 
-function rewriteDecodedDeliveryInPlace(
-  encoded: Uint8Array,
-  deliveryGeneration: bigint,
-  streamId: number,
-): Uint8Array {
-  // The negotiated batch decoder has already validated this exact frame view. WebSocket.send()
-  // snapshots BufferSource bytes before returning, so a sole synced Browser can consume the owned
-  // inbound buffer without allocating a second payload-sized copy.
-  const view = new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength);
-  view.setBigUint64(16, deliveryGeneration, true);
-  view.setUint32(40, streamId, true);
-  return encoded;
-}
 const MAX_HOST_INPUT_BUFFERED_BYTES = 8 * 1024 * 1024;
 const SOCKET_REPLACED = 4001;
 const SLOW_CLIENT = 4008;
@@ -219,21 +185,15 @@ function hasUnadvancedDeliveryCursor(attachment: SocketAttachment): boolean {
   return eventCursorUnchanged && ptyCursorUnchanged;
 }
 
-function isSemanticInputFrame(frame: ClientControlFrame): frame is SemanticInputFrame {
-  return frame.type !== "ack" && frame.type !== "attach" && frame.type !== "writer-lease-renew";
-}
-
 export class TerminalSessionDO extends DurableObject<CloudEnv> {
   private readonly sql: SqlStorage;
   private readonly store: RelayStore;
   private readonly connections: RelayConnectionStore;
   private readonly snapshots: SnapshotStore;
   private readonly snapshotUploads: SnapshotUploadCoordinator;
-  private readonly inputTelemetry = new CloudInputTelemetry();
-  private readonly browserControlLane = new BoundedKeyedQueue<WebSocket>(
-    BROWSER_CONTROL_LANE_LIMITS,
-    () => Date.now(),
-  );
+  private readonly writerAuthority: WriterAuthority;
+  private readonly hostDataBatchProcessor: HostDataBatchProcessor;
+  private readonly browserControlLane: BrowserControlLane;
   private readonly hostDataInFlight = new Set<WebSocket>();
   private readonly messageQueue = new BoundedSerialQueue<WebSocket>();
 
@@ -253,6 +213,39 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     this.snapshotUploads = new SnapshotUploadCoordinator(ctx, env.SNAPSHOTS, this.snapshots, () =>
       this.pinnedSnapshotIds(),
     );
+    this.browserControlLane = new BrowserControlLane({
+      process: (webSocket, message, timing) =>
+        this.processWebSocketMessage(webSocket, message, timing),
+      reject: (webSocket, attachment, reason) =>
+        this.rejectInboundMessage(webSocket, attachment, reason),
+    });
+    this.writerAuthority = new WriterAuthority({
+      activeBrowserControl: (clientId) => this.activeBrowserControl(clientId),
+      closeDisplacedWriters: (connectionId, fence) => {
+        this.closeSockets((candidate) => {
+          return (
+            candidate.peer === "browser" &&
+            candidate.role === "writer" &&
+            candidate.connectionId !== connectionId &&
+            candidate.leaseFence !== null &&
+            candidate.leaseFence !== fence
+          );
+        });
+      },
+      sql: this.sql,
+      store: this.store,
+    });
+    this.hostDataBatchProcessor = new HostDataBatchProcessor({
+      browserDataSockets: () => this.browserDataSockets(),
+      failCurrentHost: (attachment, reason) => this.failCurrentHost(attachment, reason),
+      hasPinnedDeliveryInProgress: () => this.hasPinnedDeliveryInProgress(),
+      resetBrowserAfterDataSendFailure: (webSocket, attachment) =>
+        this.resetBrowserAfterDataSendFailure(webSocket, attachment),
+      resetBrowserDelivery: (clientId, reason, notifyHost) =>
+        this.resetBrowserDelivery(clientId, reason, notifyHost),
+      sql: this.sql,
+      store: this.store,
+    });
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     void this.ctx.blockConcurrencyWhile(() => this.snapshotUploads.initialize());
   }
@@ -288,47 +281,14 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const inbound = this.validateInboundMessage(webSocket, message);
     if (inbound === undefined) return Promise.resolve();
     if (inbound.attachment.peer === "browser" && inbound.attachment.channel === "control") {
-      const processing = this.browserControlLane.enqueue(
+      this.browserControlLane.dispatch(
         webSocket,
+        inbound.attachment,
+        message,
         inbound.bytes,
-        (timing) => this.processWebSocketMessage(webSocket, message, { ...timing, receivedAtMs }),
-        (timing, reason) => {
-          const disposition = reason === "age" ? "lane-expired" : "lane-overload";
-          this.recordDroppedBrowserInput(
-            inbound.attachment,
-            message,
-            { ...timing, receivedAtMs },
-            disposition,
-          );
-          this.rejectInboundMessage(
-            webSocket,
-            inbound.attachment,
-            reason === "age"
-              ? "browser control lane age exceeded"
-              : "browser control lane isolated an overloaded source",
-          );
-        },
         inbound.queueLimits,
+        receivedAtMs,
       );
-      if (processing === undefined) {
-        const rejectedAtMs = Date.now();
-        this.recordDroppedBrowserInput(
-          inbound.attachment,
-          message,
-          {
-            enqueuedAtMs: receivedAtMs,
-            receivedAtMs,
-            startedAtMs: rejectedAtMs,
-            waitMs: Math.max(0, rejectedAtMs - receivedAtMs),
-          },
-          "lane-overload",
-        );
-        this.rejectInboundMessage(webSocket, inbound.attachment, "browser control lane exceeded");
-        return Promise.resolve();
-      }
-      void processing.catch(() => {
-        this.rejectInboundMessage(webSocket, inbound.attachment, "browser control message failed");
-      });
       return Promise.resolve();
     }
     const usesDataCredit =
@@ -564,7 +524,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
 
     if (attachment.clientId === null) return;
-    this.releaseWriterLease(attachment.clientId, attachment.leaseFence, attachment.connectionId);
+    this.writerAuthority.release(
+      attachment.clientId,
+      attachment.leaseFence,
+      attachment.connectionId,
+    );
     if (this.activeBrowserControl(attachment.clientId, webSocket) !== undefined) return;
     this.connections.closeConnectionSet(attachment.connectionSetId);
     this.closeSockets((candidate) => {
@@ -793,7 +757,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         for (const socket of this.ctx.getWebSockets(`client:${ticket.client_id}`)) {
           const previous = readAttachment(socket);
           if (previous?.channel === "control") {
-            this.releaseWriterLease(ticket.client_id, previous.leaseFence, previous.connectionId);
+            this.writerAuthority.release(
+              ticket.client_id,
+              previous.leaseFence,
+              previous.connectionId,
+            );
           }
         }
         this.closeSockets((candidate) => {
@@ -1239,7 +1207,14 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.activeBrowserControl(attachment.clientId) !== webSocket
     ) {
       if (isSemanticInputFrame(frame)) {
-        this.recordInputSpan(frame, attachment, timing, "rejected", null, attachment.leaseFence);
+        this.browserControlLane.recordInput(
+          frame,
+          attachment,
+          timing,
+          "rejected",
+          null,
+          attachment.leaseFence,
+        );
       }
       return;
     }
@@ -1259,20 +1234,34 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       return;
     }
     if (attachment.controlState !== "active") {
-      this.recordInputSpan(frame, attachment, timing, "rejected", null, attachment.leaseFence);
+      this.browserControlLane.recordInput(
+        frame,
+        attachment,
+        timing,
+        "rejected",
+        null,
+        attachment.leaseFence,
+      );
       this.rejectInput(webSocket, frame.inputEpoch, frame.clientInputSeq);
       return;
     }
-    const latestAttachment = this.liveWriterAttachment(webSocket, attachment, Date.now());
+    const latestAttachment = this.writerAuthority.liveAttachment(webSocket, attachment, Date.now());
     if (latestAttachment === undefined) {
-      this.recordInputSpan(frame, attachment, timing, "rejected", null, attachment.leaseFence);
+      this.browserControlLane.recordInput(
+        frame,
+        attachment,
+        timing,
+        "rejected",
+        null,
+        attachment.leaseFence,
+      );
       this.rejectInput(webSocket, frame.inputEpoch, frame.clientInputSeq);
       return;
     }
 
     const host = this.currentInputHostControl();
     if (host === undefined) {
-      this.recordInputSpan(
+      this.browserControlLane.recordInput(
         frame,
         attachment,
         timing,
@@ -1298,7 +1287,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       },
       "semantic input delivery failed",
     );
-    this.recordInputSpan(
+    this.browserControlLane.recordInput(
       frame,
       attachment,
       timing,
@@ -1329,7 +1318,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (clientId === null) return;
     const expiresAt =
       attachment.controlState === "active" && attachment.role === "writer"
-        ? await this.renewWriterLease(webSocket, attachment, writerLease)
+        ? await this.writerAuthority.renew(webSocket, attachment, writerLease)
         : undefined;
     const latestAttachment = readAttachment(webSocket);
     const active =
@@ -1374,12 +1363,16 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     const initialActivation = initial.controlAttachment.controlState === "awaiting-attach";
     const lease =
       initialActivation && attachment.role === "writer"
-        ? await this.acquireWriterLease(attachment.clientId!, attachment.connectionId, Date.now())
+        ? await this.writerAuthority.acquire(
+            attachment.clientId!,
+            attachment.connectionId,
+            Date.now(),
+          )
         : undefined;
     const currentResult = this.resolveBrowserAttachContext(webSocket, attachment, frame);
     if (!currentResult.ok) {
       if (lease !== undefined) {
-        this.releaseWriterLease(attachment.clientId!, lease.fence, attachment.connectionId);
+        this.writerAuthority.release(attachment.clientId!, lease.fence, attachment.connectionId);
       }
       return;
     }
@@ -1651,7 +1644,7 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       this.failCurrentHost(attachment, "invalid host data frame");
       return;
     }
-    const canonicalBatch = this.handleCanonicalHostDataBatch(webSocket, attachment, logicalFrames);
+    const canonicalBatch = this.hostDataBatchProcessor.process(attachment, logicalFrames);
     if (canonicalBatch !== undefined) {
       await canonicalBatch;
     } else {
@@ -1676,153 +1669,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         this.failCurrentHost(attachment, "host data acknowledgement failed");
       }
     }
-  }
-
-  private handleCanonicalHostDataBatch(
-    webSocket: WebSocket,
-    attachment: SocketAttachment,
-    logicalFrames: Array<{ encoded: Uint8Array; frame: DataFrame }>,
-  ): Promise<void> | undefined {
-    if (
-      logicalFrames.length < 2 ||
-      this.hasPinnedDeliveryInProgress() ||
-      logicalFrames.some(
-        ({ frame }) =>
-          frame.streamId !== 0 ||
-          (frame.kind !== DataFrameKind.PtyOutput && frame.kind !== DataFrameKind.ResizeApplied),
-      )
-    ) {
-      return undefined;
-    }
-
-    const session = this.session();
-    if (session === undefined) {
-      this.failCurrentHost(attachment, "host session epoch mismatch");
-      return Promise.resolve();
-    }
-    const sessionEpoch = BigInt(session.session_epoch);
-    let headEventSeq = BigInt(session.head_event_seq);
-    let nextPtyOffset = BigInt(session.next_pty_offset);
-    for (const { frame } of logicalFrames) {
-      if (
-        frame.sessionEpoch !== sessionEpoch ||
-        frame.deliveryGeneration !== 0n ||
-        frame.eventSeq !== headEventSeq + 1n ||
-        frame.ptyOffset !== nextPtyOffset ||
-        (frame.kind === DataFrameKind.ResizeApplied && frame.payload.byteLength !== 16) ||
-        (frame.kind === DataFrameKind.PtyOutput &&
-          frame.ptyOffset > MAX_U64 - BigInt(frame.payload.byteLength))
-      ) {
-        this.failCurrentHost(attachment, "canonical data sequence gap");
-        return Promise.resolve();
-      }
-      headEventSeq = frame.eventSeq;
-      if (frame.kind === DataFrameKind.PtyOutput) {
-        nextPtyOffset = frame.ptyOffset + BigInt(frame.payload.byteLength);
-      }
-    }
-
-    this.sql.exec(
-      `UPDATE session_state
-       SET head_event_seq = ?, next_pty_offset = ?, updated_at = ?
-       WHERE singleton = 1 AND host_fence = ?`,
-      headEventSeq.toString(),
-      nextPtyOffset.toString(),
-      Date.now(),
-      session.host_fence,
-    );
-
-    const pendingResets: Promise<void>[] = [];
-    const frames = logicalFrames.map(({ frame }) => frame);
-    const browserDataSockets = this.browserDataSockets();
-    const rewriteInPlace =
-      browserDataSockets.filter((socket) => readAttachment(socket)?.dataState === "synced")
-        .length === 1;
-    for (const browserData of browserDataSockets) {
-      const initialAttachment = readAttachment(browserData);
-      if (
-        initialAttachment?.dataState !== "synced" ||
-        initialAttachment.clientId === null ||
-        browserData.readyState !== WebSocket.OPEN
-      ) {
-        continue;
-      }
-      const client = this.clientById(initialAttachment.clientId);
-      if (
-        client === undefined ||
-        client.stream_id !== initialAttachment.streamId ||
-        client.delivery_generation !== initialAttachment.deliveryGeneration
-      ) {
-        continue;
-      }
-
-      const cursor = advanceDeliveryCursorBatch(initialAttachment, frames);
-      if (cursor.kind === "sequence-error") {
-        pendingResets.push(
-          this.resetBrowserDelivery(initialAttachment.clientId, "journal-gap", false),
-        );
-        continue;
-      }
-      if (cursor.kind === "credit-exceeded") {
-        pendingResets.push(
-          this.resetBrowserDelivery(initialAttachment.clientId, "slow-client", true),
-        );
-        continue;
-      }
-      let deliveredAll = true;
-      const browserBatchEnabled =
-        rewriteInPlace &&
-        initialAttachment.relayCapabilities.includes(RelayCapability.browserDataBatchV1);
-      if (browserBatchEnabled) {
-        try {
-          for (const logical of logicalFrames) {
-            rewriteDecodedDeliveryInPlace(
-              logical.encoded,
-              BigInt(client.delivery_generation),
-              client.stream_id,
-            );
-          }
-          const first = logicalFrames[0]!.encoded;
-          const batchBytes = logicalFrames.reduce(
-            (total, logical) => total + logical.encoded.byteLength,
-            0,
-          );
-          browserData.send(new Uint8Array(first.buffer, first.byteOffset, batchBytes));
-        } catch {
-          const reset = this.resetBrowserAfterDataSendFailure(browserData, initialAttachment);
-          if (reset !== undefined) pendingResets.push(reset);
-          deliveredAll = false;
-        }
-      } else {
-        for (const logical of logicalFrames) {
-          const rewritten = rewriteInPlace
-            ? rewriteDecodedDeliveryInPlace(
-                logical.encoded,
-                BigInt(client.delivery_generation),
-                client.stream_id,
-              )
-            : rewriteDelivery(
-                logical.encoded,
-                BigInt(client.delivery_generation),
-                client.stream_id,
-              );
-          try {
-            browserData.send(rewritten);
-          } catch {
-            const reset = this.resetBrowserAfterDataSendFailure(browserData, initialAttachment);
-            if (reset !== undefined) pendingResets.push(reset);
-            deliveredAll = false;
-            break;
-          }
-        }
-      }
-      if (deliveredAll) {
-        writeAttachment(browserData, { ...initialAttachment, ...cursor.nextState });
-      }
-    }
-    return pendingResets.length === 0
-      ? Promise.resolve()
-      : Promise.all(pendingResets).then(() => undefined);
   }
 
   private async handleHostDataFrame(
@@ -2173,174 +2019,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     }
   }
 
-  private async acquireWriterLease(
-    clientId: string,
-    connectionId: string,
-    now: number,
-  ): Promise<AcquiredLease | undefined> {
-    const existing = this.writerLease();
-    if (existing !== undefined && existing.expires_at > now) return undefined;
-    const token = randomId(32);
-    const digest = await sha256Hex(token);
-    const current = this.writerLease();
-    if (current !== undefined && current.expires_at > Date.now()) return undefined;
-    const currentFence = BigInt(current?.fence ?? "0");
-    if (currentFence >= MAX_U64) throw new Error("writer lease fence space exhausted");
-    const fence = (currentFence + 1n).toString();
-    const expiresAt = Date.now() + WRITER_LEASE_MS;
-    this.sql.exec(
-      `INSERT INTO writer_lease
-        (singleton, client_id, connection_id, lease_digest, fence, expires_at)
-       VALUES (1, ?, ?, ?, ?, ?)
-       ON CONFLICT(singleton) DO UPDATE SET
-         client_id = excluded.client_id,
-         connection_id = excluded.connection_id,
-         lease_digest = excluded.lease_digest,
-         fence = excluded.fence,
-         expires_at = excluded.expires_at`,
-      clientId,
-      connectionId,
-      digest,
-      fence,
-      expiresAt,
-    );
-    this.closeSockets((candidate) => {
-      return (
-        candidate.peer === "browser" &&
-        candidate.role === "writer" &&
-        candidate.connectionId !== connectionId &&
-        candidate.leaseFence !== null &&
-        candidate.leaseFence !== fence
-      );
-    });
-    return { expiresAt, fence, token };
-  }
-
-  private async renewWriterLease(
-    webSocket: WebSocket,
-    attachment: SocketAttachment,
-    token: string,
-  ): Promise<number | undefined> {
-    const initial = this.liveWriterAttachment(webSocket, attachment, Date.now());
-    if (initial === undefined || token.length > 256) return undefined;
-    const digest = await sha256Hex(token);
-    const currentAttachment = this.liveWriterAttachment(webSocket, initial, Date.now());
-    if (currentAttachment === undefined) return undefined;
-    const lease = this.writerLease();
-    if (
-      lease === undefined ||
-      lease.client_id !== currentAttachment.clientId ||
-      lease.connection_id !== currentAttachment.connectionId ||
-      lease.fence !== currentAttachment.leaseFence ||
-      lease.lease_digest !== digest ||
-      lease.expires_at <= Date.now()
-    ) {
-      return undefined;
-    }
-    const expiresAt = Date.now() + WRITER_LEASE_MS;
-    this.sql.exec(
-      `UPDATE writer_lease SET expires_at = ?
-       WHERE singleton = 1 AND client_id = ? AND connection_id = ?
-         AND fence = ? AND lease_digest = ? AND expires_at > ?`,
-      expiresAt,
-      currentAttachment.clientId,
-      currentAttachment.connectionId,
-      currentAttachment.leaseFence,
-      digest,
-      Date.now(),
-    );
-    const renewed = this.writerLease();
-    if (
-      renewed?.client_id !== currentAttachment.clientId ||
-      renewed.connection_id !== currentAttachment.connectionId ||
-      renewed.fence !== currentAttachment.leaseFence ||
-      renewed.lease_digest !== digest ||
-      renewed.expires_at !== expiresAt
-    ) {
-      return undefined;
-    }
-    writeAttachment(webSocket, { ...currentAttachment, leaseExpiresAt: expiresAt });
-    return expiresAt;
-  }
-
-  private releaseWriterLease(clientId: string, fence: string | null, connectionId: string): void {
-    if (fence === null) return;
-    this.sql.exec(
-      `UPDATE writer_lease SET expires_at = 0
-       WHERE singleton = 1 AND client_id = ? AND connection_id = ? AND fence = ?`,
-      clientId,
-      connectionId,
-      fence,
-    );
-  }
-
-  private liveWriterAttachment(
-    webSocket: WebSocket,
-    expected: SocketAttachment,
-    now: number,
-  ): LiveWriterAttachment | undefined {
-    const current = readAttachment(webSocket);
-    if (
-      webSocket.readyState !== WebSocket.OPEN ||
-      current?.peer !== "browser" ||
-      current.channel !== "control" ||
-      current.role !== "writer" ||
-      current.controlState !== "active" ||
-      current.clientId === null ||
-      current.clientId !== expected.clientId ||
-      current.connectionId !== expected.connectionId ||
-      current.connectionSetId !== expected.connectionSetId ||
-      current.leaseFence === null ||
-      current.leaseFence !== expected.leaseFence ||
-      current.leaseExpiresAt === null ||
-      current.leaseExpiresAt <= now ||
-      this.activeBrowserControl(current.clientId) !== webSocket
-    ) {
-      return undefined;
-    }
-    return current as LiveWriterAttachment;
-  }
-
-  private recordDroppedBrowserInput(
-    attachment: SocketAttachment,
-    message: ArrayBuffer | string,
-    timing: BrowserControlTiming,
-    disposition: Extract<CloudInputDisposition, "lane-expired" | "lane-overload">,
-  ): void {
-    if (typeof message !== "string" || attachment.clientId === null) return;
-    let frame: ClientControlFrame;
-    try {
-      frame = decodeControlFrame(message, ClientControlFrameSchema);
-    } catch {
-      return;
-    }
-    if (!isSemanticInputFrame(frame)) return;
-    this.recordInputSpan(frame, attachment, timing, disposition, null, attachment.leaseFence);
-  }
-
-  private recordInputSpan(
-    frame: SemanticInputFrame,
-    attachment: SocketAttachment,
-    timing: BrowserControlTiming | undefined,
-    disposition: CloudInputDisposition,
-    hostSendAtMs: number | null,
-    writerFence: string | null,
-  ): void {
-    if (timing === undefined || attachment.clientId === null) return;
-    this.inputTelemetry.record({
-      clientId: attachment.clientId,
-      clientInputSeq: frame.clientInputSeq,
-      connectionId: attachment.connectionId,
-      disposition,
-      hostSendAtMs,
-      inputEpoch: frame.inputEpoch,
-      queueEnteredAtMs: timing.enqueuedAtMs,
-      queueLeftAtMs: timing.startedAtMs,
-      receivedAtMs: timing.receivedAtMs,
-      writerFence,
-    });
-  }
-
   private session(): SessionRow | undefined {
     return this.store.session();
   }
@@ -2351,10 +2029,6 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
 
   private clientByStream(streamId: number): ClientRow | undefined {
     return this.store.clientByStream(streamId);
-  }
-
-  private writerLease(): WriterLeaseRow | undefined {
-    return this.store.writerLease();
   }
 
   private ticket(ticketDigest: string): TicketRow | undefined {
@@ -2575,7 +2249,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
       closeProtocol(webSocket, reason);
       return;
     }
-    this.releaseWriterLease(attachment.clientId, attachment.leaseFence, attachment.connectionId);
+    this.writerAuthority.release(
+      attachment.clientId,
+      attachment.leaseFence,
+      attachment.connectionId,
+    );
     this.connections.closeConnectionSet(attachment.connectionSetId);
     this.closeSockets(
       (candidate) => {

@@ -3,13 +3,11 @@ import {
   CloudResourceIdSchema,
   ConnectionSetRequestSchema,
   ConnectionSetResponseSchema,
-  MAX_DELIVERY_OUTSTANDING_BYTES,
   RELAY_CAPABILITIES_HEADER,
   RelayCapability,
   ServerControlFrameSchema,
   decodeDataFrame,
   decodeDataFrameBatchEntries,
-  deliveryOutstandingBytes,
   type BrowserCapabilityRole,
   type ClientControlFrame,
   type ReplicaCursor,
@@ -24,6 +22,7 @@ import {
 } from "@zhongduan/session-client";
 
 import type { CapabilityManager } from "./capability";
+import { DeliveryAckCoalescer } from "./delivery-ack-coalescer";
 import type { InputDispatcher, InputTransportSendResult } from "./input-dispatcher";
 
 const CLIENT_ID_PREFIX = "zhongduan:browser-client:";
@@ -46,9 +45,6 @@ const SOCKET_REPLACED_REASON = "connection replaced";
 // A legal 1 MiB input can expand to six bytes per byte when JSON escapes control characters.
 const MAX_CONTROL_FRAME_BYTES = 6 * 1024 * 1024 + 4_096;
 const MAX_CONTROL_QUEUE_BYTES = MAX_CONTROL_FRAME_BYTES;
-const DELIVERY_ACK_FLUSH_INTERVAL_MS = 10;
-const DELIVERY_ACK_FLUSH_BYTES = MAX_DELIVERY_OUTSTANDING_BYTES / 16;
-const DELIVERY_ACK_FLUSH_EVENTS = 256n;
 const textEncoder = new TextEncoder();
 
 type SessionPhase =
@@ -149,6 +145,7 @@ export class TerminalSession {
   readonly #storage?: TerminalSessionOptions["storage"];
   readonly #listeners = new Set<() => void>();
   readonly #intentionalSockets = new WeakSet<WebSocket>();
+  readonly #deliveryAcks: DeliveryAckCoalescer;
   readonly coordinator: SessionCoordinator;
   #snapshot: TerminalSessionSnapshot;
   #control: WebSocket | null = null;
@@ -173,10 +170,7 @@ export class TerminalSession {
   #heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   #attachStartTimer: ReturnType<typeof setTimeout> | null = null;
   #writerLeaseTimer: ReturnType<typeof setTimeout> | null = null;
-  #acknowledgementTimer: ReturnType<typeof setTimeout> | null = null;
   #snapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  #pendingAcknowledgement: ReplicaCursor | null = null;
-  #lastAcknowledgedCursor: ReplicaCursor | null = null;
   #snapshotFailureCount = 0;
   #lastControlPongAt = 0;
   #lastDataPongAt = 0;
@@ -210,11 +204,31 @@ export class TerminalSession {
       phase: "idle",
       role: options.capabilities.role,
     };
+    this.#deliveryAcks = new DeliveryAckCoalescer({
+      clearTimer: this.#clearTimer,
+      connectionEpoch: () => this.#connectionEpoch,
+      deliveryGeneration: () => this.#generation,
+      isConnectionCurrent: (connectionEpoch) => this.#isCurrentConnection(connectionEpoch),
+      isDeliveryLive: () => this.coordinator.state === "live",
+      protocolFailure: () => this.#protocolFailure(),
+      send: (cursor) =>
+        this.#sendControl(
+          ClientControlFrameSchema.parse({
+            type: "ack",
+            sessionEpoch: cursor.sessionEpoch.toString(),
+            deliveryGeneration: cursor.deliveryGeneration.toString(),
+            eventSeq: cursor.lastEventSeq.toString(),
+            nextPtyOffset: cursor.nextPtyOffset.toString(),
+          }),
+          true,
+        ),
+      setTimer: this.#setTimer,
+    });
     this.coordinator = new SessionCoordinator({
       host: options.host,
       ...(options.initialCursor === undefined ? {} : { initialCursor: options.initialCursor }),
       snapshots: options.snapshots,
-      onAcknowledge: (cursor) => this.#acknowledge(cursor),
+      onAcknowledge: (cursor) => this.#deliveryAcks.acknowledge(cursor),
       onReplicaProgress: () => this.#syncDeliveryState(),
       onResync: (reason) => this.#handleCoordinatorResync(reason),
     });
@@ -585,7 +599,7 @@ export class TerminalSession {
             nextPtyOffset: cursor.nextPtyOffset.toString(),
           };
     if (this.#sendControl(ClientControlFrameSchema.parse(frame), true)) {
-      this.#resetAcknowledgementState(
+      this.#deliveryAcks.reset(
         cursor === null ? null : { ...cursor, deliveryGeneration: generation },
       );
       this.#startAttachStartWatchdog(generation);
@@ -762,7 +776,7 @@ export class TerminalSession {
     const dataEpoch = ++this.#dataEpoch;
     const abort = new AbortController();
     this.#replacementAbort = abort;
-    this.#resetAcknowledgementState();
+    this.#deliveryAcks.reset();
     this.#generation = generation;
     this.#input.noteDataTransportReplacement();
     this.#input.setReplicaCurrent(false);
@@ -812,79 +826,6 @@ export class TerminalSession {
       return false;
     }
     return true;
-  }
-
-  #acknowledge(cursor: ReplicaCursor): void {
-    if (cursor.deliveryGeneration !== this.#generation) return;
-    const previous = this.#pendingAcknowledgement ?? this.#lastAcknowledgedCursor;
-    if (
-      previous !== null &&
-      (cursor.sessionEpoch !== previous.sessionEpoch ||
-        cursor.deliveryGeneration !== previous.deliveryGeneration ||
-        cursor.lastEventSeq < previous.lastEventSeq ||
-        cursor.nextPtyOffset < previous.nextPtyOffset)
-    ) {
-      this.#protocolFailure();
-      return;
-    }
-    if (
-      previous !== null &&
-      cursor.lastEventSeq === previous.lastEventSeq &&
-      cursor.nextPtyOffset === previous.nextPtyOffset
-    ) {
-      return;
-    }
-
-    this.#pendingAcknowledgement = { ...cursor };
-    const last = this.#lastAcknowledgedCursor;
-    if (
-      last === null ||
-      this.coordinator.state !== "live" ||
-      cursor.lastEventSeq - last.lastEventSeq >= DELIVERY_ACK_FLUSH_EVENTS ||
-      deliveryOutstandingBytes(
-        { eventSeq: last.lastEventSeq, nextPtyOffset: last.nextPtyOffset },
-        { eventSeq: cursor.lastEventSeq, nextPtyOffset: cursor.nextPtyOffset },
-      ) >= BigInt(DELIVERY_ACK_FLUSH_BYTES)
-    ) {
-      this.#flushAcknowledgement();
-      return;
-    }
-    if (this.#acknowledgementTimer !== null) return;
-    const connectionEpoch = this.#connectionEpoch;
-    const generation = cursor.deliveryGeneration;
-    this.#acknowledgementTimer = this.#setTimer(() => {
-      this.#acknowledgementTimer = null;
-      if (!this.#isCurrentConnection(connectionEpoch) || this.#generation !== generation) return;
-      this.#flushAcknowledgement();
-    }, DELIVERY_ACK_FLUSH_INTERVAL_MS);
-  }
-
-  #flushAcknowledgement(): void {
-    if (this.#acknowledgementTimer !== null) {
-      this.#clearTimer(this.#acknowledgementTimer);
-      this.#acknowledgementTimer = null;
-    }
-    const cursor = this.#pendingAcknowledgement;
-    this.#pendingAcknowledgement = null;
-    if (cursor === null || cursor.deliveryGeneration !== this.#generation) return;
-    const sent = this.#sendControl(
-      ClientControlFrameSchema.parse({
-        type: "ack",
-        sessionEpoch: cursor.sessionEpoch.toString(),
-        deliveryGeneration: cursor.deliveryGeneration.toString(),
-        eventSeq: cursor.lastEventSeq.toString(),
-        nextPtyOffset: cursor.nextPtyOffset.toString(),
-      }),
-      true,
-    );
-    if (sent) this.#lastAcknowledgedCursor = cursor;
-  }
-
-  #resetAcknowledgementState(cursor: ReplicaCursor | null = null): void {
-    if (this.#acknowledgementTimer !== null) this.#clearTimer(this.#acknowledgementTimer);
-    this.#acknowledgementTimer = null;
-    this.#pendingAcknowledgement = null;
-    this.#lastAcknowledgedCursor = cursor === null ? null : { ...cursor };
   }
 
   #sendControl(frame: ClientControlFrame, critical = false): boolean {
@@ -1146,7 +1087,7 @@ export class TerminalSession {
     this.#cancelAttachStartWatchdog();
     this.#stopHeartbeat();
     this.#stopWriterLeaseRenewal();
-    this.#resetAcknowledgementState();
+    this.#deliveryAcks.reset();
     this.#input.detachTransport();
     this.#writerLease = null;
     this.#writerFence = null;
