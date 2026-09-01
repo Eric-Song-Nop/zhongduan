@@ -17,8 +17,10 @@ are before the configured network delay.
   quantization noise.
 - CANDIDATE is five clean runs of the 100/100 ms, no-jitter steady cell, with 24 measured samples and
   four warmups per run: 120 measured Browser samples total.
-- The nearest-rank candidate p99 must not exceed CURRENT p99. A missing, zero, non-finite, stale, dirty,
-  wrong-profile, incomplete, or non-recomputable population fails closed.
+- The nearest-rank candidate p99 must not exceed CURRENT p99. Individual durations are normalized to
+  the harness's declared 0.1 ms Browser-clock resolution before this comparison; the report also
+  retains the unquantized p50/p95/p99/max so sub-bucket arithmetic is never hidden. A missing, zero,
+  non-finite, stale, dirty, wrong-profile, incomplete, or non-recomputable population fails closed.
 - The run is inside the E0 supported-load envelope. It deliberately does not claim queue saturation,
   E1 hard-limit throughput, Cloudflare edge latency, E2 lane isolation, or E3 Host behavior. The E1
   hard limits remain safety contracts proven by invariant and overload tests.

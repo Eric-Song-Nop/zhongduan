@@ -37,6 +37,7 @@
     "startEvent": "browser.keydown",
     "endEvent": "browser.send-decision",
     "statistic": "p99-nearest-rank",
+    "durationResolutionMs": 0.1,
     "currentReport": "../terminal-journey/current-baseline.json",
     "currentScenarioSelector": {
       "variant": "steady",
@@ -45,7 +46,7 @@
     "expectedCurrentScenarioCount": 17,
     "minimumCurrentSamples": 408,
     "minimumCandidateSamples": 120,
-    "candidateComparison": "candidate-p99/current-p99",
+    "candidateComparison": "quantized-candidate-p99/quantized-current-p99",
     "maximumRegressionRatioToCurrent": 1
   },
   "artifactLimits": {

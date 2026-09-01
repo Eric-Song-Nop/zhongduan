@@ -59,6 +59,7 @@ describe("E1 Browser latency contract", () => {
     expect(() => validateE1BrowserLatencyContract(contract, e0Contract)).not.toThrow();
     expect((contract["measurement"] as Data)["minimumCandidateSamples"]).toBe(120);
     expect((contract["measurement"] as Data)["maximumRegressionRatioToCurrent"]).toBe(1);
+    expect((contract["measurement"] as Data)["durationResolutionMs"]).toBe(0.1);
     expect((contract["evidenceBoundary"] as Data)["saturatesE1HardLimits"]).toBe(false);
   });
 
@@ -66,8 +67,16 @@ describe("E1 Browser latency contract", () => {
     const evidence = passingEvidence();
     const currentMeasurement = (evidence.report["current"] as Data)["measurement"] as Data;
     const candidateMeasurement = (evidence.report["candidate"] as Data)["measurement"] as Data;
-    expect(currentMeasurement).toMatchObject({ sampleCount: 408, p99Ms: 0.4 });
-    expect(candidateMeasurement).toMatchObject({ sampleCount: 120, p99Ms: 0.3001 });
+    expect(currentMeasurement).toMatchObject({
+      sampleCount: 408,
+      p99Ms: 0.4,
+      comparisonP99Ms: 0.4,
+    });
+    expect(candidateMeasurement).toMatchObject({
+      sampleCount: 120,
+      p99Ms: 0.3001,
+      comparisonP99Ms: 0.3,
+    });
     expect(evidence.report["status"]).toBe("passed");
     expect(() => assertE1BrowserLatencyGate(evidence.report)).not.toThrow();
   });

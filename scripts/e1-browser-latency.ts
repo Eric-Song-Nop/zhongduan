@@ -113,6 +113,7 @@ function expectedContract(e0Contract: Data): Data {
       startEvent: "browser.keydown",
       endEvent: "browser.send-decision",
       statistic: "p99-nearest-rank",
+      durationResolutionMs: 0.1,
       currentReport: "../terminal-journey/current-baseline.json",
       currentScenarioSelector: {
         variant: "steady",
@@ -122,7 +123,7 @@ function expectedContract(e0Contract: Data): Data {
       expectedCurrentScenarioCount: 17,
       minimumCurrentSamples: 408,
       minimumCandidateSamples: 120,
-      candidateComparison: "candidate-p99/current-p99",
+      candidateComparison: "quantized-candidate-p99/quantized-current-p99",
       maximumRegressionRatioToCurrent: 1,
     },
     artifactLimits: {
@@ -252,18 +253,22 @@ function spanSamples(contract: Data, e0Contract: Data, scenarios: Data[], label:
   return durations;
 }
 
-function measurementSummary(span: unknown, values: number[]): Data {
+function measurementSummary(span: unknown, values: number[], resolutionMs: number): Data {
   if (typeof span !== "string" || values.length === 0) {
     throw new ContractError("Browser latency measurement has no samples");
   }
+  if (resolutionMs <= 0) throw new ContractError("Browser duration resolution must be positive");
+  const quantized = values.map((value) => round(value / resolutionMs, 0) * resolutionMs);
   return {
     span,
     statistic: "p99-nearest-rank",
+    durationResolutionMs: resolutionMs,
     sampleCount: values.length,
     p50Ms: round(percentile(values, 0.5), 6),
     p95Ms: round(percentile(values, 0.95), 6),
     p99Ms: round(percentile(values, 0.99), 6),
     maxMs: round(Math.max(...values), 6),
+    comparisonP99Ms: round(percentile(quantized, 0.99), 6),
   };
 }
 
@@ -312,10 +317,22 @@ export function assembleE1BrowserLatencyEvidence(
   ) {
     throw new ContractError("CANDIDATE Browser population is not the exact frozen population");
   }
-  const currentMeasurement = measurementSummary(measurement["span"], currentValues);
-  const candidateMeasurement = measurementSummary(measurement["span"], candidateValues);
-  const currentP99Ms = finite(currentMeasurement["p99Ms"], "CURRENT p99");
-  const candidateP99Ms = finite(candidateMeasurement["p99Ms"], "CANDIDATE p99");
+  const durationResolutionMs = finite(
+    measurement["durationResolutionMs"],
+    "Browser duration resolution",
+  );
+  const currentMeasurement = measurementSummary(
+    measurement["span"],
+    currentValues,
+    durationResolutionMs,
+  );
+  const candidateMeasurement = measurementSummary(
+    measurement["span"],
+    candidateValues,
+    durationResolutionMs,
+  );
+  const currentP99Ms = finite(currentMeasurement["comparisonP99Ms"], "CURRENT p99");
+  const candidateP99Ms = finite(candidateMeasurement["comparisonP99Ms"], "CANDIDATE p99");
   if (currentP99Ms <= 0) throw new ContractError("CURRENT p99 must be finite and non-zero");
   const ratio = round(candidateP99Ms / currentP99Ms, 9);
   const maximumRatio = finite(
@@ -369,6 +386,8 @@ export function assembleE1BrowserLatencyEvidence(
       },
       comparison: {
         operation: measurement["candidateComparison"],
+        currentRawP99Ms: currentMeasurement["p99Ms"],
+        candidateRawP99Ms: candidateMeasurement["p99Ms"],
         currentP99Ms,
         candidateP99Ms,
         value: ratio,
