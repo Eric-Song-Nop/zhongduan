@@ -18,6 +18,8 @@ export interface QueueTaskTiming {
   waitMs: number;
 }
 
+export type QueueExpirationReason = "age" | "global-overload";
+
 interface QueueUsage {
   bytes: number;
   count: number;
@@ -29,11 +31,14 @@ interface QueueReservation<Key extends object> {
 }
 
 interface KeyedQueueEntry<Key extends object> extends QueueReservation<Key> {
+  deadline: ReturnType<typeof setTimeout> | undefined;
   enqueuedAtMs: number;
-  expire: (timing: QueueTaskTiming) => Promise<void> | void;
+  expire: (timing: QueueTaskTiming, reason: QueueExpirationReason) => Promise<void> | void;
   reject: (reason: unknown) => void;
   resolve: () => void;
   run: (timing: QueueTaskTiming) => Promise<void> | void;
+  startedAtMs: number | undefined;
+  state: "active" | "queued" | "settled";
 }
 
 export const RELAY_MESSAGE_QUEUE_LIMITS: QueueLimits = {
@@ -136,8 +141,11 @@ export class BoundedSerialQueue<Key extends object> {
 
 /**
  * A bounded, keyed execution lane. Work for one key is strictly FIFO; ready keys rotate after each
- * task so one connection cannot monopolize the lane. Independent keys can execute up to the declared
- * concurrency without sharing the bulk relay's serial tail.
+ * task so one connection cannot monopolize the lane. Every entry has an enqueue-relative hard
+ * deadline; expiry releases the entire key even if its active head never settles. Independent keys
+ * can execute up to the declared concurrency without sharing the bulk relay's serial tail. At global
+ * pressure, a lower-occupancy key evicts the largest actual occupant rather than inheriting its
+ * overload.
  */
 export class BoundedKeyedQueue<Key extends object> {
   readonly #limits: KeyedQueueLimits;
@@ -177,7 +185,7 @@ export class BoundedKeyedQueue<Key extends object> {
     key: Key,
     bytes: number,
     run: (timing: QueueTaskTiming) => Promise<void> | void,
-    expire: (timing: QueueTaskTiming) => Promise<void> | void,
+    expire: (timing: QueueTaskTiming, reason: QueueExpirationReason) => Promise<void> | void,
     socketLimits: SocketQueueLimits = this.#limits,
   ): Promise<void> | undefined {
     if (!this.#reserve(key, bytes, socketLimits)) return undefined;
@@ -191,13 +199,17 @@ export class BoundedKeyedQueue<Key extends object> {
     });
     const entry: KeyedQueueEntry<Key> = {
       bytes,
+      deadline: undefined,
       enqueuedAtMs,
       expire,
       key,
       reject,
       resolve,
       run,
+      startedAtMs: undefined,
+      state: "queued",
     };
+    entry.deadline = setTimeout(() => this.#expireKey(key, "age", entry), this.#limits.maxAgeMs);
     const pending = this.#pending.get(key);
     if (pending === undefined) this.#pending.set(key, [entry]);
     else pending.push(entry);
@@ -208,15 +220,17 @@ export class BoundedKeyedQueue<Key extends object> {
 
   #reserve(key: Key, bytes: number, socketLimits: SocketQueueLimits): boolean {
     if (!Number.isSafeInteger(bytes) || bytes < 0) return false;
-    const socket = this.#socketUsage.get(key) ?? { bytes: 0, count: 0 };
+    let socket = this.#socketUsage.get(key) ?? { bytes: 0, count: 0 };
     if (
-      this.#globalUsage.count + 1 > this.#limits.globalCount ||
-      this.#globalUsage.bytes + bytes > this.#limits.globalBytes ||
       socket.count + 1 > socketLimits.socketCount ||
       socket.bytes + bytes > socketLimits.socketBytes
     ) {
       return false;
     }
+    if (!this.#makeGlobalRoom(key, bytes)) {
+      return false;
+    }
+    socket = this.#socketUsage.get(key) ?? { bytes: 0, count: 0 };
 
     this.#globalUsage = {
       bytes: this.#globalUsage.bytes + bytes,
@@ -224,6 +238,45 @@ export class BoundedKeyedQueue<Key extends object> {
     };
     this.#socketUsage.set(key, { bytes: socket.bytes + bytes, count: socket.count + 1 });
     return true;
+  }
+
+  #makeGlobalRoom(key: Key, bytes: number): boolean {
+    while (
+      this.#globalUsage.count + 1 > this.#limits.globalCount ||
+      this.#globalUsage.bytes + bytes > this.#limits.globalBytes
+    ) {
+      const current = this.#socketUsage.get(key) ?? { bytes: 0, count: 0 };
+      const currentScore = this.#usageScore(current);
+      let largest: Key | undefined;
+      let largestScore = currentScore;
+      for (const [candidate, usage] of this.#socketUsage) {
+        if (candidate === key) continue;
+        const score = this.#usageScore(usage);
+        if (score > largestScore) {
+          largest = candidate;
+          largestScore = score;
+        }
+      }
+      if (largest === undefined) return false;
+      this.#expireKey(largest, "global-overload");
+    }
+    return true;
+  }
+
+  #usageScore(usage: QueueUsage): number {
+    const byteShare =
+      this.#limits.globalBytes === 0
+        ? usage.bytes === 0
+          ? 0
+          : Number.POSITIVE_INFINITY
+        : usage.bytes / this.#limits.globalBytes;
+    const countShare =
+      this.#limits.globalCount === 0
+        ? usage.count === 0
+          ? 0
+          : Number.POSITIVE_INFINITY
+        : usage.count / this.#limits.globalCount;
+    return Math.max(byteShare, countShare);
   }
 
   #markReady(key: Key): void {
@@ -241,12 +294,14 @@ export class BoundedKeyedQueue<Key extends object> {
       if (entry === undefined || this.#activeKeys.has(key)) continue;
       this.#activeKeys.add(key);
       this.#activeCount += 1;
+      entry.state = "active";
       this.#run(entry);
     }
   }
 
   #run(entry: KeyedQueueEntry<Key>): void {
     const startedAtMs = this.#now();
+    entry.startedAtMs = startedAtMs;
     const timing = {
       enqueuedAtMs: entry.enqueuedAtMs,
       startedAtMs,
@@ -254,7 +309,11 @@ export class BoundedKeyedQueue<Key extends object> {
     } satisfies QueueTaskTiming;
     let processing: Promise<void> | void;
     try {
-      processing = timing.waitMs > this.#limits.maxAgeMs ? entry.expire(timing) : entry.run(timing);
+      if (timing.waitMs >= this.#limits.maxAgeMs) {
+        this.#expireKey(entry.key, "age", entry);
+        return;
+      }
+      processing = entry.run(timing);
     } catch (error) {
       this.#reject(entry, error);
       return;
@@ -270,11 +329,13 @@ export class BoundedKeyedQueue<Key extends object> {
   }
 
   #resolve(entry: KeyedQueueEntry<Key>): void {
+    if (entry.state === "settled") return;
     entry.resolve();
     this.#finish(entry);
   }
 
   #reject(entry: KeyedQueueEntry<Key>, error: unknown): void {
+    if (entry.state === "settled") return;
     entry.reject(error);
     this.#finish(entry);
   }
@@ -287,6 +348,55 @@ export class BoundedKeyedQueue<Key extends object> {
     pending.shift();
     if (pending.length === 0) this.#pending.delete(entry.key);
 
+    entry.state = "settled";
+    if (entry.deadline !== undefined) clearTimeout(entry.deadline);
+    entry.deadline = undefined;
+    this.#releaseReservation(entry);
+
+    this.#activeKeys.delete(entry.key);
+    this.#activeCount -= 1;
+    if (pending.length > 0) this.#markReady(entry.key);
+    this.#pump();
+  }
+
+  #expireKey(key: Key, reason: QueueExpirationReason, trigger?: KeyedQueueEntry<Key>): void {
+    const entries = this.#pending.get(key);
+    if (entries === undefined || (trigger !== undefined && !entries.includes(trigger))) return;
+
+    this.#pending.delete(key);
+    this.#readyKeys.delete(key);
+    for (let index = this.#readyOrder.length - 1; index >= 0; index -= 1) {
+      if (this.#readyOrder[index] === key) this.#readyOrder.splice(index, 1);
+    }
+    if (this.#activeKeys.delete(key)) this.#activeCount -= 1;
+
+    const expiredAtMs = this.#now();
+    for (const entry of entries) {
+      if (entry.state === "settled") continue;
+      entry.state = "settled";
+      if (entry.deadline !== undefined) clearTimeout(entry.deadline);
+      entry.deadline = undefined;
+      this.#releaseReservation(entry);
+      const startedAtMs = entry.startedAtMs ?? expiredAtMs;
+      const timing = {
+        enqueuedAtMs: entry.enqueuedAtMs,
+        startedAtMs,
+        waitMs: Math.max(0, startedAtMs - entry.enqueuedAtMs),
+      } satisfies QueueTaskTiming;
+      let expiration: Promise<void> | void;
+      try {
+        expiration = entry.expire(timing, reason);
+      } catch (error) {
+        entry.reject(error);
+        continue;
+      }
+      if (expiration === undefined) entry.resolve();
+      else void expiration.then(entry.resolve, entry.reject);
+    }
+    this.#pump();
+  }
+
+  #releaseReservation(entry: QueueReservation<Key>): void {
     const socket = this.#socketUsage.get(entry.key);
     if (socket === undefined) throw new Error("keyed queue reservation is missing");
     this.#globalUsage = {
@@ -296,10 +406,5 @@ export class BoundedKeyedQueue<Key extends object> {
     const next = { bytes: socket.bytes - entry.bytes, count: socket.count - 1 };
     if (next.count === 0) this.#socketUsage.delete(entry.key);
     else this.#socketUsage.set(entry.key, next);
-
-    this.#activeKeys.delete(entry.key);
-    this.#activeCount -= 1;
-    if (pending.length > 0) this.#markReady(entry.key);
-    this.#pump();
   }
 }

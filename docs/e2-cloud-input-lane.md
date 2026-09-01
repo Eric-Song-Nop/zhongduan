@@ -44,19 +44,24 @@ The Browser-lane source-of-truth limits are exported from
 
 | Resource                         |                  Hard limit | Over-limit behavior                                     |
 | -------------------------------- | --------------------------: | ------------------------------------------------------- |
-| Browser lane bytes               |                      32 MiB | reject admission and isolate the source connection      |
-| Browser lane frames              |                         512 | reject admission and isolate the source connection      |
+| Browser lane bytes               |                      32 MiB | isolate the largest occupying connection                |
+| Browser lane frames              |                         512 | isolate the largest occupying connection                |
 | One Browser connection bytes     |                      16 MiB | isolate only that connection set                        |
 | One Browser connection frames    |                          64 | isolate only that connection set                        |
 | Queue residence                  |                      250 ms | expire the frame and isolate only that connection set   |
 | Independent active connections   |                           4 | retain per-connection FIFO and rotate ready connections |
 | Host input socket buffered bytes |                       8 MiB | terminate the writer input epoch before accepting more  |
 | Host transport batch             | 256 KiB / 64 logical frames | reject the batch and fail the current Host pair         |
-| Host data messages in flight     |                           1 | fail the current Host pair                               |
-| Host retained batch work         | 8 MiB / 8192 logical frames | close the Host relay pair                                |
+| Host data messages in flight     |                           1 | fail the current Host pair                              |
+| Host retained batch work         | 8 MiB / 8192 logical frames | close the Host relay pair                               |
 
-Reservations include executing work and are released on success, expiry, or exception. A noisy
-Browser cannot close a healthy Host or consume another Browser's per-connection allowance.
+Every queued or executing entry owns an independent 250 ms deadline. When one deadline fires, the
+lane expires that connection key, closes the source, and releases all of its active and pending
+reservations without waiting for a stuck head task. At global admission pressure, a new or
+lower-occupancy connection evicts the largest actual lane occupant; a high-occupancy source cannot
+evict a healthier source to admit more of its own work. Reservations otherwise release on success or
+exception. A noisy Browser cannot close a healthy Host or consume another Browser's per-connection
+allowance.
 
 The negotiated Host message is the exact concatenation of independently valid v2 frames, without a
 second envelope. For an all-canonical live batch, Cloud validates every logical frame in order, then
@@ -68,6 +73,13 @@ yield between logical frames. Host frames whose payload is 3–256 bytes are kep
 bulk batches, so small interactive output is not coalesced with the bulk bytes that immediately
 overwrite it. Older peers neither send batches nor expect `data-ack`, which makes rollout
 capability-gated in each direction.
+
+A delivery barrier may wait behind the one credited canonical batch, but that local retention is not
+the recovery marker linearization point. The batching layer returns a send receipt only after the
+barrier-containing batch has reached `WebSocket.send`; only then does recovery enter
+`marker-uncertain` and start its five-second outcome timeout. An early synchronous result is retained
+until the same receipt, so batching cannot move the frozen pause/barrier/pin boundary back into a Host
+queue.
 
 This follows Cloudflare's recommendation to batch logical WebSocket messages when per-message context
 switching becomes material, while the credit adds the E2-specific ingress bound; see
@@ -130,8 +142,10 @@ The Worker tests cover the E2 failure and load boundaries:
 - a legacy Host keeps one frame per WebSocket message and never waits for the new acknowledgement;
 - 64 live cursor advances produce one cumulative Browser ACK for the latest cursor, while recovery
   ACKs and replacement resets remain immediate;
-- per-connection FIFO, cross-connection progress, fair rotation, bytes/count rejection, age expiry,
-  and reservation cleanup are deterministic queue tests;
+- per-connection FIFO, cross-connection progress, fair rotation, largest-source overload isolation,
+  active-head hard expiry, and immediate reservation cleanup are deterministic queue tests;
+- a recovery barrier held behind an unacknowledged canonical batch cannot enter marker uncertainty or
+  consume its timeout until the batch receives credit and the barrier reaches `WebSocket.send`;
 - higher-fence replacement, heartbeat expiry, socket close, hibernation, and delayed displaced input
   prove that an old writer connection has zero successful Host sends;
 - a throwing Host send returns `uncertain`, closes both Host authority and the writer input epoch, and

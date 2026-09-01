@@ -36,6 +36,12 @@ const MIN_LATENCY_SENSITIVE_DATA_FRAME_BYTES = DATA_HEADER_BYTES + 3;
 const MAX_LATENCY_SENSITIVE_DATA_FRAME_BYTES = DATA_HEADER_BYTES + 256;
 const textEncoder = new TextEncoder();
 
+interface PendingDataFrame {
+  readonly bytes: Uint8Array;
+  readonly rejectSent?: (error: unknown) => void;
+  readonly resolveSent?: () => void;
+}
+
 export interface HostRelayConnectionOptions {
   heartbeatIntervalMs?: number;
   heartbeatTimeoutMs?: number;
@@ -72,7 +78,7 @@ export class HostRelayConnection {
   #dataBatchScheduled = false;
   #inFlightDataBytes = 0;
   #pendingDataBytes = 0;
-  readonly #pendingDataFrames: Uint8Array[] = [];
+  readonly #pendingDataFrames: PendingDataFrame[] = [];
   #queuedControlBytes = 0;
   #queuedControlCount = 0;
   #ready = false;
@@ -116,6 +122,7 @@ export class HostRelayConnection {
       closePair: (reason) => this.#close(1011, reason),
       sendControl: (frame) => this.#sendControl(frame),
       sendData: (frame) => this.#sendData(frame),
+      sendDataWithReceipt: (frame) => this.#sendDataWithReceipt(frame),
       session: this.#session,
       ...(options.snapshotCheckpointCache === undefined
         ? {}
@@ -359,6 +366,24 @@ export class HostRelayConnection {
   }
 
   #sendData(frame: Uint8Array): void {
+    this.#enqueueData(frame);
+  }
+
+  #sendDataWithReceipt(frame: Uint8Array): Promise<void> {
+    let rejectSent!: (error: unknown) => void;
+    let resolveSent!: () => void;
+    const receipt = new Promise<void>((resolve, reject) => {
+      rejectSent = reject;
+      resolveSent = resolve;
+    });
+    this.#enqueueData(frame, { rejectSent, resolveSent });
+    return receipt;
+  }
+
+  #enqueueData(
+    frame: Uint8Array,
+    receipt: Pick<PendingDataFrame, "rejectSent" | "resolveSent"> = {},
+  ): void {
     if (this.#closed || this.#pair.data.readyState !== WebSocket.OPEN) {
       throw new Error("Host data WebSocket is not open");
     }
@@ -367,6 +392,7 @@ export class HostRelayConnection {
     }
     if (!this.#dataBatchEnabled) {
       this.#sendRawData(frame);
+      receipt.resolveSent?.();
       return;
     }
     if (frame.byteLength > MAX_DATA_BATCH_BYTES) {
@@ -382,7 +408,7 @@ export class HostRelayConnection {
     ) {
       throw new Error("Host data WebSocket buffer exceeded");
     }
-    this.#pendingDataFrames.push(frame);
+    this.#pendingDataFrames.push({ bytes: frame, ...receipt });
     this.#pendingDataBytes += frame.byteLength;
     if (
       this.#pendingDataFrames.length >= MAX_DATA_BATCH_FRAMES ||
@@ -409,7 +435,7 @@ export class HostRelayConnection {
     let count = 0;
     let bytes = 0;
     while (count < this.#pendingDataFrames.length && count < MAX_DATA_BATCH_FRAMES) {
-      const next = this.#pendingDataFrames[count]!;
+      const next = this.#pendingDataFrames[count]!.bytes;
       const latencySensitive =
         next.byteLength >= MIN_LATENCY_SENSITIVE_DATA_FRAME_BYTES &&
         next.byteLength <= MAX_LATENCY_SENSITIVE_DATA_FRAME_BYTES;
@@ -419,10 +445,16 @@ export class HostRelayConnection {
       count += 1;
       if (latencySensitive) break;
     }
-    const frames = this.#pendingDataFrames.splice(0, count);
+    const pending = this.#pendingDataFrames.splice(0, count);
     this.#pendingDataBytes -= bytes;
-    const encoded = encodeDataFrameBatch(frames);
-    this.#sendRawData(encoded);
+    const encoded = encodeDataFrameBatch(pending.map(({ bytes: frame }) => frame));
+    try {
+      this.#sendRawData(encoded);
+    } catch (error) {
+      for (const entry of pending) entry.rejectSent?.(error);
+      throw error;
+    }
+    for (const entry of pending) entry.resolveSent?.();
     this.#inFlightDataBytes = encoded.byteLength;
   }
 
@@ -466,7 +498,8 @@ export class HostRelayConnection {
     this.#closed = true;
     this.#pairFence = null;
     this.#ready = false;
-    this.#pendingDataFrames.length = 0;
+    const pendingDataFrames = this.#pendingDataFrames.splice(0);
+    for (const entry of pendingDataFrames) entry.rejectSent?.(new Error(reason));
     this.#inFlightDataBytes = 0;
     this.#pendingDataBytes = 0;
     if (this.#heartbeatTimer !== undefined) clearTimeout(this.#heartbeatTimer);

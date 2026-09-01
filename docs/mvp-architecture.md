@@ -35,12 +35,12 @@ Browser wterm
 
 ## CURRENT owner 与生命周期
 
-| 执行 owner                                                           | 当前拥有的状态与工作                                                                                                               | 当前串行化边界与生命周期                                                                                                                                                                    |
-| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Host `TerminalSession` actor                                         | PTY、authoritative Ghostty core、`eventSeq`、`nextPtyOffset`、journal append、writer fence 和 input result cache                   | PTY output、semantic input、resize、query response 和 snapshot capture 共用一个同步队列；生命周期等于本地 PTY session                                                                       |
-| Host `HostRelayConnection` / `HostDeliveryScheduler`                 | 一对 Cloud control/data socket、canonical publisher、attach recovery queue、一个 active recovery、一个 delivery barrier waiter     | control frame 共用一条 Promise chain；协商后 Host data 使用单 in-flight credit 与有界 transport batch；recovery attempt 逐个执行；relay 重连不终止 PTY                                      |
+| 执行 owner                                                           | 当前拥有的状态与工作                                                                                                               | 当前串行化边界与生命周期                                                                                                                                                                                                |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Host `TerminalSession` actor                                         | PTY、authoritative Ghostty core、`eventSeq`、`nextPtyOffset`、journal append、writer fence 和 input result cache                   | PTY output、semantic input、resize、query response 和 snapshot capture 共用一个同步队列；生命周期等于本地 PTY session                                                                                                   |
+| Host `HostRelayConnection` / `HostDeliveryScheduler`                 | 一对 Cloud control/data socket、canonical publisher、attach recovery queue、一个 active recovery、一个 delivery barrier waiter     | control frame 共用一条 Promise chain；协商后 Host data 使用单 in-flight credit 与有界 transport batch；recovery attempt 逐个执行；relay 重连不终止 PTY                                                                  |
 | Cloud `TerminalSessionDO`                                            | session/client row、host fence、connection-scoped writer lease、ticket、snapshot/upload metadata、WebSocket 协调和 delivery cursor | Browser control 使用有界 keyed lane；Host control/data 保留 bulk serial queue；Host data 单 in-flight credit 限制 runtime ingress；sole synced Browser 可协商 canonical data batch；SQLite 与 attachment 跨 DO 唤醒保留 |
-| Browser `TerminalSession` / `SessionCoordinator` / `InputDispatcher` | connection/delivery generation、live replica、detached restore candidate、recovery tail、input epoch/sequence 和 pending ACK       | 每个页面实例拥有本地状态；可协商并顺序解析 canonical data batch；data-only replacement 只 fence 旧 delivery；full/control replacement 还会 detach input transport，并把未决 input 标为 `uncertain` |
+| Browser `TerminalSession` / `SessionCoordinator` / `InputDispatcher` | connection/delivery generation、live replica、detached restore candidate、recovery tail、input epoch/sequence 和 pending ACK       | 每个页面实例拥有本地状态；可协商并顺序解析 canonical data batch；data-only replacement 只 fence 旧 delivery；full/control replacement 还会 detach input transport，并把未决 input 标为 `uncertain`                      |
 
 Cloud 的 Browser data WebSocket attachment 当前会序列化 `deliveryGeneration`、`dataState`、
 first/acked/sent event cursor 与 PTY offset、`replayMode`、`snapshotId` 以及 pinned
@@ -129,6 +129,7 @@ Host pause canonical publisher
   -> choose base R and current fixed commit C
   -> flush already-canonical frames through C to Cloud
   -> send DeliveryBarrier(stream, generation, mode, C[, snapshotId])
+  -> receive the actual Host data WebSocket send receipt and start the 5 s outcome deadline
   -> Cloud pin Browser data attachment at C and return ready
   -> Host send directed exact tail (R, C]
   -> Host send ReplayCommit(C)
@@ -142,8 +143,10 @@ Host pause canonical publisher
 pin 写入 Browser data WebSocket attachment 后，Cloud 只接受不超过 pinned commit 的 directed tail 和精确
 匹配的 `ReplayCommit(C)`。只要存在 `catching-up` 的 pinned delivery，Cloud 收到新的 stream-0 canonical
 frame 就会 fail current Host；因此 Host 必须保持 publisher pause。`ReplayCommit` 把该 Browser data state
-推进为 `synced`，随后 Host 才 resume publisher。barrier marker 的结果若变成 uncertain，Host 会关闭整个
-relay pair，而不是猜测 pin 是否已经建立。
+推进为 `synced`，随后 Host 才 resume publisher。协商后的 barrier 可以在 Host 本地等待前一批
+`data-ack`，但只有 batching 层证明该 barrier 已实际交给 `WebSocket.send` 后才进入
+`marker-uncertain` 并启动 5 s timeout。此后的 marker 结果若变成 uncertain，Host 会关闭整个 relay
+pair，而不是猜测 pin 是否已经建立。
 
 Host 同一时间只运行一个 recovery attempt 和一个 barrier。warm admission 或现有 checkpoint 不可用时，
 cold snapshot preparation 也只有一个 build in flight；pending attach 每个 Browser stream 只保留最新
@@ -162,7 +165,7 @@ delivery generation。
 | Host canonical publisher queue              | 8 MiB / 1024 frames                                                           | barrier 前可中断并重排 recovery；marker/pin 后或继续超限时关闭 relay pair       |
 | Warm replay 与 cold snapshot tail admission | 各 256 KiB / 512 frames                                                       | warm 转 cold，或使 checkpoint/tail 不可用后重试                                 |
 | Cloud Host bulk serial queue                | 32 MiB / 2048 tasks                                                           | Host 超限会 fail current Host                                                   |
-| Cloud Browser control lane                  | 32 MiB / 512 tasks / 250 ms / concurrency 4                                   | 超限或过期只隔离来源 Browser connection                                         |
+| Cloud Browser control lane                  | 32 MiB / 512 tasks / 250 ms / concurrency 4                                   | 每项 hard deadline；全局超限隔离实际最大占用 connection                         |
 | Cloud per-socket inbound profile            | Browser control 16 MiB / 64；Host control 1 MiB / 64；Host data 16 MiB / 1024 | 拒绝该入队并按 peer 执行上述关闭策略                                            |
 | Negotiated Host data transport              | 256 KiB / 64 frames / 1 in-flight；Host retained 8 MiB / 8192 frames          | credit 违规或 Cloud admission 失败会关闭 Host pair；旧 peer 保持单帧消息        |
 | Negotiated Browser canonical data transport | 256 KiB / 64 frames；仅 sole synced Browser                                   | 未协商、多 Browser 或 recovery 路径保持单帧消息                                 |
@@ -186,8 +189,9 @@ turn 内立即 drain，但 snapshot encode 也在这个 owner 内同步执行；
 
 以下是 CURRENT inventory，不是 future design 或完成标准：
 
-- Cloud 的一个 `BoundedSerialQueue` 为所有 inbound socket 共用同一 Promise tail。即使 bytes/count 有界，
-  Browser input、lease、ACK 和 attach 的 queue wait 仍会随排在前面的无关 Host bulk work 增长。
+- Cloud 的 Host control/data 仍共用一个 `BoundedSerialQueue` Promise tail；Browser control 已改用独立
+  keyed lane，因此 input、lease、ACK 和 attach 不再排在无关 Host bulk work 后，但同 connection 仍严格
+  FIFO。
 - recovery pause 覆盖整个 Host-to-Cloud canonical publisher，并且 recovery 逐个执行。一个 Browser recovery
   会延迟所有 Browser 的新 canonical output；期间 input 即使已写入 PTY，其 echo 也只能先进入 Host queue。
 - synchronous snapshot encode 与 PTY output、resize 和 semantic input 共用 Host authority actor，可能直接
@@ -196,8 +200,9 @@ turn 内立即 drain，但 snapshot encode 也在这个 owner 内同步执行；
   schema validation 和 send admission 之前分配。
 - Host input 只有 high-water 与有限 result cache，不拒绝 high-water 之后的 gap，因而不能证明 strict
   contiguous input prefix。
-- overload 隔离并不一致：per-Browser delivery credit 超限只 reset 该 Browser，但 Cloud global inbound、Host
-  canonical queue 或 barrier marker uncertainty 会关闭整个 Host relay pair。
+- overload 隔离仍按 owner 分层：Browser keyed lane 的全局压力隔离最大占用 Browser，per-Browser delivery
+  credit 超限只 reset 该 Browser；Host inbound/canonical queue 或已发送 barrier 的 marker uncertainty 仍会
+  关闭整个 Host relay pair。
 
 ## 其他 CURRENT 边界
 

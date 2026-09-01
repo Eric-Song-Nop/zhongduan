@@ -62,6 +62,7 @@ export interface HostDeliverySchedulerOptions {
   monotonicNow?: () => number;
   sendControl: (frame: HostControlFrame) => void;
   sendData: (frame: Uint8Array) => void;
+  sendDataWithReceipt?: (frame: Uint8Array) => Promise<void>;
   session: TerminalSession;
   snapshotCheckpointCache?: SnapshotCheckpointCache;
   snapshotPublisher: SnapshotPublisherLike;
@@ -82,6 +83,7 @@ export class HostDeliveryScheduler {
   readonly #monotonicNow: () => number;
   readonly #sendControl: (frame: HostControlFrame) => void;
   readonly #sendDataFrame: (frame: Uint8Array) => void;
+  readonly #sendDataFrameWithReceipt: (frame: Uint8Array) => Promise<void>;
   readonly #session: TerminalSession;
   readonly #snapshotCheckpointCache: SnapshotCheckpointCache;
   readonly #snapshotPublisher: SnapshotPublisherLike;
@@ -105,6 +107,12 @@ export class HostDeliveryScheduler {
     this.#monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
     this.#sendControl = options.sendControl;
     this.#sendDataFrame = options.sendData;
+    this.#sendDataFrameWithReceipt =
+      options.sendDataWithReceipt ??
+      ((frame) => {
+        options.sendData(frame);
+        return Promise.resolve();
+      });
     this.#session = options.session;
     this.#snapshotCheckpointCache =
       options.snapshotCheckpointCache ?? new SnapshotCheckpointCache();
@@ -128,7 +136,7 @@ export class HostDeliveryScheduler {
       yieldIo: this.#yieldIo,
     });
     this.#barriers = new DeliveryBarrierWaiter({
-      sendData: (frame) => this.#sendData(frame),
+      sendData: (frame) => this.#sendDataWithReceipt(frame),
       sessionEpoch: () => this.#session.sessionEpoch,
     });
   }
@@ -579,23 +587,7 @@ export class HostDeliveryScheduler {
       commitEventSeq: commit.lastEventSeq.toString(),
       commitPtyOffset: commit.nextPtyOffset.toString(),
     };
-    const deadline = new AbortController();
-    const timeout = setTimeout(
-      () => deadline.abort(new DOMException("delivery barrier timed out", "TimeoutError")),
-      DELIVERY_BARRIER_TIMEOUT_MS,
-    );
-    let result: DeliveryBarrierResult;
-    try {
-      result = await this.#barriers.wait(
-        identity,
-        AbortSignal.any([active.controller.signal, deadline.signal, this.#connectionAbort.signal]),
-        () => {
-          active.phase = "marker-uncertain";
-        },
-      );
-    } finally {
-      clearTimeout(timeout);
-    }
+    const result = await this.#waitForDeliveryBarrier(identity, active);
     if (result.status !== "ready") {
       active.phase = "pre-marker";
       this.#resumeCanonical();
@@ -645,32 +637,16 @@ export class HostDeliveryScheduler {
     }
     await this.#flushCanonicalThrough(commit);
     active.controller.signal.throwIfAborted();
-    const deadline = new AbortController();
-    const timeout = setTimeout(
-      () => deadline.abort(new DOMException("delivery barrier timed out", "TimeoutError")),
-      DELIVERY_BARRIER_TIMEOUT_MS,
-    );
-    let result: DeliveryBarrierResult;
-    try {
-      const identity: BarrierIdentity = {
-        mode: "snapshot",
-        connectionId: request.connectionId,
-        snapshotId: checkpoint.published.metadata.snapshotId,
-        streamId: request.streamId,
-        deliveryGeneration: request.deliveryGeneration,
-        commitEventSeq: commit.lastEventSeq.toString(),
-        commitPtyOffset: commit.nextPtyOffset.toString(),
-      };
-      result = await this.#barriers.wait(
-        identity,
-        AbortSignal.any([active.controller.signal, deadline.signal, this.#connectionAbort.signal]),
-        () => {
-          active.phase = "marker-uncertain";
-        },
-      );
-    } finally {
-      clearTimeout(timeout);
-    }
+    const identity: BarrierIdentity = {
+      mode: "snapshot",
+      connectionId: request.connectionId,
+      snapshotId: checkpoint.published.metadata.snapshotId,
+      streamId: request.streamId,
+      deliveryGeneration: request.deliveryGeneration,
+      commitEventSeq: commit.lastEventSeq.toString(),
+      commitPtyOffset: commit.nextPtyOffset.toString(),
+    };
+    const result = await this.#waitForDeliveryBarrier(identity, active);
     if (result.status !== "ready") {
       active.phase = "pre-marker";
       this.#resumeCanonical();
@@ -785,6 +761,41 @@ export class HostDeliveryScheduler {
     this.#sendDataFrame(frame);
     if (this.#bufferedAmount() > HOST_CANONICAL_QUEUE_LIMITS.maxBytes) {
       throw new Error("Host data WebSocket buffer exceeded");
+    }
+  }
+
+  #sendDataWithReceipt(frame: Uint8Array): Promise<void> {
+    if (this.#failed) return Promise.reject(new Error("delivery scheduler is stopped"));
+    if (this.#bufferedAmount() > HOST_CANONICAL_QUEUE_LIMITS.maxBytes) {
+      return Promise.reject(new Error("Host data WebSocket buffer exceeded"));
+    }
+    return this.#sendDataFrameWithReceipt(frame).then(() => {
+      if (this.#bufferedAmount() > HOST_CANONICAL_QUEUE_LIMITS.maxBytes) {
+        throw new Error("Host data WebSocket buffer exceeded");
+      }
+    });
+  }
+
+  async #waitForDeliveryBarrier(
+    identity: BarrierIdentity,
+    active: ActiveRecovery,
+  ): Promise<DeliveryBarrierResult> {
+    const deadline = new AbortController();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await this.#barriers.wait(
+        identity,
+        AbortSignal.any([active.controller.signal, deadline.signal, this.#connectionAbort.signal]),
+        () => {
+          active.phase = "marker-uncertain";
+          timeout = setTimeout(
+            () => deadline.abort(new DOMException("delivery barrier timed out", "TimeoutError")),
+            DELIVERY_BARRIER_TIMEOUT_MS,
+          );
+        },
+      );
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
     }
   }
 
