@@ -1,0 +1,69 @@
+{
+  "schemaVersion": "zhongduan-e1-browser-latency-contract-v1",
+  "stage": "E1",
+  "status": "frozen-relative-fail-closed",
+  "e0ContractSha256": "06731bf64555ec4736147826a277464a2e394cd6ba6575266b72dc54c5d09cbc",
+  "workload": {
+    "e0Variant": "steady",
+    "candidateScenarioCount": 5,
+    "samplesPerScenario": 24,
+    "warmupSamplesPerScenario": 4,
+    "candidateSeeds": [450, 451, 452, 453, 454],
+    "candidateProfile": {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 100,
+      "jitterMs": 0,
+      "networkFault": "none",
+      "networkImplementation": "two independent Node.js HTTP/WebSocket userspace proxies"
+    },
+    "e0SupportedLoad": {
+      "maximumOutstandingInputs": 32,
+      "maximumInputBytes": 65536,
+      "bulkBacklogBytes": [0, 262144, 1048576, 4194304]
+    },
+    "e1HardLimits": {
+      "maxBytes": 6295552,
+      "maxCount": 256,
+      "maxPending": 1024,
+      "maxPreAdmissionAgeMs": 250,
+      "maxQueuedAgeMs": 250,
+      "maxSentAgeMs": 30000,
+      "maxTerminationAgeMs": 5000,
+      "maxRetainedResults": 4096
+    }
+  },
+  "measurement": {
+    "span": "browser-keydown-to-send-decision",
+    "startEvent": "browser.keydown",
+    "endEvent": "browser.send-decision",
+    "statistic": "p99-nearest-rank",
+    "currentReport": "../terminal-journey/current-baseline.json",
+    "currentScenarioSelector": {
+      "variant": "steady",
+      "reason": "Both span boundaries precede injected link delay and the steady journey settles each input before the next sample. All source-controlled steady cells therefore form the least noisy CURRENT Browser population."
+    },
+    "expectedCurrentScenarioCount": 17,
+    "minimumCurrentSamples": 408,
+    "minimumCandidateSamples": 120,
+    "candidateComparison": "candidate-p99/current-p99",
+    "maximumRegressionRatioToCurrent": 1
+  },
+  "artifactLimits": {
+    "maximumCompressedBytes": 4194304,
+    "maximumUncompressedBytes": 33554432
+  },
+  "evidenceBoundary": {
+    "measured": "Real Chromium keydown through the E1 Browser InputDispatcher send decision, using the E0 steady raw-semantic-PTY journey.",
+    "withinE0SupportedLoad": true,
+    "saturatesE0SupportedLoad": false,
+    "saturatesE1HardLimits": false,
+    "hardLimitEvidence": "E1 invariant, overload, bytes/count/pending, and deadline tests; not this latency population.",
+    "simulated": ["Browser/Cloud RTT", "Cloud/Host RTT"],
+    "notClaimed": [
+      "Cloudflare edge latency",
+      "queue-saturation throughput",
+      "E2 Cloud input-lane isolation",
+      "E3 Host contiguous-prefix behavior"
+    ]
+  }
+}
