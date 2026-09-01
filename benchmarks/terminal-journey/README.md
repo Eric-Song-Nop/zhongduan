@@ -14,9 +14,12 @@ only one run of each of the nine variants is incomplete: all sixteen 20/100/300/
 local jitter, disconnect, reconnect, output-flood, and cold-attach cells are mandatory. Real edge,
 Durable Object hibernation, and Host relay replacement remain explicitly `requires-staging`.
 
-`current-baseline.json` is accepted as CURRENT only when it is a complete report generated from raw
-scenarios at one clean committed E0 revision. An incomplete diagnostic artifact is intentionally
-rejected by `validate_report` and cannot serve as an E1–E4 denominator.
+The checked-in CURRENT is a two-file evidence bundle. `current-baseline.json` is the small,
+reviewable summary; `current-baseline.scenarios.jsonl.gz` contains the canonical raw scenario JSONL.
+The summary records compressed and uncompressed sizes and SHA-256 digests. Loading the bundle applies
+strict size bounds, verifies both digests, reconstructs aggregate events, observations, and latency
+samples in memory, and then recomputes every derived claim. Neither file alone can serve as an E1–E4
+denominator, and raw payloads are never duplicated inside the summary.
 
 During aggregation, latency endpoints are paired inside each source scenario before samples are
 combined across the matrix. This preserves repeated workload-local sample IDs across independent RTT
@@ -26,9 +29,11 @@ the 24 `probe-measured-*` samples sent after each configured backlog is establis
 
 The checked-in complete CURRENT scenario matrix was measured from clean commit
 `f56205fd99b6ea0133fc387098221ebf2906ca3b` (tree
-`ef3922f354493327e41adae24c1258f7eaa07c50`). It retains 25 scenario reports, covers 21 local cells
-with two lifecycle cells explicitly marked `requires-staging`, passes all eight correctness oracles,
-and measures all seven spans. Its finite relative denominators are:
+`ef3922f354493327e41adae24c1258f7eaa07c50`). Its bounded archive retains 25 scenario reports,
+82,036 raw events, and 5,964 derivable latency samples while the JSON summary remains directly
+reviewable. It covers 21 local cells with two lifecycle cells explicitly marked `requires-staging`,
+passes all eight correctness oracles, and measures all seven spans. Its finite relative denominators
+are:
 
 - Cloud bulk isolation: `1.043997829`
 - Snapshot-enabled/disabled Host input p99: `1.286902287`
@@ -113,6 +118,10 @@ done
   --artifact-kind current \
   --report benchmarks/terminal-journey/current-baseline.json
 ```
+
+The merge writes both `current-baseline.json` and its deterministic
+`current-baseline.scenarios.jsonl.gz` companion. Commit both files. The same bundling applies to a
+merged candidate report, so later evidence does not reintroduce monolithic expanded JSON.
 
 The runner-only Browser instrumentation assigns a harness-local ID at UI consumption, observes
 semantic `WebSocket.send`, maps the v2 Browser identity (`inputEpoch/clientInputSeq`), promotes it to
