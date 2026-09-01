@@ -6,6 +6,7 @@
     duplicateSample: null,
     nextLocalIntent: 1,
     intents: [],
+    productResults: [],
     intentsBySample: Object.create(null),
     pendingByBrowserIdentity: Object.create(null),
     installedSockets: new WeakSet(),
@@ -32,23 +33,26 @@
       ? `${frame.inputEpoch}/${frame.clientInputSeq}`
       : null;
   const sampleFromFrame = (frame) => {
-    if (state.currentSample !== null) return state.currentSample;
     const identity = browserIdentity(frame);
     if (identity !== null && state.pendingByBrowserIdentity[identity] !== undefined) {
       return state.pendingByBrowserIdentity[identity].sampleId;
     }
     const payload = frame?.type === "paste" || frame?.type === "text" ? frame.data : frame?.text;
-    if (typeof payload !== "string") return null;
-    for (const pattern of [
-      /ZHONGDUAN_E0_PROBE:([A-Za-z0-9_-]+)\r/u,
-      /ZHONGDUAN_E0_SECURE:([A-Za-z0-9_-]+)\r/u,
-      /ZHONGDUAN_E0_FLOOD:([A-Za-z0-9_-]+)\r/u,
-      /ZHONGDUAN_E0_INTERRUPT_ARM:[A-Za-z0-9_-]+:([A-Za-z0-9_-]+)\r/u,
-    ]) {
-      const match = pattern.exec(payload);
-      if (match !== null) return match[1];
+    if (typeof payload === "string") {
+      for (const pattern of [
+        /ZHONGDUAN_E0_PROBE:([A-Za-z0-9_-]+)\r/u,
+        /ZHONGDUAN_E0_SECURE:([A-Za-z0-9_-]+)\r/u,
+        /ZHONGDUAN_E0_FLOOD:([A-Za-z0-9_-]+)\r/u,
+        /ZHONGDUAN_E0_INTERRUPT_ARM:[A-Za-z0-9_-]+:([A-Za-z0-9_-]+)\r/u,
+      ]) {
+        const match = pattern.exec(payload);
+        if (match !== null) return match[1];
+      }
     }
-    return null;
+    // Paste/text samples carry their marker in-band. Only key events (for example Ctrl-C)
+    // need the short-lived UI attribution window. Focus, resize, and mouse reconciliation may
+    // legitimately race that window and are independent semantic intents.
+    return frame?.type === "key" ? state.currentSample : null;
   };
   const finish = (
     intent,
@@ -119,6 +123,7 @@
   window.addEventListener("zhongduan:input-intent-result", (event) => {
     const result = event.detail;
     if (result === null || typeof result !== "object") return;
+    state.productResults.push({ ...result, observedAtUnixNs: now() });
     const identity = browserIdentity(result.identity);
     const intent =
       identity === null

@@ -131,6 +131,9 @@ validation 或 admission 失败不得推进 `clientInputSeq`。Queue reservation
 
 ### E1 evidence 与完成条件
 
+实现契约、hard limits、rollout matrix 与验证入口见
+[E1 Browser input admission](./e1-browser-input-admission.md)。
+
 - Property/sequence test 证明 malformed、oversize、policy rejection 和 queue overflow 都不分配 sequence；
   下一个合法 intent 不产生 gap。
 - Fault test 覆盖 sender 缺失、send 前抛错、acceptance uncertainty、full/control replacement、data-only

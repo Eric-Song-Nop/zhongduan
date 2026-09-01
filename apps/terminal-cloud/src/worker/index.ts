@@ -3,6 +3,7 @@ import {
   CreateSessionRequestSchema,
   CreateSessionResponseSchema,
   RELAY_CAPABILITIES_HEADER,
+  RelayCapability,
   selectRelayCapabilities,
 } from "@zhongduan/protocol";
 import { AuthError, secretsEqual, verifyBearerCapability } from "./auth";
@@ -137,12 +138,17 @@ async function createConnectionSet(
   ) {
     return json({ error: "invalid-connection-set" }, 400);
   }
+  const roleCapabilities = selectedCapabilities.filter((capability) =>
+    claims.role === "host"
+      ? capability === RelayCapability.deliveryBarrierOutcomeV1
+      : capability === RelayCapability.browserInputAdmissionV1,
+  );
   return sessionStub(env, sessionId).fetch("https://do.internal/internal/connection-sets", {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      ...(claims.role === "host" && selectedCapabilities.length > 0
-        ? { [RELAY_CAPABILITIES_HEADER]: selectedCapabilities.join(",") }
+      ...(roleCapabilities.length > 0
+        ? { [RELAY_CAPABILITIES_HEADER]: roleCapabilities.join(",") }
         : {}),
     },
     body: JSON.stringify({

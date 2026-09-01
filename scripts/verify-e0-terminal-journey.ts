@@ -99,6 +99,7 @@ interface BrowserHarness {
   events: Data[];
   intents: BrowserHarnessIntent[];
   intentsBySample: Record<string, BrowserHarnessIntent | undefined>;
+  productResults: Data[];
   consume(sampleId: string): string;
 }
 
@@ -126,13 +127,16 @@ class Signal {
   }
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  return Promise.race([
-    promise,
-    delay(timeoutMs).then(() => {
-      throw new JourneyError(message);
-    }),
-  ]);
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => reject(new JourneyError(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
 }
 
 function unixNanoseconds(): bigint {
@@ -197,19 +201,37 @@ export class ManagedProcess {
   }
 
   async stop(): Promise<void> {
-    if (this.process.exitCode !== null || this.process.pid === undefined) return;
-    try {
-      process.kill(-this.process.pid, "SIGTERM");
-    } catch {}
-    await Promise.race([
-      new Promise<void>((resolvePromise) => this.process.once("exit", () => resolvePromise())),
-      delay(5_000),
-    ]);
-    if (this.process.exitCode === null) {
+    const exited = () => this.process.exitCode !== null || this.process.signalCode !== null;
+    const waitForExit = async (): Promise<void> => {
+      if (exited()) return;
+      await new Promise<void>((resolvePromise) => {
+        const onExit = () => {
+          clearTimeout(timeout);
+          resolvePromise();
+        };
+        const timeout = setTimeout(() => {
+          this.process.off("exit", onExit);
+          resolvePromise();
+        }, 5_000);
+        this.process.once("exit", onExit);
+      });
+    };
+    if (!exited() && this.process.pid !== undefined) {
       try {
-        process.kill(-this.process.pid, "SIGKILL");
+        process.kill(-this.process.pid, "SIGTERM");
       } catch {}
+      await waitForExit();
+      if (!exited()) {
+        try {
+          process.kill(-this.process.pid, "SIGKILL");
+        } catch {}
+        await waitForExit();
+      }
     }
+    // ChildProcess keeps piped stdio handles referenced even after a forceful group shutdown on
+    // some platforms. Closing them makes successful journey commands terminate deterministically.
+    this.process.stdout?.destroy();
+    this.process.stderr?.destroy();
   }
 }
 
@@ -1293,6 +1315,7 @@ async function browserJourney(
               activeElement: document.activeElement?.tagName ?? null,
               e0Events: (harness?.events ?? []).slice(-50),
               e0Intents: (harness?.intents ?? []).slice(-10),
+              productInputResults: (harness?.productResults ?? []).slice(-20),
             };
           }),
         );

@@ -1017,7 +1017,16 @@ function validateObservationEffects(observations: Data, events: Data[], label: s
       !deepEqual(item["passiveBrowserIdentities"], browserIdentities) ||
       item["passiveSendAttemptCount"] !== sampleAttempts.length
     ) {
-      throw new ContractError(`${label} passive send evidence disagrees with proxy events`);
+      throw new ContractError(
+        `${label} passive send evidence disagrees with proxy events for ${sampleId}: ` +
+          `browser=${JSON.stringify({
+            identities: item["passiveBrowserIdentities"],
+            attempts: item["passiveSendAttemptCount"],
+          })}, proxy=${JSON.stringify({
+            identities: browserIdentities,
+            attempts: sampleAttempts.length,
+          })}`,
+      );
     }
     if (browserIdentities.length > 0) {
       if (
