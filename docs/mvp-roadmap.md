@@ -161,6 +161,9 @@ contract、replacement/coalescing 语义、rollout 边界与验证入口。
 Cloud input queue wait / latency 不随无关 Host bulk/data backlog 线性增长，或以 benchmark 证明共享 owner
 具有等价隔离。
 
+**实现证据：** [E2 Cloud input lane and connection-scoped writer](./e2-cloud-input-lane.md)
+固定独立 execution owner、queue contract、writer/hibernation/rejection 语义、E0 supported-load 测试与验证入口。
+
 ### E3 — Host contiguous input epoch
 
 **依赖：** E2。

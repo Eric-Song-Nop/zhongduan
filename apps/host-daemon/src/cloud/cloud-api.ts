@@ -103,7 +103,10 @@ export class CloudApiClient {
       ConnectionSetResponseSchema,
       signal,
       {
-        [RELAY_CAPABILITIES_HEADER]: RelayCapability.deliveryBarrierOutcomeV1,
+        [RELAY_CAPABILITIES_HEADER]: [
+          RelayCapability.deliveryBarrierOutcomeV1,
+          RelayCapability.hostDataBatchV1,
+        ].join(","),
       },
     );
   }

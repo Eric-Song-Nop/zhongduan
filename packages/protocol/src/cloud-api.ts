@@ -11,12 +11,18 @@ const capability = z.string().min(1).max(4_096);
 
 export const RELAY_CAPABILITIES_HEADER = "x-zhongduan-relay-capabilities";
 export const RelayCapability = {
+  // Exact concatenated v2 Cloud-to-Browser data frames.
+  browserDataBatchV1: "browser-data-batch-v1",
   browserInputAdmissionV1: "browser-input-admission-v1",
   deliveryBarrierOutcomeV1: "delivery-barrier-outcome-v1",
+  // Exact concatenated v2 Host data frames with one Cloud-issued `data-ack` credit in flight.
+  hostDataBatchV1: "host-data-batch-v1",
 } as const;
 export const RelayCapabilitySchema = z.enum([
+  RelayCapability.browserDataBatchV1,
   RelayCapability.browserInputAdmissionV1,
   RelayCapability.deliveryBarrierOutcomeV1,
+  RelayCapability.hostDataBatchV1,
 ]);
 export type RelayCapability = z.infer<typeof RelayCapabilitySchema>;
 

@@ -7,6 +7,17 @@ export interface QueueLimits {
 
 export type SocketQueueLimits = Pick<QueueLimits, "socketBytes" | "socketCount">;
 
+export interface KeyedQueueLimits extends QueueLimits {
+  maxAgeMs: number;
+  maxConcurrency: number;
+}
+
+export interface QueueTaskTiming {
+  enqueuedAtMs: number;
+  startedAtMs: number;
+  waitMs: number;
+}
+
 interface QueueUsage {
   bytes: number;
   count: number;
@@ -17,6 +28,14 @@ interface QueueReservation<Key extends object> {
   key: Key;
 }
 
+interface KeyedQueueEntry<Key extends object> extends QueueReservation<Key> {
+  enqueuedAtMs: number;
+  expire: (timing: QueueTaskTiming) => Promise<void> | void;
+  reject: (reason: unknown) => void;
+  resolve: () => void;
+  run: (timing: QueueTaskTiming) => Promise<void> | void;
+}
+
 export const RELAY_MESSAGE_QUEUE_LIMITS: QueueLimits = {
   globalBytes: 32 * 1024 * 1024,
   globalCount: 2_048,
@@ -25,10 +44,24 @@ export const RELAY_MESSAGE_QUEUE_LIMITS: QueueLimits = {
 };
 
 export const RELAY_MESSAGE_QUEUE_PROFILES = {
-  browserControl: { socketBytes: 16 * 1024 * 1024, socketCount: 8 },
+  browserControl: { socketBytes: 16 * 1024 * 1024, socketCount: 64 },
   hostControl: { socketBytes: 1024 * 1024, socketCount: 64 },
   hostData: { socketBytes: 16 * 1024 * 1024, socketCount: 1_024 },
 } satisfies Record<string, SocketQueueLimits>;
+
+/**
+ * E2 Browser control/input lane contract. A connection preserves FIFO while independent Browser
+ * connections may make progress concurrently. Reservations include active work until it settles, so
+ * these limits cover both queued and executing tasks.
+ */
+export const BROWSER_CONTROL_LANE_LIMITS: KeyedQueueLimits = Object.freeze({
+  globalBytes: 32 * 1024 * 1024,
+  globalCount: 512,
+  socketBytes: 16 * 1024 * 1024,
+  socketCount: 64,
+  maxAgeMs: 250,
+  maxConcurrency: 4,
+});
 
 export class BoundedSerialQueue<Key extends object> {
   readonly #limits: QueueLimits;
@@ -98,5 +131,175 @@ export class BoundedSerialQueue<Key extends object> {
     const next = { bytes: socket.bytes - reservation.bytes, count: socket.count - 1 };
     if (next.count === 0) this.#socketUsage.delete(reservation.key);
     else this.#socketUsage.set(reservation.key, next);
+  }
+}
+
+/**
+ * A bounded, keyed execution lane. Work for one key is strictly FIFO; ready keys rotate after each
+ * task so one connection cannot monopolize the lane. Independent keys can execute up to the declared
+ * concurrency without sharing the bulk relay's serial tail.
+ */
+export class BoundedKeyedQueue<Key extends object> {
+  readonly #limits: KeyedQueueLimits;
+  readonly #now: () => number;
+  readonly #socketUsage = new Map<Key, QueueUsage>();
+  readonly #pending = new Map<Key, Array<KeyedQueueEntry<Key>>>();
+  readonly #activeKeys = new Set<Key>();
+  readonly #readyKeys = new Set<Key>();
+  readonly #readyOrder: Key[] = [];
+  #activeCount = 0;
+  #globalUsage: QueueUsage = { bytes: 0, count: 0 };
+
+  constructor(limits: KeyedQueueLimits, now: () => number = () => performance.now()) {
+    if (!Number.isSafeInteger(limits.maxConcurrency) || limits.maxConcurrency < 1) {
+      throw new Error("keyed queue maxConcurrency must be a positive safe integer");
+    }
+    if (!Number.isFinite(limits.maxAgeMs) || limits.maxAgeMs < 0) {
+      throw new Error("keyed queue maxAgeMs must be finite and non-negative");
+    }
+    this.#limits = limits;
+    this.#now = now;
+  }
+
+  get activeCount(): number {
+    return this.#activeCount;
+  }
+
+  get queuedBytes(): number {
+    return this.#globalUsage.bytes;
+  }
+
+  get queuedCount(): number {
+    return this.#globalUsage.count;
+  }
+
+  enqueue(
+    key: Key,
+    bytes: number,
+    run: (timing: QueueTaskTiming) => Promise<void> | void,
+    expire: (timing: QueueTaskTiming) => Promise<void> | void,
+    socketLimits: SocketQueueLimits = this.#limits,
+  ): Promise<void> | undefined {
+    if (!this.#reserve(key, bytes, socketLimits)) return undefined;
+
+    const enqueuedAtMs = this.#now();
+    let resolve!: () => void;
+    let reject!: (reason: unknown) => void;
+    const settled = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    const entry: KeyedQueueEntry<Key> = {
+      bytes,
+      enqueuedAtMs,
+      expire,
+      key,
+      reject,
+      resolve,
+      run,
+    };
+    const pending = this.#pending.get(key);
+    if (pending === undefined) this.#pending.set(key, [entry]);
+    else pending.push(entry);
+    this.#markReady(key);
+    this.#pump();
+    return settled;
+  }
+
+  #reserve(key: Key, bytes: number, socketLimits: SocketQueueLimits): boolean {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) return false;
+    const socket = this.#socketUsage.get(key) ?? { bytes: 0, count: 0 };
+    if (
+      this.#globalUsage.count + 1 > this.#limits.globalCount ||
+      this.#globalUsage.bytes + bytes > this.#limits.globalBytes ||
+      socket.count + 1 > socketLimits.socketCount ||
+      socket.bytes + bytes > socketLimits.socketBytes
+    ) {
+      return false;
+    }
+
+    this.#globalUsage = {
+      bytes: this.#globalUsage.bytes + bytes,
+      count: this.#globalUsage.count + 1,
+    };
+    this.#socketUsage.set(key, { bytes: socket.bytes + bytes, count: socket.count + 1 });
+    return true;
+  }
+
+  #markReady(key: Key): void {
+    if (this.#activeKeys.has(key) || this.#readyKeys.has(key)) return;
+    this.#readyKeys.add(key);
+    this.#readyOrder.push(key);
+  }
+
+  #pump(): void {
+    while (this.#activeCount < this.#limits.maxConcurrency) {
+      const key = this.#readyOrder.shift();
+      if (key === undefined) return;
+      this.#readyKeys.delete(key);
+      const entry = this.#pending.get(key)?.[0];
+      if (entry === undefined || this.#activeKeys.has(key)) continue;
+      this.#activeKeys.add(key);
+      this.#activeCount += 1;
+      this.#run(entry);
+    }
+  }
+
+  #run(entry: KeyedQueueEntry<Key>): void {
+    const startedAtMs = this.#now();
+    const timing = {
+      enqueuedAtMs: entry.enqueuedAtMs,
+      startedAtMs,
+      waitMs: Math.max(0, startedAtMs - entry.enqueuedAtMs),
+    } satisfies QueueTaskTiming;
+    let processing: Promise<void> | void;
+    try {
+      processing = timing.waitMs > this.#limits.maxAgeMs ? entry.expire(timing) : entry.run(timing);
+    } catch (error) {
+      this.#reject(entry, error);
+      return;
+    }
+    if (processing === undefined) {
+      this.#resolve(entry);
+      return;
+    }
+    void processing.then(
+      () => this.#resolve(entry),
+      (error: unknown) => this.#reject(entry, error),
+    );
+  }
+
+  #resolve(entry: KeyedQueueEntry<Key>): void {
+    entry.resolve();
+    this.#finish(entry);
+  }
+
+  #reject(entry: KeyedQueueEntry<Key>, error: unknown): void {
+    entry.reject(error);
+    this.#finish(entry);
+  }
+
+  #finish(entry: KeyedQueueEntry<Key>): void {
+    const pending = this.#pending.get(entry.key);
+    if (pending?.[0] !== entry) {
+      throw new Error("keyed queue head is inconsistent");
+    }
+    pending.shift();
+    if (pending.length === 0) this.#pending.delete(entry.key);
+
+    const socket = this.#socketUsage.get(entry.key);
+    if (socket === undefined) throw new Error("keyed queue reservation is missing");
+    this.#globalUsage = {
+      bytes: this.#globalUsage.bytes - entry.bytes,
+      count: this.#globalUsage.count - 1,
+    };
+    const next = { bytes: socket.bytes - entry.bytes, count: socket.count - 1 };
+    if (next.count === 0) this.#socketUsage.delete(entry.key);
+    else this.#socketUsage.set(entry.key, next);
+
+    this.#activeKeys.delete(entry.key);
+    this.#activeCount -= 1;
+    if (pending.length > 0) this.#markReady(entry.key);
+    this.#pump();
   }
 }

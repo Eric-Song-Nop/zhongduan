@@ -78,7 +78,10 @@ describe("CloudApiClient", () => {
       expiresAt: 2_000,
       controlTicket: "control_ticket_host01",
       dataTicket: "data_ticket_host0001",
-      selectedCapabilities: [RelayCapability.deliveryBarrierOutcomeV1],
+      selectedCapabilities: [
+        RelayCapability.deliveryBarrierOutcomeV1,
+        RelayCapability.hostDataBatchV1,
+      ],
     };
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
       jsonResponse(response),
@@ -93,7 +96,7 @@ describe("CloudApiClient", () => {
     const [, init] = fetchMock.mock.calls[0]!;
     expect(JSON.parse(init?.body as string)).toEqual({});
     expect(new Headers(init?.headers).get(RELAY_CAPABILITIES_HEADER)).toBe(
-      RelayCapability.deliveryBarrierOutcomeV1,
+      `${RelayCapability.deliveryBarrierOutcomeV1},${RelayCapability.hostDataBatchV1}`,
     );
   });
 

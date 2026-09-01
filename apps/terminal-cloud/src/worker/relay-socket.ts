@@ -16,6 +16,7 @@ export const SocketAttachmentSchema = z.strictObject({
   deliveryGeneration: DecimalU64Schema,
   hostFence: DecimalU64Schema.nullable(),
   leaseFence: DecimalU64Schema.nullable(),
+  leaseExpiresAt: z.number().int().nonnegative().nullable().default(null),
   controlState: z.enum(["awaiting-attach", "active"]).nullable(),
   dataState: z.enum(["awaiting-attach", "catching-up", "synced"]).nullable(),
   firstEventSeq: DecimalU64Schema.nullable(),

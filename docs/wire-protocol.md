@@ -9,13 +9,24 @@
 每个参与者建立两条 WebSocket：
 
 - `control`：UTF-8 JSON，承载 attach、writer lease、语义 input、ACK、host 状态和 resync。
-- `data`：一条 WebSocket message 对应一个二进制 frame，承载 PTY output、resize、replay
-  commit，以及 Host 到 relay 的 recovery barrier。
+- `data`：默认一条 WebSocket message 对应一个二进制 frame，承载 PTY output、resize、replay
+  commit，以及 Host 到 relay 的 recovery barrier。协商 `host-data-batch-v1` 后，Host 到 Cloud 的
+  message 可以是最多 64 个原始 v2 frame 的直接拼接；Browser 单独协商
+  `browser-data-batch-v1` 后，Cloud 也可把同一 canonical batch 直接拼接为一个 Browser message。
 - `snapshot`：受权 HTTP response 从私有 R2 对象直接流向浏览器，不经过 DO WebSocket。
 
 所有重建 Host authority 所必需的 terminal mutation 必须在 data 通道内排序并消耗 `eventSeq`；当前只有
 `PTY_OUTPUT` 与 `RESIZE_APPLIED`。input ACK、writer lease 和其他临时交互 metadata 不属于 terminal
 mutation，不能推进 replica cursor。control 消息不能直接改变 replica。
+
+`host-data-batch-v1` 不增加第二层 envelope，也不改变 logical frame identity、bytes 或顺序。单个 batch
+最多 256 KiB；Host 同时只能发送一个未获 credit 的 batch。Cloud 完成该 batch 的验证、canonical commit
+与 Browser delivery 后，在 Host data socket 上返回固定文本 `data-ack`，Host 才发送下一批。未协商的
+peer 不发送拼接 batch，也不发送或等待该 ACK。
+
+`browser-data-batch-v1` 同样不增加 envelope。它只用于 sole synced Browser 的 canonical live
+delivery；directed recovery、mixed batch、多 Browser fan-out 或未协商的 Browser 仍保持一条 message
+一个 v2 frame。Browser 必须按拼接顺序解析和应用全部 logical frame，ACK cursor 语义不变。
 
 ## Data Header
 
@@ -76,6 +87,8 @@ snapshot continuation 是 parser 恢复材料，不是新的 PTY output。snapsh
 ## 限制
 
 - 单 data payload 最大 16 MiB；Host 正常 PTY batch 目标为 16 KiB / 4 ms。
+- 协商的 Host transport batch 最大 256 KiB / 64 logical frames，单次 in-flight 为 1；Host 等待 credit
+  时最多保留 8 MiB / 8192 logical frames。
 - paste 最大 1 MiB；Host 在写入前再次执行会话策略限制。
 - control decoder 拒绝未知字段，所有 uint64 在 JSON 中用十进制字符串。
 - 任意 magic、version、长度、epoch、generation、seq 或 offset 错误都会终止当前 delivery，并请求新 generation。

@@ -140,8 +140,10 @@ async function createConnectionSet(
   }
   const roleCapabilities = selectedCapabilities.filter((capability) =>
     claims.role === "host"
-      ? capability === RelayCapability.deliveryBarrierOutcomeV1
-      : capability === RelayCapability.browserInputAdmissionV1,
+      ? capability === RelayCapability.deliveryBarrierOutcomeV1 ||
+        capability === RelayCapability.hostDataBatchV1
+      : capability === RelayCapability.browserDataBatchV1 ||
+        capability === RelayCapability.browserInputAdmissionV1,
   );
   return sessionStub(env, sessionId).fetch("https://do.internal/internal/connection-sets", {
     method: "POST",

@@ -1,6 +1,10 @@
 import { DataFrameKind, MAX_DELIVERY_OUTSTANDING_BYTES, type DataFrame } from "@zhongduan/protocol";
 import { describe, expect, it } from "vitest";
-import { advanceDeliveryCursor, type DeliveryCursorState } from "../src/worker/relay-delivery";
+import {
+  advanceDeliveryCursor,
+  advanceDeliveryCursorBatch,
+  type DeliveryCursorState,
+} from "../src/worker/relay-delivery";
 
 const baseline: DeliveryCursorState = {
   dataState: "catching-up",
@@ -63,6 +67,19 @@ describe("delivery cursor validation", () => {
     expect(advanceDeliveryCursor(baseline, frame({ eventSeq: 2n }))).toEqual({
       kind: "sequence-error",
     });
+  });
+
+  it("advances a canonical batch with one final cursor state", () => {
+    expect(
+      advanceDeliveryCursorBatch(baseline, [
+        frame(),
+        frame({ eventSeq: 2n, ptyOffset: 3n, payload: new Uint8Array([4, 5]) }),
+      ]),
+    ).toMatchObject({
+      kind: "ok",
+      nextState: { sentEventSeq: "2", sentPtyOffset: "5" },
+    });
+    expect(advanceDeliveryCursorBatch(baseline, [])).toEqual({ kind: "sequence-error" });
   });
 
   it("enforces credit against the acknowledged cursor", () => {

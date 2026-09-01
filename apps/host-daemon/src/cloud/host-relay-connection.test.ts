@@ -1,8 +1,10 @@
 import {
   DataFrameKind,
   HostControlFrameSchema,
+  RelayCapability,
   decodeControlFrame,
   decodeDataFrame,
+  decodeDataFrameBatch,
   type ConnectionSetResponse,
   type ResizePayload,
 } from "@zhongduan/protocol";
@@ -94,6 +96,7 @@ function createHarness(
     authority?: FakeTerminalAuthority;
     heartbeatIntervalMs?: number;
     heartbeatTimeoutMs?: number;
+    hostDataBatch?: boolean;
     readyTimeoutMs?: number;
   } = {},
 ) {
@@ -107,7 +110,10 @@ function createHarness(
   const control = new FakeWebSocket();
   const data = new FakeWebSocket();
   const pair: HostSocketPair = {
-    connection: connectionSet,
+    connection:
+      options.hostDataBatch === true
+        ? { ...connectionSet, selectedCapabilities: [RelayCapability.hostDataBatchV1] }
+        : connectionSet,
     control: control as unknown as WebSocket,
     data: data as unknown as WebSocket,
     close() {
@@ -175,6 +181,66 @@ afterEach(() => {
 });
 
 describe("HostRelayConnection", () => {
+  it("holds the next negotiated batch for Cloud credit without changing logical order", async () => {
+    const harness = createHarness({ hostDataBatch: true });
+    const started = harness.relay.start();
+    for (let index = 0; index < 128; index += 1) {
+      harness.pty.emit(Uint8Array.of(index));
+    }
+    const ready = decodeControlFrame(harness.control.sent[0] as string, HostControlFrameSchema);
+    if (ready.type !== "host-ready") throw new Error("expected host-ready");
+    harness.control.message(
+      JSON.stringify({
+        type: "host-ready-ack",
+        sessionEpoch: ready.sessionEpoch,
+        headEventSeq: ready.headEventSeq,
+        nextPtyOffset: ready.nextPtyOffset,
+      }),
+    );
+    await started;
+    await settle();
+
+    expect(harness.data.sent).toHaveLength(1);
+    harness.data.message("data-ack");
+    await settle();
+    expect(harness.data.sent).toHaveLength(2);
+    const frames = harness.data.sent.flatMap((batch) => decodeDataFrameBatch(batch as Uint8Array));
+    expect(frames).toHaveLength(128);
+    expect(frames.map((frame) => frame.eventSeq)).toEqual(
+      Array.from({ length: 128 }, (_, index) => BigInt(index + 1)),
+    );
+    harness.relay.close();
+    harness.session.dispose();
+  });
+
+  it("keeps a latency-sensitive data frame out of the surrounding bulk batches", async () => {
+    const harness = createHarness({ hostDataBatch: true });
+    const started = harness.relay.start();
+    harness.pty.emit(new Uint8Array(1_024));
+    harness.pty.emit(new Uint8Array(60));
+    harness.pty.emit(new Uint8Array(1_024));
+    const ready = decodeControlFrame(harness.control.sent[0] as string, HostControlFrameSchema);
+    if (ready.type !== "host-ready") throw new Error("expected host-ready");
+    harness.control.message(
+      JSON.stringify({
+        type: "host-ready-ack",
+        sessionEpoch: ready.sessionEpoch,
+        headEventSeq: ready.headEventSeq,
+        nextPtyOffset: ready.nextPtyOffset,
+      }),
+    );
+    await started;
+    await settle();
+
+    expect(decodeDataFrameBatch(harness.data.sent[0] as Uint8Array)).toHaveLength(1);
+    harness.data.message("data-ack");
+    expect(decodeDataFrameBatch(harness.data.sent[1] as Uint8Array)[0]?.payload).toHaveLength(60);
+    harness.data.message("data-ack");
+    expect(decodeDataFrameBatch(harness.data.sent[2] as Uint8Array)).toHaveLength(1);
+    harness.relay.close();
+    harness.session.dispose();
+  });
+
   it("does not pump canonical data before matching host-ready-ack", async () => {
     const harness = createHarness();
     const started = harness.relay.start();
