@@ -807,9 +807,9 @@ describe("live Durable Object relay", () => {
         },
       });
       Reflect.set(instance, "browserControlLane", {
-        enqueue() {
+        dispatch() {
           inputAdmissions += 1;
-          return inputGate;
+          void inputGate;
         },
       });
 
@@ -992,17 +992,17 @@ describe("live Durable Object relay", () => {
         const input = Reflect.get(instance, "browserControlLane") as {
           queuedBytes: number;
           queuedCount: number;
-        };
-        const telemetry = Reflect.get(instance, "inputTelemetry") as {
-          snapshot(): {
-            dispositionCounts: Record<string, number>;
-            maxQueueWaitMs: number;
+          telemetry: {
+            snapshot(): {
+              dispositionCounts: Record<string, number>;
+              maxQueueWaitMs: number;
+            };
           };
         };
         return {
           bulk: { bytes: bulk.queuedBytes, count: bulk.queuedCount },
           input: { bytes: input.queuedBytes, count: input.queuedCount },
-          telemetry: telemetry.snapshot(),
+          telemetry: input.telemetry.snapshot(),
         };
       },
     );
@@ -3747,22 +3747,22 @@ describe("live Durable Object relay", () => {
     });
 
     const evidence = await runInDurableObject(sessionStub(session.sessionId), (instance, state) => {
-      const telemetry = Reflect.get(instance, "inputTelemetry") as {
-        snapshot(): {
-          records: Array<Record<string, unknown>>;
-          retainedCount: number;
-        };
-      };
       const lane = Reflect.get(instance, "browserControlLane") as {
         queuedBytes: number;
         queuedCount: number;
+        telemetry: {
+          snapshot(): {
+            records: Array<Record<string, unknown>>;
+            retainedCount: number;
+          };
+        };
       };
       return {
         lane: { bytes: lane.queuedBytes, count: lane.queuedCount },
         lease: state.storage.sql
           .exec("SELECT connection_id, expires_at, fence FROM writer_lease WHERE singleton = 1")
           .one(),
-        telemetry: telemetry.snapshot(),
+        telemetry: lane.telemetry.snapshot(),
       };
     });
     expect(evidence.lease).toEqual(leaseBeforeInput);
