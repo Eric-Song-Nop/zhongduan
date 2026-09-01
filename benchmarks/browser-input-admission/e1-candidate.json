@@ -1,0 +1,143 @@
+{
+  "candidate": {
+    "measurement": {
+      "comparisonP99Ms": 0.4,
+      "durationResolutionMs": 0.1,
+      "maxMs": 0.4002,
+      "p50Ms": 0.2,
+      "p95Ms": 0.3003,
+      "p99Ms": 0.4002,
+      "sampleCount": 120,
+      "span": "browser-keydown-to-send-decision",
+      "statistic": "p99-nearest-rank"
+    },
+    "profile": {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 100,
+      "jitterMs": 0,
+      "networkFault": "none",
+      "networkImplementation": "two independent Node.js HTTP/WebSocket userspace proxies"
+    },
+    "rawEventCount": 3730,
+    "scenarioCount": 5,
+    "scenarioSha256": [
+      "835204a17ece6410890c315de931f73ce877ddff8a17113fca79eddbc61a37eb",
+      "57738f1869661824f9b22725952ba583c167b73384e9e2fbff56fc688da016d4",
+      "c999dce13b4da1c5d9d32f97618218259ece60f1562e2546752543f2d6e46653",
+      "959eda0514a04c0f7e749725baa6c6fcdb9a2960e8efe73fa07d134e8152025d",
+      "2972ce58b1cd4ca22f550218ed06fd63821bb42c59114ecb93b59df5abc2b82a"
+    ],
+    "seeds": [450, 451, 452, 453, 454]
+  },
+  "candidateStatus": "complete",
+  "comparison": {
+    "candidateP99Ms": 0.4,
+    "candidateRawP99Ms": 0.4002,
+    "currentP99Ms": 0.4,
+    "currentRawP99Ms": 0.4,
+    "maximumRegressionRatioToCurrent": 1,
+    "operation": "quantized-candidate-p99/quantized-current-p99",
+    "status": "passed",
+    "value": 1
+  },
+  "contractSha256": "d3d4b00053ef14767ab3860e7e85ea845ae55b51af8c07db9792daf211dc4ef0",
+  "current": {
+    "environment": {
+      "executionTier": "local-workerd",
+      "ghosttyArtifactVerified": true,
+      "ghosttyEngineId": "ghostty:fe317f850c3ab212f6638122c459b9b48b99a016:wterm-engine-sha256:2836a71302115fb2989235666560fc4b6a5739158478e85e4d25bd1f1248fe96",
+      "harnessRuntime": "TypeScript on Node.js",
+      "node": "v24.20.0",
+      "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+      "wtermGitlink": "4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6"
+    },
+    "measurement": {
+      "comparisonP99Ms": 0.4,
+      "durationResolutionMs": 0.1,
+      "maxMs": 0.4004,
+      "p50Ms": 0.2,
+      "p95Ms": 0.3002,
+      "p99Ms": 0.4,
+      "sampleCount": 408,
+      "span": "browser-keydown-to-send-decision",
+      "statistic": "p99-nearest-rank"
+    },
+    "reconstructedReportSha256": "562c3369e63544cbf9d342eb914e7acb0b572a3bf585e2e461f35f90bce45d80",
+    "reportPath": "../terminal-journey/current-baseline.json",
+    "scenarioCount": 17,
+    "selector": {
+      "reason": "Both span boundaries precede injected link delay and the steady journey settles each input before the next sample. All source-controlled steady cells therefore form the least noisy CURRENT Browser population.",
+      "variant": "steady"
+    },
+    "sourceRevision": "f56205fd99b6ea0133fc387098221ebf2906ca3b",
+    "sourceTreeGitOid": "ef3922f354493327e41adae24c1258f7eaa07c50"
+  },
+  "e0ContractSha256": "06731bf64555ec4736147826a277464a2e394cd6ba6575266b72dc54c5d09cbc",
+  "environment": {
+    "executionTier": "local-workerd",
+    "harnessRuntime": "TypeScript on Node.js",
+    "node": "v24.20.0",
+    "platform": "darwin-arm64",
+    "wtermGitlink": "4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6"
+  },
+  "evidenceBoundary": {
+    "hardLimitEvidence": "E1 invariant, overload, bytes/count/pending, and deadline tests; not this latency population.",
+    "measured": "Real Chromium keydown through the E1 Browser InputDispatcher send decision, using the E0 steady raw-semantic-PTY journey.",
+    "notClaimed": [
+      "Cloudflare edge latency",
+      "queue-saturation throughput",
+      "E2 Cloud input-lane isolation",
+      "E3 Host contiguous-prefix behavior"
+    ],
+    "saturatesE0SupportedLoad": false,
+    "saturatesE1HardLimits": false,
+    "simulated": ["Browser/Cloud RTT", "Cloud/Host RTT"],
+    "withinE0SupportedLoad": true
+  },
+  "failures": [],
+  "generatedAt": "2026-09-01T10:08:31Z",
+  "scenarioArchive": {
+    "compressedBytes": 65971,
+    "compressedSha256": "d2110b6cd3bfc854b6dbeb0b597043126f4bed5e9b52489221eaa6f16192b9e2",
+    "compression": "gzip-9-mtime-0",
+    "format": "canonical-jsonl",
+    "path": "e1-candidate.scenarios.jsonl.gz",
+    "scenarioCount": 5,
+    "uncompressedBytes": 998695,
+    "uncompressedSha256": "61f2ff375fa5dde7217ddd5860b879c7607e93e03994e9ac3683c6e1dda862d6"
+  },
+  "schemaVersion": "zhongduan-e1-browser-latency-candidate-v1",
+  "sourceRevision": "7b7e8c55fd577b1e035bb135b0252ca046e75f3a",
+  "sourceTreeDirty": false,
+  "sourceTreeGitOid": "bcaa78d8c91a6f2c9b550d585b80c43e114eba0e",
+  "status": "passed",
+  "workload": {
+    "candidateProfile": {
+      "browserCloudRttMs": 100,
+      "cloudHostRttMs": 100,
+      "jitterMs": 0,
+      "networkFault": "none",
+      "networkImplementation": "two independent Node.js HTTP/WebSocket userspace proxies"
+    },
+    "candidateScenarioCount": 5,
+    "candidateSeeds": [450, 451, 452, 453, 454],
+    "e0SupportedLoad": {
+      "bulkBacklogBytes": [0, 262144, 1048576, 4194304],
+      "maximumInputBytes": 65536,
+      "maximumOutstandingInputs": 32
+    },
+    "e0Variant": "steady",
+    "e1HardLimits": {
+      "maxBytes": 6295552,
+      "maxCount": 256,
+      "maxPending": 1024,
+      "maxPreAdmissionAgeMs": 250,
+      "maxQueuedAgeMs": 250,
+      "maxRetainedResults": 4096,
+      "maxSentAgeMs": 30000,
+      "maxTerminationAgeMs": 5000
+    },
+    "samplesPerScenario": 24,
+    "warmupSamplesPerScenario": 4
+  }
+}

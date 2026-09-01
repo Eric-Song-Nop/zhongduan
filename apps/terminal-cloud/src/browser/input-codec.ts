@@ -1,5 +1,5 @@
 import type { TerminalInputEvent, TerminalMouseInputEvent } from "@wterm/core";
-import { ClientControlFrameSchema, type ClientControlFrame } from "@zhongduan/protocol";
+import { ClientControlFrameSchema, MAX_U64, type ClientControlFrame } from "@zhongduan/protocol";
 
 export type InputFrame = Exclude<
   ClientControlFrame,
@@ -7,6 +7,8 @@ export type InputFrame = Exclude<
 >;
 export type InputKind = TerminalInputEvent["type"] | "unknown";
 export type InputPayload = { type: InputFrame["type"] } & Record<string, unknown>;
+declare const validatedPayload: unique symbol;
+export type ValidatedInputPayload = InputPayload & { readonly [validatedPayload]: true };
 
 const textEncoder = new TextEncoder();
 
@@ -95,13 +97,14 @@ export function normalizeInputEvent(
   };
 }
 
-export function isValidInputPayload(payload: InputPayload): boolean {
-  return ClientControlFrameSchema.safeParse({
+export function validateInputPayload(payload: InputPayload): ValidatedInputPayload | null {
+  const result = ClientControlFrameSchema.safeParse({
     ...payload,
     writerLease: "validation",
     inputEpoch: "validation",
     clientInputSeq: "1",
-  }).success;
+  });
+  return result.success ? (payload as ValidatedInputPayload) : null;
 }
 
 export function encodedJsonBytes(value: unknown): number {
@@ -109,16 +112,30 @@ export function encodedJsonBytes(value: unknown): number {
 }
 
 export function encodeInputFrame(
-  payload: InputPayload,
+  payload: ValidatedInputPayload,
   writerLease: string,
   identity: { readonly inputEpoch: string; readonly clientInputSeq: string },
 ): { readonly frame: InputFrame; readonly encodedBytes: number } {
-  const frame = ClientControlFrameSchema.parse({
-    ...payload,
+  // `validateInputPayload` validates the immutable normalized payload before admission. Authority
+  // validates the bounded lease/epoch, and the owner supplies its canonical decimal sequence. Do
+  // not repeat the complete Zod union walk after identity allocation on every Browser key.
+  if (
+    writerLease.length === 0 ||
+    writerLease.length > 128 ||
+    identity.inputEpoch.length === 0 ||
+    identity.inputEpoch.length > 128 ||
+    identity.clientInputSeq.length > 20 ||
+    !/^[1-9][0-9]*$/u.test(identity.clientInputSeq) ||
+    BigInt(identity.clientInputSeq) > MAX_U64
+  ) {
+    throw new Error("invalid input identity");
+  }
+  const frame = {
+    ...(payload as InputPayload),
     writerLease,
     inputEpoch: identity.inputEpoch,
     clientInputSeq: identity.clientInputSeq,
-  }) as InputFrame;
+  } as InputFrame;
   return {
     frame: Object.freeze(frame),
     encodedBytes: encodedJsonBytes(frame),

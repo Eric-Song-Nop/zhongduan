@@ -131,6 +131,7 @@ function harness(
     setTimer: clock.setTimer,
     clearTimer: clock.clearTimer,
     queueMicrotask: (callback) => microtasks.push(callback),
+    scheduleSendDecision: (callback) => microtasks.push(callback),
     ...(options.policy === undefined ? {} : { policy: options.policy }),
     onIntentResult: (result) => {
       results.push(result);
@@ -185,14 +186,65 @@ function acknowledge(
 }
 
 describe("InputDispatcher E1 admission owner", () => {
+  it("keeps the non-coalescible key path in one owner turn", () => {
+    const microtasks: Array<() => void> = [];
+    const frames: InputFrame[] = [];
+    const dispatcher = new InputDispatcher({
+      getObservedEventSeq: () => 9n,
+      inputEpoch: "epoch-inline",
+      createLocalIntentId: () => "local-inline",
+      queueMicrotask: (callback) => microtasks.push(callback),
+    });
+    expect(
+      dispatcher.attachTransport({
+        generation: 1,
+        writerFence: "1",
+        writerLease: "lease-1",
+        sender: (frame) => (frames.push(frame), "accepted"),
+      }),
+    ).toBe(true);
+
+    const localIntentId = dispatcher.send(key());
+
+    expect(microtasks).toEqual([]);
+    expect(frames).toMatchObject([{ type: "key", clientInputSeq: "1" }]);
+    expect(dispatcher.getIntent(localIntentId)).toMatchObject({ state: "sent" });
+  });
+
+  it("fails closed before admission when transport identity fields exceed wire bounds", () => {
+    const setup = harness();
+    expect(
+      setup.dispatcher.attachTransport({
+        generation: 1,
+        writerFence: "18446744073709551616",
+        writerLease: "lease",
+        sender: () => "accepted",
+      }),
+    ).toBe(false);
+    expect(
+      setup.dispatcher.attachTransport({
+        generation: 2,
+        writerFence: "1",
+        writerLease: "x".repeat(129),
+        sender: () => "accepted",
+      }),
+    ).toBe(false);
+    const localIntentId = setup.dispatcher.send(key());
+    expect(setup.dispatcher.getResult(localIntentId)).toMatchObject({
+      identity: null,
+      outcome: "not-sent",
+      reason: "not-writable",
+    });
+  });
+
   it("allocates Browser identity only after admission and converges an ACK exactly once", () => {
     const setup = harness();
     expect(setup.attach()).toBe(true);
 
     const localIntentId = setup.dispatcher.send(key());
     expect(setup.dispatcher.getIntent(localIntentId)).toMatchObject({
-      state: "consumed",
-      identity: null,
+      state: "queued",
+      identity: expect.objectContaining({ clientInputSeq: "1" }),
     });
     setup.flush();
 
@@ -303,7 +355,7 @@ describe("InputDispatcher E1 admission owner", () => {
   it("expires pre-admission work without allocating a sequence", () => {
     const setup = harness();
     setup.attach();
-    const expired = setup.dispatcher.send(key());
+    const expired = setup.dispatcher.send({ type: "text", text: "expires", source: "input" });
 
     setup.clock.advance(INPUT_QUEUE_CONTRACT.maxPreAdmissionAgeMs);
     setup.flush();
@@ -414,7 +466,7 @@ describe("InputDispatcher E1 admission owner", () => {
   it("classifies pre-admission, queued, sent, and ACKed work across full replacement", () => {
     const pre = harness();
     pre.attach();
-    const preId = pre.dispatcher.send(key());
+    const preId = pre.dispatcher.send({ type: "text", text: "pre", source: "input" });
     pre.dispatcher.detachTransport();
     expect(pre.dispatcher.getResult(preId)).toMatchObject({
       outcome: "not-sent",
@@ -425,7 +477,6 @@ describe("InputDispatcher E1 admission owner", () => {
     const queued = harness();
     queued.attach();
     const queuedId = queued.dispatcher.send(key());
-    queued.runNext();
     queued.dispatcher.detachTransport();
     expect(queued.dispatcher.getResult(queuedId)).toMatchObject({
       outcome: "not-sent",
@@ -616,7 +667,6 @@ describe("InputDispatcher E1 admission owner", () => {
     const setup = harness();
     setup.attach();
     const localIntentId = setup.dispatcher.send(key());
-    setup.runNext(); // admission only
     expect(setup.dispatcher.getIntent(localIntentId)).toMatchObject({ state: "queued" });
 
     setup.clock.advance(INPUT_QUEUE_CONTRACT.maxQueuedAgeMs);

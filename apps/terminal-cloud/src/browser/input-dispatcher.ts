@@ -21,8 +21,8 @@ import {
   encodeInputFrame,
   encodedJsonBytes,
   isCoalesciblePayloadPair,
-  isValidInputPayload,
   normalizeInputEvent,
+  validateInputPayload,
   type InputPayload,
 } from "./input-codec";
 import {
@@ -75,6 +75,7 @@ export interface InputDispatcherOptions {
   policy?: (event: TerminalInputEvent) => boolean;
   now?: () => number;
   queueMicrotask?: (callback: () => void) => void;
+  scheduleSendDecision?: (callback: () => void) => void;
   setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
   assertInvariants?: boolean;
@@ -105,6 +106,7 @@ export class InputDispatcher implements InputSink {
   readonly #policy: ((event: TerminalInputEvent) => boolean) | undefined;
   readonly #now: () => number;
   readonly #queueMicrotask: (callback: () => void) => void;
+  readonly #scheduleSendDecision: (callback: () => void) => void;
   readonly #setTimer: NonNullable<InputDispatcherOptions["setTimer"]>;
   readonly #clearTimer: NonNullable<InputDispatcherOptions["clearTimer"]>;
   readonly #assertInvariantTurns: boolean;
@@ -114,6 +116,7 @@ export class InputDispatcher implements InputSink {
   #authority: AuthorityState = initialAuthorityState();
   #unusedInitialEpoch: string;
   #admissionScheduled = false;
+  #drainingQueue = false;
   #sendScheduled = false;
   #deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   #deadlineAtMs: number | null = null;
@@ -147,6 +150,10 @@ export class InputDispatcher implements InputSink {
     this.#now = options.now ?? Date.now;
     this.#queueMicrotask =
       options.queueMicrotask ?? ((callback) => globalThis.queueMicrotask(callback));
+    // Admission keeps one microtask-sized coalescing window. Once identities are allocated, the
+    // healthy Browser path drains inline; tests can inject a scheduler to hold the queued state at
+    // an exact fault boundary without imposing a second production microtask on every key.
+    this.#scheduleSendDecision = options.scheduleSendDecision ?? ((callback) => callback());
     this.#setTimer =
       options.setTimer ?? ((callback, delayMs) => globalThis.setTimeout(callback, delayMs));
     this.#clearTimer = options.clearTimer ?? ((timer) => globalThis.clearTimeout(timer));
@@ -298,14 +305,15 @@ export class InputDispatcher implements InputSink {
       return localIntentId;
     }
 
-    if (!isValidInputPayload(normalized)) {
+    const validated = validateInputPayload(normalized);
+    if (validated === null) {
       this.#finishNotSent(localIntentId, "validation");
       return localIntentId;
     }
 
     let normalizedBytes: number;
     try {
-      normalizedBytes = encodedJsonBytes(normalized);
+      normalizedBytes = encodedJsonBytes(validated);
     } catch {
       this.#finishNotSent(localIntentId, "malformed");
       return localIntentId;
@@ -325,12 +333,12 @@ export class InputDispatcher implements InputSink {
       return localIntentId;
     }
 
-    if (normalized.type === "resize-request") {
+    if (validated.type === "resize-request") {
       const nextResize = {
-        cols: normalized["cols"] as number,
-        rows: normalized["rows"] as number,
-        widthPx: normalized["widthPx"] as number,
-        heightPx: normalized["heightPx"] as number,
+        cols: validated["cols"] as number,
+        rows: validated["rows"] as number,
+        widthPx: validated["widthPx"] as number,
+        heightPx: validated["heightPx"] as number,
       };
       if (this.#latestResize !== null && !sameDimensions(this.#latestResize, nextResize)) {
         this.#resizeConfirmed = false;
@@ -338,14 +346,14 @@ export class InputDispatcher implements InputSink {
       this.#latestResize = nextResize;
     }
 
-    const validationReason = this.#authorityValidationReason(normalized);
+    const validationReason = this.#authorityValidationReason(validated);
     if (validationReason !== null) {
       this.#finishNotSent(localIntentId, validationReason);
       return localIntentId;
     }
 
     const previous = this.#ledger.lastPreAdmission();
-    if (isCoalesciblePayloadPair(previous?.normalized, normalized)) {
+    if (isCoalesciblePayloadPair(previous?.normalized, validated)) {
       this.#finishNotSent(previous!, "superseded");
     }
     if (!this.#ledger.canReservePreAdmission(normalizedBytes)) {
@@ -353,8 +361,12 @@ export class InputDispatcher implements InputSink {
       return localIntentId;
     }
 
-    this.#ledger.enqueuePreAdmission(localIntentId, normalized, normalizedBytes);
-    this.#scheduleAdmission();
+    this.#ledger.enqueuePreAdmission(localIntentId, validated, normalizedBytes);
+    // Key events cannot coalesce. Admit them in the originating event turn so the safety ledger
+    // does not add a whole microtask to the latency-sensitive keydown path. A key also acts as an
+    // ordering barrier and admits any earlier state intent before itself.
+    if (validated.type === "key") this.#admitPreAdmission();
+    else this.#scheduleAdmission();
     this.#markDirty();
     return localIntentId;
   }
@@ -437,63 +449,72 @@ export class InputDispatcher implements InputSink {
   }
 
   #scheduleSend(): void {
-    if (this.#sendScheduled) return;
+    if (this.#sendScheduled || this.#drainingQueue) return;
     this.#sendScheduled = true;
-    this.#queueMicrotask(() => {
+    this.#scheduleSendDecision(() => {
       this.#transaction(() => this.#drainQueue());
     });
   }
 
   #drainQueue(): void {
     this.#sendScheduled = false;
-    for (;;) {
-      const queued = this.#ledger.queueHead();
-      if (queued === undefined) return;
-      const now = this.#now();
-      if (now >= queued.deadlineAtMs) {
-        this.#finishNotSent(queued, "queue-expired");
-        this.#sealIdentityEpoch(queued.identity, true);
-        continue;
-      }
+    if (this.#drainingQueue) return;
+    this.#drainingQueue = true;
+    try {
+      for (;;) {
+        const queued = this.#ledger.queueHead();
+        if (queued === undefined) return;
+        const now = this.#now();
+        if (now >= queued.deadlineAtMs) {
+          this.#finishNotSent(queued, "queue-expired");
+          this.#sealIdentityEpoch(queued.identity, true);
+          continue;
+        }
 
-      const authority = this.#authority;
-      if (
-        !isWritableAuthority(authority) ||
-        queued.transportGeneration !== authority.transport.generation ||
-        queued.identity.writerFence !== authority.epoch.writerFence ||
-        queued.identity.inputEpoch !== authority.epoch.inputEpoch
-      ) {
-        this.#finishNotSent(queued, "control-replaced");
-        this.#sealIdentityEpoch(queued.identity, false);
-        continue;
-      }
+        const authority = this.#authority;
+        if (
+          !isWritableAuthority(authority) ||
+          queued.transportGeneration !== authority.transport.generation ||
+          queued.identity.writerFence !== authority.epoch.writerFence ||
+          queued.identity.inputEpoch !== authority.epoch.inputEpoch
+        ) {
+          this.#finishNotSent(queued, "control-replaced");
+          this.#sealIdentityEpoch(queued.identity, false);
+          continue;
+        }
 
-      const sending = this.#ledger.startSending(queued.localIntentId, now);
-      this.#markDirty();
-      let decision: ReturnType<InputTransport["sender"]>;
-      try {
-        decision = authority.transport.sender(sending.frame);
-      } catch {
-        decision = "uncertain";
-      }
-
-      // Replacement/result callbacks may reenter while sender is on the stack. The canonical
-      // ledger record wins; a stale return value cannot rewrite a transition that already occurred.
-      const current = this.#ledger.get(sending.localIntentId);
-      if (current?.phase !== "sending") continue;
-      const decidedAt = this.#now();
-      if (decision === "accepted") {
-        this.#ledger.markSent(current.localIntentId, decidedAt + INPUT_QUEUE_CONTRACT.maxSentAgeMs);
+        const sending = this.#ledger.startSending(queued.localIntentId, now);
         this.#markDirty();
-        continue;
-      }
-      if (decision === "proven-not-accepted") {
-        this.#finishNotSent(current, "transport-rejected");
+        let decision: ReturnType<InputTransport["sender"]>;
+        try {
+          decision = authority.transport.sender(sending.frame);
+        } catch {
+          decision = "uncertain";
+        }
+
+        // Replacement/result callbacks may reenter while sender is on the stack. The canonical
+        // ledger record wins; a stale return value cannot rewrite a transition that already occurred.
+        const current = this.#ledger.get(sending.localIntentId);
+        if (current?.phase !== "sending") continue;
+        const decidedAt = this.#now();
+        if (decision === "accepted") {
+          this.#ledger.markSent(
+            current.localIntentId,
+            decidedAt + INPUT_QUEUE_CONTRACT.maxSentAgeMs,
+          );
+          this.#markDirty();
+          continue;
+        }
+        if (decision === "proven-not-accepted") {
+          this.#finishNotSent(current, "transport-rejected");
+          this.#sealIdentityEpoch(current.identity, true);
+          continue;
+        }
+        this.#beginTermination(current, "transport-uncertain", decidedAt);
         this.#sealIdentityEpoch(current.identity, true);
-        continue;
       }
-      this.#beginTermination(current, "transport-uncertain", decidedAt);
-      this.#sealIdentityEpoch(current.identity, true);
+    } finally {
+      this.#drainingQueue = false;
     }
   }
 
