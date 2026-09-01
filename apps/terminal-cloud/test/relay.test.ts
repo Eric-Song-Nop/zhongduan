@@ -6,8 +6,10 @@ import {
   RELAY_CAPABILITIES_HEADER,
   RelayCapability,
   decodeDataFrame,
+  decodeDataFrameBatch,
   encodeDeliveryBarrierPayload,
   encodeDataFrame,
+  encodeDataFrameBatch,
   type DataFrame,
 } from "@zhongduan/protocol";
 import { env, exports as workerExports } from "cloudflare:workers";
@@ -84,6 +86,16 @@ class SocketInbox {
 
   get pendingMessageCount(): number {
     return this.#messages.length;
+  }
+
+  discardAll(expected: unknown): number {
+    let discarded = 0;
+    for (let index = this.#messages.length - 1; index >= 0; index -= 1) {
+      if (this.#messages[index] !== expected) continue;
+      this.#messages.splice(index, 1);
+      discarded += 1;
+    }
+    return discarded;
   }
 
   nextMessage(): Promise<unknown> {
@@ -287,6 +299,7 @@ async function beginWarmDelivery(
     streamId: browser.connection.streamId,
     deliveryGeneration: browser.connection.deliveryGeneration,
   });
+  expect(host.data.inbox.discardAll("data-ack")).toBeGreaterThan(0);
   expect(host.data.inbox.pendingMessageCount).toBe(0);
 }
 
@@ -323,6 +336,7 @@ async function beginSnapshotDelivery(
     connectionId: browser.connection.connectionId,
     snapshotId,
   });
+  expect(host.data.inbox.discardAll("data-ack")).toBeGreaterThan(0);
   expect(host.data.inbox.pendingMessageCount).toBe(0);
   return manifest;
 }
@@ -388,10 +402,14 @@ async function openHost(
     session.sessionId,
     session.hostCapability,
     undefined,
-    negotiateOutcomeDetails ? [RelayCapability.deliveryBarrierOutcomeV1] : [],
+    negotiateOutcomeDetails
+      ? [RelayCapability.deliveryBarrierOutcomeV1, RelayCapability.hostDataBatchV1]
+      : [],
   );
   expect(connection.selectedCapabilities).toEqual(
-    negotiateOutcomeDetails ? [RelayCapability.deliveryBarrierOutcomeV1] : undefined,
+    negotiateOutcomeDetails
+      ? [RelayCapability.deliveryBarrierOutcomeV1, RelayCapability.hostDataBatchV1]
+      : undefined,
   );
   const control = await upgrade(session.sessionId, "control", connection.controlTicket);
   const data = await upgrade(session.sessionId, "data", connection.dataTicket);
@@ -615,6 +633,117 @@ function recoveryInputFrames(writerLease: string) {
 }
 
 describe("live Durable Object relay", () => {
+  it("commits a negotiated Host data batch as its original ordered v2 frames", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    host.data.socket.send(
+      encodeDataFrameBatch([
+        ptyFrame(1n, 0n, textEncoder.encode("a")),
+        ptyFrame(2n, 1n, textEncoder.encode("b")),
+      ]),
+    );
+    await drainSession(session.sessionId);
+
+    const cursor = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) =>
+        state.storage.sql
+          .exec("SELECT head_event_seq, next_pty_offset FROM session_state WHERE singleton = 1")
+          .one() as { head_event_seq: string; next_pty_offset: string },
+    );
+    expect(cursor).toEqual({ head_event_seq: "2", next_pty_offset: "2" });
+    expect(await host.data.inbox.nextMessage()).toBe("data-ack");
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("forwards a negotiated canonical batch as one ordered Browser data message", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.observerCapability, undefined, [
+      RelayCapability.browserDataBatchV1,
+    ]);
+    await attachBrowser(session, host, browser);
+    await beginWarmDelivery(session, host, browser, 0n, 0n);
+    host.data.socket.send(
+      replayCommit(
+        0n,
+        0n,
+        BigInt(browser.connection.deliveryGeneration),
+        browser.connection.streamId,
+      ),
+    );
+    await drainSession(session.sessionId);
+    await browser.data.inbox.nextDataFrame();
+    expect(await host.data.inbox.nextMessage()).toBe("data-ack");
+
+    host.data.socket.send(
+      encodeDataFrameBatch([
+        ptyFrame(1n, 0n, textEncoder.encode("a")),
+        ptyFrame(2n, 1n, textEncoder.encode("b")),
+      ]),
+    );
+    await drainSession(session.sessionId);
+
+    const forwarded = decodeDataFrameBatch(
+      await bytesFromMessage(await browser.data.inbox.nextMessage()),
+    );
+    expect(forwarded).toMatchObject([
+      {
+        deliveryGeneration: BigInt(browser.connection.deliveryGeneration),
+        eventSeq: 1n,
+        ptyOffset: 0n,
+        streamId: browser.connection.streamId,
+      },
+      {
+        deliveryGeneration: BigInt(browser.connection.deliveryGeneration),
+        eventSeq: 2n,
+        ptyOffset: 1n,
+        streamId: browser.connection.streamId,
+      },
+    ]);
+    expect(browser.data.inbox.pendingMessageCount).toBe(0);
+    expect(await host.data.inbox.nextMessage()).toBe("data-ack");
+  });
+
+  it("retains one-frame-per-message delivery for an unnegotiated Browser", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.observerCapability);
+    await attachBrowser(session, host, browser);
+    await beginWarmDelivery(session, host, browser, 0n, 0n);
+    host.data.socket.send(
+      replayCommit(
+        0n,
+        0n,
+        BigInt(browser.connection.deliveryGeneration),
+        browser.connection.streamId,
+      ),
+    );
+    await drainSession(session.sessionId);
+    await browser.data.inbox.nextDataFrame();
+    expect(await host.data.inbox.nextMessage()).toBe("data-ack");
+
+    host.data.socket.send(
+      encodeDataFrameBatch([
+        ptyFrame(1n, 0n, textEncoder.encode("a")),
+        ptyFrame(2n, 1n, textEncoder.encode("b")),
+      ]),
+    );
+    await drainSession(session.sessionId);
+
+    expect(await browser.data.inbox.nextDataFrame()).toMatchObject({
+      eventSeq: 1n,
+      payload: textEncoder.encode("a"),
+    });
+    expect(await browser.data.inbox.nextDataFrame()).toMatchObject({
+      eventSeq: 2n,
+      payload: textEncoder.encode("b"),
+    });
+    expect(browser.data.inbox.pendingMessageCount).toBe(0);
+    expect(await host.data.inbox.nextMessage()).toBe("data-ack");
+  });
+
   it("fails the current host pair before queueing an oversized data frame", async () => {
     const session = await createSession();
     const host = await openHost(session);
@@ -639,6 +768,259 @@ describe("live Durable Object relay", () => {
     expect((await browser.data.inbox.nextClose()).code).toBe(4001);
     expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
     expect(host.data.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("releases WebSocket events after bounded admission instead of awaiting queue tails", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.observerCapability);
+
+    await runInDurableObject(sessionStub(session.sessionId), async (instance, state) => {
+      const hostData = state.getWebSockets("peer:host").find((socket) => {
+        return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+      });
+      const browserControl = state
+        .getWebSockets(`client:${browser.connection.clientId}`)
+        .find((socket) => {
+          return (socket.deserializeAttachment() as { channel?: string }).channel === "control";
+        });
+      if (hostData === undefined) throw new Error("Host data socket is missing");
+      if (browserControl === undefined) throw new Error("Browser control socket is missing");
+
+      const originalBulk = Reflect.get(instance, "messageQueue");
+      const originalInput = Reflect.get(instance, "browserControlLane");
+      let releaseBulk!: () => void;
+      let releaseInput!: () => void;
+      const bulkGate = new Promise<void>((resolve) => {
+        releaseBulk = resolve;
+      });
+      const inputGate = new Promise<void>((resolve) => {
+        releaseInput = resolve;
+      });
+      let bulkAdmissions = 0;
+      let inputAdmissions = 0;
+
+      Reflect.set(instance, "messageQueue", {
+        enqueue() {
+          bulkAdmissions += 1;
+          return bulkGate;
+        },
+      });
+      Reflect.set(instance, "browserControlLane", {
+        enqueue() {
+          inputAdmissions += 1;
+          return inputGate;
+        },
+      });
+
+      let handlersReleased = false;
+      try {
+        const bulkDispatch = instance.webSocketMessage(hostData, new ArrayBuffer(1));
+        const inputDispatch = instance.webSocketMessage(
+          browserControl,
+          JSON.stringify(keyFrame("not_owned", "event_release", "1")),
+        );
+        handlersReleased = await Promise.race([
+          Promise.all([bulkDispatch, inputDispatch]).then(() => true),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+        ]);
+      } finally {
+        releaseBulk();
+        releaseInput();
+        await Promise.all([bulkGate, inputGate]);
+        Reflect.set(instance, "messageQueue", originalBulk);
+        Reflect.set(instance, "browserControlLane", originalInput);
+      }
+
+      expect(bulkAdmissions).toBe(1);
+      expect(inputAdmissions).toBe(1);
+      expect(handlersReleased).toBe(true);
+    });
+
+    expect(host.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect(browser.control.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("fails a negotiated Host that spends a second data credit before the first settles", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+
+    await runInDurableObject(sessionStub(session.sessionId), async (instance, state) => {
+      const hostData = state.getWebSockets("peer:host").find((socket) => {
+        return (socket.deserializeAttachment() as { channel?: string }).channel === "data";
+      });
+      if (hostData === undefined) throw new Error("Host data socket is missing");
+      const original = Reflect.get(instance, "messageQueue");
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let admissions = 0;
+      Reflect.set(instance, "messageQueue", {
+        enqueue() {
+          admissions += 1;
+          return gate;
+        },
+      });
+      try {
+        await instance.webSocketMessage(hostData, new ArrayBuffer(1));
+        await instance.webSocketMessage(hostData, new ArrayBuffer(1));
+        expect(admissions).toBe(1);
+      } finally {
+        release();
+        await gate;
+        Reflect.set(instance, "messageQueue", original);
+      }
+    });
+
+    expect((await host.control.inbox.nextClose()).code).toBe(4400);
+    expect((await host.data.inbox.nextClose()).code).toBe(4400);
+  });
+
+  it("keeps a cumulative delivery ACK burst from becoming an input-lane tail", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.writerCapability, undefined, [
+      RelayCapability.browserInputAdmissionV1,
+    ]);
+    const { welcome } = await attachBrowser(session, host, browser);
+    const writerLease = String(welcome.writerLease);
+
+    await runInDurableObject(sessionStub(session.sessionId), async (instance, state) => {
+      const browserControl = state
+        .getWebSockets(`client:${browser.connection.clientId}`)
+        .find((socket) => {
+          return (socket.deserializeAttachment() as { channel?: string }).channel === "control";
+        });
+      if (browserControl === undefined) throw new Error("Browser control socket is missing");
+      const acknowledgement = JSON.stringify({
+        type: "ack",
+        sessionEpoch: "7",
+        deliveryGeneration: browser.connection.deliveryGeneration,
+        eventSeq: "0",
+        nextPtyOffset: "0",
+      });
+      const dispatches = Array.from({ length: 64 }, () =>
+        instance.webSocketMessage(browserControl, acknowledgement),
+      );
+      dispatches.push(
+        instance.webSocketMessage(
+          browserControl,
+          JSON.stringify(keyFrame(writerLease, "ack_burst", "1")),
+        ),
+      );
+      await Promise.all(dispatches);
+    });
+
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "key",
+      connectionId: browser.connection.connectionId,
+      writerFence: "1",
+      inputEpoch: "ack_burst",
+      clientInputSeq: "1",
+    });
+    expect(browser.control.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("drains the E0 supported input load outside a blocked 4 MiB Host bulk tail", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.writerCapability, undefined, [
+      RelayCapability.browserInputAdmissionV1,
+    ]);
+    const { welcome } = await attachBrowser(session, host, browser);
+    const writerLease = String(welcome.writerLease);
+
+    let releaseBulk!: () => void;
+    let markBulkStarted!: () => void;
+    const bulkStarted = new Promise<void>((resolve) => {
+      markBulkStarted = resolve;
+    });
+    await runInDurableObject(sessionStub(session.sessionId), async (instance) => {
+      const queue = Reflect.get(instance, "messageQueue") as {
+        enqueue(key: object, bytes: number, task: () => Promise<void>): Promise<void> | undefined;
+      };
+      const gate = new Promise<void>((resolve) => {
+        releaseBulk = resolve;
+      });
+      const blocked = queue.enqueue({}, 4 * 1024 * 1024, async () => {
+        markBulkStarted();
+        await gate;
+      });
+      expect(blocked).toBeDefined();
+      await bulkStarted;
+    });
+
+    const frames = Array.from({ length: 32 }, (_, index) => ({
+      type: "paste",
+      writerLease,
+      inputEpoch: "bulk_isolation",
+      clientInputSeq: String(index + 1),
+      data: index === 0 ? "\u0003" : "x".repeat(1_800),
+    }));
+    const encoded = frames.map((frame) => JSON.stringify(frame));
+    expect(
+      encoded.reduce((bytes, frame) => bytes + Buffer.byteLength(frame), 0),
+    ).toBeLessThanOrEqual(64 * 1024);
+    for (const frame of encoded) browser.control.socket.send(frame);
+
+    const forwarded = await Promise.all(
+      frames.map(() => host.control.inbox.nextJson<Record<string, unknown>>()),
+    );
+    expect(forwarded).toHaveLength(32);
+    expect(forwarded.map((frame) => frame.clientInputSeq)).toEqual(
+      Array.from({ length: 32 }, (_, index) => String(index + 1)),
+    );
+    expect(forwarded.filter((frame) => frame.data === "\u0003")).toHaveLength(1);
+    expect(
+      forwarded.every(
+        (frame) =>
+          frame.type === "paste" &&
+          frame.connectionId === browser.connection.connectionId &&
+          frame.inputEpoch === "bulk_isolation" &&
+          frame.writerFence === "1",
+      ),
+    ).toBe(true);
+
+    const whileBulkBlocked = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (instance) => {
+        const bulk = Reflect.get(instance, "messageQueue") as {
+          queuedBytes: number;
+          queuedCount: number;
+        };
+        const input = Reflect.get(instance, "browserControlLane") as {
+          queuedBytes: number;
+          queuedCount: number;
+        };
+        const telemetry = Reflect.get(instance, "inputTelemetry") as {
+          snapshot(): {
+            dispositionCounts: Record<string, number>;
+            maxQueueWaitMs: number;
+          };
+        };
+        return {
+          bulk: { bytes: bulk.queuedBytes, count: bulk.queuedCount },
+          input: { bytes: input.queuedBytes, count: input.queuedCount },
+          telemetry: telemetry.snapshot(),
+        };
+      },
+    );
+    expect(whileBulkBlocked).toMatchObject({
+      bulk: { bytes: 4 * 1024 * 1024, count: 1 },
+      input: { bytes: 0, count: 0 },
+      telemetry: { dispositionCounts: { "host-sent": 32 } },
+    });
+    expect(whileBulkBlocked.telemetry.maxQueueWaitMs).toBeLessThanOrEqual(250);
+
+    releaseBulk();
+    await drainSession(session.sessionId);
+    const queues = await runInDurableObject(sessionStub(session.sessionId), (instance) => {
+      const bulk = Reflect.get(instance, "messageQueue") as { queuedCount: number };
+      const input = Reflect.get(instance, "browserControlLane") as { queuedCount: number };
+      return { bulk: bulk.queuedCount, input: input.queuedCount };
+    });
+    expect(queues).toEqual({ bulk: 0, input: 0 });
   });
 
   it("isolates an input acknowledgement control sink failure without failing the Host", async () => {
@@ -673,10 +1055,12 @@ describe("live Durable Object relay", () => {
     expect(healthy.data.socket.readyState).toBe(WebSocket.OPEN);
   });
 
-  it("fences a throwing Host sink and returns uncertain without dropping recovery input control", async () => {
+  it("fences both Host and writer epochs when an input send becomes uncertain", async () => {
     const session = await createSession();
     const host = await openHost(session);
-    const browser = await openBrowser(session, session.writerCapability);
+    const browser = await openBrowser(session, session.writerCapability, undefined, [
+      RelayCapability.browserInputAdmissionV1,
+    ]);
     const attached = await attachBrowser(session, host, browser);
     const writerLease = String(attached.welcome.writerLease);
 
@@ -708,12 +1092,12 @@ describe("live Durable Object relay", () => {
     });
     expect((await host.control.inbox.nextClose()).code).toBe(4400);
     expect((await host.data.inbox.nextClose()).code).toBe(4400);
-    expect(browser.control.socket.readyState).toBe(WebSocket.OPEN);
+    expect((await browser.control.inbox.nextClose()).code).toBe(4400);
     const lease = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
       return state.storage.sql.exec("SELECT client_id, fence, expires_at FROM writer_lease").one();
     });
     expect(lease).toMatchObject({ client_id: browser.connection.clientId, fence: "1" });
-    expect(Number(lease.expires_at)).toBeGreaterThan(Date.now());
+    expect(lease.expires_at).toBe(0);
   });
 
   it("fences a throwing Host attach-request sink while preserving browser recovery state", async () => {
@@ -1009,14 +1393,6 @@ describe("live Durable Object relay", () => {
         nextPtyOffset: "11",
       }),
     );
-    browser.control.socket.send(JSON.stringify(keyFrame("stale", "awaiting_attach", "1")));
-    await drainSession(session.sessionId);
-    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
-      type: "input-ack",
-      inputEpoch: "awaiting_attach",
-      clientInputSeq: "1",
-      status: "rejected",
-    });
     expect(browser.control.socket.readyState).toBe(WebSocket.OPEN);
     await upgrade(session.sessionId, "data", reconnect.dataTicket);
     browser.control.socket.send(
@@ -1296,6 +1672,96 @@ describe("live Durable Object relay", () => {
     );
     expect(pending).toEqual({ sets: 16, tickets: 16 });
     await createConnectionSet(session.sessionId, session.hostCapability);
+  }, 15_000);
+
+  it("drops an old input frame that was already queued when a higher writer fence wins", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const first = await openBrowser(session, session.writerCapability, undefined, [
+      RelayCapability.browserInputAdmissionV1,
+    ]);
+    const firstAttach = await attachBrowser(session, host, first);
+    const firstLease = String(firstAttach.welcome.writerLease);
+    const delayedMessage = JSON.stringify(keyFrame(firstLease, "delayed_old_writer", "1"));
+
+    await runInDurableObject(sessionStub(session.sessionId), async (instance, state) => {
+      const oldControl = state
+        .getWebSockets(`client:${first.connection.clientId}`)
+        .find(
+          (socket) =>
+            (socket.deserializeAttachment() as { channel?: string }).channel === "control",
+        );
+      if (oldControl === undefined) throw new Error("old writer control socket is missing");
+      const lane = Reflect.get(instance, "browserControlLane") as {
+        enqueue(
+          key: WebSocket,
+          bytes: number,
+          run: (timing: {
+            enqueuedAtMs: number;
+            startedAtMs: number;
+            waitMs: number;
+          }) => Promise<void>,
+          expire: () => void,
+        ): Promise<void> | undefined;
+        queuedCount: number;
+      };
+      const processMessage = Reflect.get(instance, "processWebSocketMessage") as (
+        socket: WebSocket,
+        message: ArrayBuffer | string,
+        timing?: {
+          enqueuedAtMs: number;
+          receivedAtMs: number;
+          startedAtMs: number;
+          waitMs: number;
+        },
+      ) => Promise<void>;
+      let releaseOldLane!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseOldLane = resolve;
+      });
+      const blocker = lane.enqueue(
+        oldControl,
+        1,
+        () => gate,
+        () => undefined,
+      );
+      const receivedAtMs = performance.now();
+      const delayed = lane.enqueue(
+        oldControl,
+        delayedMessage.length * 2,
+        (timing) =>
+          processMessage.call(instance, oldControl, delayedMessage, { ...timing, receivedAtMs }),
+        () => undefined,
+      );
+      expect(blocker).toBeDefined();
+      expect(delayed).toBeDefined();
+      expect(lane.queuedCount).toBe(2);
+      state.storage.sql.exec(
+        `UPDATE writer_lease
+         SET connection_id = 'replacement_connection', fence = '2', expires_at = ?
+         WHERE singleton = 1`,
+        Date.now() + 30_000,
+      );
+      oldControl.close(4001, "connection replaced");
+      releaseOldLane();
+      await Promise.all([blocker, delayed]);
+    });
+    expect(await first.control.inbox.nextClose()).toMatchObject({
+      code: 4001,
+      reason: "connection replaced",
+    });
+    await drainSession(session.sessionId);
+    expect(host.control.inbox.pendingMessageCount).toBe(0);
+    const lease = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) =>
+      state.storage.sql
+        .exec("SELECT connection_id, fence, expires_at FROM writer_lease WHERE singleton = 1")
+        .one(),
+    );
+    expect(lease).toMatchObject({
+      connection_id: "replacement_connection",
+      fence: "2",
+    });
+    expect(Number(lease.expires_at)).toBeGreaterThan(Date.now());
   });
 
   it("forwards strictly increasing writer fences in Host control order", async () => {
@@ -1344,17 +1810,19 @@ describe("live Durable Object relay", () => {
     const secondLease = secondWelcome.writerLease;
     expect(typeof secondLease).toBe("string");
 
-    first.control.socket.send(JSON.stringify(keyFrame(String(firstLease), "input_first", "2")));
-    expect(await first.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
-      type: "input-ack",
-      status: "rejected",
-    });
-    first.control.socket.close(1000, "old writer closed late");
+    const displaced = await first.control.inbox.nextClose();
+    expect(displaced).toMatchObject({ code: 4001, reason: "connection replaced" });
     await drainSession(session.sessionId);
     const lease = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => {
-      return state.storage.sql.exec("SELECT client_id, fence, expires_at FROM writer_lease").one();
+      return state.storage.sql
+        .exec("SELECT client_id, connection_id, fence, expires_at FROM writer_lease")
+        .one();
     });
-    expect(lease).toMatchObject({ client_id: second.connection.clientId, fence: "2" });
+    expect(lease).toMatchObject({
+      client_id: second.connection.clientId,
+      connection_id: secondReplacement.connection.connectionId,
+      fence: "2",
+    });
     expect(Number(lease.expires_at)).toBeGreaterThan(Date.now());
 
     secondReplacement.control.socket.send(
@@ -1425,7 +1893,7 @@ describe("live Durable Object relay", () => {
       fence: "2",
     });
     expect(Number(state.lease.expires_at)).toBeGreaterThan(Date.now());
-  });
+  }, 15_000);
 
   it("fails closed instead of wrapping an exhausted writer fence", async () => {
     const session = await createSession();
@@ -1491,15 +1959,106 @@ describe("live Durable Object relay", () => {
         type: "input-ack",
         inputEpoch: "idle_writer",
         clientInputSeq: "2",
-        status: "rejected",
+        status: "uncertain",
       });
+      expect((await writer.control.inbox.nextClose()).code).toBe(4400);
+      expect((await writer.data.inbox.nextClose()).code).toBe(4400);
       expect(host.control.inbox.pendingMessageCount).toBe(0);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("reports a fenced writer lease as lost and releases the current fence on control close", async () => {
+  it("terminates an E1 writer epoch after heartbeat expiry", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const startedAt = Date.now();
+    try {
+      const session = await createSession();
+      const host = await openHost(session);
+      const writer = await openBrowser(session, session.writerCapability, undefined, [
+        RelayCapability.browserInputAdmissionV1,
+      ]);
+      const { welcome } = await attachBrowser(session, host, writer);
+      const writerLease = String(welcome.writerLease);
+
+      vi.setSystemTime(startedAt + 30_001);
+      writer.control.socket.send(JSON.stringify(keyFrame(writerLease, "expired_e1", "1")));
+      expect(await writer.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+        type: "input-ack",
+        writerFence: "1",
+        inputEpoch: "expired_e1",
+        clientInputSeq: "1",
+        status: "uncertain",
+      });
+      expect((await writer.control.inbox.nextClose()).code).toBe(4400);
+      expect((await writer.data.inbox.nextClose()).code).toBe(4400);
+      expect(host.control.inbox.pendingMessageCount).toBe(0);
+
+      const lease = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) =>
+        state.storage.sql
+          .exec("SELECT connection_id, expires_at, fence FROM writer_lease WHERE singleton = 1")
+          .one(),
+      );
+      expect(lease).toEqual({
+        connection_id: writer.connection.connectionId,
+        expires_at: 0,
+        fence: "1",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("proves the same connection-scoped writer attachment after hibernation", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const writer = await openBrowser(session, session.writerCapability);
+    const { welcome } = await attachBrowser(session, host, writer);
+    const writerLease = String(welcome.writerLease);
+    const before = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) => ({
+      attachment: state
+        .getWebSockets(`client:${writer.connection.clientId}`)
+        .find(
+          (socket) =>
+            (socket.deserializeAttachment() as { channel?: string }).channel === "control",
+        )
+        ?.deserializeAttachment(),
+      lease: state.storage.sql
+        .exec(
+          "SELECT client_id, connection_id, expires_at, fence FROM writer_lease WHERE singleton = 1",
+        )
+        .one(),
+    }));
+    expect(before.attachment).toMatchObject({
+      clientId: writer.connection.clientId,
+      connectionId: writer.connection.connectionId,
+      leaseExpiresAt: before.lease.expires_at,
+      leaseFence: "1",
+    });
+
+    await evictDurableObject(sessionStub(session.sessionId), { webSockets: "hibernate" });
+    writer.control.socket.send(JSON.stringify(keyFrame(writerLease, "hibernated_writer", "1")));
+    expect(await host.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "key",
+      clientId: writer.connection.clientId,
+      connectionId: writer.connection.connectionId,
+      inputEpoch: "hibernated_writer",
+      clientInputSeq: "1",
+      writerFence: "1",
+    });
+    await drainSession(session.sessionId);
+
+    const after = await runInDurableObject(sessionStub(session.sessionId), (_instance, state) =>
+      state.storage.sql
+        .exec(
+          "SELECT client_id, connection_id, expires_at, fence FROM writer_lease WHERE singleton = 1",
+        )
+        .one(),
+    );
+    expect(after).toEqual(before.lease);
+  });
+
+  it("closes a displaced writer and releases only the current connection fence on close", async () => {
     const session = await createSession();
     const host = await openHost(session);
     const first = await openBrowser(session, session.writerCapability);
@@ -1514,9 +2073,9 @@ describe("live Durable Object relay", () => {
     const secondLease = String(secondAttach.welcome.writerLease);
     expect(secondLease).not.toBe(firstLease);
 
-    expect(await renewWriterLease(session, first, firstLease)).toEqual({
-      type: "writer-lease-status",
-      active: false,
+    expect(await first.control.inbox.nextClose()).toMatchObject({
+      code: 4001,
+      reason: "connection replaced",
     });
     const secondStatus = await renewWriterLease(session, second, secondLease);
     expect(secondStatus).toMatchObject({ type: "writer-lease-status", active: true });
@@ -2705,13 +3264,6 @@ describe("live Durable Object relay", () => {
     expect(replacementAttach.welcome).toMatchObject({ deliveryGeneration: "3" });
     expect(replacementLease).not.toBe(writerLease);
 
-    replacement.control.socket.send(JSON.stringify(keyFrame(writerLease, "full_replacement", "1")));
-    expect(await replacement.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
-      type: "input-ack",
-      inputEpoch: "full_replacement",
-      clientInputSeq: "1",
-      status: "rejected",
-    });
     replacement.control.socket.send(
       JSON.stringify(keyFrame(replacementLease, "full_replacement", "1")),
     );
@@ -3130,14 +3682,16 @@ describe("live Durable Object relay", () => {
     });
   });
 
-  it("negotiates E1 Browser fences while preserving the v2 input path", async () => {
+  it("negotiates Browser input and data lanes while filtering Host-only capabilities", async () => {
     const session = await createSession();
     const host = await openHost(session);
     const browser = await openBrowser(session, session.writerCapability, undefined, [
       RelayCapability.deliveryBarrierOutcomeV1,
+      RelayCapability.browserDataBatchV1,
       RelayCapability.browserInputAdmissionV1,
     ]);
     expect(browser.connection.selectedCapabilities).toEqual([
+      RelayCapability.browserDataBatchV1,
       RelayCapability.browserInputAdmissionV1,
     ]);
     const { welcome } = await attachBrowser(session, host, browser);
@@ -3152,6 +3706,17 @@ describe("live Durable Object relay", () => {
       type: "writer-lease-status",
       active: true,
       writerFence: "1",
+    });
+    const leaseBeforeInput = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, state) =>
+        state.storage.sql
+          .exec("SELECT connection_id, expires_at, fence FROM writer_lease WHERE singleton = 1")
+          .one(),
+    );
+    expect(leaseBeforeInput).toMatchObject({
+      connection_id: browser.connection.connectionId,
+      fence: "1",
     });
     browser.control.socket.send(JSON.stringify(keyFrame(writerLease, "e1_browser_epoch", "1")));
     const forwarded = await host.control.inbox.nextJson<Record<string, unknown>>();
@@ -3181,13 +3746,35 @@ describe("live Durable Object relay", () => {
       authorityEventSeq: "1",
     });
 
-    browser.control.socket.send(JSON.stringify(keyFrame("stale-lease", "e1_rejected", "2")));
-    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
-      type: "input-ack",
-      writerFence: "1",
-      inputEpoch: "e1_rejected",
-      clientInputSeq: "2",
-      status: "rejected",
+    const evidence = await runInDurableObject(sessionStub(session.sessionId), (instance, state) => {
+      const telemetry = Reflect.get(instance, "inputTelemetry") as {
+        snapshot(): {
+          records: Array<Record<string, unknown>>;
+          retainedCount: number;
+        };
+      };
+      const lane = Reflect.get(instance, "browserControlLane") as {
+        queuedBytes: number;
+        queuedCount: number;
+      };
+      return {
+        lane: { bytes: lane.queuedBytes, count: lane.queuedCount },
+        lease: state.storage.sql
+          .exec("SELECT connection_id, expires_at, fence FROM writer_lease WHERE singleton = 1")
+          .one(),
+        telemetry: telemetry.snapshot(),
+      };
     });
+    expect(evidence.lease).toEqual(leaseBeforeInput);
+    expect(evidence.lane).toEqual({ bytes: 0, count: 0 });
+    expect(evidence.telemetry.retainedCount).toBe(1);
+    expect(evidence.telemetry.records[0]).toMatchObject({
+      clientInputSeq: "1",
+      connectionId: browser.connection.connectionId,
+      disposition: "host-sent",
+      inputEpoch: "e1_browser_epoch",
+      writerFence: "1",
+    });
+    expect(evidence.telemetry.records[0]).not.toHaveProperty("writerLease");
   });
 });

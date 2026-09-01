@@ -3,10 +3,13 @@ import {
   CloudResourceIdSchema,
   ConnectionSetRequestSchema,
   ConnectionSetResponseSchema,
+  MAX_DELIVERY_OUTSTANDING_BYTES,
   RELAY_CAPABILITIES_HEADER,
   RelayCapability,
   ServerControlFrameSchema,
   decodeDataFrame,
+  decodeDataFrameBatchEntries,
+  deliveryOutstandingBytes,
   type BrowserCapabilityRole,
   type ClientControlFrame,
   type ReplicaCursor,
@@ -43,6 +46,9 @@ const SOCKET_REPLACED_REASON = "connection replaced";
 // A legal 1 MiB input can expand to six bytes per byte when JSON escapes control characters.
 const MAX_CONTROL_FRAME_BYTES = 6 * 1024 * 1024 + 4_096;
 const MAX_CONTROL_QUEUE_BYTES = MAX_CONTROL_FRAME_BYTES;
+const DELIVERY_ACK_FLUSH_INTERVAL_MS = 10;
+const DELIVERY_ACK_FLUSH_BYTES = MAX_DELIVERY_OUTSTANDING_BYTES / 16;
+const DELIVERY_ACK_FLUSH_EVENTS = 256n;
 const textEncoder = new TextEncoder();
 
 type SessionPhase =
@@ -155,6 +161,7 @@ export class TerminalSession {
   #writerLease: string | null = null;
   #writerFence: string | null = null;
   #inputAdmissionEnabled = false;
+  #dataBatchEnabled = false;
   #inputReplacementScheduled = false;
   #clientId: string | undefined;
   #connectPromise: Promise<void> | null = null;
@@ -166,7 +173,10 @@ export class TerminalSession {
   #heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   #attachStartTimer: ReturnType<typeof setTimeout> | null = null;
   #writerLeaseTimer: ReturnType<typeof setTimeout> | null = null;
+  #acknowledgementTimer: ReturnType<typeof setTimeout> | null = null;
   #snapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  #pendingAcknowledgement: ReplicaCursor | null = null;
+  #lastAcknowledgedCursor: ReplicaCursor | null = null;
   #snapshotFailureCount = 0;
   #lastControlPongAt = 0;
   #lastDataPongAt = 0;
@@ -308,6 +318,7 @@ export class TerminalSession {
     this.#writerLease = null;
     this.#writerFence = null;
     this.#inputAdmissionEnabled = false;
+    this.#dataBatchEnabled = false;
     this.#stopHeartbeat();
     this.#stopWriterLeaseRenewal();
     this.#cancelDataFailureTimer();
@@ -316,6 +327,8 @@ export class TerminalSession {
     if (!this.#isCurrentConnection(connectionEpoch)) return;
     this.#inputAdmissionEnabled =
       response.selectedCapabilities?.includes(RelayCapability.browserInputAdmissionV1) ?? false;
+    this.#dataBatchEnabled =
+      response.selectedCapabilities?.includes(RelayCapability.browserDataBatchV1) ?? false;
     const generation = BigInt(response.deliveryGeneration);
 
     // Activation is one synchronous fence before any replacement callback can run.
@@ -373,7 +386,10 @@ export class TerminalSession {
           headers: {
             ...this.#capabilities.authorizationHeaders(),
             "Content-Type": "application/json",
-            [RELAY_CAPABILITIES_HEADER]: RelayCapability.browserInputAdmissionV1,
+            [RELAY_CAPABILITIES_HEADER]: [
+              RelayCapability.browserDataBatchV1,
+              RelayCapability.browserInputAdmissionV1,
+            ].join(","),
           },
           body: JSON.stringify(request),
           signal: requestSignal,
@@ -463,12 +479,21 @@ export class TerminalSession {
         return;
       }
       try {
-        const frame = decodeDataFrame(event.data);
-        if (frame.deliveryGeneration !== generation || frame.streamId !== streamId) {
-          this.#protocolFailure();
-          return;
+        const entries = this.#dataBatchEnabled
+          ? decodeDataFrameBatchEntries(event.data)
+          : [
+              {
+                encoded: new Uint8Array(event.data),
+                frame: decodeDataFrame(event.data),
+              },
+            ];
+        for (const entry of entries) {
+          if (entry.frame.deliveryGeneration !== generation || entry.frame.streamId !== streamId) {
+            this.#protocolFailure();
+            return;
+          }
         }
-        this.coordinator.acceptData(event.data);
+        for (const entry of entries) this.coordinator.acceptData(entry.encoded);
         this.#syncDeliveryState();
       } catch {
         this.#protocolFailure();
@@ -560,6 +585,9 @@ export class TerminalSession {
             nextPtyOffset: cursor.nextPtyOffset.toString(),
           };
     if (this.#sendControl(ClientControlFrameSchema.parse(frame), true)) {
+      this.#resetAcknowledgementState(
+        cursor === null ? null : { ...cursor, deliveryGeneration: generation },
+      );
       this.#startAttachStartWatchdog(generation);
     }
   }
@@ -734,6 +762,7 @@ export class TerminalSession {
     const dataEpoch = ++this.#dataEpoch;
     const abort = new AbortController();
     this.#replacementAbort = abort;
+    this.#resetAcknowledgementState();
     this.#generation = generation;
     this.#input.noteDataTransportReplacement();
     this.#input.setReplicaCurrent(false);
@@ -787,7 +816,58 @@ export class TerminalSession {
 
   #acknowledge(cursor: ReplicaCursor): void {
     if (cursor.deliveryGeneration !== this.#generation) return;
-    this.#sendControl(
+    const previous = this.#pendingAcknowledgement ?? this.#lastAcknowledgedCursor;
+    if (
+      previous !== null &&
+      (cursor.sessionEpoch !== previous.sessionEpoch ||
+        cursor.deliveryGeneration !== previous.deliveryGeneration ||
+        cursor.lastEventSeq < previous.lastEventSeq ||
+        cursor.nextPtyOffset < previous.nextPtyOffset)
+    ) {
+      this.#protocolFailure();
+      return;
+    }
+    if (
+      previous !== null &&
+      cursor.lastEventSeq === previous.lastEventSeq &&
+      cursor.nextPtyOffset === previous.nextPtyOffset
+    ) {
+      return;
+    }
+
+    this.#pendingAcknowledgement = { ...cursor };
+    const last = this.#lastAcknowledgedCursor;
+    if (
+      last === null ||
+      this.coordinator.state !== "live" ||
+      cursor.lastEventSeq - last.lastEventSeq >= DELIVERY_ACK_FLUSH_EVENTS ||
+      deliveryOutstandingBytes(
+        { eventSeq: last.lastEventSeq, nextPtyOffset: last.nextPtyOffset },
+        { eventSeq: cursor.lastEventSeq, nextPtyOffset: cursor.nextPtyOffset },
+      ) >= BigInt(DELIVERY_ACK_FLUSH_BYTES)
+    ) {
+      this.#flushAcknowledgement();
+      return;
+    }
+    if (this.#acknowledgementTimer !== null) return;
+    const connectionEpoch = this.#connectionEpoch;
+    const generation = cursor.deliveryGeneration;
+    this.#acknowledgementTimer = this.#setTimer(() => {
+      this.#acknowledgementTimer = null;
+      if (!this.#isCurrentConnection(connectionEpoch) || this.#generation !== generation) return;
+      this.#flushAcknowledgement();
+    }, DELIVERY_ACK_FLUSH_INTERVAL_MS);
+  }
+
+  #flushAcknowledgement(): void {
+    if (this.#acknowledgementTimer !== null) {
+      this.#clearTimer(this.#acknowledgementTimer);
+      this.#acknowledgementTimer = null;
+    }
+    const cursor = this.#pendingAcknowledgement;
+    this.#pendingAcknowledgement = null;
+    if (cursor === null || cursor.deliveryGeneration !== this.#generation) return;
+    const sent = this.#sendControl(
       ClientControlFrameSchema.parse({
         type: "ack",
         sessionEpoch: cursor.sessionEpoch.toString(),
@@ -797,6 +877,14 @@ export class TerminalSession {
       }),
       true,
     );
+    if (sent) this.#lastAcknowledgedCursor = cursor;
+  }
+
+  #resetAcknowledgementState(cursor: ReplicaCursor | null = null): void {
+    if (this.#acknowledgementTimer !== null) this.#clearTimer(this.#acknowledgementTimer);
+    this.#acknowledgementTimer = null;
+    this.#pendingAcknowledgement = null;
+    this.#lastAcknowledgedCursor = cursor === null ? null : { ...cursor };
   }
 
   #sendControl(frame: ClientControlFrame, critical = false): boolean {
@@ -1058,6 +1146,7 @@ export class TerminalSession {
     this.#cancelAttachStartWatchdog();
     this.#stopHeartbeat();
     this.#stopWriterLeaseRenewal();
+    this.#resetAcknowledgementState();
     this.#input.detachTransport();
     this.#writerLease = null;
     this.#writerFence = null;

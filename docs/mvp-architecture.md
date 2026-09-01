@@ -1,7 +1,7 @@
 # MVP 架构：CURRENT protocol v2 runtime inventory
 
-> 状态：本文只记录 PR #24 head（`5d7511782542de511292d25908b8d92be4319636`）对应的
-> **CURRENT protocol v2** 实现事实，包括现有缺陷。它不是产品 acceptance gate、future protocol
+> 状态：本文记录从 PR #24 baseline 演进到当前 E2 tree 的 **CURRENT protocol v2** 实现事实，包括
+> 现有缺陷。它不是产品 acceptance gate、future protocol
 > 或实施 roadmap。CURRENT 文档与该基线代码冲突时以代码为准；稳定产品边界见
 > [产品契约与协议边界](terminal-protocol-architecture.md)，阶段与完成条件见
 > [MVP 路线](mvp-roadmap.md)，输入 TARGET 细节见[输入核心实施计划](input-core-plan.md)。
@@ -35,12 +35,12 @@ Browser wterm
 
 ## CURRENT owner 与生命周期
 
-| 执行 owner                                                           | 当前拥有的状态与工作                                                                                                           | 当前串行化边界与生命周期                                                                                                                                              |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Host `TerminalSession` actor                                         | PTY、authoritative Ghostty core、`eventSeq`、`nextPtyOffset`、journal append、writer fence 和 input result cache               | PTY output、semantic input、resize、query response 和 snapshot capture 共用一个同步队列；生命周期等于本地 PTY session                                                 |
-| Host `HostRelayConnection` / `HostDeliveryScheduler`                 | 一对 Cloud control/data socket、canonical publisher、attach recovery queue、一个 active recovery、一个 delivery barrier waiter | control frame 共用一条 Promise chain；recovery attempt 逐个执行；relay 重连不终止 PTY                                                                                 |
-| Cloud `TerminalSessionDO`                                            | session/client row、host fence、writer lease、ticket、snapshot/upload metadata、WebSocket 协调和 delivery cursor               | 同一 DO 的 Browser control、Host control 和 Host data inbound work 共用一个 `BoundedSerialQueue`；SQLite 与 Hibernation WebSocket attachment 跨 DO 唤醒保留           |
-| Browser `TerminalSession` / `SessionCoordinator` / `InputDispatcher` | connection/delivery generation、live replica、detached restore candidate、recovery tail、input epoch/sequence 和 pending ACK   | 每个页面实例拥有本地状态；data-only replacement 只 fence 旧 delivery；full/control replacement 还会 detach input transport，并把未决 input 的聚合状态标为 `uncertain` |
+| 执行 owner                                                           | 当前拥有的状态与工作                                                                                                               | 当前串行化边界与生命周期                                                                                                                                                                    |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Host `TerminalSession` actor                                         | PTY、authoritative Ghostty core、`eventSeq`、`nextPtyOffset`、journal append、writer fence 和 input result cache                   | PTY output、semantic input、resize、query response 和 snapshot capture 共用一个同步队列；生命周期等于本地 PTY session                                                                       |
+| Host `HostRelayConnection` / `HostDeliveryScheduler`                 | 一对 Cloud control/data socket、canonical publisher、attach recovery queue、一个 active recovery、一个 delivery barrier waiter     | control frame 共用一条 Promise chain；协商后 Host data 使用单 in-flight credit 与有界 transport batch；recovery attempt 逐个执行；relay 重连不终止 PTY                                      |
+| Cloud `TerminalSessionDO`                                            | session/client row、host fence、connection-scoped writer lease、ticket、snapshot/upload metadata、WebSocket 协调和 delivery cursor | Browser control 使用有界 keyed lane；Host control/data 保留 bulk serial queue；Host data 单 in-flight credit 限制 runtime ingress；sole synced Browser 可协商 canonical data batch；SQLite 与 attachment 跨 DO 唤醒保留 |
+| Browser `TerminalSession` / `SessionCoordinator` / `InputDispatcher` | connection/delivery generation、live replica、detached restore candidate、recovery tail、input epoch/sequence 和 pending ACK       | 每个页面实例拥有本地状态；可协商并顺序解析 canonical data batch；data-only replacement 只 fence 旧 delivery；full/control replacement 还会 detach input transport，并把未决 input 标为 `uncertain` |
 
 Cloud 的 Browser data WebSocket attachment 当前会序列化 `deliveryGeneration`、`dataState`、
 first/acked/sent event cursor 与 PTY offset、`replayMode`、`snapshotId` 以及 pinned
@@ -151,29 +151,32 @@ delivery generation。
 
 ## CURRENT queue 与资源上限
 
-这些数字是 PR #24 实现中的保护条件和默认值，不是 future wire compatibility 保证。
+这些数字是当前 E2 实现中的保护条件和默认值，不是 future wire compatibility 保证。
 
-| owner / resource                            | CURRENT 默认上限                                                             | 超限或到期行为                                                                  |
-| ------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| Host journal segment                        | 256 KiB 或 250 ms                                                            | seal segment                                                                    |
-| Host journal retention                      | 60 s / 8 MiB                                                                 | 按已 seal segment 淘汰；ACK 不延长 retention                                    |
-| Host relay inbound control chain            | 8 MiB / 64 frames                                                            | 关闭 Host relay pair                                                            |
-| Host control WebSocket send buffer          | 1 MiB                                                                        | 关闭 Host relay pair                                                            |
-| Host canonical publisher queue              | 8 MiB / 1024 frames                                                          | barrier 前可中断并重排 recovery；marker/pin 后或继续超限时关闭 relay pair       |
-| Warm replay 与 cold snapshot tail admission | 各 256 KiB / 512 frames                                                      | warm 转 cold，或使 checkpoint/tail 不可用后重试                                 |
-| Cloud inbound serial queue（全 DO）         | 32 MiB / 2048 tasks                                                          | Host 超限会 fail current Host；Browser 超限关闭该 Browser                       |
-| Cloud per-socket inbound profile            | Browser control 16 MiB / 8；Host control 1 MiB / 64；Host data 16 MiB / 1024 | 拒绝该入队并按 peer 执行上述关闭策略                                            |
-| Browser delivery outstanding                | 512 KiB                                                                      | reset 该 Browser data delivery 并推进 `deliveryGeneration`；control socket 保留 |
-| Browser recovery tail                       | 2 MiB / 1024 frames                                                          | 请求 resync                                                                     |
-| Browser restore deadline                    | 5 s                                                                          | 放弃 candidate 并请求 resync                                                    |
-| Browser connections per session             | 16                                                                           | 新 reservation 返回容量错误                                                     |
-| Host input result cache                     | 4096 entries                                                                 | 淘汰最旧结果；旧 identity 只能返回 `uncertain`                                  |
-| Snapshot checkpoint metadata cache          | 30 s                                                                         | 过期后重新准备 cold checkpoint                                                  |
-| Snapshot recovery quiet / max quiet wait    | 250 ms / 5 s                                                                 | 延后 cold capture，但最多等待当前上限                                           |
-| Snapshot encode budget / publish timeout    | 5 s / 120 s                                                                  | 本次 preparation 失败或重试                                                     |
-| Snapshot build minimum interval             | 1 s                                                                          | 延后下一次 build                                                                |
-| Snapshot blob                               | 32 MiB compressed / 128 MiB uncompressed                                     | 拒绝 snapshot                                                                   |
-| Cloud snapshot/upload rows                  | 32 total / 4 pending；latest + active pins + 2 recent 受保护                 | maintenance 回收未受保护对象                                                    |
+| owner / resource                            | CURRENT 默认上限                                                              | 超限或到期行为                                                                  |
+| ------------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Host journal segment                        | 256 KiB 或 250 ms                                                             | seal segment                                                                    |
+| Host journal retention                      | 60 s / 8 MiB                                                                  | 按已 seal segment 淘汰；ACK 不延长 retention                                    |
+| Host relay inbound control chain            | 8 MiB / 64 frames                                                             | 关闭 Host relay pair                                                            |
+| Host control WebSocket send buffer          | 1 MiB                                                                         | 关闭 Host relay pair                                                            |
+| Host canonical publisher queue              | 8 MiB / 1024 frames                                                           | barrier 前可中断并重排 recovery；marker/pin 后或继续超限时关闭 relay pair       |
+| Warm replay 与 cold snapshot tail admission | 各 256 KiB / 512 frames                                                       | warm 转 cold，或使 checkpoint/tail 不可用后重试                                 |
+| Cloud Host bulk serial queue                | 32 MiB / 2048 tasks                                                           | Host 超限会 fail current Host                                                   |
+| Cloud Browser control lane                  | 32 MiB / 512 tasks / 250 ms / concurrency 4                                   | 超限或过期只隔离来源 Browser connection                                         |
+| Cloud per-socket inbound profile            | Browser control 16 MiB / 64；Host control 1 MiB / 64；Host data 16 MiB / 1024 | 拒绝该入队并按 peer 执行上述关闭策略                                            |
+| Negotiated Host data transport              | 256 KiB / 64 frames / 1 in-flight；Host retained 8 MiB / 8192 frames          | credit 违规或 Cloud admission 失败会关闭 Host pair；旧 peer 保持单帧消息        |
+| Negotiated Browser canonical data transport | 256 KiB / 64 frames；仅 sole synced Browser                                   | 未协商、多 Browser 或 recovery 路径保持单帧消息                                 |
+| Browser delivery outstanding                | 512 KiB                                                                       | reset 该 Browser data delivery 并推进 `deliveryGeneration`；control socket 保留 |
+| Browser recovery tail                       | 2 MiB / 1024 frames                                                           | 请求 resync                                                                     |
+| Browser restore deadline                    | 5 s                                                                           | 放弃 candidate 并请求 resync                                                    |
+| Browser connections per session             | 16                                                                            | 新 reservation 返回容量错误                                                     |
+| Host input result cache                     | 4096 entries                                                                  | 淘汰最旧结果；旧 identity 只能返回 `uncertain`                                  |
+| Snapshot checkpoint metadata cache          | 30 s                                                                          | 过期后重新准备 cold checkpoint                                                  |
+| Snapshot recovery quiet / max quiet wait    | 250 ms / 5 s                                                                  | 延后 cold capture，但最多等待当前上限                                           |
+| Snapshot encode budget / publish timeout    | 5 s / 120 s                                                                   | 本次 preparation 失败或重试                                                     |
+| Snapshot build minimum interval             | 1 s                                                                           | 延后下一次 build                                                                |
+| Snapshot blob                               | 32 MiB compressed / 128 MiB uncompressed                                      | 拒绝 snapshot                                                                   |
+| Cloud snapshot/upload rows                  | 32 total / 4 pending；latest + active pins + 2 recent 受保护                  | maintenance 回收未受保护对象                                                    |
 
 Host `TerminalSession` 的同步 actor queue 没有独立 bytes/count hard limit。当前调用通常在同一个 JavaScript
 turn 内立即 drain，但 snapshot encode 也在这个 owner 内同步执行；表中的 5 s encode budget 是完成后

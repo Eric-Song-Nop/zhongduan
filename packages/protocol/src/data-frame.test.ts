@@ -5,7 +5,10 @@ import {
   DATA_PROTOCOL_VERSION,
   DataFrameKind,
   decodeDataFrame,
+  decodeDataFrameBatch,
+  decodeDataFrameBatchEntries,
   encodeDataFrame,
+  encodeDataFrameBatch,
   encodeResizePayload,
   rewriteDelivery,
 } from "./data-frame";
@@ -74,6 +77,34 @@ describe("data frame codec", () => {
     new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength).setUint16(6, 1, true);
     expect(() => decodeDataFrame(encoded)).toThrowError(
       expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_FLAGS" }),
+    );
+  });
+
+  it("round-trips a bounded concatenated transport batch without changing logical frames", () => {
+    const first = encodeDataFrame(outputFrame);
+    const secondFrame = {
+      ...outputFrame,
+      eventSeq: outputFrame.eventSeq + 1n,
+      ptyOffset: outputFrame.ptyOffset + BigInt(outputFrame.payload.byteLength),
+      payload: new TextEncoder().encode("next"),
+    };
+    const second = encodeDataFrame(secondFrame);
+    const batch = encodeDataFrameBatch([first, second]);
+
+    expect(batch.byteLength).toBe(first.byteLength + second.byteLength);
+    expect(decodeDataFrameBatch(batch)).toEqual([outputFrame, secondFrame]);
+    expect(decodeDataFrameBatchEntries(batch)).toEqual([
+      { encoded: first, frame: outputFrame },
+      { encoded: second, frame: secondFrame },
+    ]);
+    expect(() => decodeDataFrame(batch)).toThrowError(
+      expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_LENGTH" }),
+    );
+    expect(() => decodeDataFrameBatch(batch.subarray(0, batch.byteLength - 1))).toThrowError(
+      expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_LENGTH" }),
+    );
+    expect(() => encodeDataFrameBatch([])).toThrowError(
+      expect.objectContaining<Partial<ProtocolError>>({ code: "BAD_LENGTH" }),
     );
   });
 

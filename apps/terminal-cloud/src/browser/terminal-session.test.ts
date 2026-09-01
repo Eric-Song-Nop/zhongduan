@@ -5,6 +5,7 @@ import {
   RELAY_CAPABILITIES_HEADER,
   RelayCapability,
   encodeDataFrame,
+  encodeDataFrameBatch,
   type ReplicaCursor,
   type ResizePayload,
 } from "@zhongduan/protocol";
@@ -251,7 +252,7 @@ async function openRecoveryUnderWatchdog(
     expiresAt: timers.now + 30_000,
     controlTicket: "control_ticket_warm_watchdog",
     dataTicket: "data_ticket_warm_watchdog",
-    selectedCapabilities: ["browser-input-admission-v1"],
+    selectedCapabilities: ["browser-data-batch-v1", "browser-input-admission-v1"],
   };
   const fetch = vi.fn(
     async () =>
@@ -339,6 +340,60 @@ async function openRecoveryUnderWatchdog(
 }
 
 describe("TerminalSession delivery activation", () => {
+  it("coalesces live delivery acknowledgements while retaining the latest cursor", async () => {
+    const timers = new ManualTimers();
+    timers.now = 2_000_000_000_000;
+    const { control, data, session } = await openRecoveryUnderWatchdog(timers, "warm-start");
+    data.message(dataFrame(2n, 10n, 20n, [], DataFrameKind.ReplayCommit));
+    expect(session.snapshot.phase).toBe("live");
+
+    const acknowledgementsBefore = controlFrames(control).filter(
+      (frame) => frame.type === "ack",
+    ).length;
+    for (let index = 0; index < 64; index += 1) {
+      data.message(dataFrame(2n, 11n + BigInt(index), 20n + BigInt(index), [65]));
+    }
+    expect(controlFrames(control).filter((frame) => frame.type === "ack")).toHaveLength(
+      acknowledgementsBefore,
+    );
+
+    await timers.advanceBy(10);
+    const acknowledgements = controlFrames(control).filter((frame) => frame.type === "ack");
+    expect(acknowledgements).toHaveLength(acknowledgementsBefore + 1);
+    expect(acknowledgements.at(-1)).toMatchObject({
+      deliveryGeneration: "2",
+      eventSeq: "74",
+      nextPtyOffset: "84",
+    });
+    session.close();
+  });
+
+  it("applies every logical frame in a negotiated Browser data batch", async () => {
+    const timers = new ManualTimers();
+    timers.now = 2_000_000_000_000;
+    const { control, data, session } = await openRecoveryUnderWatchdog(timers, "warm-start");
+    data.message(dataFrame(2n, 10n, 20n, [], DataFrameKind.ReplayCommit));
+
+    const batch = encodeDataFrameBatch([
+      new Uint8Array(dataFrame(2n, 11n, 20n, [65])),
+      new Uint8Array(dataFrame(2n, 12n, 21n, [66])),
+    ]);
+    data.message(batch.buffer as ArrayBuffer);
+    await timers.advanceBy(10);
+
+    expect(
+      controlFrames(control)
+        .filter((frame) => frame.type === "ack")
+        .at(-1),
+    ).toMatchObject({
+      deliveryGeneration: "2",
+      eventSeq: "12",
+      nextPtyOffset: "22",
+    });
+    expect(session.snapshot.phase).toBe("live");
+    session.close();
+  });
+
   it("waits for explicit reclaim after another control connection replaces this page", async () => {
     const timers = new ManualTimers();
     timers.now = 2_000_000_000_000;
@@ -590,7 +645,10 @@ describe("TerminalSession delivery activation", () => {
       expect.stringContaining("/connection-sets"),
       expect.objectContaining({
         headers: expect.objectContaining({
-          [RELAY_CAPABILITIES_HEADER]: RelayCapability.browserInputAdmissionV1,
+          [RELAY_CAPABILITIES_HEADER]: [
+            RelayCapability.browserDataBatchV1,
+            RelayCapability.browserInputAdmissionV1,
+          ].join(","),
         }),
       }),
     );

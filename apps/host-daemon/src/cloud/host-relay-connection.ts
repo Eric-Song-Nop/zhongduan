@@ -1,6 +1,11 @@
 import {
+  DATA_HEADER_BYTES,
+  MAX_DATA_BATCH_BYTES,
+  MAX_DATA_BATCH_FRAMES,
+  RelayCapability,
   RelayToHostControlFrameSchema,
   decodeControlFrame,
+  encodeDataFrameBatch,
   encodeControlFrame,
   type HostControlFrame,
   type RelayToHostControlFrame,
@@ -25,6 +30,10 @@ export const HOST_CONTROL_QUEUE_LIMITS = {
 } as const;
 const MAX_CONTROL_MESSAGE_CHARS = 6 * 1024 * 1024 + 4_096;
 const MAX_CONTROL_BUFFERED_BYTES = 1024 * 1024;
+const HOST_DATA_BATCH_ACK = "data-ack";
+const MAX_PENDING_DATA_FRAMES = 8_192;
+const MIN_LATENCY_SENSITIVE_DATA_FRAME_BYTES = DATA_HEADER_BYTES + 3;
+const MAX_LATENCY_SENSITIVE_DATA_FRAME_BYTES = DATA_HEADER_BYTES + 256;
 const textEncoder = new TextEncoder();
 
 export interface HostRelayConnectionOptions {
@@ -45,6 +54,7 @@ export class HostRelayConnection {
   readonly #monotonicNow: () => number;
   readonly #session: TerminalSession;
   readonly #scheduler: HostDeliveryScheduler;
+  readonly #dataBatchEnabled: boolean;
   readonly #readyTimeoutMs: number;
   readonly #readyPromise: Promise<void>;
   readonly #resolveReady: () => void;
@@ -59,6 +69,10 @@ export class HostRelayConnection {
   #heartbeatLastControlAckAt = 0;
   #heartbeatLastDataAckAt = 0;
   #heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+  #dataBatchScheduled = false;
+  #inFlightDataBytes = 0;
+  #pendingDataBytes = 0;
+  readonly #pendingDataFrames: Uint8Array[] = [];
   #queuedControlBytes = 0;
   #queuedControlCount = 0;
   #ready = false;
@@ -77,6 +91,9 @@ export class HostRelayConnection {
       throw new RangeError("Host heartbeat timeout must exceed its positive interval");
     }
     this.#monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
+    this.#dataBatchEnabled =
+      options.pair.connection.selectedCapabilities?.includes(RelayCapability.hostDataBatchV1) ??
+      false;
     this.#readyTimeoutMs = options.readyTimeoutMs ?? HOST_READY_TIMEOUT_MS;
     if (!Number.isInteger(this.#readyTimeoutMs) || this.#readyTimeoutMs <= 0) {
       throw new RangeError("host-ready timeout must be a positive integer");
@@ -205,6 +222,20 @@ export class HostRelayConnection {
       this.#heartbeatLastDataAckAt = this.#monotonicNow();
       return;
     }
+    if (event.data === HOST_DATA_BATCH_ACK) {
+      if (!this.#ready || !this.#dataBatchEnabled || this.#inFlightDataBytes === 0) {
+        this.#close(1002, "unexpected Host data acknowledgement");
+        return;
+      }
+      this.#heartbeatLastDataAckAt = this.#monotonicNow();
+      this.#inFlightDataBytes = 0;
+      try {
+        this.#flushDataBatch();
+      } catch (error) {
+        this.#close(1011, error instanceof Error ? error.message : "Host data batch failed");
+      }
+      return;
+    }
     this.#close(1002, "Host data channel is send-only");
   };
 
@@ -225,6 +256,7 @@ export class HostRelayConnection {
       this.#close(1002, "invalid relay control frame");
       return;
     }
+    this.#heartbeatLastControlAckAt = this.#monotonicNow();
 
     if (frame.type === "host-ready-ack") {
       this.#handleReadyAck(frame);
@@ -281,8 +313,12 @@ export class HostRelayConnection {
         return;
       }
       try {
-        this.#sendRawControl("ping");
-        this.#sendRawDataHeartbeat();
+        if (now - this.#heartbeatLastControlAckAt >= this.#heartbeatIntervalMs) {
+          this.#sendRawControl("ping");
+        }
+        if (now - this.#heartbeatLastDataAckAt >= this.#heartbeatIntervalMs) {
+          this.#sendRawDataHeartbeat();
+        }
       } catch (error) {
         this.#close(1011, error instanceof Error ? error.message : "Host heartbeat failed");
         return;
@@ -329,13 +365,88 @@ export class HostRelayConnection {
     if (!(frame.buffer instanceof ArrayBuffer)) {
       throw new Error("Host data frame must use an owned ArrayBuffer");
     }
+    if (!this.#dataBatchEnabled) {
+      this.#sendRawData(frame);
+      return;
+    }
+    if (frame.byteLength > MAX_DATA_BATCH_BYTES) {
+      throw new Error("Host data frame exceeds the negotiated batch bound");
+    }
+    if (
+      this.#pendingDataFrames.length + 1 > MAX_PENDING_DATA_FRAMES ||
+      this.#pair.data.bufferedAmount +
+        this.#inFlightDataBytes +
+        this.#pendingDataBytes +
+        frame.byteLength >
+        HOST_CANONICAL_QUEUE_LIMITS.maxBytes
+    ) {
+      throw new Error("Host data WebSocket buffer exceeded");
+    }
+    this.#pendingDataFrames.push(frame);
+    this.#pendingDataBytes += frame.byteLength;
+    if (
+      this.#pendingDataFrames.length >= MAX_DATA_BATCH_FRAMES ||
+      this.#pendingDataBytes >= MAX_DATA_BATCH_BYTES
+    ) {
+      this.#flushDataBatch();
+      return;
+    }
+    if (this.#dataBatchScheduled) return;
+    this.#dataBatchScheduled = true;
+    queueMicrotask(() => {
+      this.#dataBatchScheduled = false;
+      if (this.#closed) return;
+      try {
+        this.#flushDataBatch();
+      } catch (error) {
+        this.#close(1011, error instanceof Error ? error.message : "Host data batch failed");
+      }
+    });
+  }
+
+  #flushDataBatch(): void {
+    if (this.#pendingDataFrames.length === 0 || this.#inFlightDataBytes > 0) return;
+    let count = 0;
+    let bytes = 0;
+    while (count < this.#pendingDataFrames.length && count < MAX_DATA_BATCH_FRAMES) {
+      const next = this.#pendingDataFrames[count]!;
+      const latencySensitive =
+        next.byteLength >= MIN_LATENCY_SENSITIVE_DATA_FRAME_BYTES &&
+        next.byteLength <= MAX_LATENCY_SENSITIVE_DATA_FRAME_BYTES;
+      if (count > 0 && latencySensitive) break;
+      if (count > 0 && bytes + next.byteLength > MAX_DATA_BATCH_BYTES) break;
+      bytes += next.byteLength;
+      count += 1;
+      if (latencySensitive) break;
+    }
+    const frames = this.#pendingDataFrames.splice(0, count);
+    this.#pendingDataBytes -= bytes;
+    const encoded = encodeDataFrameBatch(frames);
+    this.#sendRawData(encoded);
+    this.#inFlightDataBytes = encoded.byteLength;
+  }
+
+  #sendRawData(frame: Uint8Array): void {
+    if (this.#closed || this.#pair.data.readyState !== WebSocket.OPEN) {
+      throw new Error("Host data WebSocket is not open");
+    }
+    if (!(frame.buffer instanceof ArrayBuffer)) {
+      throw new Error("Host data frame must use an owned ArrayBuffer");
+    }
+    if (this.#pair.data.bufferedAmount + frame.byteLength > HOST_CANONICAL_QUEUE_LIMITS.maxBytes) {
+      throw new Error("Host data WebSocket buffer exceeded");
+    }
     this.#pair.data.send(frame as Uint8Array<ArrayBuffer>);
+    if (this.#pair.data.bufferedAmount > HOST_CANONICAL_QUEUE_LIMITS.maxBytes) {
+      throw new Error("Host data WebSocket buffer exceeded");
+    }
   }
 
   #sendRawDataHeartbeat(): void {
     if (this.#closed || this.#pair.data.readyState !== WebSocket.OPEN) {
       throw new Error("Host data WebSocket is not open");
     }
+    this.#flushDataBatch();
     if (this.#pair.data.bufferedAmount > HOST_CANONICAL_QUEUE_LIMITS.maxBytes) {
       throw new Error("Host data WebSocket buffer exceeded");
     }
@@ -355,6 +466,9 @@ export class HostRelayConnection {
     this.#closed = true;
     this.#pairFence = null;
     this.#ready = false;
+    this.#pendingDataFrames.length = 0;
+    this.#inFlightDataBytes = 0;
+    this.#pendingDataBytes = 0;
     if (this.#heartbeatTimer !== undefined) clearTimeout(this.#heartbeatTimer);
     this.#heartbeatTimer = undefined;
     this.#unlisten();

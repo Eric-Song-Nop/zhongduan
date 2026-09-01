@@ -47,6 +47,7 @@ export interface ClientRow {
 
 export interface WriterLeaseRow {
   client_id: string;
+  connection_id: string;
   expires_at: number;
   fence: string;
   lease_digest: string;
@@ -244,6 +245,23 @@ export function migrateRelayStore(state: DurableObjectState, sql: SqlStorage): v
         );
       }
       state.storage.kv.put("schema-version", 5);
+    });
+    version = 5;
+  }
+
+  if (version < 6) {
+    state.storage.transactionSync(() => {
+      const hasConnectionId = sql
+        .exec("PRAGMA table_info(writer_lease)")
+        .toArray()
+        .some((column) => column.name === "connection_id");
+      if (!hasConnectionId) {
+        sql.exec("ALTER TABLE writer_lease ADD COLUMN connection_id TEXT NOT NULL DEFAULT ''");
+      }
+      // A pre-E2 row did not prove which live control attachment owned the lease. Preserve its fence
+      // high-water, but force a fresh connection-scoped acquisition after deployment/hibernation.
+      sql.exec("UPDATE writer_lease SET expires_at = 0 WHERE connection_id = ''");
+      state.storage.kv.put("schema-version", 6);
     });
   }
 }

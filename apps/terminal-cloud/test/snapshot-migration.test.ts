@@ -132,6 +132,62 @@ async function installV3Fixture(sessionId: string): Promise<void> {
   });
 }
 
+describe("relay store migration", () => {
+  it("preserves the writer fence but expires a pre-E2 lease without a connection owner", async () => {
+    const session = await createSession();
+    await runInDurableObject(sessionStub(session.sessionId), async (_instance, durable) => {
+      const sql = durable.storage.sql;
+      sql.exec("DROP TABLE writer_lease");
+      sql.exec(`
+        CREATE TABLE writer_lease (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          client_id TEXT NOT NULL,
+          lease_digest TEXT NOT NULL,
+          fence TEXT NOT NULL,
+          expires_at INTEGER NOT NULL
+        )
+      `);
+      sql.exec(
+        `INSERT INTO writer_lease
+          (singleton, client_id, lease_digest, fence, expires_at)
+         VALUES (1, 'legacy-client', 'legacy-digest', '41', ?)`,
+        Date.now() + 60_000,
+      );
+      durable.storage.kv.put("schema-version", 5);
+    });
+    await evictDurableObject(sessionStub(session.sessionId));
+
+    const coldGet = await getSnapshot(session, "snapshot_e2_migration_probe");
+    expect(coldGet.status).toBe(404);
+    await coldGet.body?.cancel();
+
+    const migrated = await runInDurableObject(
+      sessionStub(session.sessionId),
+      (_instance, durable) => ({
+        columns: durable.storage.sql
+          .exec("PRAGMA table_info(writer_lease)")
+          .toArray()
+          .map((column) => column.name),
+        lease: durable.storage.sql
+          .exec(
+            `SELECT client_id, connection_id, fence, expires_at
+             FROM writer_lease WHERE singleton = 1`,
+          )
+          .one(),
+        version: durable.storage.kv.get<number>("schema-version"),
+      }),
+    );
+    expect(migrated.columns).toContain("connection_id");
+    expect(migrated.lease).toEqual({
+      client_id: "legacy-client",
+      connection_id: "",
+      fence: "41",
+      expires_at: 0,
+    });
+    expect(migrated.version).toBe(6);
+  });
+});
+
 describe("snapshot retention migration", () => {
   // Preserve the 1,001-row stress fixture while other workerd files share the test scheduler.
   it("migrates v3 in O(1) and drains a large snapshot ledger in fixed alarm batches", async () => {
@@ -167,7 +223,7 @@ describe("snapshot retention migration", () => {
       backlog: 1,
       currentUploads: 0,
       snapshots: LEGACY_SNAPSHOT_ROWS,
-      version: 5,
+      version: 6,
     });
     expect(migrated.alarm).not.toBeNull();
     expect(migrated.indexes).toEqual([

@@ -5,6 +5,8 @@ export const DATA_MAGIC = 0x5a54524d;
 export const DATA_PROTOCOL_VERSION = 2;
 export const DATA_HEADER_BYTES = 48;
 export const MAX_DATA_PAYLOAD_BYTES = 16 * 1024 * 1024;
+export const MAX_DATA_BATCH_BYTES = 256 * 1024;
+export const MAX_DATA_BATCH_FRAMES = 64;
 
 export const DataFrameKind = {
   PtyOutput: 1,
@@ -32,6 +34,11 @@ export interface DataFrameHeader {
 
 export interface DataFrame extends DataFrameHeader {
   payload: Uint8Array;
+}
+
+export interface DecodedDataFrameBatchEntry {
+  encoded: Uint8Array;
+  frame: DataFrame;
 }
 
 const validKinds = new Set<number>(Object.values(DataFrameKind));
@@ -133,6 +140,74 @@ export function decodeDataFrame(encoded: ArrayBuffer | Uint8Array): DataFrame {
     streamId: view.getUint32(40, true),
     payload: bytes.subarray(DATA_HEADER_BYTES),
   };
+}
+
+/**
+ * Encodes a negotiated Host-to-Cloud transport batch. The batch has no second envelope: it is the
+ * exact concatenation of independently valid v2 data frames, so logical frame bytes and ordering
+ * remain unchanged.
+ */
+export function encodeDataFrameBatch(frames: readonly Uint8Array[]): Uint8Array {
+  if (frames.length === 0 || frames.length > MAX_DATA_BATCH_FRAMES) {
+    throw new ProtocolError(
+      "BAD_LENGTH",
+      `data frame batch must contain 1..${MAX_DATA_BATCH_FRAMES} frames`,
+    );
+  }
+  let totalBytes = 0;
+  for (const frame of frames) {
+    decodeDataFrame(frame);
+    totalBytes += frame.byteLength;
+    if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_DATA_BATCH_BYTES) {
+      throw new ProtocolError(
+        "BAD_LENGTH",
+        `data frame batch exceeds ${MAX_DATA_BATCH_BYTES} bytes`,
+      );
+    }
+  }
+  const encoded = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const frame of frames) {
+    encoded.set(frame, offset);
+    offset += frame.byteLength;
+  }
+  return encoded;
+}
+
+/**
+ * Decodes one negotiated Host-to-Cloud transport batch while retaining zero-copy views of the
+ * original logical frame bytes.
+ */
+export function decodeDataFrameBatchEntries(
+  encoded: ArrayBuffer | Uint8Array,
+): DecodedDataFrameBatchEntry[] {
+  const bytes = encoded instanceof Uint8Array ? encoded : new Uint8Array(encoded);
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_DATA_BATCH_BYTES) {
+    throw new ProtocolError("BAD_LENGTH", "data frame batch has an invalid byte length");
+  }
+
+  const entries: DecodedDataFrameBatchEntry[] = [];
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    if (entries.length >= MAX_DATA_BATCH_FRAMES || bytes.byteLength - offset < DATA_HEADER_BYTES) {
+      throw new ProtocolError("BAD_LENGTH", "data frame batch is truncated or has too many frames");
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset + offset, DATA_HEADER_BYTES);
+    const payloadLength = view.getUint32(44, true);
+    const frameLength = DATA_HEADER_BYTES + payloadLength;
+    if (payloadLength > MAX_DATA_PAYLOAD_BYTES || frameLength > bytes.byteLength - offset) {
+      throw new ProtocolError("BAD_LENGTH", "data frame batch contains a truncated frame");
+    }
+    const logical = bytes.subarray(offset, offset + frameLength);
+    entries.push({ encoded: logical, frame: decodeDataFrame(logical) });
+    offset += frameLength;
+  }
+  return entries;
+}
+
+/** Decodes one negotiated Host-to-Cloud transport batch into its original logical v2 frames. */
+export function decodeDataFrameBatch(encoded: ArrayBuffer | Uint8Array): DataFrame[] {
+  return decodeDataFrameBatchEntries(encoded).map(({ frame }) => frame);
 }
 
 export function rewriteDelivery(

@@ -188,6 +188,9 @@ Host-send 的路径也只能等待同一 Host proof；不能证明时必须返�
 
 ### E2 evidence 与完成条件
 
+当前实现与可复跑证据见
+[E2 Cloud input lane and connection-scoped writer](./e2-cloud-input-lane.md)。
+
 - Writer replacement、heartbeat expiry、socket close、DO hibernation 和 delayed old-frame fault test 证明旧
   connection 成功 input 次数为 0。
 - Output flood、snapshot maintenance 和 R2 workload 下，input lane 的 queue bytes/count/age 均不越界；
