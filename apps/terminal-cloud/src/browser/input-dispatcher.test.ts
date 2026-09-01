@@ -83,6 +83,10 @@ class ManualClock {
     }
     this.now = target;
   }
+
+  elapseWithoutTimers(milliseconds: number): void {
+    this.now += milliseconds;
+  }
 }
 
 interface Harness {
@@ -533,6 +537,65 @@ describe("InputDispatcher E1 admission owner", () => {
     expect(setup.clock.timers.size).toBe(0);
   });
 
+  it("enforces elapsed sent and proof deadlines before accepting an ACK", () => {
+    const setup = harness();
+    setup.attach();
+    const localIntentId = setup.dispatcher.send(key());
+    setup.flush();
+    const identity = identityFor(setup.dispatcher, localIntentId);
+
+    setup.clock.elapseWithoutTimers(
+      INPUT_QUEUE_CONTRACT.maxSentAgeMs + INPUT_QUEUE_CONTRACT.maxTerminationAgeMs + 1,
+    );
+
+    expect(acknowledge(setup.dispatcher, identity)).toBe(false);
+    expect(setup.dispatcher.getResult(localIntentId)).toMatchObject({
+      outcome: "uncertain",
+      reason: "termination-timeout",
+    });
+    expect(setup.dispatcher.status).toMatchObject({
+      writable: false,
+      controlReplacementRequired: true,
+    });
+  });
+
+  it("seals an elapsed sent epoch before admitting another input", () => {
+    const setup = harness();
+    setup.attach();
+    const first = setup.dispatcher.send(key());
+    setup.flush();
+
+    setup.clock.elapseWithoutTimers(INPUT_QUEUE_CONTRACT.maxSentAgeMs + 1);
+    const second = setup.dispatcher.send(key());
+
+    expect(setup.dispatcher.getIntent(first)).toMatchObject({ state: "terminating" });
+    expect(setup.dispatcher.getResult(second)).toMatchObject({
+      identity: null,
+      outcome: "not-sent",
+      reason: "not-writable",
+    });
+    expect(setup.frames).toHaveLength(1);
+    expect(setup.dispatcher.status.controlReplacementRequired).toBe(true);
+  });
+
+  it("enforces an elapsed proof deadline before accepting a tombstone", () => {
+    const setup = harness();
+    setup.attach({ decision: "uncertain" });
+    const localIntentId = setup.dispatcher.send(key());
+    setup.flush();
+    const identity = identityFor(setup.dispatcher, localIntentId);
+
+    setup.clock.elapseWithoutTimers(INPUT_QUEUE_CONTRACT.maxTerminationAgeMs + 1);
+
+    expect(setup.dispatcher.acceptTombstoneProof({ ...identity, authorityEventSeq: "13" })).toBe(
+      false,
+    );
+    expect(setup.dispatcher.getResult(localIntentId)).toMatchObject({
+      outcome: "uncertain",
+      reason: "transport-uncertain",
+    });
+  });
+
   it("expires an admitted queue item before sender invocation and never replays it", () => {
     const setup = harness();
     setup.attach();
@@ -627,22 +690,57 @@ describe("InputDispatcher E1 admission owner", () => {
     expect(setup.dispatcher.getResult(localIntentId)).toBeUndefined();
   });
 
-  it("defers result observers until owner state is committed", () => {
+  it("notifies result observers synchronously after owner state is committed", () => {
     let dispatcher!: InputDispatcher;
     let followup: string | null = null;
+    let observedCommitted = false;
     const setup = harness({
       onIntentResult: (result) => {
-        if (result.reason === "validation") followup = dispatcher.send(key());
+        if (result.reason === "validation") {
+          observedCommitted = dispatcher.getResult(result.localIntentId) === result;
+          followup = dispatcher.send(key());
+        }
       },
     });
     dispatcher = setup.dispatcher;
     setup.attach();
     setup.dispatcher.send(key({ modifiers: 0, consumedModifiers: 2 }));
+
+    expect(observedCommitted).toBe(true);
+    expect(followup).not.toBeNull();
     setup.flush();
 
-    expect(followup).not.toBeNull();
     expect(identityFor(setup.dispatcher, followup!).clientInputSeq).toBe("1");
     expect(setup.frames).toHaveLength(1);
+  });
+
+  it("does not accumulate a deferred notification queue for synchronous local rejection", () => {
+    const microtasks: Array<() => void> = [];
+    let delivered = 0;
+    const dispatcher = new InputDispatcher({
+      getObservedEventSeq: () => 0n,
+      createLocalIntentId: () => "bulk-local-rejection",
+      queueMicrotask: (callback) => microtasks.push(callback),
+      onIntentResult: () => {
+        delivered += 1;
+      },
+    });
+    let first = "";
+    let last = "";
+
+    for (let index = 0; index < 50_000; index += 1) {
+      const id = dispatcher.send(key());
+      if (index === 0) first = id;
+      last = id;
+    }
+
+    expect(delivered).toBe(50_000);
+    expect(microtasks).toEqual([]);
+    expect(dispatcher.getResult(first)).toBeUndefined();
+    expect(dispatcher.getResult(last)).toMatchObject({
+      outcome: "not-sent",
+      reason: "not-writable",
+    });
   });
 
   it("creates a new consumption and identity for resize reconciliation", () => {

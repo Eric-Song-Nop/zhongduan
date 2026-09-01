@@ -237,7 +237,6 @@ export class InputDispatcher implements InputSink {
   #queueBytes = 0;
   #admissionScheduled = false;
   #sendScheduled = false;
-  #resultNotificationScheduled = false;
   #deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   #deadlineAtMs: number | null = null;
   #localIntentCounter = 0n;
@@ -875,9 +874,16 @@ export class InputDispatcher implements InputSink {
       if (record.deadlineAtMs === undefined || now < record.deadlineAtMs) continue;
       if (record.state === "sent") {
         const identity = record.identity;
-        this.#beginTermination(record, "acknowledgement-timeout", now);
+        // A throttled timer does not move the product boundary. The proof interval starts at the
+        // original ACK deadline, not when JavaScript eventually gets CPU time again.
+        this.#beginTermination(record, "acknowledgement-timeout", record.deadlineAtMs);
         if (identity !== null) this.#sealIdentityEpoch(identity, true);
-      } else if (record.state === "terminating") {
+      }
+      if (
+        record.state === "terminating" &&
+        record.deadlineAtMs !== undefined &&
+        now >= record.deadlineAtMs
+      ) {
         const { terminationReason } = record;
         this.#finishUncertain(
           record,
@@ -965,7 +971,6 @@ export class InputDispatcher implements InputSink {
       }
     }
     this.#resultNotifications.push(result);
-    this.#scheduleResultNotifications();
     this.#markDirty();
   }
 
@@ -983,20 +988,19 @@ export class InputDispatcher implements InputSink {
     this.#queueBytes -= record.encodedBytes;
   }
 
-  #scheduleResultNotifications(): void {
-    if (this.#resultNotificationScheduled) return;
-    this.#resultNotificationScheduled = true;
-    this.#queueMicrotask(() => {
-      this.#resultNotificationScheduled = false;
-      const results = this.#resultNotifications.splice(0);
-      for (const result of results) {
-        try {
-          this.#onIntentResult?.(result);
-        } catch {
-          // Result observation is isolated from the state machine owner.
-        }
+  #flushResultNotifications(): void {
+    // This is a transaction-local worklist, not a deferred queue. Every outer owner transaction
+    // drains it synchronously after status publication and before returning to its caller. If an
+    // observer reenters the dispatcher, that nested transaction drains the same worklist in commit
+    // order, so synchronous local rejection cannot accumulate unbounded microtask-held results.
+    while (this.#resultNotifications.length > 0) {
+      const result = this.#resultNotifications.shift()!;
+      try {
+        this.#onIntentResult?.(result);
+      } catch {
+        // Result observation is isolated from the state machine owner.
       }
-    });
+    }
   }
 
   #nextLocalIntentId(): LocalIntentId {
@@ -1043,14 +1047,19 @@ export class InputDispatcher implements InputSink {
   }
 
   #transaction<T>(operation: () => T): T {
+    const outermost = this.#mutationDepth === 0;
     this.#mutationDepth += 1;
     try {
+      // Timers are only wake-up hints. Any owner entry first catches up semantic time so browser
+      // suspension/throttling cannot admit input or accept proof beyond a product deadline.
+      if (outermost) this.#expireDeadlines();
       return operation();
     } finally {
       this.#mutationDepth -= 1;
       if (this.#mutationDepth === 0) {
         this.#rescheduleDeadline();
         this.#publishStatus();
+        this.#flushResultNotifications();
       }
     }
   }

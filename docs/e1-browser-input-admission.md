@@ -40,6 +40,16 @@ writer/mouse gates, and whether a full control replacement is required. `getInte
 exposes identity, state, encoded bytes, admission/send timestamps, transport generation, deadline,
 and retained result.
 
+Timers are wake-up hints rather than the source of deadline truth. Every owner transaction, including
+new consumption, ACK handling, and tombstone proof handling, first expires work against the current
+clock. A delayed sent-age transition preserves the original absolute ACK deadline, so its proof
+interval cannot be extended by Browser suspension or background timer throttling.
+
+After an outer owner transaction has committed its records and published status, it synchronously
+drains product-result notifications before returning. The reentrant worklist therefore cannot grow
+across calls or remain captured by a delayed microtask; observer exceptions still cannot roll back an
+owner transition.
+
 ## Replacement and coalescing
 
 - A full/control replacement makes pre-admission work `not-sent/control-replaced`, makes admitted but
@@ -98,8 +108,11 @@ node scripts/verify-e0-terminal-journey.ts \
 
 The dispatcher suite covers sequence/no-gap properties, bytes/count/pending overload, pre-admission
 coalescing, admitted identity immutability, missing/throwing/uncertain sender outcomes, full versus
-data-only replacement, both age bounds, tombstone proof, late ACK immutability, result retention, and
+data-only replacement, both age bounds, suspended-timer ACK/proof/admission expiry, tombstone proof,
+late ACK immutability, result retention, 50,000 synchronous local-result notifications, and
 callback/replacement reentrancy. The Worker/DO test exercises the negotiated welcome → semantic input
 → Host ACK and local rejection path while the unchanged relay suite continues to exercise legacy v2.
-The correctness-fault journey observes product terminal-result events, acceptance uncertainty without
-automatic retry, and a writer transfer whose displaced page cannot automatically reclaim control.
+The correctness-fault journey requires product terminal-result events for every measured E1 input;
+passive socket-close inference cannot satisfy that evidence. It also observes acceptance uncertainty
+without automatic retry and a writer transfer whose displaced page cannot automatically reclaim
+control.

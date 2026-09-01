@@ -90,6 +90,8 @@ interface BrowserHarnessIntent {
   sampleId: string;
   localIntentId: string;
   terminal: Data | null;
+  passiveTerminal: Data | null;
+  productTerminal: Data | null;
   sends: Array<{ identity: string }>;
 }
 
@@ -780,36 +782,68 @@ async function markRender(page: Page, sampleId: string, matching = true): Promis
   await appendBrowserEvent(page, "browser.useful-render", sampleId);
 }
 
-async function intentObservation(page: Page, sampleId: string, timeoutMs: number): Promise<Data> {
+async function intentObservation(
+  page: Page,
+  sampleId: string,
+  timeoutMs: number,
+  requireProductResult = false,
+): Promise<Data> {
   try {
     await page.waitForFunction(
-      (observedSample) => {
+      ({ observedSample, productRequired }) => {
         const intent = (window as unknown as HarnessWindow).__zhongduanE0.intentsBySample[
           observedSample
         ];
-        return intent !== undefined && intent.terminal !== null;
+        return (
+          intent !== undefined &&
+          (productRequired ? intent.productTerminal !== null : intent.terminal !== null)
+        );
       },
-      sampleId,
-      { timeout: Math.min(timeoutMs, 5_000) },
+      { observedSample: sampleId, productRequired: requireProductResult },
+      { timeout: Math.min(timeoutMs, requireProductResult ? 10_000 : 5_000) },
     );
-  } catch {}
-  const intent = await page.evaluate((observedSample) => {
-    const intent = (window as unknown as HarnessWindow).__zhongduanE0.intentsBySample[
-      observedSample
-    ];
-    if (intent === undefined) return null;
-    return {
-      sampleId: intent.sampleId,
-      localIntentId: intent.localIntentId,
-      terminal: intent.terminal === null ? null : { ...intent.terminal },
-      browserIdentities: [...new Set(intent.sends.map((send) => send.identity))].sort(),
-      sendAttemptCount: intent.sends.length,
-    };
-  }, sampleId);
+  } catch (error: unknown) {
+    if (requireProductResult) {
+      throw new JourneyError(
+        `sample ${sampleId} did not publish an E1 product input result: ${String(error)}`,
+      );
+    }
+  }
+  const intent = await page.evaluate(
+    ({ observedSample, productRequired }) => {
+      const intent = (window as unknown as HarnessWindow).__zhongduanE0.intentsBySample[
+        observedSample
+      ];
+      if (intent === undefined) return null;
+      return {
+        sampleId: intent.sampleId,
+        localIntentId: intent.localIntentId,
+        terminal:
+          productRequired || intent.productTerminal !== null
+            ? intent.productTerminal === null
+              ? null
+              : { ...intent.productTerminal }
+            : intent.terminal === null
+              ? null
+              : { ...intent.terminal },
+        browserIdentities: [...new Set(intent.sends.map((send) => send.identity))].sort(),
+        sendAttemptCount: intent.sends.length,
+      };
+    },
+    { observedSample: sampleId, productRequired: requireProductResult },
+  );
   if (!isData(intent) || typeof intent["localIntentId"] !== "string") {
     throw new JourneyError(`sample ${sampleId} was not recorded at UI consumption`);
   }
   const terminalRecords = isData(intent["terminal"]) ? [intent["terminal"]] : [];
+  if (
+    requireProductResult &&
+    (terminalRecords.length !== 1 ||
+      terminalRecords[0]!["source"] !== "product-intent-result-event" ||
+      typeof terminalRecords[0]!["productLocalIntentId"] !== "string")
+  ) {
+    throw new JourneyError(`sample ${sampleId} lacks its E1 product input result evidence`);
+  }
   return {
     sampleId,
     localIntentId: intent["localIntentId"],
@@ -823,11 +857,16 @@ async function intentObservation(page: Page, sampleId: string, timeoutMs: number
   };
 }
 
-async function runProbe(page: Page, sampleId: string, timeoutMs: number): Promise<Data> {
+async function runProbe(
+  page: Page,
+  sampleId: string,
+  timeoutMs: number,
+  requireProductResult = false,
+): Promise<Data> {
   await dispatchPaste(page, `${PROBE_PREFIX.toString("ascii")}${sampleId}\r`, sampleId);
   await waitForGrid(page, `${RESULT_PREFIX}${sampleId}`, timeoutMs);
   await markRender(page, sampleId);
-  return intentObservation(page, sampleId, timeoutMs);
+  return intentObservation(page, sampleId, timeoutMs, requireProductResult);
 }
 
 async function runFaultCommand(
@@ -835,9 +874,10 @@ async function runFaultCommand(
   payload: string,
   sampleId: string,
   timeoutMs: number,
+  requireProductResult = false,
 ): Promise<Data> {
   await dispatchPaste(page, payload, sampleId);
-  const observation = await intentObservation(page, sampleId, timeoutMs);
+  const observation = await intentObservation(page, sampleId, timeoutMs, requireProductResult);
   let matchingOutputObserved = false;
   try {
     await waitForGrid(page, `${RESULT_PREFIX}${sampleId}`, Math.min(timeoutMs, 5_000));
@@ -1038,7 +1078,9 @@ async function browserJourney(
       ) {
         const probeSample = `probe-${primary}`;
         if (warmup) warmupSampleIds.add(probeSample);
-        intentTarget.push(await runProbe(page, probeSample, timeoutMs));
+        intentTarget.push(
+          await runProbe(page, probeSample, timeoutMs, variant === "correctness-faults"),
+        );
       } else if (variant.startsWith("bulk-backlog-")) {
         if (bulkBacklogBytes > 0) {
           const floodSample = `flood-command-${primary}`;
@@ -1183,7 +1225,7 @@ async function browserJourney(
       );
       await waitForGrid(page, `${RESULT_PREFIX}${duplicateSample}`, timeoutMs);
       await markRender(page, duplicateSample);
-      measuredIntents.push(await intentObservation(page, duplicateSample, timeoutMs));
+      measuredIntents.push(await intentObservation(page, duplicateSample, timeoutMs, true));
 
       const uncertaintySample = "uncertain-000";
       trace.disconnectSample = uncertaintySample;
@@ -1198,7 +1240,7 @@ async function browserJourney(
       acceptanceReconnectObserved = true;
       stage = "observe-uncertain-no-retry";
       await page.waitForTimeout(1_000);
-      const uncertainty = await intentObservation(page, uncertaintySample, timeoutMs);
+      const uncertainty = await intentObservation(page, uncertaintySample, timeoutMs, true);
       uncertainty["acceptanceUncertaintyInjected"] = true;
       measuredIntents.push(uncertainty);
 
@@ -1226,7 +1268,7 @@ async function browserJourney(
       await waitLiveWriter(secondPage, timeoutMs);
       heldSignals.release.set();
       await pasteTask;
-      measuredIntents.push(await intentObservation(page, oldSample, timeoutMs));
+      measuredIntents.push(await intentObservation(page, oldSample, timeoutMs, true));
       (observations["writerTransfers"] as Data[]).push({
         sampleId: "writer-transfer-000",
         oldWriterSuccessfulEffects: 0,
@@ -1239,6 +1281,7 @@ async function browserJourney(
           `${PROBE_PREFIX.toString("ascii")}${newSample}\r`,
           newSample,
           timeoutMs,
+          true,
         ),
       );
       const secureSample = "secure-000";
@@ -1248,6 +1291,7 @@ async function browserJourney(
           `${SECURE_PREFIX.toString("ascii")}${secureSample}\r`,
           secureSample,
           timeoutMs,
+          true,
         ),
       );
       const speculativePresentationCount = await activePage
@@ -1295,6 +1339,13 @@ async function browserJourney(
         coldAttachValidation:
           (observations["coldCandidates"] as Data[]).length > 0 && coldSnapshotExercised,
         coldSnapshotRequested: coldSnapshotExercised,
+        ...(variant === "correctness-faults"
+          ? {
+              requiredProductIntentSampleIds: measuredIntents.map((item) =>
+                String(item["sampleId"]),
+              ),
+            }
+          : {}),
       },
     };
   } catch (error: unknown) {

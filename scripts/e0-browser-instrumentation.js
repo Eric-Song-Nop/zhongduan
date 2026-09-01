@@ -23,6 +23,8 @@
       consumedAtUnixNs: now(),
       sends: [],
       terminal: null,
+      passiveTerminal: null,
+      productTerminal: null,
     };
     state.intents.push(intent);
     state.intentsBySample[sampleId] = intent;
@@ -63,8 +65,7 @@
     source = "passive-wire-observation",
     productLocalIntentId = null,
   ) => {
-    if (intent.terminal !== null) return;
-    intent.terminal = {
+    const terminal = {
       sampleId: intent.sampleId,
       localIntentId: intent.localIntentId,
       outcome,
@@ -75,6 +76,17 @@
       productLocalIntentId,
       observedAtUnixNs: now(),
     };
+    if (source === "product-intent-result-event") {
+      if (intent.productTerminal !== null) return;
+      intent.productTerminal = terminal;
+      // Passive socket evidence may arrive first, but it is never allowed to mask or replace the
+      // product owner result used by E1 fault validation.
+      intent.terminal = terminal;
+      return;
+    }
+    if (intent.passiveTerminal !== null) return;
+    intent.passiveTerminal = terminal;
+    if (intent.productTerminal === null) intent.terminal = terminal;
   };
   const acceptAck = (frame) => {
     const identity = browserIdentity(frame);

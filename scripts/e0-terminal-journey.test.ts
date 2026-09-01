@@ -218,6 +218,21 @@ describe("E0 TypeScript contract and evidence bundle", () => {
     overlap["snapshotFinalizationAtUnixNs"] = overlap["lastHostReceiveAtUnixNs"];
     expect(() => validateScenarioReport(forged, contract)).toThrow(ContractError);
   });
+
+  it("does not let passive wire inference satisfy declared E1 product-result evidence", () => {
+    const correctnessScenario = (current()["scenarioReports"] as Data[]).find(
+      (item) => item["variant"] === "correctness-faults",
+    )!;
+    const forged = clone(correctnessScenario);
+    const observations = forged["observations"] as Data;
+    const intents = observations["intents"] as Data[];
+    const evidence = forged["workloadEvidence"] as Data;
+    evidence["requiredProductIntentSampleIds"] = intents.map((item) => item["sampleId"]);
+
+    expect(() => validateScenarioReport(forged, contract)).toThrow(
+      /lacks an E1 product input result/u,
+    );
+  });
 });
 
 describe("E0 oracle and latency derivation", () => {
