@@ -1,0 +1,182 @@
+{
+  "schemaVersion": "zhongduan-terminal-journey-contract-v1",
+  "stage": "E0",
+  "status": "frozen",
+  "workload": {
+    "id": "raw-semantic-pty-v1",
+    "description": "A real Chromium -> Browser InputSink -> Worker/Miniflare Durable Object -> Host -> node-pty -> deterministic child journey using the committed WTerm/Ghostty runtime.",
+    "samplesPerVariant": 24,
+    "warmupSamples": 4,
+    "probePrefix": "ZHONGDUAN_E0_PROBE",
+    "outputFlood": {
+      "chunkBytes": 4096,
+      "maximumBytes": 4194304,
+      "maximumDurationMs": 5000
+    },
+    "supportedLoad": {
+      "maximumOutstandingInputs": 32,
+      "maximumInputBytes": 65536,
+      "bulkBacklogBytes": [0, 262144, 1048576, 4194304]
+    },
+    "requiredVariants": [
+      "steady",
+      "output-flood",
+      "bulk-backlog-0",
+      "bulk-backlog-262144",
+      "bulk-backlog-1048576",
+      "bulk-backlog-4194304",
+      "snapshot-disabled",
+      "snapshot-enabled",
+      "correctness-faults"
+    ]
+  },
+  "matrix": {
+    "browserCloudRttMs": [20, 100, 300, 600],
+    "cloudHostRttMs": [20, 100, 300, 600],
+    "networkFaults": ["none", "jitter", "disconnect", "reconnect"],
+    "loadAndRecovery": ["steady", "output-flood", "cold-attach"],
+    "lifecycleAndReplacement": ["none", "do-hibernation", "host-relay-replacement"],
+    "localAutomatic": ["rtt", "jitter", "disconnect", "reconnect", "output-flood", "cold-attach"],
+    "stagingRequired": ["real-cloudflare-edge", "do-hibernation", "host-relay-replacement"]
+  },
+  "oracles": [
+    {
+      "id": "ui-consumed-silent-loss",
+      "description": "Every UI-consumed intent has exactly one immutable terminal outcome.",
+      "metric": "silentLossCount",
+      "operator": "eq",
+      "target": 0
+    },
+    {
+      "id": "duplicate-pty-effect",
+      "description": "A wire identity has no duplicate PTY effect inside the declared dedupe window.",
+      "metric": "duplicatePtyEffectCount",
+      "operator": "eq",
+      "target": 0
+    },
+    {
+      "id": "uncertain-auto-retry",
+      "description": "An acceptance-uncertain identity is never automatically sent again.",
+      "metric": "uncertainAutoRetryCount",
+      "operator": "eq",
+      "target": 0
+    },
+    {
+      "id": "output-flood-ctrl-c-once",
+      "description": "Ctrl-C reaches the Host PTY exactly once while output is flooding.",
+      "metric": "invalidCtrlCEffectCount",
+      "operator": "eq",
+      "target": 0
+    },
+    {
+      "id": "old-writer-effect-after-transfer",
+      "description": "After writer transfer, an old writer produces no successful PTY input effect.",
+      "metric": "oldWriterSuccessfulEffectCount",
+      "operator": "eq",
+      "target": 0
+    },
+    {
+      "id": "cold-candidate-visible-before-validation",
+      "description": "A cold candidate is not visible before snapshot and suffix validation completes.",
+      "metric": "prematureCandidateVisibilityCount",
+      "operator": "eq",
+      "target": 0
+    },
+    {
+      "id": "snapshot-authority-divergence",
+      "description": "Snapshot/recovery on and off produce the same normalized authority state and continuation behavior for the same canonical I/O, while equivalent canonical byte splitting preserves authority WRITE_PTY effects.",
+      "metric": "authorityDivergenceCount",
+      "operator": "eq",
+      "target": 0
+    },
+    {
+      "id": "secure-input-speculative-presentation",
+      "description": "Secure-input journeys never enable speculative presentation.",
+      "metric": "secureInputSpeculationCount",
+      "operator": "eq",
+      "target": 0
+    }
+  ],
+  "latencySpans": [
+    {
+      "id": "browser-keydown-to-send-decision",
+      "startEvent": "browser.keydown",
+      "endEvent": "browser.send-decision"
+    },
+    {
+      "id": "cloud-browser-receive-to-host-send",
+      "startEvent": "cloud.browser-receive",
+      "endEvent": "cloud.host-send"
+    },
+    {
+      "id": "host-receive-to-pty-write",
+      "startEvent": "host.receive",
+      "endEvent": "host.pty-write"
+    },
+    {
+      "id": "input-to-matching-browser-render",
+      "startEvent": "browser.input-consumed",
+      "endEvent": "browser.matching-render"
+    },
+    {
+      "id": "pty-output-to-browser-useful-render",
+      "startEvent": "pty.output",
+      "endEvent": "browser.useful-render"
+    },
+    {
+      "id": "ctrl-c-to-pty-write",
+      "startEvent": "browser.ctrl-c",
+      "endEvent": "host.pty-write"
+    },
+    {
+      "id": "ctrl-c-to-application-quiet",
+      "startEvent": "browser.ctrl-c",
+      "endEvent": "browser.application-quiet"
+    }
+  ],
+  "relativeThresholds": {
+    "cloudBulkIsolation": {
+      "status": "frozen-relative-fail-closed",
+      "span": "cloud-browser-receive-to-host-send",
+      "statistic": "p99",
+      "backlogLevelsBytes": [0, 262144, 1048576, 4194304],
+      "measurement": "one-plus-nonnegative-normalized-p99-slope-per-MiB",
+      "currentMeasurementSource": "current-baseline.json#/relativeThresholdMeasurements/cloudBulkIsolation",
+      "candidateComparison": "candidate/current",
+      "maximumRegressionRatioToCurrent": 1.0,
+      "requireFiniteCurrentMeasurement": true,
+      "statement": "A candidate is never green without a measured CURRENT denominator. The metric is 1 + max(0, normalized p99 slope), so a flat or improving CURRENT remains a finite non-zero comparison denominator."
+    },
+    "snapshotHostInput": {
+      "status": "frozen-relative-fail-closed",
+      "span": "host-receive-to-pty-write",
+      "statistic": "p99",
+      "baselineVariant": "snapshot-disabled",
+      "candidateVariant": "snapshot-enabled",
+      "measurement": "snapshot-enabled/snapshot-disabled",
+      "currentMeasurementSource": "current-baseline.json#/relativeThresholdMeasurements/snapshotHostInput",
+      "candidateComparison": "candidate/current",
+      "maximumRegressionRatioToCurrent": 1.0,
+      "requireFiniteCurrentMeasurement": true,
+      "statement": "The snapshot-enabled/disabled p99 ratio may not regress the measured CURRENT ratio."
+    },
+    "outputFloodCtrlC": {
+      "status": "frozen-relative-fail-closed",
+      "span": "ctrl-c-to-application-quiet",
+      "statistic": "p99",
+      "baselineVariant": "steady",
+      "candidateVariant": "output-flood",
+      "measurement": "output-flood/steady",
+      "currentMeasurementSource": "current-baseline.json#/relativeThresholdMeasurements/outputFloodCtrlC",
+      "candidateComparison": "candidate/current",
+      "maximumRegressionRatioToCurrent": 1.0,
+      "requireFiniteCurrentMeasurement": true,
+      "requiresCorrectnessOracle": "output-flood-ctrl-c-once",
+      "statement": "The output-flood/steady p99 ratio may not regress CURRENT and is invalid unless Ctrl-C has exactly one PTY effect."
+    }
+  },
+  "deadlinePolicy": {
+    "scenarioDeadlineMs": 120000,
+    "statement": "The deadline only terminates a hung run and is never evaluated as a latency SLO."
+  }
+}

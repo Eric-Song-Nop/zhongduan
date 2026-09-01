@@ -1,0 +1,2 @@
+aiohttp==3.12.15
+playwright==1.59.0

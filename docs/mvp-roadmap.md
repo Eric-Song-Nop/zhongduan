@@ -132,6 +132,10 @@ active roadmap 和专项实现计划。
 **完成条件：** harness 与 baseline 可在 source control 中复跑；当前失败项被显式记录；由测量得到的
 相对阈值进入 benchmark contract。没有这些产物，不得开始 R0–R4。
 
+**证据入口：** [E0 terminal journey](../benchmarks/terminal-journey/README.md) 固定 workload、矩阵、
+oracle、span、相对比较规则与 CURRENT 报告。`not-measured` 是 fail-closed 结果，不得作为完成或发布证据；
+本地 Workerd 结果也不能替代 Cloudflare staging 的 lifecycle 与 edge latency 证据。
+
 ### E1 — Browser validate/admit
 
 **依赖：** E0。
