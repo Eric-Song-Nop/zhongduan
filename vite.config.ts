@@ -33,6 +33,8 @@ export default defineConfig({
       verify: {
         command: [
           "node scripts/prepare-wterm.mjs",
+          "python3 -B -m unittest scripts/test_e0_terminal_journey.py",
+          "node scripts/e0_authority_oracle.mjs",
           "vp check",
           "node scripts/verify-no-source-emit.mjs",
           "vp test --run",
@@ -47,6 +49,19 @@ export default defineConfig({
           "pnpm --dir apps/terminal-cloud exec vp test --config vitest.worker.config.ts --run test/relay.test.ts test/runtime.test.ts",
           "pnpm --dir apps/terminal-cloud exec vp test --config vitest.browser.config.ts --run src/browser/terminal-session.test.ts",
         ],
+        cache: false,
+      },
+      "verify-e0-contract": {
+        command: [
+          "node scripts/prepare-wterm.mjs",
+          "python3 -B -m unittest scripts/test_e0_terminal_journey.py",
+          "node scripts/e0_authority_oracle.mjs",
+          "python3 -B scripts/verify-e0-terminal-journey.py --matrix-plan",
+        ],
+        cache: false,
+      },
+      "verify-e0-local": {
+        command: "python3 -B scripts/verify-e0-terminal-journey.py",
         cache: false,
       },
       "verify-clean-host": {
