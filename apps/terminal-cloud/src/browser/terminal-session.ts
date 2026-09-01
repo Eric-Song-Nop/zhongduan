@@ -1,13 +1,7 @@
 import {
   ClientControlFrameSchema,
   CloudResourceIdSchema,
-  ConnectionSetRequestSchema,
-  ConnectionSetResponseSchema,
-  RELAY_CAPABILITIES_HEADER,
-  RelayCapability,
   ServerControlFrameSchema,
-  decodeDataFrame,
-  decodeDataFrameBatchEntries,
   type BrowserCapabilityRole,
   type ClientControlFrame,
   type ReplicaCursor,
@@ -21,31 +15,26 @@ import {
   type SnapshotTransport,
 } from "@zhongduan/session-client";
 
+import {
+  BrowserRelayAuthenticationError,
+  BrowserRelayConnection,
+  BrowserRelayConnectionFactory,
+  type BrowserRelayConnectionEvents,
+} from "./browser-relay-connection";
+import { BrowserWriterSession } from "./browser-writer-session";
 import type { CapabilityManager } from "./capability";
 import { DeliveryAckCoalescer } from "./delivery-ack-coalescer";
-import type { InputDispatcher, InputTransportSendResult } from "./input-dispatcher";
+import type { InputDispatcher } from "./input-dispatcher";
 
-const CLIENT_ID_PREFIX = "zhongduan:browser-client:";
-const SOCKET_OPEN_TIMEOUT_MS = 10_000;
 // CURRENT recovery serializes delivery barriers for at most 16 Browsers. A cold build may spend 5s
 // encoding and 120s publishing before each Browser then consumes up to a 5s barrier window. Keep a
 // 10s scheduling margin beyond that 205s service envelope. A later capability replaces this
 // duplicated cross-app budget with generation-scoped progress.
 export const ATTACH_START_TIMEOUT_MS = 5_000 + 120_000 + 16 * 5_000 + 10_000;
 const DATA_REPLACEMENT_GRACE_MS = 350;
-const HEARTBEAT_INTERVAL_MS = 15_000;
-const HEARTBEAT_TIMEOUT_MS = 45_000;
-const WRITER_LEASE_RENEW_INTERVAL_MS = 10_000;
-const HTTP_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_RECONNECT_DELAY_MS = 10_000;
 const SNAPSHOT_RETRY_BASE_MS = 2_000;
 const SNAPSHOT_RETRY_MAX_MS = 30_000;
-const SOCKET_REPLACED_CODE = 4001;
-const SOCKET_REPLACED_REASON = "connection replaced";
-// A legal 1 MiB input can expand to six bytes per byte when JSON escapes control characters.
-const MAX_CONTROL_FRAME_BYTES = 6 * 1024 * 1024 + 4_096;
-const MAX_CONTROL_QUEUE_BYTES = MAX_CONTROL_FRAME_BYTES;
-const textEncoder = new TextEncoder();
 
 type SessionPhase =
   | "idle"
@@ -95,33 +84,6 @@ function defaultWebSocketUrl(path: string): string {
   return url.href;
 }
 
-function clientStorageKey(sessionId: string): string {
-  return `${CLIENT_ID_PREFIX}${sessionId}`;
-}
-
-function readClientId(
-  storage: Pick<Storage, "getItem" | "removeItem"> | undefined,
-  sessionId: string,
-): string | undefined {
-  if (storage === undefined) return undefined;
-  let value: string | null;
-  try {
-    value = storage.getItem(clientStorageKey(sessionId));
-  } catch {
-    return undefined;
-  }
-  if (value === null) return undefined;
-  if (!CloudResourceIdSchema.safeParse(value).success) {
-    try {
-      storage.removeItem(clientStorageKey(sessionId));
-    } catch {
-      // Browser storage is an optional reconnect optimization.
-    }
-    return undefined;
-  }
-  return value;
-}
-
 function frameMatchesDelivery(
   frame: Extract<ServerControlFrame, { type: "replay-start" | "snapshot-manifest" }>,
   generation: bigint,
@@ -130,69 +92,43 @@ function frameMatchesDelivery(
   return BigInt(frame.deliveryGeneration) === generation && frame.streamId === streamId;
 }
 
+/** Owns user-visible session/recovery state and composes transport, writer, and replica owners. */
 export class TerminalSession {
   readonly #sessionId: string;
   readonly #engineId: string;
   readonly #capabilities: CapabilityManager;
-  readonly #input: InputDispatcher;
-  readonly #fetch: typeof fetch;
-  readonly #createWebSocket: NonNullable<TerminalSessionOptions["createWebSocket"]>;
-  readonly #makeWebSocketUrl: NonNullable<TerminalSessionOptions["makeWebSocketUrl"]>;
+  readonly #connectionFactory: BrowserRelayConnectionFactory;
   readonly #now: () => number;
   readonly #random: () => number;
   readonly #setTimer: NonNullable<TerminalSessionOptions["setTimer"]>;
   readonly #clearTimer: NonNullable<TerminalSessionOptions["clearTimer"]>;
-  readonly #storage?: TerminalSessionOptions["storage"];
   readonly #listeners = new Set<() => void>();
-  readonly #intentionalSockets = new WeakSet<WebSocket>();
   readonly #deliveryAcks: DeliveryAckCoalescer;
+  readonly #writer: BrowserWriterSession;
   readonly coordinator: SessionCoordinator;
   #snapshot: TerminalSessionSnapshot;
-  #control: WebSocket | null = null;
-  #data: WebSocket | null = null;
+  #connection: BrowserRelayConnection | null = null;
   #connectionEpoch = 0;
-  #dataEpoch = 0;
-  #generation: bigint | null = null;
-  #streamId = 0;
-  #connectionId: string | null = null;
-  #writerLease: string | null = null;
-  #writerFence: string | null = null;
-  #inputAdmissionEnabled = false;
-  #dataBatchEnabled = false;
-  #inputReplacementScheduled = false;
-  #clientId: string | undefined;
   #connectPromise: Promise<void> | null = null;
   #connectAbort: AbortController | null = null;
-  #replacementAbort: AbortController | null = null;
   #needsReconnect = false;
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   #dataFailureTimer: ReturnType<typeof setTimeout> | null = null;
-  #heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   #attachStartTimer: ReturnType<typeof setTimeout> | null = null;
-  #writerLeaseTimer: ReturnType<typeof setTimeout> | null = null;
   #snapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
   #snapshotFailureCount = 0;
-  #lastControlPongAt = 0;
-  #lastDataPongAt = 0;
   #automaticReconnectBlocked = false;
   #closed = false;
-  #unsubscribeInput: (() => void) | null = null;
 
   constructor(options: TerminalSessionOptions) {
     this.#sessionId = CloudResourceIdSchema.parse(options.sessionId);
     this.#engineId = options.engineId;
     this.#capabilities = options.capabilities;
-    this.#input = options.input;
-    this.#fetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
-    this.#createWebSocket = options.createWebSocket ?? ((url) => new WebSocket(url));
-    this.#makeWebSocketUrl = options.makeWebSocketUrl ?? defaultWebSocketUrl;
     this.#now = options.now ?? Date.now;
     this.#random = options.random ?? Math.random;
     this.#setTimer =
       options.setTimer ?? ((callback, delayMs) => globalThis.setTimeout(callback, delayMs));
     this.#clearTimer = options.clearTimer ?? ((timer) => globalThis.clearTimeout(timer));
-    this.#storage = options.storage;
-    this.#clientId = readClientId(this.#storage, this.#sessionId);
     this.#snapshot = {
       attempt: 0,
       controlConnected: false,
@@ -204,10 +140,21 @@ export class TerminalSession {
       phase: "idle",
       role: options.capabilities.role,
     };
+    this.#connectionFactory = new BrowserRelayConnectionFactory({
+      capabilities: this.#capabilities,
+      clearTimer: this.#clearTimer,
+      createWebSocket: options.createWebSocket ?? ((url) => new WebSocket(url)),
+      fetch: options.fetch ?? ((input, init) => globalThis.fetch(input, init)),
+      makeWebSocketUrl: options.makeWebSocketUrl ?? defaultWebSocketUrl,
+      now: this.#now,
+      sessionId: this.#sessionId,
+      setTimer: this.#setTimer,
+      ...(options.storage === undefined ? {} : { storage: options.storage }),
+    });
     this.#deliveryAcks = new DeliveryAckCoalescer({
       clearTimer: this.#clearTimer,
       connectionEpoch: () => this.#connectionEpoch,
-      deliveryGeneration: () => this.#generation,
+      deliveryGeneration: () => this.#connection?.deliveryGeneration ?? null,
       isConnectionCurrent: (connectionEpoch) => this.#isCurrentConnection(connectionEpoch),
       isDeliveryLive: () => this.coordinator.state === "live",
       protocolFailure: () => this.#protocolFailure(),
@@ -232,21 +179,17 @@ export class TerminalSession {
       onReplicaProgress: () => this.#syncDeliveryState(),
       onResync: (reason) => this.#handleCoordinatorResync(reason),
     });
-    this.#unsubscribeInput = this.#input.subscribe(() => {
-      if (
-        !this.#input.status.controlReplacementRequired ||
-        this.#inputReplacementScheduled ||
-        this.#closed
-      ) {
-        return;
-      }
-      this.#inputReplacementScheduled = true;
-      globalThis.queueMicrotask(() => {
-        this.#inputReplacementScheduled = false;
-        if (!this.#closed && this.#input.status.controlReplacementRequired) {
-          this.#failFullConnection();
-        }
-      });
+    this.#writer = new BrowserWriterSession({
+      clearTimer: this.#clearTimer,
+      connectionEpoch: () => this.#connectionEpoch,
+      input: options.input,
+      isConnectionCurrent: (connectionEpoch) => this.#isCurrentConnection(connectionEpoch),
+      onControlReplacementRequired: () => this.#failFullConnection(),
+      onProtocolFailure: () => this.#protocolFailure(),
+      role: options.capabilities.role,
+      sendControl: (frame, critical) => this.#sendControl(frame, critical),
+      sendInput: (frame) => this.#connection?.sendInput(frame) ?? "proven-not-accepted",
+      setTimer: this.#setTimer,
     });
   }
 
@@ -282,9 +225,7 @@ export class TerminalSession {
     this.#cancelReconnectTimer();
     this.#cancelSnapshotRetry(true);
     this.#invalidateFullConnection();
-    this.#input.detachTransport("closed");
-    this.#unsubscribeInput?.();
-    this.#unsubscribeInput = null;
+    this.#writer.close();
     this.#capabilities.stop();
     this.coordinator.close();
     this.#update({
@@ -311,10 +252,11 @@ export class TerminalSession {
         if (this.#closed || this.#automaticReconnectBlocked) return;
         this.#invalidateFullConnection();
         this.#update({
-          lastError: error instanceof AuthenticationError ? "authentication" : "connection",
-          phase: error instanceof AuthenticationError ? "failed" : "reconnecting",
+          lastError:
+            error instanceof BrowserRelayAuthenticationError ? "authentication" : "connection",
+          phase: error instanceof BrowserRelayAuthenticationError ? "failed" : "reconnecting",
         });
-        if (!(error instanceof AuthenticationError)) this.#scheduleReconnect();
+        if (!(error instanceof BrowserRelayAuthenticationError)) this.#scheduleReconnect();
       })
       .finally(() => {
         this.#connectPromise = null;
@@ -327,259 +269,104 @@ export class TerminalSession {
 
   async #connectFull(signal: AbortSignal): Promise<void> {
     const connectionEpoch = ++this.#connectionEpoch;
-    ++this.#dataEpoch;
-    this.#input.detachTransport();
-    this.#writerLease = null;
-    this.#writerFence = null;
-    this.#inputAdmissionEnabled = false;
-    this.#dataBatchEnabled = false;
-    this.#stopHeartbeat();
-    this.#stopWriterLeaseRenewal();
+    this.#writer.beginConnection();
     this.#cancelDataFailureTimer();
 
-    const response = await this.#createConnectionSet(signal);
-    if (!this.#isCurrentConnection(connectionEpoch)) return;
-    this.#inputAdmissionEnabled =
-      response.selectedCapabilities?.includes(RelayCapability.browserInputAdmissionV1) ?? false;
-    this.#dataBatchEnabled =
-      response.selectedCapabilities?.includes(RelayCapability.browserDataBatchV1) ?? false;
-    const generation = BigInt(response.deliveryGeneration);
-
-    // Activation is one synchronous fence before any replacement callback can run.
-    this.coordinator.fenceDeliveryGeneration(generation);
-    ++this.#dataEpoch;
-    this.#generation = generation;
-    this.#streamId = response.streamId;
-    this.#connectionId = response.connectionId;
-    this.#closeSocket(this.#control);
-    this.#closeSocket(this.#data);
-    this.#control = null;
-    this.#data = null;
-    this.#update({ controlConnected: false, dataConnected: false });
-
-    const control = await this.#openControl(response.controlTicket, connectionEpoch, signal);
-    if (!this.#isCurrentConnection(connectionEpoch)) {
-      this.#closeSocket(control);
-      return;
-    }
-    this.#control = control;
-    this.#lastControlPongAt = this.#now();
-    this.#update({ controlConnected: true });
-
-    const dataEpoch = this.#dataEpoch;
-    const data = await this.#openData(
-      response.dataTicket,
+    const connection = await this.#connectionFactory.create(
       connectionEpoch,
-      dataEpoch,
-      generation,
-      response.streamId,
+      this.#connectionEvents(),
       signal,
     );
-    if (!this.#isCurrentData(connectionEpoch, dataEpoch, generation)) {
-      this.#closeSocket(data);
+    if (!this.#isCurrentConnection(connectionEpoch)) {
+      connection.close();
       return;
     }
-    this.#data = data;
-    this.#lastDataPongAt = this.#now();
-    this.#startHeartbeat(connectionEpoch, dataEpoch, generation);
+    this.#writer.setInputAdmissionEnabled(connection.inputAdmissionEnabled);
+
+    // Activation is one synchronous fence before any replacement callback can run.
+    this.coordinator.fenceDeliveryGeneration(connection.deliveryGeneration);
+    this.#connection?.close();
+    this.#connection = connection;
+    this.#update({ controlConnected: false, dataConnected: false });
+
+    await connection.openControl(signal);
+    if (!this.#isCurrentRelayConnection(connection)) {
+      connection.close();
+      return;
+    }
+    this.#update({ controlConnected: true });
+
+    await connection.openInitialData(signal);
+    if (!this.#isCurrentRelayConnection(connection)) {
+      connection.close();
+      return;
+    }
     this.#update({ dataConnected: true, phase: "attaching" });
     this.#sendAttach();
   }
 
-  async #createConnectionSet(signal: AbortSignal) {
-    const request = ConnectionSetRequestSchema.parse(
-      this.#clientId === undefined ? {} : { clientId: this.#clientId },
-    );
-    return this.#withRequestDeadline(signal, async (requestSignal) => {
-      const response = await this.#fetch(
-        `/api/v1/sessions/${encodeURIComponent(this.#sessionId)}/connection-sets`,
-        {
-          method: "POST",
-          credentials: "same-origin",
-          redirect: "error",
-          headers: {
-            ...this.#capabilities.authorizationHeaders(),
-            "Content-Type": "application/json",
-            [RELAY_CAPABILITIES_HEADER]: [
-              RelayCapability.browserDataBatchV1,
-              RelayCapability.browserInputAdmissionV1,
-            ].join(","),
-          },
-          body: JSON.stringify(request),
-          signal: requestSignal,
-        },
-      );
-      this.#throwIfAborted(requestSignal);
-      if (response.status === 401 || response.status === 403) throw new AuthenticationError();
-      if (!response.ok) throw new Error("connection set request failed");
-      const connectionSet = ConnectionSetResponseSchema.parse(await response.json());
-      this.#throwIfAborted(requestSignal);
-      if (connectionSet.clientId === null || connectionSet.streamId === 0) {
-        throw new Error("browser connection set has no delivery identity");
-      }
-      this.#clientId = connectionSet.clientId;
-      try {
-        this.#storage?.setItem(clientStorageKey(this.#sessionId), connectionSet.clientId);
-      } catch {
-        // The in-memory identity remains valid when storage is unavailable.
-      }
-      return connectionSet;
-    });
-  }
-
-  async #openControl(
-    ticket: string,
-    connectionEpoch: number,
-    signal: AbortSignal,
-  ): Promise<WebSocket> {
-    const socket = this.#createWebSocket(
-      this.#makeWebSocketUrl(
-        `/api/v1/sessions/${encodeURIComponent(this.#sessionId)}/ws/control?ticket=${encodeURIComponent(ticket)}`,
-      ),
-    );
-    socket.addEventListener("message", (event) => {
-      if (!this.#isCurrentConnection(connectionEpoch) || socket !== this.#control) return;
-      this.#handleControlMessage(event.data);
-    });
-    socket.addEventListener("close", (event) => {
-      if (this.#intentionalSockets.has(socket) || !this.#isCurrentConnection(connectionEpoch))
-        return;
-      const externallyReplaced =
-        event.code === SOCKET_REPLACED_CODE && event.reason === SOCKET_REPLACED_REASON;
-      this.#update({ controlConnected: false });
-      this.#invalidateFullConnection();
-      if (externallyReplaced) {
-        // Another control connection for this stable Browser client is now authoritative. An
-        // automatic reconnect here would let two tabs repeatedly displace each other. The user
-        // may explicitly reclaim control through reconnectNow().
-        this.#automaticReconnectBlocked = true;
-        this.#needsReconnect = false;
-        this.#update({
-          controlOwnership: this.#capabilities.role === "observer" ? "observer" : "waiting",
-          lastError: null,
-          phase: "displaced",
-        });
-        return;
-      }
-      this.#scheduleReconnect();
-    });
-    return this.#awaitOpen(socket, signal);
-  }
-
-  async #openData(
-    ticket: string,
-    connectionEpoch: number,
-    dataEpoch: number,
-    generation: bigint,
-    streamId: number,
-    signal?: AbortSignal,
-  ): Promise<WebSocket> {
-    const socket = this.#createWebSocket(
-      this.#makeWebSocketUrl(
-        `/api/v1/sessions/${encodeURIComponent(this.#sessionId)}/ws/data?ticket=${encodeURIComponent(ticket)}`,
-      ),
-    );
-    socket.binaryType = "arraybuffer";
-    socket.addEventListener("message", (event) => {
-      if (!this.#isCurrentData(connectionEpoch, dataEpoch, generation) || socket !== this.#data) {
-        return;
-      }
-      if (event.data === "pong") {
-        this.#lastDataPongAt = this.#now();
-        return;
-      }
-      if (!(event.data instanceof ArrayBuffer)) {
-        this.#protocolFailure();
-        return;
-      }
-      try {
-        const entries = this.#dataBatchEnabled
-          ? decodeDataFrameBatchEntries(event.data)
-          : [
-              {
-                encoded: new Uint8Array(event.data),
-                frame: decodeDataFrame(event.data),
-              },
-            ];
-        for (const entry of entries) {
-          if (entry.frame.deliveryGeneration !== generation || entry.frame.streamId !== streamId) {
-            this.#protocolFailure();
-            return;
-          }
-        }
-        for (const entry of entries) this.coordinator.acceptData(entry.encoded);
+  #connectionEvents(): BrowserRelayConnectionEvents {
+    return {
+      controlClosed: (connection, externallyReplaced) =>
+        this.#handleControlClosed(connection, externallyReplaced),
+      controlMessage: (connection, data) => {
+        if (this.#isCurrentRelayConnection(connection)) this.#handleControlMessage(data);
+      },
+      dataClosed: (connection) => this.#handleDataClosed(connection),
+      dataFrames: (connection, encodedFrames) => {
+        if (!this.#isCurrentRelayConnection(connection)) return;
+        for (const encoded of encodedFrames) this.coordinator.acceptData(encoded);
         this.#syncDeliveryState();
-      } catch {
-        this.#protocolFailure();
-      }
-    });
-    socket.addEventListener("close", () => {
-      if (
-        this.#intentionalSockets.has(socket) ||
-        !this.#isCurrentData(connectionEpoch, dataEpoch, generation)
-      ) {
-        return;
-      }
-      this.#data = null;
-      this.#stopHeartbeat();
-      this.#input.setReplicaCurrent(false);
-      this.#update({ dataConnected: false, phase: "reconnecting" });
-      this.#cancelDataFailureTimer();
-      this.#dataFailureTimer = this.#setTimer(() => {
-        this.#dataFailureTimer = null;
-        if (this.#snapshotRetryTimer !== null) return;
-        this.#invalidateFullConnection();
-        this.#scheduleReconnect();
-      }, DATA_REPLACEMENT_GRACE_MS);
-    });
-    return this.#awaitOpen(socket, signal);
+      },
+      protocolFailure: (connection) => {
+        if (this.#isCurrentRelayConnection(connection)) this.#protocolFailure();
+      },
+      transportFailure: (connection) => {
+        if (this.#isCurrentRelayConnection(connection)) this.#failFullConnection();
+      },
+    };
   }
 
-  #awaitOpen(socket: WebSocket, signal?: AbortSignal): Promise<WebSocket> {
-    return new Promise((resolve, reject) => {
-      const timeout = this.#setTimer(() => {
-        cleanup();
-        this.#closeSocket(socket);
-        reject(new Error("websocket open timed out"));
-      }, SOCKET_OPEN_TIMEOUT_MS);
-      const cleanup = () => {
-        this.#clearTimer(timeout);
-        socket.removeEventListener("open", onOpen);
-        socket.removeEventListener("close", onClose);
-        socket.removeEventListener("error", onError);
-        signal?.removeEventListener("abort", onAbort);
-      };
-      const onOpen = () => {
-        cleanup();
-        resolve(socket);
-      };
-      const onClose = () => {
-        cleanup();
-        reject(new Error("websocket closed before opening"));
-      };
-      const onError = () => {
-        cleanup();
-        reject(new Error("websocket failed before opening"));
-      };
-      const onAbort = () => {
-        cleanup();
-        this.#closeSocket(socket);
-        reject(signal?.reason ?? new DOMException("connection attempt aborted", "AbortError"));
-      };
-      socket.addEventListener("open", onOpen);
-      socket.addEventListener("close", onClose);
-      socket.addEventListener("error", onError);
-      signal?.addEventListener("abort", onAbort, { once: true });
-      if (signal?.aborted) onAbort();
-    });
+  #handleControlClosed(connection: BrowserRelayConnection, externallyReplaced: boolean): void {
+    if (!this.#isCurrentRelayConnection(connection)) return;
+    this.#update({ controlConnected: false });
+    this.#invalidateFullConnection();
+    if (externallyReplaced) {
+      // Another control connection for this stable Browser client is now authoritative. Automatic
+      // reconnect would let two tabs repeatedly displace each other; reconnectNow() explicitly
+      // reclaims control.
+      this.#automaticReconnectBlocked = true;
+      this.#needsReconnect = false;
+      this.#update({
+        controlOwnership: this.#capabilities.role === "observer" ? "observer" : "waiting",
+        lastError: null,
+        phase: "displaced",
+      });
+      return;
+    }
+    this.#scheduleReconnect();
+  }
+
+  #handleDataClosed(connection: BrowserRelayConnection): void {
+    if (!this.#isCurrentRelayConnection(connection)) return;
+    this.#writer.setReplicaCurrent(false);
+    this.#update({ dataConnected: false, phase: "reconnecting" });
+    this.#cancelDataFailureTimer();
+    this.#dataFailureTimer = this.#setTimer(() => {
+      this.#dataFailureTimer = null;
+      if (this.#snapshotRetryTimer !== null) return;
+      this.#invalidateFullConnection();
+      this.#scheduleReconnect();
+    }, DATA_REPLACEMENT_GRACE_MS);
   }
 
   #sendAttach(): void {
-    const generation = this.#generation;
-    if (generation === null) {
+    const connection = this.#connection;
+    if (connection === null) {
       this.#protocolFailure();
       return;
     }
+    const generation = connection.deliveryGeneration;
     const cursor = this.coordinator.activeCursor;
     const frame =
       cursor === null
@@ -602,15 +389,11 @@ export class TerminalSession {
       this.#deliveryAcks.reset(
         cursor === null ? null : { ...cursor, deliveryGeneration: generation },
       );
-      this.#startAttachStartWatchdog(generation);
+      this.#startAttachStartWatchdog(connection, generation);
     }
   }
 
   #handleControlMessage(data: unknown): void {
-    if (data === "pong") {
-      this.#lastControlPongAt = this.#now();
-      return;
-    }
     if (typeof data !== "string") {
       this.#protocolFailure();
       return;
@@ -627,15 +410,13 @@ export class TerminalSession {
         this.#acceptWelcome(frame);
         return;
       case "input-ack":
-        if (!this.#inputAdmissionEnabled) return;
-        if (frame.writerFence === undefined) {
-          this.#protocolFailure();
-          return;
-        }
-        this.#input.acceptAcknowledgement(frame);
+        this.#writer.acceptAcknowledgement(frame);
         return;
       case "writer-lease-status":
-        this.#acceptWriterLeaseStatus(frame);
+        {
+          const controlOwnership = this.#writer.acceptLeaseStatus(frame);
+          if (controlOwnership !== undefined) this.#update({ controlOwnership });
+        }
         return;
       case "host-offline":
         this.#update({ hostOnline: false, phase: "offline" });
@@ -662,76 +443,20 @@ export class TerminalSession {
   }
 
   #acceptWelcome(frame: Extract<ServerControlFrame, { type: "welcome" }>): void {
-    const generation = this.#generation;
+    const connection = this.#connection;
     if (
-      generation === null ||
-      frame.connectionId !== this.#connectionId ||
-      frame.streamId !== this.#streamId ||
-      BigInt(frame.deliveryGeneration) !== generation ||
+      connection === null ||
+      frame.connectionId !== connection.connectionId ||
+      frame.streamId !== connection.streamId ||
+      BigInt(frame.deliveryGeneration) !== connection.deliveryGeneration ||
       frame.engineId !== this.#engineId
     ) {
       this.#protocolFailure(frame.engineId !== this.#engineId ? "engine" : "protocol");
       return;
     }
-    const previousLease = this.#writerLease;
-    const previousFence = this.#writerFence;
-    if (this.#inputAdmissionEnabled && frame.writerLease !== undefined) {
-      if (frame.writerFence === undefined) {
-        this.#protocolFailure();
-        return;
-      }
-      this.#writerLease = frame.writerLease;
-      this.#writerFence = frame.writerFence;
-    } else {
-      // During component skew a new Browser cannot allocate a Browser-visible identity without a
-      // Cloud fence. A new-new pair selects browser-input-admission-v1 and stays writable on v2.
-      this.#writerLease = null;
-      this.#writerFence = null;
-    }
-    const writable =
-      this.#input.status.connected &&
-      previousLease === this.#writerLease &&
-      previousFence === this.#writerFence
-        ? this.#input.status.writable
-        : this.#attachInputTransport();
-    if (this.#writerLease !== null && !writable) {
-      this.#protocolFailure();
-      return;
-    }
-    if (this.#writerLease === null) this.#stopWriterLeaseRenewal();
-    else this.#startWriterLeaseRenewal();
-    this.#update({
-      controlOwnership:
-        this.#capabilities.role === "observer"
-          ? "observer"
-          : this.#writerLease === null
-            ? "waiting"
-            : "writer",
-      hostOnline: true,
-      phase: "attaching",
-    });
-  }
-
-  #acceptWriterLeaseStatus(
-    frame: Extract<ServerControlFrame, { type: "writer-lease-status" }>,
-  ): void {
-    if (!this.#inputAdmissionEnabled || this.#capabilities.role === "observer") return;
-    if (frame.active) {
-      if (
-        frame.writerFence === undefined ||
-        this.#writerFence === null ||
-        frame.writerFence !== this.#writerFence ||
-        this.#writerLease === null
-      ) {
-        this.#protocolFailure();
-      }
-      return;
-    }
-    this.#writerLease = null;
-    this.#writerFence = null;
-    this.#stopWriterLeaseRenewal();
-    this.#input.revokeWriterAuthority();
-    this.#update({ controlOwnership: "waiting" });
+    const controlOwnership = this.#writer.acceptWelcome(frame);
+    if (controlOwnership === undefined) return;
+    this.#update({ controlOwnership, hostOnline: true, phase: "attaching" });
   }
 
   #handleResyncRequired(frame: Extract<ServerControlFrame, { type: "resync-required" }>): void {
@@ -740,10 +465,11 @@ export class TerminalSession {
       return;
     }
     const generation = BigInt(frame.deliveryGeneration);
+    const connection = this.#connection;
     if (
       frame.dataTicket !== undefined &&
-      (this.#generation === null ||
-        generation <= this.#generation ||
+      (connection === null ||
+        generation <= connection.deliveryGeneration ||
         frame.expiresAt! <= this.#now())
     ) {
       this.#protocolFailure();
@@ -751,7 +477,7 @@ export class TerminalSession {
     }
     if (frame.dataTicket !== undefined) this.#cancelSnapshotRetry(false);
     this.#cancelAttachStartWatchdog();
-    this.#input.setReplicaCurrent(false);
+    this.#writer.setReplicaCurrent(false);
     this.coordinator.fenceDeliveryGeneration(generation);
     this.#syncDeliveryState();
     if (frame.dataTicket === undefined) {
@@ -764,64 +490,48 @@ export class TerminalSession {
   }
 
   async #replaceData(ticket: string, generation: bigint): Promise<void> {
-    const connectionEpoch = this.#connectionEpoch;
-    if (!this.#isCurrentConnection(connectionEpoch) || this.#control?.readyState !== 1) {
+    const connection = this.#connection;
+    if (
+      connection === null ||
+      !this.#isCurrentRelayConnection(connection) ||
+      !connection.controlConnected
+    ) {
       this.#invalidateFullConnection();
       this.#scheduleReconnect();
       return;
     }
-    this.#abortDataReplacement();
-    // Fence first, then invalidate the old transport callback before opening replacement data.
+    // Fence first, then invalidate the old data incarnation inside the connection owner.
     this.coordinator.fenceDeliveryGeneration(generation);
-    const dataEpoch = ++this.#dataEpoch;
-    const abort = new AbortController();
-    this.#replacementAbort = abort;
     this.#deliveryAcks.reset();
-    this.#generation = generation;
-    this.#input.noteDataTransportReplacement();
-    this.#input.setReplicaCurrent(false);
-    this.#stopHeartbeat();
-    this.#closeSocket(this.#data);
-    this.#data = null;
+    this.#writer.noteDataTransportReplacement();
+    this.#writer.setReplicaCurrent(false);
     this.#update({ dataConnected: false, phase: "reconnecting" });
     try {
-      const data = await this.#openData(
-        ticket,
-        connectionEpoch,
-        dataEpoch,
-        generation,
-        this.#streamId,
-        abort.signal,
-      );
-      if (!this.#isCurrentData(connectionEpoch, dataEpoch, generation)) {
-        this.#closeSocket(data);
-        return;
-      }
-      this.#data = data;
-      this.#lastDataPongAt = this.#now();
-      this.#startHeartbeat(connectionEpoch, dataEpoch, generation);
+      const replaced = await connection.replaceData(ticket, generation);
+      if (!replaced || !this.#isCurrentRelayConnection(connection)) return;
       this.#update({ dataConnected: true, phase: "attaching" });
       this.#sendAttach();
     } catch {
-      if (abort.signal.aborted || !this.#isCurrentData(connectionEpoch, dataEpoch, generation)) {
+      if (
+        !this.#isCurrentRelayConnection(connection) ||
+        !connection.isCurrentGeneration(generation)
+      ) {
         return;
       }
       if (this.#snapshotRetryTimer !== null) return;
       this.#invalidateFullConnection();
       this.#scheduleReconnect();
-    } finally {
-      if (this.#replacementAbort === abort) this.#replacementAbort = null;
     }
   }
 
   #matchesCurrentDelivery(
     frame: Extract<ServerControlFrame, { type: "replay-start" | "snapshot-manifest" }>,
   ): boolean {
-    const generation = this.#generation;
-    if (generation === null) return false;
+    const connection = this.#connection;
+    if (connection === null) return false;
     const frameGeneration = BigInt(frame.deliveryGeneration);
-    if (frameGeneration < generation) return false;
-    if (!frameMatchesDelivery(frame, generation, this.#streamId)) {
+    if (frameGeneration < connection.deliveryGeneration) return false;
+    if (!frameMatchesDelivery(frame, connection.deliveryGeneration, connection.streamId)) {
       this.#protocolFailure();
       return false;
     }
@@ -829,29 +539,10 @@ export class TerminalSession {
   }
 
   #sendControl(frame: ClientControlFrame, critical = false): boolean {
-    const control = this.#control;
-    try {
-      const payload = JSON.stringify(frame);
-      const payloadBytes = textEncoder.encode(payload).byteLength;
-      if (
-        control === null ||
-        control.readyState !== 1 ||
-        payloadBytes > MAX_CONTROL_FRAME_BYTES ||
-        control.bufferedAmount + payloadBytes > MAX_CONTROL_QUEUE_BYTES
-      ) {
-        if (critical) this.#failFullConnection();
-        return false;
-      }
-      control.send(payload);
-      if (control.bufferedAmount > MAX_CONTROL_QUEUE_BYTES) {
-        if (critical) this.#failFullConnection();
-        return false;
-      }
-      return true;
-    } catch {
-      if (critical) this.#failFullConnection();
-      return false;
-    }
+    const connection = this.#connection;
+    if (connection !== null) return connection.sendControl(frame, critical);
+    if (critical) this.#failFullConnection();
+    return false;
   }
 
   #syncDeliveryState(): void {
@@ -861,9 +552,9 @@ export class TerminalSession {
       this.#cancelAttachStartWatchdog();
       phase = "live";
       this.#cancelSnapshotRetry(true);
-      this.#input.setReplicaCurrent(true);
+      this.#writer.setReplicaCurrent(true);
     } else {
-      this.#input.setReplicaCurrent(false);
+      this.#writer.setReplicaCurrent(false);
       if (deliveryState === "restoring" || deliveryState === "replaying") phase = "restoring";
       else if (deliveryState === "resyncing") phase = "reconnecting";
     }
@@ -883,10 +574,7 @@ export class TerminalSession {
       this.#scheduleSnapshotRetry();
       return;
     }
-    this.#update({
-      lastError: "protocol",
-      phase: "reconnecting",
-    });
+    this.#update({ lastError: "protocol", phase: "reconnecting" });
     this.#invalidateFullConnection();
     this.#scheduleReconnect();
   }
@@ -906,7 +594,7 @@ export class TerminalSession {
     this.#needsReconnect = true;
     if (this.#snapshotRetryTimer !== null) return;
     if (this.#reconnectTimer !== null || this.#connectPromise !== null) return;
-    this.#input.detachTransport();
+    this.#writer.detachInputTransport();
     const exponent = Math.min(6, Math.max(0, this.#snapshot.attempt - 1));
     const base = Math.min(MAX_RECONNECT_DELAY_MS, 250 * 2 ** exponent);
     const delay = Math.max(0, Math.round(base * (0.8 + this.#random() * 0.4)));
@@ -919,63 +607,13 @@ export class TerminalSession {
     }, delay);
   }
 
-  #startHeartbeat(connectionEpoch: number, dataEpoch: number, generation: bigint): void {
-    this.#stopHeartbeat();
-    const tick = () => {
-      this.#heartbeatTimer = null;
-      if (!this.#isCurrentData(connectionEpoch, dataEpoch, generation)) return;
-      const control = this.#control;
-      const data = this.#data;
-      if (control === null || data === null || control.readyState !== 1 || data.readyState !== 1) {
-        this.#invalidateFullConnection();
-        this.#scheduleReconnect();
-        return;
-      }
-      const now = this.#now();
-      if (
-        now - this.#lastControlPongAt >= HEARTBEAT_TIMEOUT_MS ||
-        now - this.#lastDataPongAt >= HEARTBEAT_TIMEOUT_MS
-      ) {
-        this.#invalidateFullConnection();
-        this.#scheduleReconnect();
-        return;
-      }
-      const heartbeatBytes = textEncoder.encode("ping").byteLength;
-      if (
-        control.bufferedAmount + heartbeatBytes > MAX_CONTROL_QUEUE_BYTES ||
-        data.bufferedAmount + heartbeatBytes > MAX_CONTROL_QUEUE_BYTES
-      ) {
-        this.#invalidateFullConnection();
-        this.#scheduleReconnect();
-        return;
-      }
-      try {
-        control.send("ping");
-        data.send("ping");
-        if (
-          control.bufferedAmount > MAX_CONTROL_QUEUE_BYTES ||
-          data.bufferedAmount > MAX_CONTROL_QUEUE_BYTES
-        ) {
-          throw new Error("heartbeat backpressure exceeded");
-        }
-      } catch {
-        this.#invalidateFullConnection();
-        this.#scheduleReconnect();
-        return;
-      }
-      this.#heartbeatTimer = this.#setTimer(tick, HEARTBEAT_INTERVAL_MS);
-    };
-    this.#heartbeatTimer = this.#setTimer(tick, HEARTBEAT_INTERVAL_MS);
-  }
-
-  #startAttachStartWatchdog(generation: bigint): void {
+  #startAttachStartWatchdog(connection: BrowserRelayConnection, generation: bigint): void {
     this.#cancelAttachStartWatchdog();
-    const connectionEpoch = this.#connectionEpoch;
-    const dataEpoch = this.#dataEpoch;
     this.#attachStartTimer = this.#setTimer(() => {
       this.#attachStartTimer = null;
       if (
-        !this.#isCurrentData(connectionEpoch, dataEpoch, generation) ||
+        !this.#isCurrentRelayConnection(connection) ||
+        !connection.isCurrentGeneration(generation) ||
         this.coordinator.state === "live"
       ) {
         return;
@@ -988,74 +626,6 @@ export class TerminalSession {
   #cancelAttachStartWatchdog(): void {
     if (this.#attachStartTimer !== null) this.#clearTimer(this.#attachStartTimer);
     this.#attachStartTimer = null;
-  }
-
-  #startWriterLeaseRenewal(): void {
-    this.#stopWriterLeaseRenewal();
-    const connectionEpoch = this.#connectionEpoch;
-    const tick = () => {
-      this.#writerLeaseTimer = null;
-      if (!this.#isCurrentConnection(connectionEpoch)) return;
-      const writerLease = this.#writerLease;
-      if (writerLease === null) return;
-      const sent = this.#sendControl(
-        ClientControlFrameSchema.parse({ type: "writer-lease-renew", writerLease }),
-        true,
-      );
-      if (!sent || !this.#isCurrentConnection(connectionEpoch)) return;
-      this.#writerLeaseTimer = this.#setTimer(tick, WRITER_LEASE_RENEW_INTERVAL_MS);
-    };
-    this.#writerLeaseTimer = this.#setTimer(tick, WRITER_LEASE_RENEW_INTERVAL_MS);
-  }
-
-  #stopWriterLeaseRenewal(): void {
-    if (this.#writerLeaseTimer !== null) this.#clearTimer(this.#writerLeaseTimer);
-    this.#writerLeaseTimer = null;
-  }
-
-  #attachInputTransport(): boolean {
-    const writable = this.#input.attachTransport({
-      generation: this.#connectionEpoch,
-      sender: (inputFrame) => this.#sendInputControl(inputFrame),
-      ...(this.#writerLease === null ? {} : { writerLease: this.#writerLease }),
-      ...(this.#writerFence === null ? {} : { writerFence: this.#writerFence }),
-    });
-    if (writable) this.#input.reconcileLatestResize();
-    return writable;
-  }
-
-  #sendInputControl(frame: ClientControlFrame): InputTransportSendResult {
-    const control = this.#control;
-    let payload: string;
-    let payloadBytes: number;
-    try {
-      payload = JSON.stringify(frame);
-      payloadBytes = textEncoder.encode(payload).byteLength;
-    } catch {
-      return "proven-not-accepted";
-    }
-    if (
-      control === null ||
-      control.readyState !== 1 ||
-      payloadBytes > MAX_CONTROL_FRAME_BYTES ||
-      control.bufferedAmount + payloadBytes > MAX_CONTROL_QUEUE_BYTES
-    ) {
-      return "proven-not-accepted";
-    }
-    try {
-      control.send(payload);
-    } catch {
-      return "uncertain";
-    }
-    if (control.bufferedAmount > MAX_CONTROL_QUEUE_BYTES) {
-      globalThis.queueMicrotask(() => this.#failFullConnection());
-    }
-    return "accepted";
-  }
-
-  #stopHeartbeat(): void {
-    if (this.#heartbeatTimer !== null) this.#clearTimer(this.#heartbeatTimer);
-    this.#heartbeatTimer = null;
   }
 
   #cancelReconnectTimer(): void {
@@ -1079,33 +649,25 @@ export class TerminalSession {
 
   #invalidateFullConnection(): void {
     ++this.#connectionEpoch;
-    ++this.#dataEpoch;
     this.#connectAbort?.abort(new DOMException("connection replaced", "AbortError"));
     this.#connectAbort = null;
-    this.#abortDataReplacement();
     this.#cancelDataFailureTimer();
     this.#cancelAttachStartWatchdog();
-    this.#stopHeartbeat();
-    this.#stopWriterLeaseRenewal();
     this.#deliveryAcks.reset();
-    this.#input.detachTransport();
-    this.#writerLease = null;
-    this.#writerFence = null;
-    this.#inputAdmissionEnabled = false;
-    this.#closeSocket(this.#control);
-    this.#closeSocket(this.#data);
-    this.#control = null;
-    this.#data = null;
+    this.#writer.disconnect();
+    this.#connection?.close();
+    this.#connection = null;
     this.#update({ controlConnected: false, dataConnected: false });
   }
 
   #scheduleSnapshotRetry(): void {
-    if (this.#closed || this.#automaticReconnectBlocked || this.#snapshotRetryTimer !== null)
+    if (this.#closed || this.#automaticReconnectBlocked || this.#snapshotRetryTimer !== null) {
       return;
+    }
     const exponent = Math.min(4, this.#snapshotFailureCount++);
     const base = Math.min(SNAPSHOT_RETRY_MAX_MS, SNAPSHOT_RETRY_BASE_MS * 2 ** exponent);
     const delay = Math.max(0, Math.round(base * (0.8 + this.#random() * 0.4)));
-    this.#input.setReplicaCurrent(false);
+    this.#writer.setReplicaCurrent(false);
     this.#update({ lastError: "connection", phase: "reconnecting" });
     this.#snapshotRetryTimer = this.#setTimer(() => {
       this.#snapshotRetryTimer = null;
@@ -1127,62 +689,12 @@ export class TerminalSession {
     this.#dataFailureTimer = null;
   }
 
-  #abortDataReplacement(): void {
-    this.#replacementAbort?.abort(new DOMException("data replacement superseded", "AbortError"));
-    this.#replacementAbort = null;
-  }
-
-  #closeSocket(socket: WebSocket | null): void {
-    if (socket === null) return;
-    this.#intentionalSockets.add(socket);
-    if (socket.readyState < 2) socket.close(1000, "replaced");
-  }
-
   #isCurrentConnection(connectionEpoch: number): boolean {
     return !this.#closed && connectionEpoch === this.#connectionEpoch;
   }
 
-  #isCurrentData(connectionEpoch: number, dataEpoch: number, generation: bigint): boolean {
-    return (
-      this.#isCurrentConnection(connectionEpoch) &&
-      dataEpoch === this.#dataEpoch &&
-      generation === this.#generation
-    );
-  }
-
-  async #withRequestDeadline<T>(
-    parentSignal: AbortSignal,
-    operation: (signal: AbortSignal) => Promise<T>,
-  ): Promise<T> {
-    const abort = new AbortController();
-    let rejectBoundary!: (reason?: unknown) => void;
-    const boundary = new Promise<never>((_resolve, reject) => {
-      rejectBoundary = reject;
-    });
-    const fail = (reason: unknown) => {
-      if (!abort.signal.aborted) abort.abort(reason);
-      rejectBoundary(reason);
-    };
-    const onAbort = () =>
-      fail(parentSignal.reason ?? new DOMException("connection attempt aborted", "AbortError"));
-    const timeout = this.#setTimer(
-      () => fail(new DOMException("connection set request timed out", "TimeoutError")),
-      HTTP_REQUEST_TIMEOUT_MS,
-    );
-    parentSignal.addEventListener("abort", onAbort, { once: true });
-    if (parentSignal.aborted) onAbort();
-    try {
-      return await Promise.race([operation(abort.signal), boundary]);
-    } finally {
-      this.#clearTimer(timeout);
-      parentSignal.removeEventListener("abort", onAbort);
-    }
-  }
-
-  #throwIfAborted(signal: AbortSignal): void {
-    if (signal.aborted) {
-      throw signal.reason ?? new DOMException("request aborted", "AbortError");
-    }
+  #isCurrentRelayConnection(connection: BrowserRelayConnection): boolean {
+    return this.#connection === connection && this.#isCurrentConnection(connection.connectionEpoch);
   }
 
   #update(patch: Partial<TerminalSessionSnapshot>): void {
@@ -1190,5 +702,3 @@ export class TerminalSession {
     for (const listener of this.#listeners) listener();
   }
 }
-
-class AuthenticationError extends Error {}
