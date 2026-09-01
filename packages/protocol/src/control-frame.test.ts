@@ -143,6 +143,44 @@ describe("control frame validation", () => {
         expiresAt: 1_800_000_000_000,
       }),
     ).toThrow();
+    expect(
+      ServerControlFrameSchema.parse({
+        type: "writer-lease-status",
+        active: true,
+        expiresAt: 1_800_000_000_000,
+        writerFence: "7",
+      }),
+    ).toMatchObject({ writerFence: "7" });
+    expect(() =>
+      ServerControlFrameSchema.parse({
+        type: "writer-lease-status",
+        active: false,
+        writerFence: "7",
+      }),
+    ).toThrow();
+  });
+
+  it("rolls out Browser writer fences without breaking legacy welcome frames", () => {
+    const welcome = {
+      type: "welcome",
+      connectionId: "connection_AAAAAAAAA",
+      streamId: 1,
+      writerLease: "lease_AAAAAAAAAAAA",
+      engineId: "engine",
+      sessionEpoch: "1",
+      deliveryGeneration: "1",
+      headEventSeq: "0",
+      nextPtyOffset: "0",
+    } as const;
+    expect(ServerControlFrameSchema.parse(welcome)).not.toHaveProperty("writerFence");
+    expect(ServerControlFrameSchema.parse({ ...welcome, writerFence: "9" })).toMatchObject({
+      writerLease: welcome.writerLease,
+      writerFence: "9",
+    });
+    const { writerLease: _writerLease, ...observerWelcome } = welcome;
+    expect(() =>
+      ServerControlFrameSchema.parse({ ...observerWelcome, writerFence: "9" }),
+    ).toThrow();
   });
 
   it("preserves international keyboard metadata and rejects surrogate code points", () => {
@@ -334,6 +372,27 @@ describe("control frame validation", () => {
         authorityEventSeq: "19",
       }),
     ).toMatchObject({ inputEpoch: "input_AAAAAAAAAAAA", clientInputSeq: "42" });
+    expect(
+      ServerControlFrameSchema.parse({
+        type: "input-ack",
+        writerFence: "8",
+        inputEpoch: "input_AAAAAAAAAAAA",
+        clientInputSeq: "42",
+        status: "written",
+        authorityEventSeq: "19",
+      }),
+    ).toMatchObject({ writerFence: "8" });
+    expect(() =>
+      HostControlFrameSchema.parse({
+        type: "input-ack",
+        connectionId: "connection_AAAAAAAAA",
+        writerFence: "8",
+        inputEpoch: "input_AAAAAAAAAAAA",
+        clientInputSeq: "42",
+        status: "written",
+        authorityEventSeq: "19",
+      }),
+    ).toThrow();
   });
 
   it("validates a generation-scoped slow-client reset notification", () => {

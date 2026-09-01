@@ -11,9 +11,13 @@ const capability = z.string().min(1).max(4_096);
 
 export const RELAY_CAPABILITIES_HEADER = "x-zhongduan-relay-capabilities";
 export const RelayCapability = {
+  browserInputAdmissionV1: "browser-input-admission-v1",
   deliveryBarrierOutcomeV1: "delivery-barrier-outcome-v1",
 } as const;
-export const RelayCapabilitySchema = z.enum([RelayCapability.deliveryBarrierOutcomeV1]);
+export const RelayCapabilitySchema = z.enum([
+  RelayCapability.browserInputAdmissionV1,
+  RelayCapability.deliveryBarrierOutcomeV1,
+]);
 export type RelayCapability = z.infer<typeof RelayCapabilitySchema>;
 
 const MAX_RELAY_CAPABILITIES_HEADER_CHARS = 1_024;

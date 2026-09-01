@@ -529,7 +529,11 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (selectedCapabilitiesResult === undefined) {
       return json({ error: "invalid-connection-set" }, 400);
     }
-    const selectedCapabilities = parsed.data.role === "host" ? selectedCapabilitiesResult : [];
+    const selectedCapabilities = selectedCapabilitiesResult.filter((capability) =>
+      parsed.data.role === "host"
+        ? capability === RelayCapability.deliveryBarrierOutcomeV1
+        : capability === RelayCapability.browserInputAdmissionV1,
+    );
     const [controlDigest, dataDigest, principalIdHash] = await Promise.all([
       sha256Hex(controlTicket),
       sha256Hex(dataTicket),
@@ -783,8 +787,27 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     if (frame.type === "input-ack") {
       const browser = this.browserControlByConnection(frame.connectionId);
       if (browser === undefined) return;
+      const browserAttachment = readAttachment(browser);
+      if (browserAttachment === undefined) {
+        closeProtocol(browser, "input acknowledgement has no writer fence");
+        return;
+      }
       const { connectionId: _connectionId, ...browserFrame } = frame;
-      this.sendBrowserControl(browser, browserFrame, "input acknowledgement delivery failed");
+      const includeWriterFence = browserAttachment.relayCapabilities.includes(
+        RelayCapability.browserInputAdmissionV1,
+      );
+      if (includeWriterFence && browserAttachment.leaseFence === null) {
+        closeProtocol(browser, "input acknowledgement has no writer fence");
+        return;
+      }
+      this.sendBrowserControl(
+        browser,
+        {
+          ...browserFrame,
+          ...(includeWriterFence ? { writerFence: browserAttachment.leaseFence! } : {}),
+        },
+        "input acknowledgement delivery failed",
+      );
       return;
     }
 
@@ -1091,7 +1114,16 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
         {
           type: "writer-lease-status",
           active,
-          ...(active ? { expiresAt } : {}),
+          ...(active
+            ? {
+                expiresAt,
+                ...(latestAttachment.relayCapabilities.includes(
+                  RelayCapability.browserInputAdmissionV1,
+                )
+                  ? { writerFence: latestAttachment.leaseFence! }
+                  : {}),
+              }
+            : {}),
         },
         "writer lease status delivery failed",
       );
@@ -1220,7 +1252,16 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
           type: "welcome",
           connectionId: current.controlAttachment.connectionId,
           streamId: current.client.stream_id,
-          ...(lease === undefined ? {} : { writerLease: lease.token }),
+          ...(lease === undefined
+            ? {}
+            : {
+                writerLease: lease.token,
+                ...(activeAttachment.relayCapabilities.includes(
+                  RelayCapability.browserInputAdmissionV1,
+                )
+                  ? { writerFence: lease.fence }
+                  : {}),
+              }),
           engineId: current.session.engine_id,
           sessionEpoch: current.session.session_epoch,
           deliveryGeneration: current.client.delivery_generation,
@@ -1635,10 +1676,23 @@ export class TerminalSessionDO extends DurableObject<CloudEnv> {
     clientInputSeq: string,
     status: "rejected" | "uncertain" = "rejected",
   ): void {
+    const attachment = readAttachment(webSocket);
+    if (attachment === undefined) {
+      closeProtocol(webSocket, "input rejection has no writer fence");
+      return;
+    }
+    const includeWriterFence = attachment.relayCapabilities.includes(
+      RelayCapability.browserInputAdmissionV1,
+    );
+    if (includeWriterFence && attachment.leaseFence === null) {
+      closeProtocol(webSocket, "input rejection has no writer fence");
+      return;
+    }
     this.sendBrowserControl(
       webSocket,
       {
         type: "input-ack",
+        ...(includeWriterFence ? { writerFence: attachment.leaseFence! } : {}),
         inputEpoch,
         clientInputSeq,
         status,

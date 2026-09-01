@@ -147,6 +147,9 @@ oracle、span、相对比较规则与 CURRENT 报告。`not-measured` 是 fail-c
 **完成条件：** sequence 只在成功 admission 后分配；未离开 Browser 的事件不会在重连后自动发送；
 UI-consumed input 不会静默丢失，所有本地 queue 都有 bytes/count/age 上限及 overload 行为。
 
+**实现证据：** [E1 Browser input admission](./e1-browser-input-admission.md) 固定 owner、queue
+contract、replacement/coalescing 语义、rollout 边界与验证入口。
+
 ### E2 — Cloud input lanes and connection-scoped writer
 
 **依赖：** E1。

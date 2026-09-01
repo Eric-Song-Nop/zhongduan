@@ -83,6 +83,11 @@ describe("Cloud HTTP contracts", () => {
         `future-relay-capability-v2,${RelayCapability.deliveryBarrierOutcomeV1}`,
       ),
     ).toEqual([RelayCapability.deliveryBarrierOutcomeV1]);
+    expect(
+      selectRelayCapabilities(
+        `${RelayCapability.browserInputAdmissionV1},${RelayCapability.deliveryBarrierOutcomeV1}`,
+      ),
+    ).toEqual([RelayCapability.browserInputAdmissionV1, RelayCapability.deliveryBarrierOutcomeV1]);
     expect(selectRelayCapabilities("future-relay-capability-v2")).toEqual([]);
     expect(selectRelayCapabilities("INVALID")).toBeUndefined();
     expect(

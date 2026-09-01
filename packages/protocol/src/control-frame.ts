@@ -1,8 +1,9 @@
 import { z } from "zod";
-import { DecimalU64Schema } from "./scalars";
+import { DecimalU64Schema, PositiveDecimalU64Schema } from "./scalars";
 import { SnapshotContentMetadataSchema, SnapshotResourceIdSchema } from "./snapshot";
 
 const u64 = DecimalU64Schema;
+const positiveU64 = PositiveDecimalU64Schema;
 const id = z.string().min(1).max(128);
 const engineId = z.string().min(1).max(512);
 const dimensions = {
@@ -203,17 +204,22 @@ export const HostControlFrameSchema = z.discriminatedUnion("type", [
 
 export type HostControlFrame = z.infer<typeof HostControlFrameSchema>;
 
-const welcome = z.strictObject({
-  type: z.literal("welcome"),
-  connectionId: id,
-  streamId: z.number().int().min(1).max(0xffff_ffff),
-  writerLease: id.optional(),
-  engineId,
-  sessionEpoch: u64,
-  deliveryGeneration: u64,
-  headEventSeq: u64,
-  nextPtyOffset: u64,
-});
+const welcome = z
+  .strictObject({
+    type: z.literal("welcome"),
+    connectionId: id,
+    streamId: z.number().int().min(1).max(0xffff_ffff),
+    writerLease: id.optional(),
+    writerFence: positiveU64.optional(),
+    engineId,
+    sessionEpoch: u64,
+    deliveryGeneration: u64,
+    headEventSeq: u64,
+    nextPtyOffset: u64,
+  })
+  .refine((frame) => frame.writerFence === undefined || frame.writerLease !== undefined, {
+    message: "writerFence requires writerLease",
+  });
 
 const hostOffline = z.strictObject({
   type: z.literal("host-offline"),
@@ -224,10 +230,18 @@ const writerLeaseStatus = z
     type: z.literal("writer-lease-status"),
     active: z.boolean(),
     expiresAt: z.number().int().positive().optional(),
+    writerFence: positiveU64.optional(),
   })
-  .refine((frame) => frame.active === (frame.expiresAt !== undefined), {
-    message: "active writer lease status requires expiresAt",
-  });
+  .refine(
+    (frame) =>
+      frame.active === (frame.expiresAt !== undefined) &&
+      (frame.writerFence === undefined || frame.active),
+    { message: "active writer lease status requires expiresAt" },
+  );
+
+const browserInputAck = inputAck.omit({ connectionId: true }).safeExtend({
+  writerFence: positiveU64.optional(),
+});
 
 const resyncRequired = z
   .strictObject({
@@ -284,7 +298,7 @@ const replayStart = z
 
 export const ServerControlFrameSchema = z.discriminatedUnion("type", [
   welcome,
-  inputAck.omit({ connectionId: true }),
+  browserInputAck,
   hostOffline,
   writerLeaseStatus,
   resyncRequired,

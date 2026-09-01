@@ -3,6 +3,8 @@ import {
   CloudResourceIdSchema,
   ConnectionSetRequestSchema,
   ConnectionSetResponseSchema,
+  RELAY_CAPABILITIES_HEADER,
+  RelayCapability,
   ServerControlFrameSchema,
   decodeDataFrame,
   type BrowserCapabilityRole,
@@ -19,7 +21,7 @@ import {
 } from "@zhongduan/session-client";
 
 import type { CapabilityManager } from "./capability";
-import type { InputDispatcher } from "./input-dispatcher";
+import type { InputDispatcher, InputTransportSendResult } from "./input-dispatcher";
 
 const CLIENT_ID_PREFIX = "zhongduan:browser-client:";
 const SOCKET_OPEN_TIMEOUT_MS = 10_000;
@@ -36,6 +38,8 @@ const HTTP_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_RECONNECT_DELAY_MS = 10_000;
 const SNAPSHOT_RETRY_BASE_MS = 2_000;
 const SNAPSHOT_RETRY_MAX_MS = 30_000;
+const SOCKET_REPLACED_CODE = 4001;
+const SOCKET_REPLACED_REASON = "connection replaced";
 // A legal 1 MiB input can expand to six bytes per byte when JSON escapes control characters.
 const MAX_CONTROL_FRAME_BYTES = 6 * 1024 * 1024 + 4_096;
 const MAX_CONTROL_QUEUE_BYTES = MAX_CONTROL_FRAME_BYTES;
@@ -48,6 +52,7 @@ type SessionPhase =
   | "restoring"
   | "live"
   | "offline"
+  | "displaced"
   | "reconnecting"
   | "failed"
   | "closed";
@@ -148,7 +153,9 @@ export class TerminalSession {
   #streamId = 0;
   #connectionId: string | null = null;
   #writerLease: string | null = null;
-  #writerIdentityConnectionId: string | null = null;
+  #writerFence: string | null = null;
+  #inputAdmissionEnabled = false;
+  #inputReplacementScheduled = false;
   #clientId: string | undefined;
   #connectPromise: Promise<void> | null = null;
   #connectAbort: AbortController | null = null;
@@ -165,6 +172,7 @@ export class TerminalSession {
   #lastDataPongAt = 0;
   #automaticReconnectBlocked = false;
   #closed = false;
+  #unsubscribeInput: (() => void) | null = null;
 
   constructor(options: TerminalSessionOptions) {
     this.#sessionId = CloudResourceIdSchema.parse(options.sessionId);
@@ -200,6 +208,22 @@ export class TerminalSession {
       onReplicaProgress: () => this.#syncDeliveryState(),
       onResync: (reason) => this.#handleCoordinatorResync(reason),
     });
+    this.#unsubscribeInput = this.#input.subscribe(() => {
+      if (
+        !this.#input.status.controlReplacementRequired ||
+        this.#inputReplacementScheduled ||
+        this.#closed
+      ) {
+        return;
+      }
+      this.#inputReplacementScheduled = true;
+      globalThis.queueMicrotask(() => {
+        this.#inputReplacementScheduled = false;
+        if (!this.#closed && this.#input.status.controlReplacementRequired) {
+          this.#failFullConnection();
+        }
+      });
+    });
   }
 
   get snapshot(): TerminalSessionSnapshot {
@@ -234,6 +258,9 @@ export class TerminalSession {
     this.#cancelReconnectTimer();
     this.#cancelSnapshotRetry(true);
     this.#invalidateFullConnection();
+    this.#input.detachTransport("closed");
+    this.#unsubscribeInput?.();
+    this.#unsubscribeInput = null;
     this.#capabilities.stop();
     this.coordinator.close();
     this.#update({
@@ -279,12 +306,16 @@ export class TerminalSession {
     ++this.#dataEpoch;
     this.#input.detachTransport();
     this.#writerLease = null;
+    this.#writerFence = null;
+    this.#inputAdmissionEnabled = false;
     this.#stopHeartbeat();
     this.#stopWriterLeaseRenewal();
     this.#cancelDataFailureTimer();
 
     const response = await this.#createConnectionSet(signal);
     if (!this.#isCurrentConnection(connectionEpoch)) return;
+    this.#inputAdmissionEnabled =
+      response.selectedCapabilities?.includes(RelayCapability.browserInputAdmissionV1) ?? false;
     const generation = BigInt(response.deliveryGeneration);
 
     // Activation is one synchronous fence before any replacement callback can run.
@@ -342,6 +373,7 @@ export class TerminalSession {
           headers: {
             ...this.#capabilities.authorizationHeaders(),
             "Content-Type": "application/json",
+            [RELAY_CAPABILITIES_HEADER]: RelayCapability.browserInputAdmissionV1,
           },
           body: JSON.stringify(request),
           signal: requestSignal,
@@ -379,11 +411,26 @@ export class TerminalSession {
       if (!this.#isCurrentConnection(connectionEpoch) || socket !== this.#control) return;
       this.#handleControlMessage(event.data);
     });
-    socket.addEventListener("close", () => {
+    socket.addEventListener("close", (event) => {
       if (this.#intentionalSockets.has(socket) || !this.#isCurrentConnection(connectionEpoch))
         return;
+      const externallyReplaced =
+        event.code === SOCKET_REPLACED_CODE && event.reason === SOCKET_REPLACED_REASON;
       this.#update({ controlConnected: false });
       this.#invalidateFullConnection();
+      if (externallyReplaced) {
+        // Another control connection for this stable Browser client is now authoritative. An
+        // automatic reconnect here would let two tabs repeatedly displace each other. The user
+        // may explicitly reclaim control through reconnectNow().
+        this.#automaticReconnectBlocked = true;
+        this.#needsReconnect = false;
+        this.#update({
+          controlOwnership: this.#capabilities.role === "observer" ? "observer" : "waiting",
+          lastError: null,
+          phase: "displaced",
+        });
+        return;
+      }
       this.#scheduleReconnect();
     });
     return this.#awaitOpen(socket, signal);
@@ -538,6 +585,11 @@ export class TerminalSession {
         this.#acceptWelcome(frame);
         return;
       case "input-ack":
+        if (!this.#inputAdmissionEnabled) return;
+        if (frame.writerFence === undefined) {
+          this.#protocolFailure();
+          return;
+        }
         this.#input.acceptAcknowledgement(frame);
         return;
       case "writer-lease-status":
@@ -580,13 +632,29 @@ export class TerminalSession {
       return;
     }
     const previousLease = this.#writerLease;
-    this.#writerLease = frame.writerLease ?? null;
-    if (this.#writerLease !== null && this.#writerIdentityConnectionId !== frame.connectionId) {
-      if (this.#writerIdentityConnectionId !== null) this.#input.startNewInputEpoch();
-      this.#writerIdentityConnectionId = frame.connectionId;
+    const previousFence = this.#writerFence;
+    if (this.#inputAdmissionEnabled && frame.writerLease !== undefined) {
+      if (frame.writerFence === undefined) {
+        this.#protocolFailure();
+        return;
+      }
+      this.#writerLease = frame.writerLease;
+      this.#writerFence = frame.writerFence;
+    } else {
+      // During component skew a new Browser cannot allocate a Browser-visible identity without a
+      // Cloud fence. A new-new pair selects browser-input-admission-v1 and stays writable on v2.
+      this.#writerLease = null;
+      this.#writerFence = null;
     }
-    if (!this.#input.status.connected || previousLease !== this.#writerLease) {
-      this.#attachInputTransport();
+    const writable =
+      this.#input.status.connected &&
+      previousLease === this.#writerLease &&
+      previousFence === this.#writerFence
+        ? this.#input.status.writable
+        : this.#attachInputTransport();
+    if (this.#writerLease !== null && !writable) {
+      this.#protocolFailure();
+      return;
     }
     if (this.#writerLease === null) this.#stopWriterLeaseRenewal();
     else this.#startWriterLeaseRenewal();
@@ -605,10 +673,22 @@ export class TerminalSession {
   #acceptWriterLeaseStatus(
     frame: Extract<ServerControlFrame, { type: "writer-lease-status" }>,
   ): void {
-    if (frame.active || this.#capabilities.role === "observer") return;
+    if (!this.#inputAdmissionEnabled || this.#capabilities.role === "observer") return;
+    if (frame.active) {
+      if (
+        frame.writerFence === undefined ||
+        this.#writerFence === null ||
+        frame.writerFence !== this.#writerFence ||
+        this.#writerLease === null
+      ) {
+        this.#protocolFailure();
+      }
+      return;
+    }
     this.#writerLease = null;
+    this.#writerFence = null;
     this.#stopWriterLeaseRenewal();
-    this.#attachInputTransport();
+    this.#input.revokeWriterAuthority();
     this.#update({ controlOwnership: "waiting" });
   }
 
@@ -655,6 +735,7 @@ export class TerminalSession {
     const abort = new AbortController();
     this.#replacementAbort = abort;
     this.#generation = generation;
+    this.#input.noteDataTransportReplacement();
     this.#input.setReplicaCurrent(false);
     this.#stopHeartbeat();
     this.#closeSocket(this.#data);
@@ -903,12 +984,44 @@ export class TerminalSession {
     this.#writerLeaseTimer = null;
   }
 
-  #attachInputTransport(): void {
-    this.#input.attachTransport((inputFrame) => {
-      const sent = this.#sendControl(inputFrame);
-      if (!sent) this.#failFullConnection();
-      return sent;
-    }, this.#writerLease ?? undefined);
+  #attachInputTransport(): boolean {
+    const writable = this.#input.attachTransport({
+      generation: this.#connectionEpoch,
+      sender: (inputFrame) => this.#sendInputControl(inputFrame),
+      ...(this.#writerLease === null ? {} : { writerLease: this.#writerLease }),
+      ...(this.#writerFence === null ? {} : { writerFence: this.#writerFence }),
+    });
+    if (writable) this.#input.reconcileLatestResize();
+    return writable;
+  }
+
+  #sendInputControl(frame: ClientControlFrame): InputTransportSendResult {
+    const control = this.#control;
+    let payload: string;
+    let payloadBytes: number;
+    try {
+      payload = JSON.stringify(frame);
+      payloadBytes = textEncoder.encode(payload).byteLength;
+    } catch {
+      return "proven-not-accepted";
+    }
+    if (
+      control === null ||
+      control.readyState !== 1 ||
+      payloadBytes > MAX_CONTROL_FRAME_BYTES ||
+      control.bufferedAmount + payloadBytes > MAX_CONTROL_QUEUE_BYTES
+    ) {
+      return "proven-not-accepted";
+    }
+    try {
+      control.send(payload);
+    } catch {
+      return "uncertain";
+    }
+    if (control.bufferedAmount > MAX_CONTROL_QUEUE_BYTES) {
+      globalThis.queueMicrotask(() => this.#failFullConnection());
+    }
+    return "accepted";
   }
 
   #stopHeartbeat(): void {
@@ -946,6 +1059,9 @@ export class TerminalSession {
     this.#stopHeartbeat();
     this.#stopWriterLeaseRenewal();
     this.#input.detachTransport();
+    this.#writerLease = null;
+    this.#writerFence = null;
+    this.#inputAdmissionEnabled = false;
     this.#closeSocket(this.#control);
     this.#closeSocket(this.#data);
     this.#control = null;

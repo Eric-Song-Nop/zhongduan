@@ -24,8 +24,13 @@ const EMPTY_SESSION: TerminalSessionSnapshot = {
 
 const EMPTY_INPUT: InputDispatcherStatus = {
   connected: false,
+  controlReplacementRequired: false,
   lastStatus: "idle",
   pending: 0,
+  preAdmission: 0,
+  preAdmissionBytes: 0,
+  queued: 0,
+  queuedBytes: 0,
   replicaCurrent: false,
   resizeConfirmed: false,
   writable: false,
@@ -58,6 +63,7 @@ function sessionStatusLabel(snapshot: TerminalSessionSnapshot, engineReady: bool
   if (snapshot.lastError === "engine") return "引擎不匹配";
   if (snapshot.phase === "live") return "已连接";
   if (snapshot.phase === "offline") return "宿主离线";
+  if (snapshot.phase === "displaced") return "连接已转移";
   if (snapshot.phase === "restoring") return "恢复会话";
   if (snapshot.phase === "attaching") return "同步终端";
   if (snapshot.phase === "reconnecting") return "正在重连";
@@ -103,6 +109,11 @@ export function TerminalApp({ capability, capabilityError, onReload }: TerminalA
       const dispatcher = new InputDispatcher({
         getObservedEventSeq: () =>
           sessionRef.current?.coordinator.activeCursor?.lastEventSeq ?? null,
+        onIntentResult: (result) => {
+          window.dispatchEvent(
+            new CustomEvent("zhongduan:input-intent-result", { detail: result }),
+          );
+        },
       });
       let host: WTermReplicaHost;
       try {
@@ -184,7 +195,7 @@ export function TerminalApp({ capability, capabilityError, onReload }: TerminalA
       ? "ok"
       : engineFailed || session.phase === "failed" || session.lastError !== null
         ? "error"
-        : session.phase === "offline"
+        : session.phase === "offline" || session.phase === "displaced"
           ? "warning"
           : "busy";
   const ownershipLabel =

@@ -417,8 +417,14 @@ async function openBrowser(
   session: CreatedSession,
   capability: string,
   clientId?: string,
+  relayCapabilities: string[] = [],
 ): Promise<BrowserEndpoint> {
-  const connection = await createConnectionSet(session.sessionId, capability, clientId);
+  const connection = await createConnectionSet(
+    session.sessionId,
+    capability,
+    clientId,
+    relayCapabilities,
+  );
   const control = await upgrade(session.sessionId, "control", connection.controlTicket);
   const data = await upgrade(session.sessionId, "data", connection.dataTicket);
   return { connection, control, data };
@@ -495,13 +501,14 @@ async function renewWriterLease(
   session: CreatedSession,
   browser: BrowserEndpoint,
   writerLease: string,
-): Promise<{ active: boolean; expiresAt?: number; type: string }> {
+): Promise<{ active: boolean; expiresAt?: number; type: string; writerFence?: string }> {
   browser.control.socket.send(JSON.stringify({ type: "writer-lease-renew", writerLease }));
   await drainSession(session.sessionId);
   return browser.control.inbox.nextJson<{
     active: boolean;
     expiresAt?: number;
     type: string;
+    writerFence?: string;
   }>();
 }
 
@@ -3120,6 +3127,67 @@ describe("live Durable Object relay", () => {
       ackedPtyOffset: finalOffset,
       sentEventSeq: "33",
       sentPtyOffset: finalOffset,
+    });
+  });
+
+  it("negotiates E1 Browser fences while preserving the v2 input path", async () => {
+    const session = await createSession();
+    const host = await openHost(session);
+    const browser = await openBrowser(session, session.writerCapability, undefined, [
+      RelayCapability.deliveryBarrierOutcomeV1,
+      RelayCapability.browserInputAdmissionV1,
+    ]);
+    expect(browser.connection.selectedCapabilities).toEqual([
+      RelayCapability.browserInputAdmissionV1,
+    ]);
+    const { welcome } = await attachBrowser(session, host, browser);
+    expect(welcome).toMatchObject({
+      type: "welcome",
+      writerFence: "1",
+      writerLease: expect.any(String),
+    });
+    const writerLease = String(welcome.writerLease);
+
+    expect(await renewWriterLease(session, browser, writerLease)).toMatchObject({
+      type: "writer-lease-status",
+      active: true,
+      writerFence: "1",
+    });
+    browser.control.socket.send(JSON.stringify(keyFrame(writerLease, "e1_browser_epoch", "1")));
+    const forwarded = await host.control.inbox.nextJson<Record<string, unknown>>();
+    expect(forwarded).toMatchObject({
+      type: "key",
+      connectionId: browser.connection.connectionId,
+      writerFence: "1",
+      inputEpoch: "e1_browser_epoch",
+      clientInputSeq: "1",
+    });
+    host.control.socket.send(
+      JSON.stringify({
+        type: "input-ack",
+        connectionId: browser.connection.connectionId,
+        inputEpoch: "e1_browser_epoch",
+        clientInputSeq: "1",
+        status: "written",
+        authorityEventSeq: "1",
+      }),
+    );
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toEqual({
+      type: "input-ack",
+      writerFence: "1",
+      inputEpoch: "e1_browser_epoch",
+      clientInputSeq: "1",
+      status: "written",
+      authorityEventSeq: "1",
+    });
+
+    browser.control.socket.send(JSON.stringify(keyFrame("stale-lease", "e1_rejected", "2")));
+    expect(await browser.control.inbox.nextJson<Record<string, unknown>>()).toMatchObject({
+      type: "input-ack",
+      writerFence: "1",
+      inputEpoch: "e1_rejected",
+      clientInputSeq: "2",
+      status: "rejected",
     });
   });
 });

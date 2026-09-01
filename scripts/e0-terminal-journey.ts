@@ -973,9 +973,7 @@ function validateTerminalIntents(input: unknown, label: string): Data[] {
         (terminalRecords[0]!["localIntentId"] !== localId ||
           terminalRecords[0]!["outcome"] !== outcomes[0]))
     ) {
-      throw new ContractError(
-        `every ${label} item must retain zero or one passive terminal outcome`,
-      );
+      throw new ContractError(`every ${label} item must retain zero or one terminal outcome`);
     }
     if (localIds.has(localId)) throw new ContractError(`${label} LocalIntentIds must be unique`);
     localIds.add(localId);
@@ -1017,7 +1015,16 @@ function validateObservationEffects(observations: Data, events: Data[], label: s
       !deepEqual(item["passiveBrowserIdentities"], browserIdentities) ||
       item["passiveSendAttemptCount"] !== sampleAttempts.length
     ) {
-      throw new ContractError(`${label} passive send evidence disagrees with proxy events`);
+      throw new ContractError(
+        `${label} passive send evidence disagrees with proxy events for ${sampleId}: ` +
+          `browser=${JSON.stringify({
+            identities: item["passiveBrowserIdentities"],
+            attempts: item["passiveSendAttemptCount"],
+          })}, proxy=${JSON.stringify({
+            identities: browserIdentities,
+            attempts: sampleAttempts.length,
+          })}`,
+      );
     }
     if (browserIdentities.length > 0) {
       if (
@@ -1267,6 +1274,37 @@ export function validateScenarioReport(
     }
     if (records(observations["secureInput"], "secure input").length === 0) {
       throw new ContractError("correctness-faults lacks secure-input evidence");
+    }
+    const requiredProductSamples = evidence["requiredProductIntentSampleIds"];
+    if (requiredProductSamples !== undefined) {
+      if (
+        !uniqueStringList(requiredProductSamples) ||
+        requiredProductSamples.length !== measuredIntents.length ||
+        requiredProductSamples.some(
+          (sampleId) => !measuredIntents.some((item) => item["sampleId"] === sampleId),
+        )
+      ) {
+        throw new ContractError(
+          "correctness-faults product evidence must cover every measured input sample",
+        );
+      }
+      for (const sampleId of requiredProductSamples) {
+        const item = measuredIntents.find((candidate) => candidate["sampleId"] === sampleId)!;
+        const terminalRecords = item["terminalRecords"];
+        const terminal = Array.isArray(terminalRecords) ? terminalRecords[0] : undefined;
+        if (
+          !Array.isArray(terminalRecords) ||
+          terminalRecords.length !== 1 ||
+          !isData(terminal) ||
+          terminal["source"] !== "product-intent-result-event" ||
+          typeof terminal["productLocalIntentId"] !== "string" ||
+          terminal["productLocalIntentId"].length === 0
+        ) {
+          throw new ContractError(
+            `correctness-faults sample ${sampleId} lacks an E1 product input result`,
+          );
+        }
+      }
     }
   }
   const measuredSampleIds = new Set(measuredIntents.map((item) => String(item["sampleId"])));

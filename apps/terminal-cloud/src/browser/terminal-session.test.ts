@@ -2,6 +2,8 @@ import type { InputSink, TerminalInputEvent, TerminalMouseInputEvent } from "@wt
 import {
   DataFrameFlag,
   DataFrameKind,
+  RELAY_CAPABILITIES_HEADER,
+  RelayCapability,
   encodeDataFrame,
   type ReplicaCursor,
   type ResizePayload,
@@ -95,6 +97,17 @@ class FakeSocket extends EventTarget {
     if (this.readyState >= 2) return;
     this.readyState = 3;
     this.dispatchEvent(new Event("close"));
+  }
+
+  remoteClose(code: number, reason: string): void {
+    if (this.readyState >= 2) return;
+    this.readyState = 3;
+    const event = new Event("close");
+    Object.defineProperties(event, {
+      code: { value: code },
+      reason: { value: reason },
+    });
+    this.dispatchEvent(event);
   }
 }
 
@@ -238,6 +251,7 @@ async function openRecoveryUnderWatchdog(
     expiresAt: timers.now + 30_000,
     controlTicket: "control_ticket_warm_watchdog",
     dataTicket: "data_ticket_warm_watchdog",
+    selectedCapabilities: ["browser-input-admission-v1"],
   };
   const fetch = vi.fn(
     async () =>
@@ -325,6 +339,180 @@ async function openRecoveryUnderWatchdog(
 }
 
 describe("TerminalSession delivery activation", () => {
+  it("waits for explicit reclaim after another control connection replaces this page", async () => {
+    const timers = new ManualTimers();
+    timers.now = 2_000_000_000_000;
+    let connection = 0;
+    const fetch = vi.fn(async () => {
+      connection += 1;
+      return new Response(
+        JSON.stringify({
+          connectionSetId: `connection_set_displaced_${connection}`,
+          connectionId: `connection_displaced_${connection}`,
+          clientId: "browser_client_displaced",
+          streamId: 7,
+          deliveryGeneration: String(connection),
+          expiresAt: timers.now + 30_000,
+          controlTicket: `control_ticket_displaced_${connection}`,
+          dataTicket: `data_ticket_displaced_${connection}`,
+          selectedCapabilities: ["browser-input-admission-v1"],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    const capabilities = new CapabilityManager({
+      bootstrap: {
+        capability: "opaque",
+        expiresAt: Math.floor(timers.now / 1_000) + 1_000,
+        issuedAt: Math.floor(timers.now / 1_000),
+        role: "writer",
+        sessionId: SESSION_ID,
+      },
+      fetch,
+      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: vi.fn(),
+    });
+    const input = new InputDispatcher({ getObservedEventSeq: () => null });
+    const sockets: FakeSocket[] = [];
+    const session = new TerminalSession({
+      capabilities,
+      engineId: ENGINE_ID,
+      host: {
+        engineId: ENGINE_ID,
+        active: new VisibleSink(),
+        restore: vi.fn<ReplicaHost["restore"]>(),
+        adopt: vi.fn(),
+      },
+      input,
+      sessionId: SESSION_ID,
+      snapshots: { load: vi.fn() },
+      fetch,
+      createWebSocket: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+      makeWebSocketUrl: (path) => path,
+      now: () => timers.now,
+      random: () => 0,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    });
+
+    session.start();
+    await waitForSockets(sockets, 1);
+    sockets[0]!.open();
+    await waitForSockets(sockets, 2);
+    sockets[1]!.open();
+    await vi.waitFor(() =>
+      expect(session.snapshot).toMatchObject({ controlConnected: true, dataConnected: true }),
+    );
+
+    sockets[0]!.remoteClose(4001, "connection replaced");
+    expect(session.snapshot).toMatchObject({
+      controlConnected: false,
+      controlOwnership: "waiting",
+      dataConnected: false,
+      phase: "displaced",
+    });
+    expect(input.status.writable).toBe(false);
+    await timers.advanceBy(60_000);
+    expect(sockets).toHaveLength(2);
+
+    session.reconnectNow();
+    await waitForSockets(sockets, 3);
+    expect(session.snapshot.phase).toBe("reconnecting");
+    session.close();
+  });
+
+  it("fails closed to read-only when an older Cloud does not select E1 admission", async () => {
+    const response = {
+      connectionSetId: "connection_set_legacy1",
+      connectionId: "connection_id_legacy01",
+      clientId: "browser_client_legacy1",
+      streamId: 7,
+      deliveryGeneration: "1",
+      expiresAt: Date.now() + 30_000,
+      controlTicket: "control_ticket_legacy1",
+      dataTicket: "data_ticket_legacy001",
+    };
+    const fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify(response), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    const capabilities = new CapabilityManager({
+      bootstrap: {
+        capability: "opaque",
+        expiresAt: Math.floor(Date.now() / 1_000) + 1_000,
+        issuedAt: Math.floor(Date.now() / 1_000),
+        role: "writer",
+        sessionId: SESSION_ID,
+      },
+      fetch,
+      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: vi.fn(),
+    });
+    const input = new InputDispatcher({
+      getObservedEventSeq: () => null,
+      inputEpoch: "input_epoch_legacy1",
+    });
+    const sockets: FakeSocket[] = [];
+    const session = new TerminalSession({
+      capabilities,
+      engineId: ENGINE_ID,
+      host: {
+        engineId: ENGINE_ID,
+        active: new VisibleSink(),
+        restore: vi.fn<ReplicaHost["restore"]>(),
+        adopt: vi.fn(),
+      },
+      input,
+      sessionId: SESSION_ID,
+      snapshots: { load: vi.fn() },
+      fetch,
+      createWebSocket: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+      makeWebSocketUrl: (path) => path,
+    });
+
+    session.start();
+    await waitForSockets(sockets, 1);
+    const control = sockets[0]!;
+    control.open();
+    await waitForSockets(sockets, 2);
+    sockets[1]!.open();
+    control.message(
+      JSON.stringify({
+        type: "welcome",
+        connectionId: response.connectionId,
+        streamId: 7,
+        writerLease: "legacy_writer_lease",
+        engineId: ENGINE_ID,
+        sessionEpoch: "1",
+        deliveryGeneration: "1",
+        headEventSeq: "0",
+        nextPtyOffset: "0",
+      }),
+    );
+
+    expect(input.status).toMatchObject({ connected: true, writable: false });
+    expect(session.snapshot.controlOwnership).toBe("waiting");
+    const localIntentId = input.send(interruptKey());
+    expect(input.getResult(localIntentId)).toMatchObject({
+      outcome: "not-sent",
+      reason: "not-writable",
+      identity: null,
+    });
+    expect(controlFrames(control).filter((frame) => frame.type === "key")).toEqual([]);
+    session.close();
+  });
+
   it("buffers data before replay-start and invalidates the old data callback before replacement", async () => {
     const sink = new VisibleSink();
     const host: ReplicaHost = {
@@ -347,6 +535,7 @@ describe("TerminalSession delivery activation", () => {
         expiresAt: Date.now() + 30_000,
         controlTicket: "control_ticket_0001",
         dataTicket: "data_ticket_000001",
+        selectedCapabilities: ["browser-input-admission-v1"],
       },
     ];
     const fetch = vi.fn(
@@ -397,6 +586,14 @@ describe("TerminalSession delivery activation", () => {
     });
 
     session.start();
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining("/connection-sets"),
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          [RELAY_CAPABILITIES_HEADER]: RelayCapability.browserInputAdmissionV1,
+        }),
+      }),
+    );
     await waitForSockets(sockets, 1);
     const control = sockets[0]!;
     control.open();
@@ -417,6 +614,7 @@ describe("TerminalSession delivery activation", () => {
         connectionId: "connection_id_00001",
         streamId: 7,
         writerLease: "writer_lease_0001",
+        writerFence: "1",
         engineId: ENGINE_ID,
         sessionEpoch: "1",
         deliveryGeneration: "2",
@@ -448,6 +646,22 @@ describe("TerminalSession delivery activation", () => {
         controlFrames(control).filter((frame) => frame.type === "resize-request"),
       ).toHaveLength(1);
     });
+    expect(controlFrames(control).find((frame) => frame.type === "resize-request")).toMatchObject({
+      inputEpoch: "input_epoch_00001",
+      clientInputSeq: "1",
+    });
+    expect(controlFrames(control).some((frame) => frame.type === "begin-input-epoch")).toBe(false);
+    control.message(
+      JSON.stringify({
+        type: "input-ack",
+        writerFence: "1",
+        inputEpoch: "input_epoch_00001",
+        clientInputSeq: "1",
+        status: "written",
+        authorityEventSeq: "11",
+      }),
+    );
+    expect(input.status.pending).toBe(0);
     input.confirmAuthoritativeResize(RESIZE);
     control.message(JSON.stringify({ type: "host-offline" }));
     expect(session.snapshot.hostOnline).toBe(false);
@@ -569,6 +783,7 @@ describe("TerminalSession delivery activation", () => {
       expiresAt: timers.now + 30_000,
       controlTicket: "control_ticket_lease01",
       dataTicket: "data_ticket_lease001",
+      selectedCapabilities: ["browser-input-admission-v1"],
     };
     const fetch = vi.fn(
       async () =>
@@ -636,6 +851,7 @@ describe("TerminalSession delivery activation", () => {
         connectionId: response.connectionId,
         streamId: 7,
         writerLease: "writer_lease_lease01",
+        writerFence: "1",
         engineId: ENGINE_ID,
         sessionEpoch: "1",
         deliveryGeneration: "2",
@@ -696,6 +912,7 @@ describe("TerminalSession delivery activation", () => {
         expiresAt: timers.now + 30_000,
         controlTicket: `control_ticket_${silentChannel}`,
         dataTicket: `data_ticket_${silentChannel}`,
+        selectedCapabilities: ["browser-input-admission-v1"],
       };
       const fetch = vi.fn(
         async () =>
@@ -877,7 +1094,7 @@ describe("TerminalSession delivery activation", () => {
     session.close();
   });
 
-  it("invalidates both sockets when a user input would exceed the native control queue", async () => {
+  it("returns not-sent and replaces both sockets before invoking a backpressured sender", async () => {
     const sink = new VisibleSink();
     const host: ReplicaHost = {
       engineId: ENGINE_ID,
@@ -894,6 +1111,7 @@ describe("TerminalSession delivery activation", () => {
       expiresAt: Date.now() + 30_000,
       controlTicket: "control_ticket_queue1",
       dataTicket: "data_ticket_queue001",
+      selectedCapabilities: ["browser-input-admission-v1"],
     };
     const fetch = vi.fn(
       async () =>
@@ -954,6 +1172,7 @@ describe("TerminalSession delivery activation", () => {
         connectionId: response.connectionId,
         streamId: 7,
         writerLease: "writer_lease_queue1",
+        writerFence: "1",
         engineId: ENGINE_ID,
         sessionEpoch: "1",
         deliveryGeneration: "2",
@@ -965,7 +1184,7 @@ describe("TerminalSession delivery activation", () => {
     control.bufferedAmount = Number.MAX_SAFE_INTEGER;
     const sentBeforeBackpressure = control.sent.length;
     input.send({ type: "text", text: "bounded", source: "input" });
-    await vi.waitFor(() => expect(input.status.lastStatus).toBe("uncertain"));
+    await vi.waitFor(() => expect(input.status.lastStatus).toBe("not-sent"));
     expect(control.sent).toHaveLength(sentBeforeBackpressure);
     expect(control.readyState).toBe(3);
     expect(data.readyState).toBe(3);
@@ -989,6 +1208,7 @@ describe("TerminalSession delivery activation", () => {
       expiresAt: Date.now() + 30_000,
       controlTicket: "control_ticket_replace1",
       dataTicket: "data_ticket_replace01",
+      selectedCapabilities: ["browser-input-admission-v1"],
     };
     const fetch = vi.fn(
       async () =>
@@ -1109,6 +1329,7 @@ describe("TerminalSession delivery activation", () => {
       expiresAt: Date.now() + 30_000,
       controlTicket: `control_ticket_000${generation}`,
       dataTicket: `data_ticket_00000${generation}`,
+      selectedCapabilities: ["browser-input-admission-v1"],
     }));
     const fetch = vi.fn(
       async () =>
@@ -1186,6 +1407,7 @@ describe("TerminalSession delivery activation", () => {
       expiresAt: Date.now() + 30_000,
       controlTicket: "control_ticket_engine1",
       dataTicket: "data_ticket_engine001",
+      selectedCapabilities: ["browser-input-admission-v1"],
     };
     const fetch = vi.fn(
       async () =>
@@ -1246,6 +1468,7 @@ describe("TerminalSession delivery activation", () => {
         connectionId: response.connectionId,
         streamId: 7,
         writerLease: "writer_lease_engine1",
+        writerFence: "1",
         engineId: ENGINE_ID,
         sessionEpoch: "1",
         deliveryGeneration: "2",
@@ -1313,6 +1536,7 @@ describe("TerminalSession delivery activation", () => {
           expiresAt: timers.now + 30_000,
           controlTicket: `control_ticket_retry${generation}`,
           dataTicket: `data_ticket_retry${generation}`,
+          selectedCapabilities: ["browser-input-admission-v1"],
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
@@ -1374,6 +1598,7 @@ describe("TerminalSession delivery activation", () => {
           connectionId: `connection_id_retry${generation}`,
           streamId: 7,
           writerLease: "writer_lease_retry1",
+          writerFence: generation.toString(),
           engineId: ENGINE_ID,
           sessionEpoch: "1",
           deliveryGeneration: generation.toString(),
@@ -1433,6 +1658,7 @@ describe("TerminalSession delivery activation", () => {
       expiresAt: timers.now + 30_000,
       controlTicket: "control_ticket_snapshot1",
       dataTicket: "data_ticket_snapshot01",
+      selectedCapabilities: ["browser-input-admission-v1"],
     };
     const fetch = vi.fn(
       async () =>
@@ -1493,6 +1719,7 @@ describe("TerminalSession delivery activation", () => {
         connectionId: response.connectionId,
         streamId: 7,
         writerLease: "writer_lease_snapshot1",
+        writerFence: "1",
         engineId: ENGINE_ID,
         sessionEpoch: "1",
         deliveryGeneration: "1",
@@ -1524,6 +1751,7 @@ describe("TerminalSession delivery activation", () => {
         connectionId: response.connectionId,
         streamId: 7,
         writerLease: "writer_lease_snapshot1",
+        writerFence: "1",
         engineId: ENGINE_ID,
         sessionEpoch: "1",
         deliveryGeneration: "2",
@@ -1582,6 +1810,7 @@ describe("TerminalSession delivery activation", () => {
       expiresAt: Date.now() + 30_000,
       controlTicket: "control_ticket_candidate1",
       dataTicket: "data_ticket_candidate01",
+      selectedCapabilities: ["browser-input-admission-v1"],
     };
     const fetch = vi.fn(
       async () =>
@@ -1636,6 +1865,7 @@ describe("TerminalSession delivery activation", () => {
         connectionId: response.connectionId,
         streamId: 7,
         writerLease: "writer_lease_candidate1",
+        writerFence: "1",
         engineId: ENGINE_ID,
         sessionEpoch: "1",
         deliveryGeneration: "1",
@@ -1677,6 +1907,7 @@ describe("TerminalSession delivery activation", () => {
       expiresAt: Date.now() + 30_000,
       controlTicket: "control_ticket_cold1",
       dataTicket: "data_ticket_cold001",
+      selectedCapabilities: ["browser-input-admission-v1"],
     };
     const fetch = vi.fn(
       async () =>
