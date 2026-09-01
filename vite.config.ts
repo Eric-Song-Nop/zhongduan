@@ -33,7 +33,7 @@ export default defineConfig({
       verify: {
         command: [
           "node scripts/prepare-wterm.mjs",
-          "python3 -B -m unittest scripts/test_e0_terminal_journey.py",
+          "node scripts/e0-terminal-journey.ts",
           "node scripts/e0_authority_oracle.mjs",
           "vp check",
           "node scripts/verify-no-source-emit.mjs",
@@ -54,14 +54,15 @@ export default defineConfig({
       "verify-e0-contract": {
         command: [
           "node scripts/prepare-wterm.mjs",
-          "python3 -B -m unittest scripts/test_e0_terminal_journey.py",
+          "node scripts/e0-terminal-journey.ts",
+          "vp test --run scripts/e0-terminal-journey.test.ts",
           "node scripts/e0_authority_oracle.mjs",
-          "python3 -B scripts/verify-e0-terminal-journey.py --matrix-plan",
+          "node scripts/verify-e0-terminal-journey.ts --matrix-plan",
         ],
         cache: false,
       },
       "verify-e0-local": {
-        command: "python3 -B scripts/verify-e0-terminal-journey.py",
+        command: "node scripts/verify-e0-terminal-journey.ts",
         cache: false,
       },
       "verify-clean-host": {

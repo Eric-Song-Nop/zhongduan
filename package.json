@@ -5,10 +5,14 @@
   "type": "module",
   "devDependencies": {
     "@types/node": "26.4.0",
+    "@types/ws": "8.18.1",
     "@zhongduan/protocol": "workspace:*",
+    "lossless-json": "4.3.1",
+    "playwright": "1.59.0",
     "typescript": "6.0.3",
     "vite-plus": "0.3.0",
-    "vitest": "4.1.11"
+    "vitest": "4.1.11",
+    "ws": "8.21.3"
   },
   "engines": {
     "node": ">=24.11.0"

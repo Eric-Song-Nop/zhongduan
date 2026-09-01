@@ -213,7 +213,7 @@
   },
   "baseline": "CURRENT",
   "baselineStatus": "complete",
-  "contractSha256": "8cc45e7a56f4c0b88c4472bb264eee3082f28e19bcdf26880fe74d6730b34c85",
+  "contractSha256": "06731bf64555ec4736147826a277464a2e394cd6ba6575266b72dc54c5d09cbc",
   "currentFailures": [],
   "deadlineIsSlo": false,
   "deadlineMs": 120000,
@@ -221,9 +221,9 @@
     "executionTier": "local-workerd",
     "ghosttyArtifactVerified": true,
     "ghosttyEngineId": "ghostty:fe317f850c3ab212f6638122c459b9b48b99a016:wterm-engine-sha256:2836a71302115fb2989235666560fc4b6a5739158478e85e4d25bd1f1248fe96",
+    "harnessRuntime": "TypeScript on Node.js",
     "node": "v24.20.0",
     "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
-    "python": "3.14.7",
     "wtermGitlink": "4764f3b5e81cb76cdb08d4ffbfba1257fd33efd6"
   },
   "evidenceBoundary": {
@@ -503,7 +503,7 @@
     {
       "maxMs": 319.7997,
       "p50Ms": 297.3,
-      "p95Ms": 311.0,
+      "p95Ms": 311,
       "p99Ms": 319.7997,
       "sampleCount": 27,
       "span": "input-to-matching-browser-render",
@@ -873,7 +873,7 @@
     }
   },
   "rawEventCount": 82036,
-  "reconstructedReportSha256": "d2c982ab9e6498de086d975737de54c0286740ba4fa8f5d2abef83279dedcc67",
+  "reconstructedReportSha256": "562c3369e63544cbf9d342eb914e7acb0b572a3bf585e2e461f35f90bce45d80",
   "relativeThresholdMeasurements": {
     "cloudBulkIsolation": {
       "metric": "one-plus-nonnegative-normalized-p99-slope-per-MiB",
@@ -922,14 +922,14 @@
   },
   "reportSchemaVersion": "zhongduan-terminal-journey-report-v1",
   "scenarioArchive": {
-    "compressedBytes": 510121,
-    "compressedSha256": "7d7d764d8ca115baef4caa962247daf751afbd16ba6f85efc44d28d7cd09fb37",
+    "compressedBytes": 505777,
+    "compressedSha256": "113af557ee46d30b228013cde4ae1cec473c0e491e32361c309296d95887cc4c",
     "compression": "gzip-9-mtime-0",
     "format": "canonical-jsonl",
     "path": "current-baseline.scenarios.jsonl.gz",
     "scenarioCount": 25,
-    "uncompressedBytes": 14790782,
-    "uncompressedSha256": "5eb03139f423ccbdbe3417b6b18b5906f829a1a8c13b51f5b13624b593573304"
+    "uncompressedBytes": 14791357,
+    "uncompressedSha256": "217ce94233e02aa351cbe4806af580dff71df32ec8d1126d3c460b422d86b958"
   },
   "schemaVersion": "zhongduan-terminal-journey-bundle-v1",
   "sourceRevision": "f56205fd99b6ea0133fc387098221ebf2906ca3b",
