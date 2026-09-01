@@ -49,10 +49,11 @@ implying that regenerated oracle evidence came from the older scenario commit.
 From the repository root:
 
 ```bash
-python3 -B -m unittest scripts/test_e0_terminal_journey.py
 node scripts/prepare-wterm.mjs
+node scripts/e0-terminal-journey.ts
+pnpm exec vp test --run scripts/e0-terminal-journey.test.ts
 node scripts/e0_authority_oracle.mjs
-python3 -B scripts/verify-e0-terminal-journey.py --matrix-plan
+node scripts/verify-e0-terminal-journey.ts --matrix-plan
 ```
 
 The authority oracle executes the committed Ghostty WASM and compares a true snapshot-disabled
@@ -63,12 +64,11 @@ byte-split `WRITE_PTY` effects. Its standalone command exits nonzero on divergen
 retains a failing result so it cannot be mistaken for missing evidence. The 120-second scenario
 deadline is a hang guard, never a latency SLO.
 
-## Install the isolated runner
+## Install the runner
 
 ```bash
-python3 -m venv .venv-e0
-.venv-e0/bin/python -m pip install -r scripts/requirements-e0-terminal-journey.txt
-.venv-e0/bin/python -m playwright install chromium
+pnpm install
+pnpm exec playwright install chromium
 ```
 
 The runner refuses to overwrite an existing `apps/terminal-cloud/.dev.vars`, does not deploy, and
@@ -86,7 +86,7 @@ comparison variants.
 mkdir -p /tmp/zhongduan-e0-current
 for browser_rtt in 20 100 300 600; do
   for host_rtt in 20 100 300 600; do
-    .venv-e0/bin/python -B scripts/verify-e0-terminal-journey.py \
+    node scripts/verify-e0-terminal-journey.ts \
       --variant steady \
       --browser-cloud-rtt-ms "$browser_rtt" \
       --cloud-host-rtt-ms "$host_rtt" \
@@ -95,25 +95,25 @@ for browser_rtt in 20 100 300 600; do
   done
 done
 
-.venv-e0/bin/python -B scripts/verify-e0-terminal-journey.py \
+node scripts/verify-e0-terminal-journey.ts \
   --variant steady --network-fault jitter --jitter-ms 10 \
   --browser-cloud-rtt-ms 100 --cloud-host-rtt-ms 100 \
   --samples 24 --warmups 4 --report /tmp/zhongduan-e0-current/steady-jitter.json
 
 for variant in output-flood correctness-faults; do
-  .venv-e0/bin/python -B scripts/verify-e0-terminal-journey.py \
+  node scripts/verify-e0-terminal-journey.ts \
     --variant "$variant" --browser-cloud-rtt-ms 100 --cloud-host-rtt-ms 100 \
     --samples 24 --warmups 4 --report "/tmp/zhongduan-e0-current/${variant}.json"
 done
 
 for variant in bulk-backlog-0 bulk-backlog-262144 bulk-backlog-1048576 \
   bulk-backlog-4194304 snapshot-disabled snapshot-enabled; do
-  .venv-e0/bin/python -B scripts/verify-e0-terminal-journey.py \
+  node scripts/verify-e0-terminal-journey.ts \
     --variant "$variant" --browser-cloud-rtt-ms 20 --cloud-host-rtt-ms 20 \
     --samples 24 --warmups 4 --report "/tmp/zhongduan-e0-current/${variant}.json"
 done
 
-.venv-e0/bin/python -B scripts/verify-e0-terminal-journey.py \
+node scripts/verify-e0-terminal-journey.ts \
   --merge-scenarios /tmp/zhongduan-e0-current/*.json \
   --artifact-kind current \
   --report benchmarks/terminal-journey/current-baseline.json
@@ -145,7 +145,7 @@ Repeat the same 25 commands from the clean final E4a commit, changing the output
 Then generate a distinct candidate artifact and the finite E4b decision together:
 
 ```bash
-.venv-e0/bin/python -B scripts/verify-e0-terminal-journey.py \
+node scripts/verify-e0-terminal-journey.ts \
   --merge-scenarios /tmp/zhongduan-e4a-candidate/*.json \
   --artifact-kind candidate \
   --current-report benchmarks/terminal-journey/current-baseline.json \
