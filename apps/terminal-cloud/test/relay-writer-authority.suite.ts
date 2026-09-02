@@ -18,6 +18,31 @@ import {
   keyFrame,
 } from "./relay-fixture";
 
+async function seedInactiveBrowserClients(sessionId: string, count: number): Promise<void> {
+  await runInDurableObject(sessionStub(sessionId), (_instance, state) => {
+    const session = state.storage.sql
+      .exec("SELECT next_stream_id FROM session_state WHERE singleton = 1")
+      .one() as { next_stream_id: number };
+    for (let index = 0; index < count; index += 1) {
+      const streamId = session.next_stream_id + index;
+      state.storage.sql.exec(
+        `INSERT INTO client_delivery
+          (client_id, principal_id_hash, role, stream_id, delivery_generation,
+           registered_at, reservation_expires_at, updated_at)
+         VALUES (?, ?, 'observer', ?, '1', 1, NULL, ?)`,
+        `inactive_client_${index.toString().padStart(2, "0")}`,
+        "inactive-client-principal",
+        streamId,
+        index + 1,
+      );
+    }
+    state.storage.sql.exec(
+      "UPDATE session_state SET next_stream_id = ? WHERE singleton = 1",
+      session.next_stream_id + count,
+    );
+  });
+}
+
 describe("live Durable Object relay: writer authority", () => {
   it("drops an old input frame that was already queued when a higher writer fence wins", async () => {
     const session = await createSession();
@@ -208,12 +233,7 @@ describe("live Durable Object relay: writer authority", () => {
     first.data.socket.close(1000, "expire first writer");
     await drainSession(session.sessionId);
 
-    for (let index = 0; index < 15; index += 1) {
-      const inactive = await openBrowser(session, session.observerCapability);
-      inactive.control.socket.close(1000, "inactive observer");
-      inactive.data.socket.close(1000, "inactive observer");
-      await drainSession(session.sessionId);
-    }
+    await seedInactiveBrowserClients(session.sessionId, 15);
 
     const next = await openBrowser(session, session.writerCapability);
     const nextAttach = await attachBrowser(session, host, next);
@@ -238,7 +258,7 @@ describe("live Durable Object relay: writer authority", () => {
       fence: "2",
     });
     expect(Number(state.lease.expires_at)).toBeGreaterThan(Date.now());
-  }, 15_000);
+  });
 
   it("fails closed instead of wrapping an exhausted writer fence", async () => {
     const session = await createSession();

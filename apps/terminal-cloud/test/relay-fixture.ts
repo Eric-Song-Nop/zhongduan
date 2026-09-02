@@ -157,14 +157,24 @@ export async function drainSession(sessionId: string): Promise<void> {
 }
 
 afterEach(async () => {
-  for (const socket of testSockets) {
-    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-      socket.close(1000, "test cleanup");
+  const sockets = [...testSockets];
+  const sessionIds = [...testSocketSessions];
+  try {
+    for (const socket of sockets) {
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        socket.close(1000, "test cleanup");
+      }
     }
+    await Promise.all(
+      sessionIds.map(async (sessionId) => {
+        await drainSession(sessionId);
+        await evictDurableObject(sessionStub(sessionId));
+      }),
+    );
+  } finally {
+    testSockets.clear();
+    testSocketSessions.clear();
   }
-  await Promise.all([...testSocketSessions].map((sessionId) => drainSession(sessionId)));
-  testSockets.clear();
-  testSocketSessions.clear();
 });
 
 export async function injectServerSendFailure(
